@@ -304,6 +304,7 @@ pub(crate) struct ChatComposer {
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
     voice: Option<crate::voice::VoiceCapture>,
+    recording_placeholder_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -403,6 +404,7 @@ impl ChatComposer {
             status_line_value: None,
             status_line_enabled: false,
             voice: None,
+            recording_placeholder_id: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -2422,12 +2424,19 @@ impl ChatComposer {
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Press,
+                modifiers,
                 ..
             } => {
-                if self.textarea.is_empty() && self.voice.is_none() {
+                if self.voice.is_none()
+                    && (self.textarea.is_empty() || modifiers.contains(KeyModifiers::SHIFT))
+                {
                     match crate::voice::VoiceCapture::start() {
                         Ok(vc) => {
                             self.voice = Some(vc);
+                            // Insert a visible placeholder immediately showing "recording"
+                            let id = Uuid::new_v4().to_string();
+                            self.textarea.insert_named_element("recording", id.clone());
+                            self.recording_placeholder_id = Some(id);
                             // Do not insert a space
                             return (InputResult::None, true);
                         }
@@ -2447,6 +2456,12 @@ impl ChatComposer {
                 if let Some(vc) = self.voice.take() {
                     match vc.stop() {
                         Ok(audio) => {
+                            // Update the existing placeholder to show "transcribing"
+                            let id = self
+                                .recording_placeholder_id
+                                .take()
+                                .unwrap_or_else(|| Uuid::new_v4().to_string());
+                            let _ = self.textarea.replace_element_by_id(&id, "transcribing");
                             let tx = self.app_event_tx.clone();
                             crate::voice::transcribe_async(audio, tx);
                         }
