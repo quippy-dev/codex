@@ -303,6 +303,7 @@ pub(crate) struct ChatComposer {
     windows_degraded_sandbox_active: bool,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
+    voice: Option<crate::voice::VoiceCapture>,
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +402,7 @@ impl ChatComposer {
             windows_degraded_sandbox_active: false,
             status_line_value: None,
             status_line_enabled: false,
+            voice: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -564,6 +566,10 @@ impl ChatComposer {
     /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
     /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        if self.voice.is_some() {
+            // Ignore paste while recording
+            return false;
+        }
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
@@ -1038,6 +1044,30 @@ impl ChatComposer {
             return (InputResult::None, false);
         }
 
+        // While recording, swallow all input except Space release to finish.
+        if self.voice.is_some() {
+            if let KeyEvent {
+                code: KeyCode::Char(' '),
+                kind: KeyEventKind::Release,
+                ..
+            } = key_event
+            {
+                if let Some(vc) = self.voice.take() {
+                    match vc.stop() {
+                        Ok(audio) => {
+                            let tx = self.app_event_tx.clone();
+                            crate::voice::transcribe_async(audio, tx);
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to stop voice capture: {e}");
+                        }
+                    }
+                }
+                return (InputResult::None, true);
+            }
+            // Swallow everything else while recording
+            return (InputResult::None, false);
+        }
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
@@ -2388,6 +2418,49 @@ impl ChatComposer {
                 let should_queue = !self.steer_enabled;
                 self.handle_submission(should_queue)
             }
+            // Spacebar handling for push-to-talk voice input when composer is empty.
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.textarea.is_empty() && self.voice.is_none() {
+                    match crate::voice::VoiceCapture::start() {
+                        Ok(vc) => {
+                            self.voice = Some(vc);
+                            // Do not insert a space
+                            return (InputResult::None, true);
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to start voice capture: {e}");
+                            // Fall through to normal input handling if capture fails
+                        }
+                    }
+                }
+                self.handle_input_basic(key_event)
+            }
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                kind: KeyEventKind::Release,
+                ..
+            } => {
+                if let Some(vc) = self.voice.take() {
+                    match vc.stop() {
+                        Ok(audio) => {
+                            let tx = self.app_event_tx.clone();
+                            crate::voice::transcribe_async(audio, tx);
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to stop voice capture: {e}");
+                        }
+                    }
+                    // Swallow the key event; don't insert a space
+                    (InputResult::None, true)
+                } else {
+                    // Not recording; treat as normal release
+                    (InputResult::None, false)
+                }
+            }
             input => self.handle_input_basic(input),
         }
     }
@@ -3259,6 +3332,14 @@ impl ChatComposer {
             }
             ActivePopup::None => {
                 let footer_props = self.footer_props();
+                let voice_hint_override = self.voice.as_ref().map(|_| {
+                    vec![(
+                        "Recording".to_string(),
+                        "— release Space to transcribe".to_string(),
+                    )]
+                });
+                let footer_hint_override =
+                    voice_hint_override.as_ref().or(self.footer_hint_override.as_ref());
                 let show_cycle_hint =
                     !footer_props.is_task_running && self.collaboration_mode_indicator.is_some();
                 let show_shortcuts_hint = match footer_props.mode {
@@ -3320,7 +3401,7 @@ impl ChatComposer {
                         .as_ref()
                         .map(|flash| flash.line.width() as u16)
                         .unwrap_or(0)
-                } else if let Some(items) = self.footer_hint_override.as_ref() {
+                } else if let Some(items) = footer_hint_override {
                     footer_hint_items_width(items)
                 } else if status_line_active {
                     truncated_status_line
@@ -3365,8 +3446,7 @@ impl ChatComposer {
                 }
                 let can_show_left_and_context =
                     can_show_left_with_context(hint_rect, left_width, right_width);
-                let has_override =
-                    self.footer_flash_visible() || self.footer_hint_override.is_some();
+                let has_override = self.footer_flash_visible() || footer_hint_override.is_some();
                 let single_line_layout = if has_override {
                     None
                 } else {
@@ -3442,7 +3522,7 @@ impl ChatComposer {
                     if let Some(flash) = self.footer_flash.as_ref() {
                         flash.line.render(inset_footer_hint_area(hint_rect), buf);
                     }
-                } else if let Some(items) = self.footer_hint_override.as_ref() {
+                } else if let Some(items) = footer_hint_override {
                     render_footer_hint_items(hint_rect, buf, items);
                 } else if status_line_active {
                     if let Some(line) = truncated_status_line {

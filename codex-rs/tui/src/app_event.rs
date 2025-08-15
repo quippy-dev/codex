@@ -280,6 +280,9 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
+    /// Insert transcribed text from voice input into the composer.
+    InsertComposerText(String),
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

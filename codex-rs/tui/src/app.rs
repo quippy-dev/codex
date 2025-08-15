@@ -873,7 +873,6 @@ impl App {
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
     }
-
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
         let Some(mut rx) = self.active_thread_rx.take() else {
             return Ok(());
@@ -1525,6 +1524,10 @@ impl App {
                         tui.insert_history_lines(display);
                     }
                 }
+            }
+            AppEvent::InsertComposerText(text) => {
+                self.chat_widget.insert_str(&text);
+                tui.frame_requester().schedule_frame();
             }
             AppEvent::StartCommitAnimation => {
                 if self
