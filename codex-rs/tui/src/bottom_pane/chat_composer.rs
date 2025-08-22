@@ -336,52 +336,7 @@ enum ActivePopup {
 const FOOTER_SPACING_HEIGHT: u16 = 0;
 
 impl ChatComposer {
-    #[inline]
-    fn after_text_change(&mut self) {
-        self.sync_command_popup();
-        if matches!(self.active_popup, ActivePopup::Command(_)) {
-            self.dismissed_file_popup_token = None;
-        } else {
-            self.sync_file_search_popup();
-        }
-    }
-
-    // TextArea helper wrappers that auto-sync popups after mutations
-    #[inline]
-    fn ta_insert_str(&mut self, text: &str) {
-        self.textarea.insert_str(text);
-        self.after_text_change();
-    }
-
-    #[inline]
-    fn ta_insert_named_element(&mut self, text: &str, id: String) {
-        self.textarea.insert_named_element(text, id);
-        self.after_text_change();
-    }
-
-    #[inline]
-    fn ta_replace_element_by_id(&mut self, id: &str, text: &str) -> bool {
-        let changed = self.textarea.replace_element_by_id(id, text);
-        if changed {
-            self.after_text_change();
-        }
-        changed
-    }
-
-    #[inline]
-    fn ta_update_named_element_by_id(&mut self, id: &str, text: &str) -> bool {
-        let changed = self.textarea.update_named_element_by_id(id, text);
-        if changed {
-            self.after_text_change();
-        }
-        changed
-    }
-
-    #[inline]
-    fn ta_set_text(&mut self, text: &str) {
-        self.textarea.set_text(text);
-        self.after_text_change();
-    }
+    
     pub fn new(
         has_input_focus: bool,
         app_event_tx: AppEventSender,
@@ -632,15 +587,14 @@ impl ChatComposer {
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
             let placeholder = self.next_large_paste_placeholder(char_count);
             self.textarea.insert_element(&placeholder);
-            self.after_text_change();
             self.pending_pastes.push((placeholder, pasted));
         } else if char_count > 1
             && self.image_paste_enabled()
             && self.handle_paste_image_path(pasted.clone())
         {
-            self.ta_insert_str(" ");
+            self.insert_str(" ");
         } else {
-            self.ta_insert_str(&pasted);
+            self.insert_str(&pasted);
         }
         // Explicit paste events should not trigger Enter suppression.
         self.paste_burst.clear_after_explicit_paste();
@@ -2562,7 +2516,9 @@ impl ChatComposer {
 
                 // Insert space immediately so normal typing works.
                 let insert_pos = self.textarea.cursor();
-                self.ta_insert_str(" ");
+                self.textarea.insert_str(" ");
+                self.sync_command_popup();
+                self.sync_file_search_popup();
 
                 // Record pending hold metadata.
                 let id = Uuid::new_v4().to_string();
@@ -2673,7 +2629,9 @@ impl ChatComposer {
                     self.voice = Some(vc);
                     // Insert a visible placeholder for the meter (no label).
                     let id = Uuid::new_v4().to_string();
-                    self.ta_insert_named_element("", id.clone());
+                    self.textarea.insert_named_element("", id.clone());
+                    self.sync_command_popup();
+                    self.sync_file_search_popup();
                     self.recording_placeholder_id = Some(id);
                     // Spawn metering animation.
                     if let Some(v) = &self.voice {
@@ -2772,16 +2730,23 @@ impl ChatComposer {
         });
     }
     pub fn replace_transcription(&mut self, id: &str, text: &str) {
-        let _ = self.ta_replace_element_by_id(id, text);
+        let _ = self.textarea.replace_element_by_id(id, text);
+        self.sync_command_popup();
+        self.sync_file_search_popup();
     }
-
     pub fn update_transcription_in_place(&mut self, id: &str, text: &str) {
-        let _ = self.ta_update_named_element_by_id(id, text);
+        let updated = self.textarea.update_named_element_by_id(id, text);
+        if updated {
+            self.sync_command_popup();
+            self.sync_file_search_popup();
+        }
     }
 
     pub fn remove_transcription_placeholder(&mut self, id: &str) {
         // Replace with empty string to delete the placeholder if present.
-        let _ = self.ta_replace_element_by_id(id, "");
+        let _ = self.textarea.replace_element_by_id(id, "");
+        self.sync_command_popup();
+        self.sync_file_search_popup();
     }
 
     /// Handle generic Input events that modify the textarea content.
