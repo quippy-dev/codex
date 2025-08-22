@@ -1051,18 +1051,14 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
-        if !self.input_enabled {
-            return (InputResult::None, false);
-        }
-
-        // While recording, swallow all input except Space release to finish.
         if self.voice.is_some() {
-            if let KeyEvent {
-                code: KeyCode::Char(' '),
-                kind: KeyEventKind::Release,
-                ..
-            } = key_event
-            {
+            let should_stop = match key_event.kind {
+                KeyEventKind::Release => matches!(key_event.code, KeyCode::Char(' ')),
+                KeyEventKind::Press | KeyEventKind::Repeat => {
+                    !matches!(key_event.code, KeyCode::Char(' '))
+                }
+            };
+            if should_stop {
                 if let Some(vc) = self.voice.take() {
                     match vc.stop() {
                         Ok(audio) => {
@@ -1086,9 +1082,13 @@ impl ChatComposer {
                         }
                     }
                 }
+                self.sync_popups();
                 return (InputResult::None, true);
             }
-            // Swallow everything else while recording
+            return (InputResult::None, false);
+        }
+
+        if !self.input_enabled {
             return (InputResult::None, false);
         }
 
@@ -2499,6 +2499,7 @@ impl ChatComposer {
                                     );
                                 }
                             }
+                            self.sync_popups();
                             return (InputResult::None, true);
                         }
                         Err(e) => {
@@ -2511,6 +2512,7 @@ impl ChatComposer {
                 // If a hold is already pending, swallow further press events to
                 // avoid inserting multiple spaces and resetting the timer on key repeat.
                 if self.space_hold_started_at.is_some() {
+                    self.sync_popups();
                     return (InputResult::None, false);
                 }
 
