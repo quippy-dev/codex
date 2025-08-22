@@ -6673,6 +6673,22 @@ impl ChatWidget {
     pub(crate) fn clear_esc_backtrack_hint(&mut self) {
         self.bottom_pane.clear_esc_backtrack_hint();
     }
+
+    pub(crate) fn bottom_pane_on_space_hold_timeout(&mut self, id: &str) {
+        self.bottom_pane.on_space_hold_timeout(id);
+    }
+
+    pub(crate) fn replace_transcription(&mut self, id: &str, text: &str) {
+        self.bottom_pane.replace_transcription(id, text);
+    }
+
+    pub(crate) fn update_transcription_in_place(&mut self, id: &str, text: &str) {
+        self.bottom_pane.update_transcription_in_place(id, text);
+    }
+
+    pub(crate) fn remove_transcription_placeholder(&mut self, id: &str) {
+        self.bottom_pane.remove_transcription_placeholder(id);
+    }
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&mut self, op: Op) {
         // Record outbound operation for session replay fidelity.

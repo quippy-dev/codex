@@ -1529,6 +1529,23 @@ impl App {
                 self.chat_widget.insert_str(&text);
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::SpaceHoldTimeout { id } => {
+                self.chat_widget.bottom_pane_on_space_hold_timeout(&id);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::TranscriptionComplete { id, text } => {
+                self.chat_widget.replace_transcription(&id, &text);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::TranscriptionFailed { id, error: _ } => {
+                self.chat_widget.remove_transcription_placeholder(&id);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::RecordingMeter { id, text } => {
+                // Update in place to preserve the element id for subsequent frames.
+                self.chat_widget.update_transcription_in_place(&id, &text);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::StartCommitAnimation => {
                 if self
                     .commit_anim_running
@@ -2282,6 +2299,11 @@ impl App {
             }
             AppEvent::StatusLineSetupCancelled => {
                 self.chat_widget.cancel_status_line_setup();
+            }
+            AppEvent::RecordingMeter { id, text } => {
+                // Update in place to preserve the element id for subsequent frames.
+                self.chat_widget.update_transcription_in_place(&id, &text);
+                tui.frame_requester().schedule_frame();
             }
         }
         Ok(AppRunControl::Continue)

@@ -213,7 +213,6 @@ pub(crate) enum AppEvent {
     UpdateFeatureFlags {
         updates: Vec<(Feature, bool)>,
     },
-
     /// Update whether the full access warning prompt has been acknowledged.
     UpdateFullAccessWarningAcknowledged(bool),
 
@@ -282,6 +281,32 @@ pub(crate) enum AppEvent {
 
     /// Insert transcribed text from voice input into the composer.
     InsertComposerText(String),
+
+    /// Voice transcription finished for the given placeholder id.
+    TranscriptionComplete {
+        id: String,
+        text: String,
+    },
+
+    /// Voice transcription failed; remove the placeholder identified by `id`.
+    TranscriptionFailed {
+        id: String,
+        #[allow(dead_code)]
+        error: String,
+    },
+
+    /// Internal: Fired 500ms after a Space key press to trigger hold-to-talk
+    /// if the space is still held. Carries a unique id to avoid races.
+    SpaceHoldTimeout {
+        id: String,
+    },
+
+    /// Live update for the in-progress voice recording placeholder. Carries
+    /// the placeholder `id` and the text to display (e.g., an ASCII meter).
+    RecordingMeter {
+        id: String,
+        text: String,
+    },
 
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),

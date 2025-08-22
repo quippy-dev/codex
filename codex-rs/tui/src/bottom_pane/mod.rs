@@ -311,6 +311,14 @@ impl BottomPane {
 
     /// Forward a key event to the active view or the composer.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> InputResult {
+        if self.composer.is_recording() {
+            let (_result, needs_redraw) = self.composer.handle_key_event(key_event);
+            if needs_redraw {
+                self.request_redraw();
+            }
+            return InputResult::None;
+        }
+
         // If a modal/view is active, handle it here; otherwise forward to composer.
         if !self.view_stack.is_empty() {
             // We need three pieces of information after routing the key:
@@ -426,7 +434,6 @@ impl BottomPane {
         self.composer.insert_str(text);
         self.request_redraw();
     }
-
     /// Replace the composer text with `text`.
     ///
     /// This is intended for fresh input where mention linkage does not need to
@@ -442,6 +449,27 @@ impl BottomPane {
             .set_text_content(text, text_elements, local_image_paths);
         self.composer.move_cursor_to_end();
         self.request_redraw();
+    }
+
+    pub(crate) fn replace_transcription(&mut self, id: &str, text: &str) {
+        self.composer.replace_transcription(id, text);
+        self.request_redraw();
+    }
+
+    pub(crate) fn update_transcription_in_place(&mut self, id: &str, text: &str) {
+        self.composer.update_transcription_in_place(id, text);
+        self.request_redraw();
+    }
+
+    pub(crate) fn remove_transcription_placeholder(&mut self, id: &str) {
+        self.composer.remove_transcription_placeholder(id);
+        self.request_redraw();
+    }
+
+    pub(crate) fn on_space_hold_timeout(&mut self, id: &str) {
+        if self.composer.on_space_hold_timeout(id) {
+            self.request_redraw();
+        }
     }
 
     /// Replace the composer text while preserving mention link targets.

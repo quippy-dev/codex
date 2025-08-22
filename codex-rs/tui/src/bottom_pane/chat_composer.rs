@@ -174,6 +174,9 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -305,6 +308,9 @@ pub(crate) struct ChatComposer {
     status_line_enabled: bool,
     voice: Option<crate::voice::VoiceCapture>,
     recording_placeholder_id: Option<String>,
+    space_hold_started_at: Option<Instant>,
+    space_hold_id: Option<String>,
+    space_insert_pos: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +411,9 @@ impl ChatComposer {
             status_line_enabled: false,
             voice: None,
             recording_placeholder_id: None,
+            space_hold_started_at: None,
+            space_hold_id: None,
+            space_insert_pos: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -1057,8 +1066,20 @@ impl ChatComposer {
                 if let Some(vc) = self.voice.take() {
                     match vc.stop() {
                         Ok(audio) => {
+                            let id = self
+                                .recording_placeholder_id
+                                .take()
+                                .unwrap_or_else(|| {
+                                    let id = Uuid::new_v4().to_string();
+                                    self.textarea
+                                        .insert_named_element("transcribing", id.clone());
+                                    id
+                                });
+                            let _ = self
+                                .textarea
+                                .update_named_element_by_id(&id, "transcribing");
                             let tx = self.app_event_tx.clone();
-                            crate::voice::transcribe_async(audio, tx);
+                            crate::voice::transcribe_async(id, audio, tx);
                         }
                         Err(e) => {
                             tracing::error!("failed to stop voice capture: {e}");
@@ -1069,6 +1090,13 @@ impl ChatComposer {
             }
             // Swallow everything else while recording
             return (InputResult::None, false);
+        }
+
+        // If a space hold is pending and another non-space key is pressed, cancel the hold.
+        if self.space_hold_started_at.is_some() && !matches!(key_event.code, KeyCode::Char(' ')) {
+            self.space_hold_started_at = None;
+            self.space_hold_id = None;
+            self.space_insert_pos = None;
         }
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
@@ -2381,13 +2409,9 @@ impl ChatComposer {
             // -------------------------------------------------------------
             KeyEvent {
                 code: KeyCode::Up | KeyCode::Down,
+                kind,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('p') | KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
+            } if matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 if self
                     .history
                     .should_handle_navigation(self.textarea.text(), self.textarea.cursor())
@@ -2395,6 +2419,28 @@ impl ChatComposer {
                     let replace_entry = match key_event.code {
                         KeyCode::Up => self.history.navigate_up(&self.app_event_tx),
                         KeyCode::Down => self.history.navigate_down(&self.app_event_tx),
+                        KeyCode::Char('p') => self.history.navigate_up(&self.app_event_tx),
+                        KeyCode::Char('n') => self.history.navigate_down(&self.app_event_tx),
+                        _ => unreachable!(),
+                    };
+                    if let Some(entry) = replace_entry {
+                        self.apply_history_entry(entry);
+                        return (InputResult::None, true);
+                    }
+                }
+                self.handle_input_basic(key_event)
+            }
+            KeyEvent {
+                code: KeyCode::Char('p') | KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                kind,
+                ..
+            } if matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if self
+                    .history
+                    .should_handle_navigation(self.textarea.text(), self.textarea.cursor())
+                {
+                    let replace_entry = match key_event.code {
                         KeyCode::Char('p') => self.history.navigate_up(&self.app_event_tx),
                         KeyCode::Char('n') => self.history.navigate_down(&self.app_event_tx),
                         _ => unreachable!(),
@@ -2424,57 +2470,95 @@ impl ChatComposer {
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Press,
-                modifiers,
                 ..
             } => {
-                if self.voice.is_none()
-                    && (self.textarea.is_empty() || modifiers.contains(KeyModifiers::SHIFT))
-                {
+                // If textarea is empty, start recording immediately without inserting a space.
+                if self.textarea.text().is_empty() {
                     match crate::voice::VoiceCapture::start() {
                         Ok(vc) => {
                             self.voice = Some(vc);
-                            // Insert a visible placeholder immediately showing "recording"
+                            // Insert visible placeholder for the meter (no label)
                             let id = Uuid::new_v4().to_string();
-                            self.textarea.insert_named_element("recording", id.clone());
+                            self.textarea.insert_named_element("", id.clone());
                             self.recording_placeholder_id = Some(id);
-                            // Do not insert a space
+                            // Spawn metering animation
+                            if let Some(v) = &self.voice {
+                                let data = v.data_arc();
+                                let stop = v.stopped_flag();
+                                let sr = v.sample_rate();
+                                let ch = v.channels();
+                                let peak = v.last_peak_arc();
+                                if let Some(idref) = &self.recording_placeholder_id {
+                                    self.spawn_recording_meter(
+                                        idref.clone(),
+                                        sr,
+                                        ch,
+                                        data,
+                                        peak,
+                                        stop,
+                                    );
+                                }
+                            }
                             return (InputResult::None, true);
                         }
                         Err(e) => {
                             tracing::error!("failed to start voice capture: {e}");
-                            // Fall through to normal input handling if capture fails
+                            return self.handle_input_basic(key_event);
                         }
                     }
                 }
+
+                // If a hold is already pending, swallow further press events to
+                // avoid inserting multiple spaces and resetting the timer on key repeat.
+                if self.space_hold_started_at.is_some() {
+                    return (InputResult::None, false);
+                }
+
+                // Insert space immediately so normal typing works.
+                let insert_pos = self.textarea.cursor();
+                self.textarea.insert_str(" ");
+                self.sync_command_popup();
+                self.sync_file_search_popup();
+
+                // Record pending hold metadata.
+                let id = Uuid::new_v4().to_string();
+                self.space_hold_started_at = Some(Instant::now());
+                self.space_hold_id = Some(id.clone());
+                self.space_insert_pos = Some(insert_pos);
+
+                // Spawn a delayed task to notify after threshold without relying on repeats.
+                let tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tx.send(AppEvent::SpaceHoldTimeout { id });
+                });
+
+                (InputResult::None, true)
+            }
+            // If we see a repeat before release, handling occurs in the top-level pending block.
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                kind: KeyEventKind::Repeat,
+                ..
+            } => {
+                // Swallow repeats while a hold is pending to avoid extra spaces.
+                if self.space_hold_started_at.is_some() {
+                    return (InputResult::None, false);
+                }
+                // Fallback: if no pending hold, treat as normal input
                 self.handle_input_basic(key_event)
             }
+            // Space release without pending (fallback): treat as normal input
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Release,
                 ..
             } => {
-                if let Some(vc) = self.voice.take() {
-                    match vc.stop() {
-                        Ok(audio) => {
-                            // Update the existing placeholder to show "transcribing"
-                            let id = self
-                                .recording_placeholder_id
-                                .take()
-                                .unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let _ = self.textarea.replace_element_by_id(&id, "transcribing");
-                            let tx = self.app_event_tx.clone();
-                            crate::voice::transcribe_async(audio, tx);
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to stop voice capture: {e}");
-                        }
-                    }
-                    // Swallow the key event; don't insert a space
-                    (InputResult::None, true)
-                } else {
-                    // Not recording; treat as normal release
-                    (InputResult::None, false)
-                }
+                // Clear any pending state; the space was already inserted on press.
+                self.space_hold_started_at = None;
+                self.space_hold_id = None;
+                self.space_insert_pos = None;
+                (InputResult::None, true)
             }
             input => self.handle_input_basic(input),
         }
@@ -2505,20 +2589,169 @@ impl ChatComposer {
         }
     }
 
-    /// Handles keys that mutate the textarea, including paste-burst detection.
-    ///
-    /// Acts as the lowest-level keypath for keys that mutate the textarea. It is also where plain
-    /// character streams are converted into explicit paste operations on terminals that do not
-    /// reliably provide bracketed paste.
-    ///
-    /// Ordering is important:
-    ///
-    /// - Always flush any *due* paste burst first so buffered text does not lag behind unrelated
-    ///   edits.
-    /// - Then handle the incoming key, intercepting only "plain" (no Ctrl/Alt) char input.
-    /// - For non-plain keys, flush via `flush_before_modified_input()` before applying the key;
-    ///   otherwise `clear_window_after_non_char()` can leave buffered text waiting without a
-    ///   timestamp to time out against.
+    /// Called when the 500ms space hold timeout elapses. If still pending and matching id,
+    /// remove the inserted space and begin voice capture.
+    pub(crate) fn on_space_hold_timeout(&mut self, id: &str) -> bool {
+        if self.voice.is_some() {
+            return false;
+        }
+        if self.space_hold_started_at.is_some() && self.space_hold_id.as_deref() == Some(id) {
+            // Remove the previously inserted space if possible.
+            if let Some(pos) = self.space_insert_pos.take() {
+                let text = self.textarea.text().to_string();
+                if pos < text.len()
+                    && let Some(ch) = text[pos..].chars().next()
+                    && ch == ' '
+                {
+                    let next = pos + ch.len_utf8();
+                    let mut new_text =
+                        String::with_capacity(text.len().saturating_sub(ch.len_utf8()));
+                    new_text.push_str(&text[..pos]);
+                    new_text.push_str(&text[next..]);
+                    let mut cursor = self.textarea.cursor();
+                    if cursor > pos {
+                        cursor = cursor.saturating_sub(ch.len_utf8());
+                    }
+                    self.textarea.set_text(&new_text);
+                    self.textarea.set_cursor(cursor);
+                    self.sync_command_popup();
+                    self.sync_file_search_popup();
+                }
+            }
+            // Clear pending state before starting capture.
+            self.space_hold_started_at = None;
+            self.space_hold_id = None;
+            self.space_insert_pos = None;
+
+            // Start voice capture.
+            match crate::voice::VoiceCapture::start() {
+                Ok(vc) => {
+                    self.voice = Some(vc);
+                    // Insert a visible placeholder for the meter (no label).
+                    let id = Uuid::new_v4().to_string();
+                    self.textarea.insert_named_element("", id.clone());
+                    self.recording_placeholder_id = Some(id);
+                    // Spawn metering animation.
+                    if let Some(v) = &self.voice {
+                        let data = v.data_arc();
+                        let stop = v.stopped_flag();
+                        let sr = v.sample_rate();
+                        let ch = v.channels();
+                        let peak = v.last_peak_arc();
+                        if let Some(idref) = &self.recording_placeholder_id {
+                            self.spawn_recording_meter(idref.clone(), sr, ch, data, peak, stop);
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::error!("failed to start voice capture: {e}");
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+    fn spawn_recording_meter(
+        &self,
+        id: String,
+        _sample_rate: u32,
+        _channels: u16,
+        _data: Arc<Mutex<Vec<i16>>>,
+        last_peak: Arc<std::sync::atomic::AtomicU16>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            use std::time::Duration;
+            let width: usize = 12;
+            let win_ms: f32 = 80.0; // analysis window (kept for potential future use)
+            // Bar glyphs low→high; single-line sparkline that scrolls left.
+            // let symbols: Vec<char> = "·•●⬤".chars().collect();
+            let symbols: Vec<char> = "⠤⠴⠶⠷⡷⡿⣿".chars().collect();
+            let mut history: VecDeque<char> = VecDeque::with_capacity(width);
+            // Prefill to fixed width so the meter is always exactly `width` chars.
+            while history.len() < width {
+                history.push_back(symbols[0]);
+            }
+            // Adaptive gain control: track a slow EMA of RMS as the noise/reference level.
+            let mut noise_ema: f64 = 0.02; // bootstrap with small non-zero to avoid division by zero
+            let alpha_noise: f64 = 0.05; // slightly faster adaptation for responsiveness
+            // Envelope follower with separate attack/release for responsiveness
+            let mut env: f64 = 0.0;
+            let attack: f64 = 0.80; // faster rise for immediate peaks
+            let release: f64 = 0.25; // quick fall but not too jumpy
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Read latest peak value from VoiceCapture
+                let latest_peak = last_peak.load(Ordering::Relaxed) as f64 / (i16::MAX as f64);
+                // Envelope follower (attack/release) for responsive yet stable meter
+                if latest_peak > env {
+                    env = attack * latest_peak + (1.0 - attack) * env;
+                } else {
+                    env = release * latest_peak + (1.0 - release) * env;
+                }
+                // Use envelope as a proxy for RMS for noise tracking
+                let rms_approx = env * 0.7;
+                noise_ema = (1.0 - alpha_noise) * noise_ema + alpha_noise * rms_approx;
+                let ref_level = noise_ema.max(0.01);
+                // Mix instantaneous peak with envelope so the bar reacts faster to changes
+                let fast_signal = 0.8 * latest_peak + 0.2 * env;
+                let target = 2.0f64; // slightly hotter meter
+                let raw = (fast_signal / (ref_level * target)).max(0.0);
+                let k = 1.6f64; // lighter compression for more punch
+                let compressed = (raw.ln_1p() / (k * 1.0).ln_1p()).min(1.0);
+                // Map to single-line glyph proportional to level (bottom→top).
+                let idx = (compressed * (symbols.len() as f64 - 1.0))
+                    .round()
+                    .clamp(0.0, symbols.len() as f64 - 1.0) as usize;
+                let level_char = symbols[idx];
+
+                if history.len() >= width {
+                    history.pop_front();
+                }
+                history.push_back(level_char);
+
+                let mut text = String::with_capacity(width);
+                for ch in &history {
+                    text.push(*ch);
+                }
+                tx.send(crate::app_event::AppEvent::RecordingMeter {
+                    id: id.clone(),
+                    text,
+                });
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    pub fn replace_transcription(&mut self, id: &str, text: &str) {
+        // Only replace if the placeholder still exists; otherwise do nothing.
+        let _ = self.textarea.replace_element_by_id(id, text);
+        self.sync_command_popup();
+        self.sync_file_search_popup();
+    }
+
+    pub fn update_transcription_in_place(&mut self, id: &str, text: &str) {
+        // Update element text but keep its id so future updates can find it.
+        let _ = self.textarea.update_named_element_by_id(id, text);
+        self.sync_command_popup();
+        self.sync_file_search_popup();
+    }
+
+    pub fn remove_transcription_placeholder(&mut self, id: &str) {
+        // Replace with empty string to delete the placeholder if present.
+        if self.textarea.replace_element_by_id(id, "") {
+            self.sync_command_popup();
+            self.sync_file_search_popup();
+        }
+    }
+
+    /// Handle generic Input events that modify the textarea content.
     fn handle_input_basic(&mut self, input: KeyEvent) -> (InputResult, bool) {
         self.handle_input_basic_with_time(input, Instant::now())
     }
@@ -3211,6 +3444,10 @@ impl ChatComposer {
         self.is_task_running = running;
     }
 
+    pub(crate) fn is_recording(&self) -> bool {
+        self.voice.is_some()
+    }
+
     pub(crate) fn set_context_window(&mut self, percent: Option<i64>, used_tokens: Option<i64>) {
         if self.context_window_percent == percent && self.context_window_used_tokens == used_tokens
         {
@@ -3300,6 +3537,9 @@ fn find_next_mention_token_range(text: &str, token: &str, from: usize) -> Option
 impl Renderable for ChatComposer {
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         if !self.input_enabled {
+            return None;
+        }
+        if self.voice.is_some() {
             return None;
         }
 
