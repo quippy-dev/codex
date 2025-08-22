@@ -372,6 +372,7 @@ impl BottomPane {
                 return InputResult::None;
             }
             let (input_result, needs_redraw) = self.composer.handle_key_event(key_event);
+            self.composer.sync_popups();
             if needs_redraw {
                 self.request_redraw();
             }
@@ -424,6 +425,7 @@ impl BottomPane {
             }
         } else {
             let needs_redraw = self.composer.handle_paste(pasted);
+            self.composer.sync_popups();
             if needs_redraw {
                 self.request_redraw();
             }
@@ -432,6 +434,7 @@ impl BottomPane {
 
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.composer.insert_str(text);
+        self.composer.sync_popups();
         self.request_redraw();
     }
     /// Replace the composer text with `text`.
@@ -453,9 +456,9 @@ impl BottomPane {
 
     pub(crate) fn replace_transcription(&mut self, id: &str, text: &str) {
         self.composer.replace_transcription(id, text);
+        self.composer.sync_popups();
         self.request_redraw();
     }
-
     pub(crate) fn update_transcription_in_place(&mut self, id: &str, text: &str) {
         self.composer.update_transcription_in_place(id, text);
         self.request_redraw();
@@ -463,6 +466,7 @@ impl BottomPane {
 
     pub(crate) fn remove_transcription_placeholder(&mut self, id: &str) {
         self.composer.remove_transcription_placeholder(id);
+        self.composer.sync_popups();
         self.request_redraw();
     }
 
@@ -869,6 +873,7 @@ impl BottomPane {
             .on_history_entry_response(log_id, offset, entry);
 
         if updated {
+            self.composer.sync_popups();
             self.request_redraw();
         }
     }

@@ -174,6 +174,9 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -336,7 +339,6 @@ enum ActivePopup {
 const FOOTER_SPACING_HEIGHT: u16 = 0;
 
 impl ChatComposer {
-    
     pub fn new(
         has_input_focus: bool,
         app_event_tx: AppEventSender,
@@ -1098,13 +1100,13 @@ impl ChatComposer {
             self.space_hold_id = None;
             self.space_insert_pos = None;
         }
+        
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
             ActivePopup::Skill(_) => self.handle_key_event_with_skill_popup(key_event),
             ActivePopup::None => self.handle_key_event_without_popup(key_event),
         };
-
         // Update (or hide/show) popup after processing the key.
         self.sync_popups();
 
@@ -2521,7 +2523,6 @@ impl ChatComposer {
                 self.textarea.insert_str(" ");
                 self.sync_command_popup();
                 self.sync_file_search_popup();
-
                 // Record pending hold metadata.
                 let id = Uuid::new_v4().to_string();
                 self.space_hold_started_at = Some(Instant::now());
@@ -2733,8 +2734,6 @@ impl ChatComposer {
     }
     pub fn replace_transcription(&mut self, id: &str, text: &str) {
         let _ = self.textarea.replace_element_by_id(id, text);
-        self.sync_command_popup();
-        self.sync_file_search_popup();
     }
     pub fn update_transcription_in_place(&mut self, id: &str, text: &str) {
         let updated = self.textarea.update_named_element_by_id(id, text);
@@ -2747,8 +2746,6 @@ impl ChatComposer {
     pub fn remove_transcription_placeholder(&mut self, id: &str) {
         // Replace with empty string to delete the placeholder if present.
         let _ = self.textarea.replace_element_by_id(id, "");
-        self.sync_command_popup();
-        self.sync_file_search_popup();
     }
 
     /// Handle generic Input events that modify the textarea content.
@@ -3424,7 +3421,6 @@ impl ChatComposer {
             .filter(|description| !description.is_empty())
             .map(str::to_string)
     }
-
     fn set_has_focus(&mut self, has_focus: bool) {
         self.has_focus = has_focus;
     }
