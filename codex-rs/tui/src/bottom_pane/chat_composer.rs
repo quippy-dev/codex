@@ -2666,7 +2666,6 @@ impl ChatComposer {
         tokio::spawn(async move {
             use std::time::Duration;
             let width: usize = 12;
-            let win_ms: f32 = 80.0; // analysis window (kept for potential future use)
             // Bar glyphs low→high; single-line sparkline that scrolls left.
             // let symbols: Vec<char> = "·•●⬤".chars().collect();
             let symbols: Vec<char> = "⠤⠴⠶⠷⡷⡿⣿".chars().collect();

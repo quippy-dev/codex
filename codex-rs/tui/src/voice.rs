@@ -206,7 +206,7 @@ pub fn transcribe_async(id: String, audio: RecordedAudio, tx: AppEventSender) {
             return;
         }
 
-        // Disable VAD: always send the full clip without trimming or rejecting.
+        // Always send the full clip without trimming or rejecting.
         let (start_sample, end_sample) = (0, audio.data.len());
 
         // Serialize WAV (trimmed segment) to memory
