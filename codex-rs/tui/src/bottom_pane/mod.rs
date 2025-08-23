@@ -372,7 +372,6 @@ impl BottomPane {
                 return InputResult::None;
             }
             let (input_result, needs_redraw) = self.composer.handle_key_event(key_event);
-            self.composer.sync_popups();
             if needs_redraw {
                 self.request_redraw();
             }
