@@ -263,7 +263,6 @@ pub(crate) enum AppEvent {
 
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
-
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),
 
@@ -283,12 +282,14 @@ pub(crate) enum AppEvent {
     InsertComposerText(String),
 
     /// Voice transcription finished for the given placeholder id.
+    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
     TranscriptionComplete {
         id: String,
         text: String,
     },
 
     /// Voice transcription failed; remove the placeholder identified by `id`.
+    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
     TranscriptionFailed {
         id: String,
         #[allow(dead_code)]
@@ -297,12 +298,14 @@ pub(crate) enum AppEvent {
 
     /// Internal: Fired 500ms after a Space key press to trigger hold-to-talk
     /// if the space is still held. Carries a unique id to avoid races.
+    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
     SpaceHoldTimeout {
         id: String,
     },
 
     /// Live update for the in-progress voice recording placeholder. Carries
     /// the placeholder `id` and the text to display (e.g., an ASCII meter).
+    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
     RecordingMeter {
         id: String,
         text: String,
