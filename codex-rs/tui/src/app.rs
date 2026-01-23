@@ -1529,22 +1529,22 @@ impl App {
                 self.chat_widget.insert_str(&text);
                 tui.frame_requester().schedule_frame();
             }
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             AppEvent::SpaceHoldTimeout { id } => {
                 self.chat_widget.bottom_pane_on_space_hold_timeout(&id);
                 tui.frame_requester().schedule_frame();
             }
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             AppEvent::TranscriptionComplete { id, text } => {
                 self.chat_widget.replace_transcription(&id, &text);
                 tui.frame_requester().schedule_frame();
             }
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             AppEvent::TranscriptionFailed { id, error: _ } => {
                 self.chat_widget.remove_transcription_placeholder(&id);
                 tui.frame_requester().schedule_frame();
             }
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             AppEvent::RecordingMeter { id, text } => {
                 // Update in place to preserve the element id for subsequent frames.
                 self.chat_widget.update_transcription_in_place(&id, &text);

@@ -103,7 +103,7 @@ use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
-#[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 use uuid::Uuid;
 
 use super::chat_composer_history::ChatComposerHistory;
@@ -176,15 +176,11 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::collections::VecDeque;
-use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-
 fn windows_degraded_sandbox_active() -> bool {
     cfg!(target_os = "windows")
         && codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
@@ -317,7 +313,7 @@ pub(crate) struct ChatComposer {
     windows_degraded_sandbox_active: bool,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
-    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     voice: Option<crate::voice::VoiceCapture>,
     recording_placeholder_id: Option<String>,
     space_hold_started_at: Option<Instant>,
@@ -421,7 +417,7 @@ impl ChatComposer {
             windows_degraded_sandbox_active: false,
             status_line_value: None,
             status_line_enabled: false,
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             voice: None,
             recording_placeholder_id: None,
             space_hold_started_at: None,
@@ -548,7 +544,7 @@ impl ChatComposer {
         }
 
         // Hide the cursor while recording voice input.
-        #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         if self.voice.is_some() {
             return None;
         }
@@ -604,7 +600,7 @@ impl ChatComposer {
     /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
     /// the next user Enter key, then syncs popup state.
     pub fn handle_paste(&mut self, pasted: String) -> bool {
-        #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         if self.voice.is_some() {
             // Ignore paste while recording
             return false;
@@ -1078,7 +1074,7 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
-        #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         if self.voice.is_some() {
             let should_stop = match key_event.kind {
                 KeyEventKind::Release => matches!(key_event.code, KeyCode::Char(' ')),
@@ -2495,7 +2491,7 @@ impl ChatComposer {
                 self.handle_submission(should_queue)
             }
             // Spacebar handling for push-to-talk voice input when composer is empty.
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Press,
@@ -2503,7 +2499,7 @@ impl ChatComposer {
             } => {
                 // If textarea is empty, start recording immediately without inserting a space.
                 if self.textarea.text().is_empty() {
-                    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+                    #[cfg(not(target_os = "linux"))]
                     {
                         match crate::voice::VoiceCapture::start() {
                             Ok(vc) => {
@@ -2569,7 +2565,7 @@ impl ChatComposer {
                 (InputResult::None, true)
             }
             // If we see a repeat before release, handling occurs in the top-level pending block.
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Repeat,
@@ -2583,7 +2579,7 @@ impl ChatComposer {
                 self.handle_input_basic(key_event)
             }
             // Space release without pending (fallback): treat as normal input
-            #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+            #[cfg(not(target_os = "linux"))]
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Release,
@@ -2626,7 +2622,7 @@ impl ChatComposer {
 
     /// Called when the 500ms space hold timeout elapses. If still pending and matching id,
     /// remove the inserted space and begin voice capture.
-    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn on_space_hold_timeout(&mut self, id: &str) -> bool {
         if self.voice.is_some() {
             return false;
@@ -2692,11 +2688,11 @@ impl ChatComposer {
         }
     }
 
-    #[cfg(any(target_env = "musl", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn on_space_hold_timeout(&mut self, _id: &str) -> bool {
         false
     }
-    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     fn spawn_recording_meter(
         &self,
         id: String,
@@ -3480,12 +3476,12 @@ impl ChatComposer {
         self.is_task_running = running;
     }
 
-    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn is_recording(&self) -> bool {
         self.voice.is_some()
     }
 
-    #[cfg(any(target_env = "musl", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn is_recording(&self) -> bool {
         false
     }
@@ -3581,7 +3577,7 @@ impl Renderable for ChatComposer {
         if !self.input_enabled {
             return None;
         }
-        #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         if self.voice.is_some() {
             return None;
         }
@@ -3631,7 +3627,7 @@ impl ChatComposer {
             ActivePopup::None => {
                 let footer_props = self.footer_props();
                 let voice_hint_override = {
-                    #[cfg(all(not(target_env = "musl"), not(target_os = "linux")))]
+                    #[cfg(not(target_os = "linux"))]
                     {
                         self.voice.as_ref().map(|_| {
                             vec![(
@@ -3640,7 +3636,7 @@ impl ChatComposer {
                             )]
                         })
                     }
-                    #[cfg(any(target_env = "musl", target_os = "linux"))]
+                    #[cfg(target_os = "linux")]
                     {
                         None
                     }
