@@ -1493,53 +1493,58 @@ impl ChatComposer {
                     return (InputResult::None, true);
                 };
 
-                let sel_path = sel.to_string_lossy().to_string();
-                // If selected path looks like an image (png/jpeg), attach as image instead of inserting text.
-                let is_image = Self::is_image_path(&sel_path);
-                if is_image {
-                    // Determine dimensions; if that fails fall back to normal path insertion.
-                    let path_buf = PathBuf::from(&sel_path);
-                    match image::image_dimensions(&path_buf) {
-                        Ok((width, height)) => {
-                            tracing::debug!("selected image dimensions={}x{}", width, height);
-                            // Remove the current @token (mirror logic from insert_selected_path without inserting text)
-                            // using the flat text and byte-offset cursor API.
-                            let cursor_offset = self.textarea.cursor();
-                            let text = self.textarea.text();
-                            // Clamp to a valid char boundary to avoid panics when slicing.
-                            let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
-                            let before_cursor = &text[..safe_cursor];
-                            let after_cursor = &text[safe_cursor..];
+                let sel_path = sel.path.to_string_lossy().to_string();
 
-                            // Determine token boundaries in the full text.
-                            let start_idx = before_cursor
-                                .char_indices()
-                                .rfind(|(_, c)| c.is_whitespace())
-                                .map(|(idx, c)| idx + c.len_utf8())
-                                .unwrap_or(0);
-                            let end_rel_idx = after_cursor
-                                .char_indices()
-                                .find(|(_, c)| c.is_whitespace())
-                                .map(|(idx, _)| idx)
-                                .unwrap_or(after_cursor.len());
-                            let end_idx = safe_cursor + end_rel_idx;
-
-                            self.textarea.replace_range(start_idx..end_idx, "");
-                            self.textarea.set_cursor(start_idx);
-
-                            self.attach_image(path_buf);
-                            // Add a trailing space to keep typing fluid.
-                            self.textarea.insert_str(" ");
-                        }
-                        Err(err) => {
-                            tracing::trace!("image dimensions lookup failed: {err}");
-                            // Fallback to plain path insertion if metadata read fails.
-                            self.insert_selected_path(&sel_path);
-                        }
-                    }
-                } else {
-                    // Non-image: inserting file path.
+                if sel.is_dir {
                     self.insert_selected_path(&sel_path);
+                } else {
+                    // If selected path looks like an image (png/jpeg), attach as image instead of inserting text.
+                    let is_image = Self::is_image_path(&sel_path);
+                    if is_image {
+                        // Determine dimensions; if that fails fall back to normal path insertion.
+                        let path_buf = PathBuf::from(&sel_path);
+                        match image::image_dimensions(&path_buf) {
+                            Ok((width, height)) => {
+                                tracing::debug!("selected image dimensions={}x{}", width, height);
+                                // Remove the current @token (mirror logic from insert_selected_path without inserting text)
+                                // using the flat text and byte-offset cursor API.
+                                let cursor_offset = self.textarea.cursor();
+                                let text = self.textarea.text();
+                                // Clamp to a valid char boundary to avoid panics when slicing.
+                                let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
+                                let before_cursor = &text[..safe_cursor];
+                                let after_cursor = &text[safe_cursor..];
+
+                                // Determine token boundaries in the full text.
+                                let start_idx = before_cursor
+                                    .char_indices()
+                                    .rfind(|(_, c)| c.is_whitespace())
+                                    .map(|(idx, c)| idx + c.len_utf8())
+                                    .unwrap_or(0);
+                                let end_rel_idx = after_cursor
+                                    .char_indices()
+                                    .find(|(_, c)| c.is_whitespace())
+                                    .map(|(idx, _)| idx)
+                                    .unwrap_or(after_cursor.len());
+                                let end_idx = safe_cursor + end_rel_idx;
+
+                                self.textarea.replace_range(start_idx..end_idx, "");
+                                self.textarea.set_cursor(start_idx);
+
+                                self.attach_image(path_buf);
+                                // Add a trailing space to keep typing fluid.
+                                self.textarea.insert_str(" ");
+                            }
+                            Err(err) => {
+                                tracing::trace!("image dimensions lookup failed: {err}");
+                                // Fallback to plain path insertion if metadata read fails.
+                                self.insert_selected_path(&sel_path);
+                            }
+                        }
+                    } else {
+                        // Non-image: inserting file path.
+                        self.insert_selected_path(&sel_path);
+                    }
                 }
                 // No selection: treat Enter as closing the popup/session.
                 self.active_popup = ActivePopup::None;
@@ -1907,17 +1912,13 @@ impl ChatComposer {
             path.to_string()
         };
 
-        // Replace the slice `[start_idx, end_idx)` with the chosen path and a trailing space.
-        let mut new_text =
-            String::with_capacity(text.len() - (end_idx - start_idx) + inserted.len() + 1);
-        new_text.push_str(&text[..start_idx]);
-        new_text.push_str(&inserted);
-        new_text.push(' ');
-        new_text.push_str(&text[end_idx..]);
-
-        // Path replacement is plain text; rebuild without carrying elements.
-        self.textarea.set_text_clearing_elements(&new_text);
-        let new_cursor = start_idx.saturating_add(inserted.len()).saturating_add(1);
+        // Preserve existing elements (e.g. prior mentions) outside the replaced token.
+        let mut replacement = String::with_capacity(inserted.len() + 1);
+        replacement.push_str(&inserted);
+        replacement.push(' ');
+        self.textarea
+            .replace_range(start_idx..end_idx, &replacement);
+        let new_cursor = start_idx.saturating_add(replacement.len());
         self.textarea.set_cursor(new_cursor);
     }
 
@@ -1965,7 +1966,6 @@ impl ChatComposer {
             .saturating_add(1);
         self.textarea.set_cursor(new_cursor);
     }
-
     fn mention_name_from_insert_text(insert_text: &str) -> Option<String> {
         let name = insert_text.strip_prefix('$')?;
         if name.is_empty() {
@@ -5840,7 +5840,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_plan_args_preserve_text_elements() {
+    fn selecting_file_after_folder_preserves_folder_text_element() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -5854,27 +5854,48 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_collaboration_modes_enabled(true);
 
-        type_chars_humanlike(&mut composer, &['/', 'p', 'l', 'a', 'n', ' ']);
-        let placeholder = local_image_label_text(1);
-        composer.attach_image(PathBuf::from("/tmp/plan.png"));
+        composer.insert_str("@doc");
+        composer.on_file_search_result(
+            "doc".to_string(),
+            vec![FileMatch {
+                score: 100,
+                path: PathBuf::from("docs"),
+                root: PathBuf::from("/repo"),
+                is_dir: true,
+                indices: None,
+            }],
+        );
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let elements_after_dir = composer.text_elements();
+        assert_eq!(composer.textarea.text(), "docs/ ");
+        assert_eq!(elements_after_dir.len(), 1);
+        assert_eq!(
+            elements_after_dir[0].placeholder(composer.textarea.text()),
+            Some("docs/")
+        );
 
-        match result {
-            InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                assert_eq!(cmd.command(), "plan");
-                assert_eq!(args, placeholder);
-                assert_eq!(text_elements.len(), 1);
-                assert_eq!(
-                    text_elements[0].placeholder(&args),
-                    Some(placeholder.as_str())
-                );
-            }
-            _ => panic!("expected CommandWithArgs for /plan with args"),
-        }
+        composer.insert_str("@main");
+        composer.on_file_search_result(
+            "main".to_string(),
+            vec![FileMatch {
+                score: 99,
+                path: PathBuf::from("main.rs"),
+                root: PathBuf::from("/repo"),
+                is_dir: false,
+                indices: None,
+            }],
+        );
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let elements_after_file = composer.text_elements();
+        assert_eq!(composer.textarea.text(), "docs/ main.rs ");
+        assert_eq!(elements_after_file.len(), 1);
+        assert_eq!(
+            elements_after_file[0].placeholder(composer.textarea.text()),
+            Some("docs/"),
+        );
     }
 
     /// Behavior: multiple paste operations can coexist; placeholders should be expanded to their
