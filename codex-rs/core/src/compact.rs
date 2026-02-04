@@ -259,7 +259,11 @@ pub(crate) fn process_compacted_history(
 ) -> Vec<ResponseItem> {
     compacted_history.retain(should_keep_compacted_history_item);
 
-    let initial_context = initial_context.to_vec();
+    let initial_context = initial_context
+        .iter()
+        .filter(|item| !is_turn_aborted_marker(item))
+        .cloned()
+        .collect::<Vec<_>>();
 
     // Re-inject canonical context from the current session since we stripped it
     // from the pre-compaction history. Keep it right before the last user
@@ -288,11 +292,13 @@ pub(crate) fn process_compacted_history(
 ///   instruction content.
 /// - non-user-content `user` messages (session prefix/instruction wrappers),
 ///   keeping only real user messages as parsed by `parse_turn_item`.
+/// - `<turn_aborted>` session prefix markers, which should not persist after compaction.
 ///
 /// This intentionally keeps `user`-role warnings and compaction-generated
 /// summary messages because they parse as `TurnItem::UserMessage`.
 fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
     match item {
+        _ if is_turn_aborted_marker(item) => false,
         ResponseItem::Message { role, .. } if role == "developer" => false,
         ResponseItem::Message { role, .. } if role == "user" => matches!(
             crate::event_mapping::parse_turn_item(item),
@@ -300,6 +306,22 @@ fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         ),
         _ => true,
     }
+}
+
+fn is_turn_aborted_marker(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    content.iter().any(|content_item| match content_item {
+        ContentItem::InputText { text } => text
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with(crate::session_prefix::TURN_ABORTED_OPEN_TAG),
+        _ => false,
+    })
 }
 
 pub(crate) fn build_compacted_history(
@@ -804,19 +826,6 @@ keep me updated
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: r#"<turn_aborted>
-  <turn_id>turn-1</turn_id>
-  <reason>interrupted</reason>
-</turn_aborted>"#
-                        .to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
                     text: "summary".to_string(),
                 }],
                 end_turn: None,
@@ -1004,4 +1013,5 @@ keep me updated
         ];
         assert_eq!(refreshed, expected);
     }
+
 }
