@@ -6,11 +6,13 @@ use codex_protocol::openai_models::ReasoningEffort;
 const COLLABORATION_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
 const COLLABORATION_MODE_DEFAULT: &str =
     include_str!("../../templates/collaboration_mode/default.md");
+const COLLABORATION_MODE_EXECUTE: &str =
+    include_str!("../../templates/collaboration_mode/execute.md");
 const KNOWN_MODE_NAMES_PLACEHOLDER: &str = "{{KNOWN_MODE_NAMES}}";
 const REQUEST_USER_INPUT_AVAILABILITY_PLACEHOLDER: &str = "{{REQUEST_USER_INPUT_AVAILABILITY}}";
 
 pub(super) fn builtin_collaboration_mode_presets() -> Vec<CollaborationModeMask> {
-    vec![plan_preset(), default_preset()]
+    vec![plan_preset(), default_preset(), execute_preset()]
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -35,6 +37,16 @@ fn default_preset() -> CollaborationModeMask {
         model: None,
         reasoning_effort: None,
         developer_instructions: Some(Some(default_mode_instructions())),
+    }
+}
+
+fn execute_preset() -> CollaborationModeMask {
+    CollaborationModeMask {
+        name: ModeKind::Execute.display_name().to_string(),
+        mode: Some(ModeKind::Execute),
+        model: None,
+        reasoning_effort: None,
+        developer_instructions: Some(Some(COLLABORATION_MODE_EXECUTE.to_string())),
     }
 }
 
