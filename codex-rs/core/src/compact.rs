@@ -9,6 +9,7 @@ use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
+use crate::instructions::UserInstructions;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnContextItem;
@@ -31,6 +32,10 @@ use tracing::error;
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+// Keep reinjected turn context bounded so large instruction blocks do not
+// dominate post-compaction history.
+const REINJECTED_INITIAL_CONTEXT_MAX_TOKENS: usize = COMPACT_USER_MESSAGE_MAX_TOKENS / 2;
+const PERMISSIONS_INSTRUCTIONS_OPEN_TAG: &str = "<permissions instructions>";
 
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
     provider.is_openai()
@@ -259,25 +264,10 @@ pub(crate) fn process_compacted_history(
 ) -> Vec<ResponseItem> {
     compacted_history.retain(should_keep_compacted_history_item);
 
-    let initial_context = initial_context
-        .iter()
-        .filter(|item| !is_turn_aborted_marker(item))
-        .cloned()
-        .collect::<Vec<_>>();
+    let initial_context = initial_context_for_reinjection(initial_context);
 
-    // Re-inject canonical context from the current session since we stripped it
-    // from the pre-compaction history. Keep it right before the last user
-    // message so older user messages remain earlier in the transcript.
-    if let Some(last_user_index) = compacted_history.iter().rposition(|item| {
-        matches!(
-            crate::event_mapping::parse_turn_item(item),
-            Some(TurnItem::UserMessage(_))
-        )
-    }) {
-        compacted_history.splice(last_user_index..last_user_index, initial_context);
-    } else {
-        compacted_history.extend(initial_context);
-    }
+    // Re-inject canonical context from the current session since we stripped from the pre-compaction history.
+    compacted_history.extend(initial_context);
 
     compacted_history
 }
@@ -322,6 +312,69 @@ fn is_turn_aborted_marker(item: &ResponseItem) -> bool {
             .starts_with(crate::session_prefix::TURN_ABORTED_OPEN_TAG),
         _ => false,
     })
+}
+
+fn initial_context_for_reinjection(initial_context: &[ResponseItem]) -> Vec<ResponseItem> {
+    let initial_context = initial_context
+        .iter()
+        .filter(|item| !is_turn_aborted_marker(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut selected: Vec<Option<ResponseItem>> = initial_context.iter().cloned().map(Some).collect();
+    let mut total_tokens: usize = initial_context
+        .iter()
+        .map(estimate_response_item_tokens)
+        .sum();
+    if total_tokens <= REINJECTED_INITIAL_CONTEXT_MAX_TOKENS {
+        return initial_context;
+    }
+
+    let mut droppable_items: Vec<(usize, usize)> = initial_context
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_droppable_initial_context_item(item))
+        .map(|(idx, item)| (idx, estimate_response_item_tokens(item)))
+        .collect();
+    // Prefer dropping the largest droppable context chunks first.
+    droppable_items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    for (idx, item_tokens) in droppable_items {
+        if total_tokens <= REINJECTED_INITIAL_CONTEXT_MAX_TOKENS {
+            break;
+        }
+        selected[idx] = None;
+        total_tokens = total_tokens.saturating_sub(item_tokens);
+    }
+
+    selected.into_iter().flatten().collect()
+}
+
+fn is_droppable_initial_context_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    // We keep permissions and environment context stable, and allow large
+    // instruction wrappers to be omitted since compaction can summarize them.
+    if role == "user" {
+        return UserInstructions::is_user_instructions(content);
+    }
+    if role == "developer" {
+        return !is_permissions_developer_message(content);
+    }
+    false
+}
+
+fn is_permissions_developer_message(content: &[ContentItem]) -> bool {
+    let [ContentItem::InputText { text }] = content else {
+        return false;
+    };
+    text.starts_with(PERMISSIONS_INSTRUCTIONS_OPEN_TAG)
+}
+
+fn estimate_response_item_tokens(item: &ResponseItem) -> usize {
+    serde_json::to_string(item)
+        .map(|s| approx_token_count(&s))
+        .unwrap_or_default()
 }
 
 pub(crate) fn build_compacted_history(
@@ -679,6 +732,15 @@ do things
         let expected = vec![
             ResponseItem::Message {
                 id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "summary".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "fresh permissions".to_string(),
@@ -704,15 +766,6 @@ do things
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "fresh personality".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "summary".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
@@ -788,6 +841,15 @@ keep me updated
         let expected = vec![
             ResponseItem::Message {
                 id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "summary".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
                 role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
                     text: "fresh permissions".to_string(),
@@ -822,17 +884,126 @@ keep me updated
                 end_turn: None,
                 phase: None,
             },
+        ];
+        assert_eq!(refreshed, expected);
+    }
+
+    #[test]
+    fn process_compacted_history_drops_largest_uncapped_context_items_to_fit_budget() {
+        let compacted_history = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "summary".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }];
+        let oversized_user_instructions = format!(
+            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+            "u".repeat(48_000)
+        );
+        let medium_developer_instructions = "d".repeat(8_000);
+        let initial_context = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "<permissions instructions>\nallowed\n</permissions instructions>"
+                        .to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: "summary".to_string(),
+                    text: oversized_user_instructions.clone(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: medium_developer_instructions.clone(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>zsh</shell>\n</environment_context>".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
             },
         ];
-        assert_eq!(refreshed, expected);
+        let initial_context_tokens: usize = initial_context
+            .iter()
+            .map(estimate_response_item_tokens)
+            .sum();
+        assert!(
+            initial_context_tokens > REINJECTED_INITIAL_CONTEXT_MAX_TOKENS,
+            "test setup should exceed reinjected initial context budget"
+        );
+
+        let refreshed = process_compacted_history(compacted_history, &initial_context);
+        let reinjected_context_tokens: usize = refreshed
+            .iter()
+            .skip(1)
+            .map(estimate_response_item_tokens)
+            .sum();
+        assert!(
+            reinjected_context_tokens <= REINJECTED_INITIAL_CONTEXT_MAX_TOKENS,
+            "re-injected context should respect budget"
+        );
+        assert!(
+            refreshed.iter().any(|item| matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer"
+                        && content_items_to_text(content).as_deref() == Some(
+                            "<permissions instructions>\nallowed\n</permissions instructions>"
+                        )
+            )),
+            "permissions instructions should always be re-injected"
+        );
+        assert!(
+            refreshed.iter().any(|item| matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && content_items_to_text(content).as_deref() == Some(
+                            "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>zsh</shell>\n</environment_context>"
+                        )
+            )),
+            "environment context should always be re-injected"
+        );
+        assert!(
+            refreshed.iter().all(|item| !matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && content_items_to_text(content).as_deref()
+                            == Some(oversized_user_instructions.as_str())
+            )),
+            "largest droppable context item should be removed first"
+        );
+        assert!(
+            refreshed.iter().any(|item| matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer"
+                        && content_items_to_text(content).as_deref()
+                            == Some(medium_developer_instructions.as_str())
+            )),
+            "smaller droppable context items should remain when budget allows"
+        );
     }
 
     #[test]
@@ -911,18 +1082,18 @@ keep me updated
         let expected = vec![
             ResponseItem::Message {
                 id: None,
-                role: "developer".to_string(),
+                role: "user".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: "fresh developer instructions".to_string(),
+                    text: "summary".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
                 id: None,
-                role: "user".to_string(),
+                role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: "summary".to_string(),
+                    text: "fresh developer instructions".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
@@ -932,7 +1103,7 @@ keep me updated
     }
 
     #[test]
-    fn process_compacted_history_inserts_context_before_last_real_user_message_only() {
+    fn process_compacted_history_appends_context_after_compacted_history() {
         let compacted_history = vec![
             ResponseItem::Message {
                 id: None,
@@ -994,18 +1165,18 @@ keep me updated
             },
             ResponseItem::Message {
                 id: None,
-                role: "developer".to_string(),
+                role: "user".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: "fresh permissions".to_string(),
+                    text: "latest user".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
                 id: None,
-                role: "user".to_string(),
+                role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: "latest user".to_string(),
+                    text: "fresh permissions".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
