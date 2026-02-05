@@ -530,6 +530,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             thread,
             event,
         } = envelope;
+        if shutdown_requested && !matches!(&event.msg, EventMsg::ShutdownComplete) {
+            continue;
+        }
         if let EventMsg::ElicitationRequest(ev) = &event.msg {
             // Automatically cancel elicitation requests in exec mode.
             thread
