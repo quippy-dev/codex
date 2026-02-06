@@ -177,20 +177,15 @@ pub enum ModeKind {
     #[serde(
         alias = "code",
         alias = "pair_programming",
-        alias = "execute",
         alias = "custom"
     )]
     Default,
+    Execute,
     #[doc(hidden)]
     #[serde(skip_serializing, skip_deserializing)]
     #[schemars(skip)]
     #[ts(skip)]
     PairProgramming,
-    #[doc(hidden)]
-    #[serde(skip_serializing, skip_deserializing)]
-    #[schemars(skip)]
-    #[ts(skip)]
-    Execute,
 }
 
 pub const TUI_VISIBLE_COLLABORATION_MODES: [ModeKind; 2] = [ModeKind::Default, ModeKind::Plan];
@@ -339,7 +334,7 @@ mod tests {
 
     #[test]
     fn mode_kind_deserializes_alias_values_to_default() {
-        for alias in ["code", "pair_programming", "execute", "custom"] {
+        for alias in ["code", "pair_programming", "custom"] {
             let json = format!("\"{alias}\"");
             let mode: ModeKind = serde_json::from_str(&json).expect("deserialize mode");
             assert_eq!(ModeKind::Default, mode);
