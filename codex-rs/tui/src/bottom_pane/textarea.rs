@@ -27,6 +27,7 @@ fn is_word_separator(ch: char) -> bool {
 struct TextElement {
     id: u64,
     range: Range<usize>,
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +102,7 @@ impl TextArea {
                 self.elements.push(TextElement {
                     id,
                     range: start..end,
+                    name: None,
                 });
             }
             self.elements.sort_by_key(|e| e.range.start);
@@ -871,6 +873,38 @@ impl TextArea {
         true
     }
 
+    pub fn insert_named_element(&mut self, text: &str, name: String) -> u64 {
+        let start = self.clamp_pos_for_insertion(self.cursor_pos);
+        self.insert_str_at(start, text);
+        let end = start + text.len();
+        let id = self.add_named_element(start..end, name);
+        // Place cursor at end of inserted element
+        self.set_cursor(end);
+        id
+    }
+
+    pub fn replace_element_by_id(&mut self, name: &str, new: &str) -> bool {
+        let Some(idx) = self
+            .elements
+            .iter()
+            .position(|element| element.name.as_deref() == Some(name))
+        else {
+            return false;
+        };
+        self.replace_element_at_index(idx, new)
+    }
+
+    pub fn update_named_element_by_id(&mut self, name: &str, new: &str) -> bool {
+        self.replace_element_by_id(name, new)
+    }
+
+    pub fn named_element_range(&self, name: &str) -> Option<Range<usize>> {
+        self.elements
+            .iter()
+            .find(|element| element.name.as_deref() == Some(name))
+            .map(|element| element.range.clone())
+    }
+
     pub fn insert_element(&mut self, text: &str) -> u64 {
         let start = self.clamp_pos_for_insertion(self.cursor_pos);
         self.insert_str_at(start, text);
@@ -909,6 +943,7 @@ impl TextArea {
         self.elements.push(TextElement {
             id,
             range: start..end,
+            name: None,
         });
         self.elements.sort_by_key(|e| e.range.start);
         Some(id)
@@ -927,8 +962,16 @@ impl TextArea {
     }
 
     fn add_element(&mut self, range: Range<usize>) -> u64 {
+        self.add_element_with_name(range, None)
+    }
+
+    fn add_named_element(&mut self, range: Range<usize>, name: String) -> u64 {
+        self.add_element_with_name(range, Some(name))
+    }
+
+    fn add_element_with_name(&mut self, range: Range<usize>, name: Option<String>) -> u64 {
         let id = self.next_element_id();
-        let elem = TextElement { id, range };
+        let elem = TextElement { id, range, name };
         self.elements.push(elem);
         self.elements.sort_by_key(|e| e.range.start);
         id
@@ -938,6 +981,73 @@ impl TextArea {
         let id = self.next_element_id;
         self.next_element_id = self.next_element_id.saturating_add(1);
         id
+    }
+
+    fn replace_element_at_index(&mut self, idx: usize, new: &str) -> bool {
+        let Some(target) = self.elements.get(idx) else {
+            return false;
+        };
+        let target_id = target.id;
+
+        let range = target.range.clone();
+        let start = range.start;
+        let end = range.end;
+        if start > end || end > self.text.len() {
+            return false;
+        }
+
+        let removed_len = end - start;
+        let inserted_len = new.len();
+        let diff = inserted_len as isize - removed_len as isize;
+
+        self.text.replace_range(range, new);
+        self.wrap_cache.replace(None);
+        self.preferred_col = None;
+
+        if new.is_empty() {
+            self.elements.retain(|element| element.id != target_id);
+        } else if let Some(element) = self
+            .elements
+            .iter_mut()
+            .find(|element| element.id == target_id)
+        {
+            element.range = start..(start + inserted_len);
+        } else {
+            return false;
+        }
+
+        if diff != 0 {
+            for element in &mut self.elements {
+                if element.id == target_id {
+                    continue;
+                }
+                if element.range.end <= start {
+                    continue;
+                }
+                if element.range.start >= end {
+                    element.range.start = ((element.range.start as isize) + diff) as usize;
+                    element.range.end = ((element.range.end as isize) + diff) as usize;
+                    continue;
+                }
+
+                element.range.start = start.min(element.range.start);
+                element.range.end =
+                    (start + inserted_len).max(element.range.end.saturating_add_signed(diff));
+            }
+        }
+
+        self.cursor_pos = if self.cursor_pos < start {
+            self.cursor_pos
+        } else if self.cursor_pos <= end {
+            start + inserted_len
+        } else {
+            ((self.cursor_pos as isize) + diff) as usize
+        };
+        self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
+
+        self.elements.sort_by_key(|element| element.range.start);
+
+        true
     }
 
     fn find_element_containing(&self, pos: usize) -> Option<usize> {
