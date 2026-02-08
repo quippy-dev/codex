@@ -1569,6 +1569,7 @@ dependencies = [
  "codex-file-search",
  "codex-git",
  "codex-keyring-store",
+ "codex-monty",
  "codex-network-proxy",
  "codex-otel",
  "codex-protocol",
@@ -1599,7 +1600,6 @@ dependencies = [
  "landlock",
  "libc",
  "maplit",
- "monty",
  "multimap",
  "notify",
  "once_cell",
@@ -1899,6 +1899,10 @@ dependencies = [
  "tracing-subscriber",
  "wiremock",
 ]
+
+[[package]]
+name = "codex-monty"
+version = "0.0.0"
 
 [[package]]
 name = "codex-network-proxy"
@@ -5198,12 +5202,6 @@ dependencies = [
  "tagptr",
  "uuid",
 ]
-
-[[package]]
-name = "monty"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07773618cf354db873984814969d052a0072b1f99e88ca29850259272a8f7ddd"
 
 [[package]]
 name = "moxcms"

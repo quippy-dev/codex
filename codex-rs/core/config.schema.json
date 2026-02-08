@@ -230,6 +230,9 @@
             "powershell_utf8": {
               "type": "boolean"
             },
+            "python_tool": {
+              "type": "boolean"
+            },
             "remote_models": {
               "type": "boolean"
             },
@@ -415,7 +418,8 @@
       "description": "Initial collaboration mode to use when the TUI starts.",
       "enum": [
         "plan",
-        "default"
+        "default",
+        "execute"
       ],
       "type": "string"
     },
@@ -1271,6 +1275,9 @@
           "type": "boolean"
         },
         "powershell_utf8": {
+          "type": "boolean"
+        },
+        "python_tool": {
           "type": "boolean"
         },
         "remote_models": {
