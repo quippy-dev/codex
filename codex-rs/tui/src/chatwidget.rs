@@ -6219,7 +6219,7 @@ impl ChatWidget {
         }
     }
 
-    /// Cycle to the next collaboration mode variant (Plan -> Default -> Plan).
+    /// Cycle to the next collaboration mode variant (Plan -> Default -> Execute -> Plan).
     fn cycle_collaboration_mode(&mut self) {
         if !self.collaboration_modes_enabled() {
             return;

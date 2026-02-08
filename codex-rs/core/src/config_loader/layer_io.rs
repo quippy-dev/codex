@@ -35,29 +35,44 @@ pub(super) async fn load_config_layers_internal(
     let LoaderOverrides {
         managed_config_path,
         managed_preferences_base64,
+        ignore_system_config,
         ..
     } = overrides;
 
     #[cfg(not(target_os = "macos"))]
     let LoaderOverrides {
         managed_config_path,
+        ignore_system_config,
         ..
     } = overrides;
 
-    let managed_config_path = AbsolutePathBuf::from_absolute_path(
-        managed_config_path.unwrap_or_else(|| managed_config_default_path(codex_home)),
-    )?;
+    let managed_config_path = match managed_config_path {
+        Some(path) => Some(path),
+        None if ignore_system_config => None,
+        None => Some(managed_config_default_path(codex_home)),
+    };
 
-    let managed_config = read_config_from_path(&managed_config_path, false)
-        .await?
-        .map(|managed_config| MangedConfigFromFile {
-            managed_config,
-            file: managed_config_path.clone(),
-        });
+    let managed_config_path = match managed_config_path {
+        Some(path) => Some(AbsolutePathBuf::from_absolute_path(path)?),
+        None => None,
+    };
+
+    let managed_config = match managed_config_path.as_ref() {
+        Some(path) => read_config_from_path(path, false)
+            .await?
+            .map(|managed_config| MangedConfigFromFile {
+                managed_config,
+                file: path.clone(),
+            }),
+        None => None,
+    };
 
     #[cfg(target_os = "macos")]
-    let managed_preferences =
-        load_managed_admin_config_layer(managed_preferences_base64.as_deref()).await?;
+    let managed_preferences = if ignore_system_config && managed_preferences_base64.is_none() {
+        None
+    } else {
+        load_managed_admin_config_layer(managed_preferences_base64.as_deref()).await?
+    };
 
     #[cfg(not(target_os = "macos"))]
     let managed_preferences = None;

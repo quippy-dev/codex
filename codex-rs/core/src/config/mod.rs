@@ -2801,6 +2801,8 @@ profile = "project"
             #[cfg(target_os = "macos")]
             managed_preferences_base64: None,
             macos_managed_config_requirements_base64: None,
+            ignore_system_config: true,
+            ignore_system_requirements: true,
         };
 
         let cwd = AbsolutePathBuf::try_from(codex_home.path())?;
@@ -2931,6 +2933,8 @@ profile = "project"
             #[cfg(target_os = "macos")]
             managed_preferences_base64: None,
             macos_managed_config_requirements_base64: None,
+            ignore_system_config: true,
+            ignore_system_requirements: true,
         };
 
         let cwd = AbsolutePathBuf::try_from(codex_home.path())?;

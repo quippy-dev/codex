@@ -7,6 +7,7 @@ use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config_loader::LoaderOverrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
 use std::path::PathBuf;
@@ -77,6 +78,11 @@ pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
     ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(default_test_overrides())
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("defaults for test should always succeed")

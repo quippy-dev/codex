@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Once;
 use std::time::Duration;
 use tokio::select;
 use tokio::time::timeout;
@@ -56,7 +59,7 @@ async fn run_codex_cli(
     codex_home: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
 ) -> anyhow::Result<CodexCliOutput> {
-    let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let codex_cli = codex_cli_bin()?;
     let mut env = HashMap::new();
     env.insert(
         "CODEX_HOME".to_string(),
@@ -117,3 +120,54 @@ async fn run_codex_cli(
         output: output.to_string(),
     })
 }
+
+fn codex_cli_bin() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+        return Ok(path);
+    }
+
+    BUILD_CODEX_CLI.call_once(|| {
+        let Some(target_dir) = cargo_target_dir() else {
+            eprintln!("unable to resolve target dir for codex CLI build");
+            return;
+        };
+        let repo_root = match codex_utils_cargo_bin::repo_root() {
+            Ok(root) => root,
+            Err(err) => {
+                eprintln!("unable to resolve repo root for codex CLI build: {err}");
+                return;
+            }
+        };
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("-p")
+            .arg("codex-cli")
+            .arg("--bin")
+            .arg("codex")
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .current_dir(repo_root.join("codex-rs"))
+            .status();
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("cargo build for codex CLI failed with status {status}");
+            }
+            Err(err) => {
+                eprintln!("cargo build for codex CLI failed: {err}");
+            }
+        }
+    });
+
+    Ok(codex_utils_cargo_bin::cargo_bin("codex")?)
+}
+
+fn cargo_target_dir() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.parent().map(PathBuf::from)
+}
+
+static BUILD_CODEX_CLI: Once = Once::new();

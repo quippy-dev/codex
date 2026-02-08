@@ -2300,6 +2300,7 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::types::McpServerConfig;
     use codex_core::config::types::McpServerTransportConfig;
+    use codex_core::config_loader::LoaderOverrides;
     use codex_core::protocol::McpAuthStatus;
     use codex_otel::RuntimeMetricTotals;
     use codex_otel::RuntimeMetricsSummary;
@@ -2320,6 +2321,11 @@ mod tests {
         let codex_home = std::env::temp_dir();
         ConfigBuilder::default()
             .codex_home(codex_home.clone())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..LoaderOverrides::default()
+            })
             .build()
             .await
             .expect("config")

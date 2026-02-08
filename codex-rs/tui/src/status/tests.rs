@@ -7,6 +7,7 @@ use chrono::Utc;
 use codex_core::AuthManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config_loader::LoaderOverrides;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::protocol::CreditsSnapshot;
 use codex_core::protocol::RateLimitSnapshot;
@@ -25,6 +26,11 @@ use tempfile::TempDir;
 async fn test_config(temp_home: &TempDir) -> Config {
     ConfigBuilder::default()
         .codex_home(temp_home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("load config")

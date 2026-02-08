@@ -2607,6 +2607,7 @@ mod tests {
     use codex_core::ThreadManager;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
+    use codex_core::config_loader::LoaderOverrides;
     use codex_core::models_manager::manager::ModelsManager;
     use codex_core::protocol::AskForApproval;
     use codex_core::protocol::Event;
@@ -2920,6 +2921,11 @@ mod tests {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..LoaderOverrides::default()
+            })
             .build()
             .await
             .expect("config");

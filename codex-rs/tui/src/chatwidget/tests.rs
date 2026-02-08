@@ -22,6 +22,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
@@ -108,6 +109,11 @@ async fn test_config() -> Config {
     let codex_home = std::env::temp_dir();
     ConfigBuilder::default()
         .codex_home(codex_home.clone())
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("config")
@@ -2869,6 +2875,10 @@ async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
     chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Execute);
+    assert_eq!(chat.current_collaboration_mode(), &initial);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
     assert_eq!(chat.current_collaboration_mode(), &initial);
 
@@ -3005,6 +3015,11 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
             "features.collaboration_modes".to_string(),
             TomlValue::Boolean(true),
         )])
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("config");
@@ -3051,6 +3066,11 @@ async fn experimental_mode_plan_applies_on_startup() {
                 TomlValue::String("plan".to_string()),
             ),
         ])
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("config");

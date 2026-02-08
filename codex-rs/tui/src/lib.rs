@@ -932,6 +932,7 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
+    use codex_core::config_loader::LoaderOverrides;
     use codex_core::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
@@ -944,6 +945,11 @@ mod tests {
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..LoaderOverrides::default()
+            })
             .build()
             .await
     }
@@ -1135,6 +1141,11 @@ trust_level = "untrusted"
         let trusted_config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .harness_overrides(trusted_overrides.clone())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..LoaderOverrides::default()
+            })
             .build()
             .await?;
         assert_eq!(
@@ -1149,6 +1160,11 @@ trust_level = "untrusted"
         let untrusted_config = ConfigBuilder::default()
             .codex_home(codex_home)
             .harness_overrides(untrusted_overrides)
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..LoaderOverrides::default()
+            })
             .build()
             .await?;
         assert_eq!(

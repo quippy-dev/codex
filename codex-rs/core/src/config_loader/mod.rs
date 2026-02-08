@@ -108,6 +108,8 @@ pub async fn load_config_layers_state(
     overrides: LoaderOverrides,
     cloud_requirements: CloudRequirementsLoader,
 ) -> io::Result<ConfigLayerStack> {
+    let ignore_system_config = overrides.ignore_system_config;
+    let ignore_system_requirements = overrides.ignore_system_requirements;
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
     if let Some(requirements) = cloud_requirements.get().await {
@@ -125,7 +127,7 @@ pub async fn load_config_layers_state(
     .await?;
 
     // Honor /etc/codex/requirements.toml.
-    if cfg!(unix) {
+    if cfg!(unix) && !ignore_system_requirements {
         load_requirements_toml(
             &mut config_requirements_toml,
             DEFAULT_REQUIREMENTS_TOML_FILE_UNIX,
@@ -136,11 +138,13 @@ pub async fn load_config_layers_state(
     // Make a best-effort to support the legacy `managed_config.toml` as a
     // requirements specification.
     let loaded_config_layers = layer_io::load_config_layers_internal(codex_home, overrides).await?;
-    load_requirements_from_legacy_scheme(
-        &mut config_requirements_toml,
-        loaded_config_layers.clone(),
-    )
-    .await?;
+    if !ignore_system_requirements {
+        load_requirements_from_legacy_scheme(
+            &mut config_requirements_toml,
+            loaded_config_layers.clone(),
+        )
+        .await?;
+    }
 
     let mut layers = Vec::<ConfigLayerEntry>::new();
 
@@ -169,17 +173,19 @@ pub async fn load_config_layers_state(
         None
     };
     if let Some(system_config_toml_file) = system_config_toml_file {
-        let system_layer =
-            load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
-                ConfigLayerEntry::new(
-                    ConfigLayerSource::System {
-                        file: system_config_toml_file.clone(),
-                    },
-                    config_toml,
-                )
-            })
-            .await?;
-        layers.push(system_layer);
+        if !ignore_system_config {
+            let system_layer =
+                load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
+                    ConfigLayerEntry::new(
+                        ConfigLayerSource::System {
+                            file: system_config_toml_file.clone(),
+                        },
+                        config_toml,
+                    )
+                })
+                .await?;
+            layers.push(system_layer);
+        }
     }
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file
