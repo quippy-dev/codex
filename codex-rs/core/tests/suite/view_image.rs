@@ -26,6 +26,8 @@ use image::Rgba;
 use image::load_from_memory;
 use serde_json::Value;
 use tokio::time::Duration;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::body_string_contains;
 
 fn find_image_message(body: &Value) -> Option<&Value> {
     body.get("input")
