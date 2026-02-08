@@ -174,11 +174,7 @@ pub enum AltScreenMode {
 pub enum ModeKind {
     Plan,
     #[default]
-    #[serde(
-        alias = "code",
-        alias = "pair_programming",
-        alias = "custom"
-    )]
+    #[serde(alias = "code", alias = "pair_programming", alias = "custom")]
     Default,
     Execute,
     #[doc(hidden)]
@@ -188,7 +184,8 @@ pub enum ModeKind {
     PairProgramming,
 }
 
-pub const TUI_VISIBLE_COLLABORATION_MODES: [ModeKind; 3] = [ModeKind::Default, ModeKind::Plan, ModeKind::Execute];
+pub const TUI_VISIBLE_COLLABORATION_MODES: [ModeKind; 3] =
+    [ModeKind::Default, ModeKind::Plan, ModeKind::Execute];
 
 impl ModeKind {
     pub const fn display_name(self) -> &'static str {
