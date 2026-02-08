@@ -90,8 +90,6 @@ impl ToolsConfig {
             web_search_mode: *web_search_mode,
             supports_image_input: model_info.input_modalities.contains(&InputModality::Image),
             python_tool: include_python_tool,
-            supports_image_input: model_info.input_modalities.contains(&InputModality::Image),
-            python_tool: include_python_tool,
             collab_tools: include_collab_tools,
             collaboration_modes_tools: include_collaboration_modes_tools,
             memory_tools: include_memory_tools,
