@@ -530,7 +530,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             thread,
             event,
         } = envelope;
-        if shutdown_requested && !matches!(&event.msg, EventMsg::ShutdownComplete) {
+        if matches!(event.msg, EventMsg::Error(_)) {
+            error_seen = true;
+        }
+        if shutdown_requested
+            && !matches!(&event.msg, EventMsg::ShutdownComplete | EventMsg::Error(_))
+        {
             continue;
         }
         if let EventMsg::ElicitationRequest(ev) = &event.msg {
@@ -556,9 +561,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 thread.submit(Op::Shutdown).await?;
                 shutdown_requested = true;
             }
-        }
-        if matches!(event.msg, EventMsg::Error(_)) {
-            error_seen = true;
         }
         if thread_id != primary_thread_id && matches!(&event.msg, EventMsg::TurnComplete(_)) {
             continue;

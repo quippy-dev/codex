@@ -1661,6 +1661,7 @@ impl CodexMessageProcessor {
             cwd,
             expiration: timeout_ms.into(),
             env,
+            network: self.config.network.clone(),
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level,
             justification: None,
