@@ -4006,38 +4006,6 @@ async fn log_post_sampling_token_usage_and_maybe_compact(
     token_limit_reached
 }
 
-async fn log_post_sampling_token_usage_and_maybe_compact(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    auto_compact_limit: i64,
-    needs_follow_up: bool,
-    allow_auto_compact: bool,
-    checkpoint: &'static str,
-) -> bool {
-    let total_usage_tokens = sess.get_total_token_usage().await;
-    let estimated_token_count = sess.get_estimated_token_count(turn_context.as_ref()).await;
-    let token_limit_reached = total_usage_tokens >= auto_compact_limit
-        || estimated_token_count.is_some_and(|count| count >= auto_compact_limit);
-
-    info!(
-        turn_id = %turn_context.sub_id,
-        total_usage_tokens,
-        estimated_token_count = ?estimated_token_count,
-        auto_compact_limit,
-        token_limit_reached,
-        needs_follow_up,
-        allow_auto_compact,
-        checkpoint,
-        "post sampling token usage"
-    );
-
-    if allow_auto_compact && token_limit_reached && needs_follow_up {
-        run_auto_compact(sess, turn_context).await;
-    }
-
-    token_limit_reached
-}
-
 fn filter_connectors_for_input(
     connectors: Vec<connectors::AppInfo>,
     input: &[ResponseItem],
