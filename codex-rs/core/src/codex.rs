@@ -3908,7 +3908,6 @@ pub(crate) async fn run_turn(
                 // As long as compaction works well in getting us way below the token
                 // limit, we should not worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
-                    let _ = run_auto_compact(&sess, &turn_context).await;
                     continue;
                 }
 
@@ -4002,6 +4001,38 @@ async fn log_post_sampling_token_usage_and_maybe_compact(
 
     if allow_auto_compact && token_limit_reached && needs_follow_up {
         let _ = run_auto_compact(sess, turn_context).await;
+    }
+
+    token_limit_reached
+}
+
+async fn log_post_sampling_token_usage_and_maybe_compact(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    auto_compact_limit: i64,
+    needs_follow_up: bool,
+    allow_auto_compact: bool,
+    checkpoint: &'static str,
+) -> bool {
+    let total_usage_tokens = sess.get_total_token_usage().await;
+    let estimated_token_count = sess.get_estimated_token_count(turn_context.as_ref()).await;
+    let token_limit_reached = total_usage_tokens >= auto_compact_limit
+        || estimated_token_count.is_some_and(|count| count >= auto_compact_limit);
+
+    info!(
+        turn_id = %turn_context.sub_id,
+        total_usage_tokens,
+        estimated_token_count = ?estimated_token_count,
+        auto_compact_limit,
+        token_limit_reached,
+        needs_follow_up,
+        allow_auto_compact,
+        checkpoint,
+        "post sampling token usage"
+    );
+
+    if allow_auto_compact && token_limit_reached && needs_follow_up {
+        run_auto_compact(sess, turn_context).await;
     }
 
     token_limit_reached
@@ -4636,6 +4667,7 @@ async fn drain_in_flight(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     auto_compact_limit: i64,
+    needs_follow_up: bool,
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
         match res {
@@ -4646,7 +4678,7 @@ async fn drain_in_flight(
                     &sess,
                     &turn_context,
                     auto_compact_limit,
-                    true,
+                    needs_follow_up,
                     in_flight.is_empty(),
                     "drain_in_flight",
                 )
@@ -4968,6 +5000,7 @@ async fn try_run_sampling_request(
         sess.clone(),
         turn_context.clone(),
         auto_compact_limit,
+        needs_follow_up,
     )
     .await?;
 

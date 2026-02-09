@@ -240,6 +240,7 @@ async fn remote_auto_compact_runs_after_multi_tool_output_drain() -> Result<()> 
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
+                config.features.enable(Feature::RemoteCompaction);
                 config.base_instructions = Some("test instructions".to_string());
                 config.model_auto_compact_token_limit = Some(500);
             }),
