@@ -162,15 +162,16 @@ pub async fn load_config_layers_state(
     // Include an entry for the "system" config folder, loading its config.toml,
     // if it exists.
     let system_config_toml_file = system_config_toml_file()?;
-    let system_layer = load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
-        ConfigLayerEntry::new(
-            ConfigLayerSource::System {
-                file: system_config_toml_file.clone(),
-            },
-            config_toml,
-        )
-    })
-    .await?;
+    let system_layer =
+        load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
+            ConfigLayerEntry::new(
+                ConfigLayerSource::System {
+                    file: system_config_toml_file.clone(),
+                },
+                config_toml,
+            )
+        })
+        .await?;
     layers.push(system_layer);
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file

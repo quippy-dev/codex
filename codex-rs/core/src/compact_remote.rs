@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::Prompt;
-use crate::compact::context_trim::trim_function_call_history_to_fit_context_window;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::compact::context_trim::trim_function_call_history_to_fit_context_window;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::error::CodexErr;

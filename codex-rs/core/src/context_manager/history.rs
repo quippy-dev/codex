@@ -437,22 +437,6 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
     }
 }
 
-fn is_model_generated_item(item: &ResponseItem) -> bool {
-    match item {
-        ResponseItem::Message { role, .. } => role == "assistant",
-        ResponseItem::Reasoning { .. }
-        | ResponseItem::FunctionCall { .. }
-        | ResponseItem::WebSearchCall { .. }
-        | ResponseItem::CustomToolCall { .. }
-        | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::Compaction { .. } => true,
-        ResponseItem::FunctionCallOutput { .. }
-        | ResponseItem::CustomToolCallOutput { .. }
-        | ResponseItem::GhostSnapshot { .. }
-        | ResponseItem::Other => false,
-    }
-}
-
 pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
     matches!(
         item,
