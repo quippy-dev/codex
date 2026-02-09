@@ -7,7 +7,6 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
 use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::models::local_image_open_tag_text;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -29,7 +28,6 @@ use image::load_from_memory;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::time::Duration;
-use wiremock::ResponseTemplate;
 
 fn find_image_message(body: &Value) -> Option<&Value> {
     body.get("input")
