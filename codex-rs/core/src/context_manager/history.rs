@@ -256,6 +256,14 @@ impl ContextManager {
         &self.items[start..]
     }
 
+    fn get_items_after_last_model_generated_tokens(&self) -> i64 {
+        self.items_after_last_model_generated_item()
+            .iter()
+            .fold(0i64, |acc, item| {
+                acc.saturating_add(estimate_item_token_count(item))
+            })
+    }
+
     /// When true, the server already accounted for past reasoning tokens and
     /// the client should not re-estimate them.
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
@@ -264,12 +272,8 @@ impl ContextManager {
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
-        let items_after_last_model_generated_tokens = self
-            .items_after_last_model_generated_item()
-            .iter()
-            .fold(0i64, |acc, item| {
-                acc.saturating_add(estimate_item_token_count(item))
-            });
+        let items_after_last_model_generated_tokens =
+            self.get_items_after_last_model_generated_tokens();
         if server_reasoning_included {
             last_tokens.saturating_add(items_after_last_model_generated_tokens)
         } else {
@@ -414,6 +418,22 @@ pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) ->
         item => serde_json::to_string(item)
             .map(|serialized| serialized.len())
             .unwrap_or_default(),
+    }
+}
+
+fn is_model_generated_item(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, .. } => role == "assistant",
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::Compaction { .. } => true,
+        ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Other => false,
     }
 }
 

@@ -251,7 +251,6 @@ async fn returns_empty_when_all_layers_missing() {
     };
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
-    let ignore_system_config = overrides.ignore_system_config;
     let layers = load_config_layers_state(
         tmp.path(),
         Some(cwd),
@@ -293,14 +292,9 @@ async fn returns_empty_when_all_layers_missing() {
         .iter()
         .filter(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
         .count();
-    let expected_system_layers = if cfg!(unix) && !ignore_system_config {
-        1
-    } else {
-        0
-    };
     assert_eq!(
-        num_system_layers, expected_system_layers,
-        "system layer should be present only on unix"
+        num_system_layers, 1,
+        "system layer should always be present"
     );
 
     #[cfg(not(target_os = "macos"))]

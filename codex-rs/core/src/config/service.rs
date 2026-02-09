@@ -905,7 +905,7 @@ remote_models = true
             },
         );
         let layers = response.layers.expect("layers present");
-        assert_eq!(layers.len(), 2, "expected two layers");
+        assert_eq!(layers.len(), 3, "expected three layers");
         assert_eq!(
             layers.first().unwrap().name,
             ConfigLayerSource::LegacyManagedConfigTomlFromFile {
@@ -914,8 +914,14 @@ remote_models = true
         );
         assert_eq!(
             layers.get(1).unwrap().name,
-            ConfigLayerSource::User { file: user_file }
+            ConfigLayerSource::User {
+                file: user_file.clone()
+            }
         );
+        assert!(matches!(
+            layers.get(2).unwrap().name,
+            ConfigLayerSource::System { .. }
+        ));
     }
 
     #[tokio::test]
