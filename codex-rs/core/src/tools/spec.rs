@@ -10,6 +10,7 @@ use crate::tools::handlers::collab::DEFAULT_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::collab::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::collab::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
+use crate::tools::python::register_python_tool;
 use crate::tools::registry::ToolRegistryBuilder;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -155,7 +156,9 @@ impl From<JsonSchema> for AdditionalProperties {
     }
 }
 
-fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, JsonSchema> {
+pub(crate) fn create_approval_parameters(
+    include_prefix_rule: bool,
+) -> BTreeMap<String, JsonSchema> {
     let mut properties = BTreeMap::from([
         (
             "sandbox_permissions".to_string(),
@@ -266,64 +269,6 @@ fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["cmd".to_string()]),
-            additional_properties: Some(false.into()),
-        },
-    })
-}
-
-fn create_python_tool(include_prefix_rule: bool) -> ToolSpec {
-    let mut properties = BTreeMap::from([
-        (
-            "code".to_string(),
-            JsonSchema::String {
-                description: Some("Python source code to execute with `python3 -c`.".to_string()),
-            },
-        ),
-        (
-            "args".to_string(),
-            JsonSchema::Array {
-                items: Box::new(JsonSchema::String { description: None }),
-                description: Some(
-                    "Optional command line arguments passed to the script as `sys.argv[1:]`."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "python".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional Python executable path. Defaults to `python3`.".to_string(),
-                ),
-            },
-        ),
-        (
-            "workdir".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional working directory to run the command in; defaults to the turn cwd."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "timeout_ms".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Maximum runtime in milliseconds before the process is terminated.".to_string(),
-                ),
-            },
-        ),
-    ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "python".to_string(),
-        description: "Run a Python snippet in a subprocess and return stdout/stderr.".to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["code".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1406,7 +1351,6 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
-    use crate::tools::handlers::PythonHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::ShellCommandHandler;
@@ -1424,7 +1368,6 @@ pub(crate) fn build_specs(
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let get_memory_handler = Arc::new(GetMemoryHandler);
-    let python_handler = Arc::new(PythonHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -1470,9 +1413,7 @@ pub(crate) fn build_specs(
     }
 
     if config.python_tool {
-        builder
-            .push_spec_with_parallel_support(create_python_tool(config.request_rule_enabled), true);
-        builder.register_handler("python", python_handler);
+        register_python_tool(&mut builder, config.request_rule_enabled);
     }
 
     builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
