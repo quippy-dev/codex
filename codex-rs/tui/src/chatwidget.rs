@@ -150,7 +150,7 @@ use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
-const PLAN_IMPLEMENTATION_EXECUTE: &str = "Yes, implement this plan in Execute mode";
+const PLAN_IMPLEMENTATION_EXECUTE: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
@@ -1437,7 +1437,7 @@ impl ChatWidget {
         let items = vec![
             SelectionItem {
                 name: PLAN_IMPLEMENTATION_EXECUTE.to_string(),
-                description: Some("Switch to Execute and start coding.".to_string()),
+                description: Some("Switch to Execute and execute the plan.".to_string()),
                 selected_description: None,
                 is_current: false,
                 actions: execute_actions,

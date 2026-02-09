@@ -22,6 +22,7 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config::ProjectConfig;
 use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
@@ -107,7 +108,7 @@ use toml::Value as TomlValue;
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
     let codex_home = std::env::temp_dir();
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .loader_overrides(LoaderOverrides {
             ignore_system_config: true,
@@ -116,7 +117,13 @@ async fn test_config() -> Config {
         })
         .build()
         .await
-        .expect("config")
+        .expect("config");
+    config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    config.sandbox_policy = Constrained::allow_any(SandboxPolicy::ReadOnly);
+    config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
+    config.notices.hide_rate_limit_model_nudge = Some(false);
+    config.active_project = ProjectConfig { trust_level: None };
+    config
 }
 
 fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError {

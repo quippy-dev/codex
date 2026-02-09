@@ -7,8 +7,11 @@ use chrono::Utc;
 use codex_core::AuthManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config::Constrained;
+use codex_core::config::ProjectConfig;
 use codex_core::config_loader::LoaderOverrides;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::protocol::AskForApproval;
 use codex_core::protocol::CreditsSnapshot;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::RateLimitWindow;
@@ -24,7 +27,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 async fn test_config(temp_home: &TempDir) -> Config {
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(temp_home.path().to_path_buf())
         .loader_overrides(LoaderOverrides {
             ignore_system_config: true,
@@ -33,7 +36,13 @@ async fn test_config(temp_home: &TempDir) -> Config {
         })
         .build()
         .await
-        .expect("load config")
+        .expect("load config");
+    config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    config.sandbox_policy = Constrained::allow_any(SandboxPolicy::ReadOnly);
+    config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
+    config.notices.hide_rate_limit_model_nudge = Some(false);
+    config.active_project = ProjectConfig { trust_level: None };
+    config
 }
 
 fn test_auth_manager(config: &Config) -> AuthManager {

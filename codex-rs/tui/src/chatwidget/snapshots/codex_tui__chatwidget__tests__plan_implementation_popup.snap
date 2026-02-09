@@ -4,11 +4,8 @@ expression: popup
 ---
   Implement this plan?
 
-› 1. Yes, implement this plan in Execute mode  Switch to Execute and start
-                                               coding.
-  2. Yes, implement this plan                  Switch to Default and start
-                                               coding.
-  3. No, stay in Plan mode                     Continue planning with the
-                                               model.
+› 1. Yes, implement this plan  Switch to Execute and execute the plan.
+  2. Yes, implement this plan  Switch to Default and start coding.
+  3. No, stay in Plan mode     Continue planning with the model.
 
   Press enter to confirm or esc to go back

@@ -935,7 +935,7 @@ mod tests {
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
     use codex_core::config_loader::LoaderOverrides;
-    use codex_core::protocol::AskForApproval;
+    use codex_protocol::config_types::TrustLevel;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
     use codex_protocol::protocol::SessionMeta;
@@ -1151,8 +1151,8 @@ trust_level = "untrusted"
             .build()
             .await?;
         assert_eq!(
-            trusted_config.approval_policy.value(),
-            AskForApproval::OnRequest
+            trusted_config.active_project.trust_level,
+            Some(TrustLevel::Trusted)
         );
 
         let untrusted_overrides = ConfigOverrides {
@@ -1170,8 +1170,8 @@ trust_level = "untrusted"
             .build()
             .await?;
         assert_eq!(
-            untrusted_config.approval_policy.value(),
-            AskForApproval::UnlessTrusted
+            untrusted_config.active_project.trust_level,
+            Some(TrustLevel::Untrusted)
         );
         Ok(())
     }
