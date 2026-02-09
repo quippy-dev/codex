@@ -1,7 +1,10 @@
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::textarea::TextArea;
+#[cfg(not(target_os = "linux"))]
 use crate::voice::VoiceCapture;
+#[cfg(target_os = "linux")]
+struct VoiceCapture;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;

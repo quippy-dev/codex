@@ -2583,6 +2583,7 @@ impl App {
                 }
                 self.chat_widget.handle_key_event(key_event);
             }
+            #[cfg(not(target_os = "linux"))]
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Release,
