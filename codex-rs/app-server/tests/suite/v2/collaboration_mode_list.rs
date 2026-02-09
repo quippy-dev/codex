@@ -45,7 +45,7 @@ async fn list_collaboration_modes_returns_presets() -> Result<()> {
     let CollaborationModeListResponse { data: items } =
         to_response::<CollaborationModeListResponse>(response)?;
 
-    let expected = vec![plan_preset(), default_preset()];
+    let expected = vec![plan_preset(), default_preset(), execute_preset()];
     assert_eq!(expected, items);
     Ok(())
 }
@@ -68,5 +68,14 @@ fn default_preset() -> CollaborationModeMask {
     presets
         .into_iter()
         .find(|p| p.mode == Some(ModeKind::Default))
+        .unwrap()
+}
+
+/// Builds the execute preset that the list response is expected to return.
+fn execute_preset() -> CollaborationModeMask {
+    let presets = test_builtin_collaboration_mode_presets();
+    presets
+        .into_iter()
+        .find(|p| p.mode == Some(ModeKind::Execute))
         .unwrap()
 }

@@ -264,11 +264,9 @@ pub fn transcribe_async(id: String, audio: RecordedAudio, tx: AppEventSender) {
             // Resolve API key using existing Codex auth logic (do not read env).
             let codex_home =
                 find_codex_home().map_err(|e| format!("failed to find codex home: {e}"))?;
-            let auth_opt = CodexAuth::from_auth_storage(
-                &codex_home,
-                AuthCredentialsStoreMode::Auto,
-            )
-            .map_err(|e| format!("failed to read auth.json: {e}"))?;
+            let auth_opt =
+                CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Auto)
+                    .map_err(|e| format!("failed to read auth.json: {e}"))?;
             let auth = match auth_opt {
                 Some(auth) => auth,
                 None => {

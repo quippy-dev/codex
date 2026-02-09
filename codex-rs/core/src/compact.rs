@@ -330,7 +330,8 @@ fn initial_context_for_reinjection(initial_context: &[ResponseItem]) -> Vec<Resp
         .filter(|item| !is_turn_aborted_marker(item))
         .cloned()
         .collect::<Vec<_>>();
-    let mut selected: Vec<Option<ResponseItem>> = initial_context.iter().cloned().map(Some).collect();
+    let mut selected: Vec<Option<ResponseItem>> =
+        initial_context.iter().cloned().map(Some).collect();
     let mut total_tokens: usize = initial_context
         .iter()
         .map(estimate_response_item_tokens)
@@ -1194,5 +1195,4 @@ keep me updated
         ];
         assert_eq!(refreshed, expected);
     }
-
 }

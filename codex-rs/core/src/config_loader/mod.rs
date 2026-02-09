@@ -172,20 +172,20 @@ pub async fn load_config_layers_state(
         // TODO(gt): Determine the path to load on Windows.
         None
     };
-    if let Some(system_config_toml_file) = system_config_toml_file {
-        if !ignore_system_config {
-            let system_layer =
-                load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
-                    ConfigLayerEntry::new(
-                        ConfigLayerSource::System {
-                            file: system_config_toml_file.clone(),
-                        },
-                        config_toml,
-                    )
-                })
-                .await?;
-            layers.push(system_layer);
-        }
+    if let Some(system_config_toml_file) = system_config_toml_file
+        && !ignore_system_config
+    {
+        let system_layer =
+            load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::System {
+                        file: system_config_toml_file.clone(),
+                    },
+                    config_toml,
+                )
+            })
+            .await?;
+        layers.push(system_layer);
     }
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file

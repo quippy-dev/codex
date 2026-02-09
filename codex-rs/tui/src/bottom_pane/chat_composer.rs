@@ -181,12 +181,6 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-fn windows_degraded_sandbox_active() -> bool {
-    cfg!(target_os = "windows")
-        && codex_core::windows_sandbox::ELEVATED_SANDBOX_NUX_ENABLED
-        && codex_core::get_platform_sandbox().is_some()
-        && !codex_core::is_windows_elevated_sandbox_enabled()
-}
 /// If the pasted content exceeds this number of characters, replace it with a
 /// placeholder in the UI.
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
@@ -1086,15 +1080,12 @@ impl ChatComposer {
                 if let Some(vc) = self.voice.take() {
                     match vc.stop() {
                         Ok(audio) => {
-                            let id = self
-                                .recording_placeholder_id
-                                .take()
-                                .unwrap_or_else(|| {
-                                    let id = Uuid::new_v4().to_string();
-                                    self.textarea
-                                        .insert_named_element("transcribing", id.clone());
-                                    id
-                                });
+                            let id = self.recording_placeholder_id.take().unwrap_or_else(|| {
+                                let id = Uuid::new_v4().to_string();
+                                self.textarea
+                                    .insert_named_element("transcribing", id.clone());
+                                id
+                            });
                             let _ = self
                                 .textarea
                                 .update_named_element_by_id(&id, "transcribing");
@@ -1122,7 +1113,7 @@ impl ChatComposer {
             self.space_hold_id = None;
             self.space_insert_pos = None;
         }
-        
+
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
@@ -1496,7 +1487,9 @@ impl ChatComposer {
                 let sel_path = sel.path.to_string_lossy().to_string();
 
                 if sel.is_dir {
-                    self.insert_selected_path(&sel_path);
+                    let trimmed = sel_path.trim_end_matches('/');
+                    let dir_path = format!("{trimmed}/");
+                    self.insert_selected_path(&dir_path, true);
                 } else {
                     // If selected path looks like an image (png/jpeg), attach as image instead of inserting text.
                     let is_image = Self::is_image_path(&sel_path);
@@ -1538,12 +1531,12 @@ impl ChatComposer {
                             Err(err) => {
                                 tracing::trace!("image dimensions lookup failed: {err}");
                                 // Fallback to plain path insertion if metadata read fails.
-                                self.insert_selected_path(&sel_path);
+                                self.insert_selected_path(&sel_path, false);
                             }
                         }
                     } else {
                         // Non-image: inserting file path.
-                        self.insert_selected_path(&sel_path);
+                        self.insert_selected_path(&sel_path, false);
                     }
                 }
                 // No selection: treat Enter as closing the popup/session.
@@ -1879,7 +1872,7 @@ impl ChatComposer {
     /// The algorithm mirrors `current_at_token` so replacement works no matter
     /// where the cursor is within the token and regardless of how many
     /// `@tokens` exist in the line.
-    fn insert_selected_path(&mut self, path: &str) {
+    fn insert_selected_path(&mut self, path: &str, insert_as_element: bool) {
         let cursor_offset = self.textarea.cursor();
         let text = self.textarea.text();
         // Clamp to a valid char boundary to avoid panics when slicing.
@@ -1912,13 +1905,16 @@ impl ChatComposer {
             path.to_string()
         };
 
-        // Preserve existing elements (e.g. prior mentions) outside the replaced token.
-        let mut replacement = String::with_capacity(inserted.len() + 1);
-        replacement.push_str(&inserted);
-        replacement.push(' ');
-        self.textarea
-            .replace_range(start_idx..end_idx, &replacement);
-        let new_cursor = start_idx.saturating_add(replacement.len());
+        self.textarea.replace_range(start_idx..end_idx, "");
+        self.textarea.set_cursor(start_idx);
+
+        if insert_as_element {
+            self.textarea.insert_element(&inserted);
+        } else {
+            self.textarea.insert_str(&inserted);
+        }
+        self.textarea.insert_str(" ");
+        let new_cursor = start_idx.saturating_add(inserted.len()).saturating_add(1);
         self.textarea.set_cursor(new_cursor);
     }
 
@@ -2490,53 +2486,16 @@ impl ChatComposer {
                 let should_queue = !self.steer_enabled;
                 self.handle_submission(should_queue)
             }
-            // Spacebar handling for push-to-talk voice input when composer is empty.
+            // Spacebar handling for push-to-talk voice input (long hold).
             #[cfg(not(target_os = "linux"))]
             KeyEvent {
                 code: KeyCode::Char(' '),
                 kind: KeyEventKind::Press,
                 ..
             } => {
-                // If textarea is empty, start recording immediately without inserting a space.
-                if self.textarea.text().is_empty() {
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        match crate::voice::VoiceCapture::start() {
-                            Ok(vc) => {
-                                self.voice = Some(vc);
-                                // Insert visible placeholder for the meter (no label)
-                                let id = Uuid::new_v4().to_string();
-                                self.textarea.insert_named_element("", id.clone());
-                                self.recording_placeholder_id = Some(id);
-                                // Spawn metering animation
-                                if let Some(v) = &self.voice {
-                                    let data = v.data_arc();
-                                    let stop = v.stopped_flag();
-                                    let sr = v.sample_rate();
-                                    let ch = v.channels();
-                                    let peak = v.last_peak_arc();
-                                    if let Some(idref) = &self.recording_placeholder_id {
-                                        self.spawn_recording_meter(
-                                            idref.clone(),
-                                            sr,
-                                            ch,
-                                            data,
-                                            peak,
-                                            stop,
-                                        );
-                                    }
-                                }
-                                self.sync_popups();
-                                return (InputResult::None, true);
-                            }
-                            Err(e) => {
-                                tracing::error!("failed to start voice capture: {e}");
-                                return self.handle_input_basic(key_event);
-                            }
-                        }
-                    }
+                if self.paste_burst.is_active() {
+                    return self.handle_input_basic(key_event);
                 }
-
                 // If a hold is already pending, swallow further press events to
                 // avoid inserting multiple spaces and resetting the timer on key repeat.
                 if self.space_hold_started_at.is_some() {
@@ -2547,8 +2506,7 @@ impl ChatComposer {
                 // Insert space immediately so normal typing works.
                 let insert_pos = self.textarea.cursor();
                 self.textarea.insert_str(" ");
-                self.sync_command_popup();
-                self.sync_file_search_popup();
+                self.sync_popups();
                 // Record pending hold metadata.
                 let id = Uuid::new_v4().to_string();
                 self.space_hold_started_at = Some(Instant::now());
@@ -2557,10 +2515,17 @@ impl ChatComposer {
 
                 // Spawn a delayed task to notify after threshold without relying on repeats.
                 let tx = self.app_event_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    tx.send(AppEvent::SpaceHoldTimeout { id });
-                });
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tx.send(AppEvent::SpaceHoldTimeout { id });
+                    });
+                } else {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(500));
+                        tx.send(AppEvent::SpaceHoldTimeout { id });
+                    });
+                }
 
                 (InputResult::None, true)
             }
@@ -2636,18 +2601,8 @@ impl ChatComposer {
                     && ch == ' '
                 {
                     let next = pos + ch.len_utf8();
-                    let mut new_text =
-                        String::with_capacity(text.len().saturating_sub(ch.len_utf8()));
-                    new_text.push_str(&text[..pos]);
-                    new_text.push_str(&text[next..]);
-                    let mut cursor = self.textarea.cursor();
-                    if cursor > pos {
-                        cursor = cursor.saturating_sub(ch.len_utf8());
-                    }
-                    self.textarea.set_text(&new_text);
-                    self.textarea.set_cursor(cursor);
-                    self.sync_command_popup();
-                    self.sync_file_search_popup();
+                    self.textarea.replace_range(pos..next, "");
+                    self.sync_popups();
                 }
             }
             // Clear pending state before starting capture.
@@ -2662,8 +2617,7 @@ impl ChatComposer {
                     // Insert a visible placeholder for the meter (no label).
                     let id = Uuid::new_v4().to_string();
                     self.textarea.insert_named_element("", id.clone());
-                    self.sync_command_popup();
-                    self.sync_file_search_popup();
+                    self.sync_popups();
                     self.recording_placeholder_id = Some(id);
                     // Spawn metering animation.
                     if let Some(v) = &self.voice {
@@ -2703,7 +2657,10 @@ impl ChatComposer {
         stop: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
             use std::time::Duration;
             let width: usize = 12;
             // Bar glyphs low→high; single-line sparkline that scrolls left.
@@ -2773,8 +2730,7 @@ impl ChatComposer {
     pub fn update_transcription_in_place(&mut self, id: &str, text: &str) -> bool {
         let updated = self.textarea.update_named_element_by_id(id, text);
         if updated {
-            self.sync_command_popup();
-            self.sync_file_search_popup();
+            self.sync_popups();
         }
         updated
     }
@@ -3048,7 +3004,7 @@ impl ChatComposer {
             .map(|items| if items.is_empty() { 0 } else { 1 })
     }
 
-    fn sync_popups(&mut self) {
+    pub(super) fn sync_popups(&mut self) {
         self.sync_slash_command_elements();
         if !self.popups_enabled() {
             self.active_popup = ActivePopup::None;
@@ -3641,8 +3597,9 @@ impl ChatComposer {
                         None
                     }
                 };
-                let footer_hint_override =
-                    voice_hint_override.as_ref().or(self.footer_hint_override.as_ref());
+                let footer_hint_override = voice_hint_override
+                    .as_ref()
+                    .or(self.footer_hint_override.as_ref());
                 let show_cycle_hint =
                     !footer_props.is_task_running && self.collaboration_mode_indicator.is_some();
                 let show_shortcuts_hint = match footer_props.mode {

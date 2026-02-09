@@ -51,6 +51,14 @@ The solution is to detect paste-like _bursts_ and buffer them into a single expl
 - When a slash command name is completed and the user types a space, the `/command` token is
   promoted into a text element so it renders distinctly and edits atomically.
 
+### Voice push-to-talk (non-Linux only)
+
+If the composer is empty, holding the spacebar for about 500 ms switches the input into voice
+capture. The space that was briefly inserted gets removed once the hold threshold fires, a
+recording placeholder is created, and `VoiceCapture::start` begins recording (`tui/src/bottom_pane
+/chat_composer.rs` lines 2489‑2629). Releasing the space sooner keeps the inserted character, so
+normal taps still behave like typing and does not trigger transcription.
+
 ### History navigation (↑/↓)
 
 Up/Down recall is handled by `ChatComposerHistory` and merges two sources:

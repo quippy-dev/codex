@@ -2576,6 +2576,13 @@ impl App {
                 }
                 self.chat_widget.handle_key_event(key_event);
             }
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                kind: KeyEventKind::Release,
+                ..
+            } => {
+                self.chat_widget.handle_key_event(key_event);
+            }
             _ => {
                 // Ignore Release key events.
             }

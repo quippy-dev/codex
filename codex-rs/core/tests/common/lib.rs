@@ -11,6 +11,7 @@ use codex_core::config_loader::LoaderOverrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
 use std::path::PathBuf;
+use std::process::Command;
 
 pub mod process;
 pub mod responses;
@@ -218,7 +219,41 @@ pub fn format_with_current_shell_display_non_login(command: &str) -> String {
 }
 
 pub fn stdio_server_bin() -> Result<String, CargoBinError> {
-    codex_utils_cargo_bin::cargo_bin("test_stdio_server").map(|p| p.to_string_lossy().to_string())
+    match codex_utils_cargo_bin::cargo_bin("test_stdio_server") {
+        Ok(path) => Ok(path.to_string_lossy().to_string()),
+        Err(err) => {
+            if let Err(build_err) = build_test_stdio_server() {
+                eprintln!("failed to build test_stdio_server: {build_err}");
+                return Err(err);
+            }
+            codex_utils_cargo_bin::cargo_bin("test_stdio_server")
+                .map(|p| p.to_string_lossy().to_string())
+        }
+    }
+}
+
+fn build_test_stdio_server() -> std::io::Result<()> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "missing workspace root"))?;
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "codex-rmcp-client",
+            "--bin",
+            "test_stdio_server",
+        ])
+        .current_dir(workspace_root)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("cargo build failed with status {status}"),
+        ));
+    }
+    Ok(())
 }
 
 pub mod fs_wait {
