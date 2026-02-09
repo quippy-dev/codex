@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
+use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
