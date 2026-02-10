@@ -87,6 +87,8 @@ pub enum Feature {
     /// Allow the model to request web searches that fetch cached content.
     /// Takes precedence over `WebSearchRequest`.
     WebSearchCached,
+    /// Allow the model to search MCP tools via BM25 before exposing them.
+    SearchTool,
     /// Use the bubblewrap-based Linux sandbox pipeline.
     UseLinuxSandboxBwrap,
     /// Allow the model to request approval and propose exec rules.
@@ -103,7 +105,7 @@ pub enum Feature {
     RuntimeMetrics,
     /// Persist rollout metadata to a local SQLite database.
     Sqlite,
-    /// Enable the get_memory tool backed by SQLite thread memories.
+    /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
     /// Enable the dedicated Python execution tool.
     PythonTool,
@@ -435,10 +437,10 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::Collab,
-        key: "collab",
-        stage: Stage::Stable,
-        default_enabled: true,
+        id: Feature::SearchTool,
+        key: "search_tool",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     // Experimental program. Rendered in the `/experimental` menu for users.
     FeatureSpec {
@@ -504,7 +506,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RemoteModels,
         key: "remote_models",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Stable,
         default_enabled: true,
     },
     FeatureSpec {
@@ -524,6 +526,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "enable_request_compression",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::Collab,
+        key: "collab",
+        stage: Stage::Experimental {
+            name: "Sub-agents",
+            menu_description: "Ask Codex to spawn multiple agents to parallelize the work and win in efficiency.",
+            announcement: "NEW: Sub-agents can now be spawned by Codex. Enable in /experimental and restart Codex!",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::Apps,
@@ -628,4 +640,24 @@ pub fn maybe_push_unstable_features_warning(
         id: "".to_owned(),
         msg: EventMsg::Warning(WarningEvent { message }),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn under_development_features_are_disabled_by_default() {
+        for spec in FEATURES {
+            if matches!(spec.stage, Stage::UnderDevelopment) {
+                assert_eq!(
+                    spec.default_enabled, false,
+                    "feature `{}` is under development and must be disabled by default",
+                    spec.key
+                );
+            }
+        }
+    }
 }

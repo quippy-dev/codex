@@ -5,7 +5,7 @@ use crate::instructions::UserInstructions;
 use crate::session_prefix::is_session_prefix;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
-use crate::truncate::approx_tokens_from_byte_count;
+use crate::truncate::approx_tokens_from_byte_count_i64;
 use crate::truncate::truncate_function_output_items_with_policy;
 use crate::truncate::truncate_text;
 use crate::user_shell_command::is_user_shell_command_text;
@@ -15,6 +15,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use std::ops::Deref;
@@ -79,9 +80,11 @@ impl ContextManager {
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
-    /// normalization and drop un-suited items.
-    pub(crate) fn for_prompt(mut self) -> Vec<ResponseItem> {
-        self.normalize_history();
+    /// normalization and drops un-suited items. When `input_modalities` does not
+    /// include `InputModality::Image`, images are stripped from messages and tool
+    /// outputs.
+    pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
+        self.normalize_history(input_modalities);
         self.items
             .retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
         self.items
@@ -110,9 +113,11 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let items_tokens = self.items.iter().fold(0i64, |acc, item| {
-            acc.saturating_add(estimate_item_token_count(item))
-        });
+        let items_tokens = self
+            .items
+            .iter()
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add);
 
         Some(base_tokens.saturating_add(items_tokens))
     }
@@ -239,9 +244,8 @@ impl ContextManager {
                     }
                 )
             })
-            .fold(0i64, |acc, item| {
-                acc.saturating_add(estimate_item_token_count(item))
-            })
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add)
     }
 
     // These are local items added after the most recent model-emitted item.
@@ -256,14 +260,6 @@ impl ContextManager {
         &self.items[start..]
     }
 
-    fn get_items_after_last_model_generated_tokens(&self) -> i64 {
-        self.items_after_last_model_generated_item()
-            .iter()
-            .fold(0i64, |acc, item| {
-                acc.saturating_add(estimate_item_token_count(item))
-            })
-    }
-
     /// When true, the server already accounted for past reasoning tokens and
     /// the client should not re-estimate them.
     pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
@@ -272,8 +268,11 @@ impl ContextManager {
             .as_ref()
             .map(|info| info.last_token_usage.total_tokens)
             .unwrap_or(0);
-        let items_after_last_model_generated_tokens =
-            self.get_items_after_last_model_generated_tokens();
+        let items_after_last_model_generated_tokens = self
+            .items_after_last_model_generated_item()
+            .iter()
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add);
         if server_reasoning_included {
             last_tokens.saturating_add(items_after_last_model_generated_tokens)
         } else {
@@ -297,34 +296,33 @@ impl ContextManager {
                 .items
                 .iter()
                 .map(estimate_response_item_model_visible_bytes)
-                .fold(0i64, |acc, bytes| {
-                    acc.saturating_add(i64::try_from(bytes).unwrap_or(i64::MAX))
-                }),
+                .fold(0i64, i64::saturating_add),
             estimated_tokens_of_items_added_since_last_successful_api_response:
                 items_after_last_model_generated
                     .iter()
-                    .fold(0i64, |acc, item| {
-                        acc.saturating_add(estimate_item_token_count(item))
-                    }),
+                    .map(estimate_item_token_count)
+                    .fold(0i64, i64::saturating_add),
             estimated_bytes_of_items_added_since_last_successful_api_response:
                 items_after_last_model_generated
                     .iter()
                     .map(estimate_response_item_model_visible_bytes)
-                    .fold(0i64, |acc, bytes| {
-                        acc.saturating_add(i64::try_from(bytes).unwrap_or(i64::MAX))
-                    }),
+                    .fold(0i64, i64::saturating_add),
         }
     }
 
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
-    fn normalize_history(&mut self) {
+    /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(&mut self.items);
 
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(&mut self.items);
+
+        // strip images when model does not support them
+        normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
@@ -399,13 +397,11 @@ fn estimate_reasoning_length(encoded_len: usize) -> usize {
 }
 
 fn estimate_item_token_count(item: &ResponseItem) -> i64 {
-    i64::try_from(approx_tokens_from_byte_count(
-        estimate_response_item_model_visible_bytes(item),
-    ))
-    .unwrap_or(i64::MAX)
+    let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
+    approx_tokens_from_byte_count_i64(model_visible_bytes)
 }
 
-pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> usize {
+pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
         ResponseItem::GhostSnapshot { .. } => 0,
         ResponseItem::Reasoning {
@@ -414,9 +410,9 @@ pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) ->
         }
         | ResponseItem::Compaction {
             encrypted_content: content,
-        } => estimate_reasoning_length(content.len()),
+        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => serde_json::to_string(item)
-            .map(|serialized| serialized.len())
+            .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
             .unwrap_or_default(),
     }
 }
