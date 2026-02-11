@@ -221,6 +221,9 @@
             "include_apply_patch_tool": {
               "type": "boolean"
             },
+            "js_repl": {
+              "type": "boolean"
+            },
             "memory_tool": {
               "type": "boolean"
             },
@@ -293,6 +296,9 @@
         "include_apply_patch_tool": {
           "type": "boolean"
         },
+        "js_repl_node_path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
         "model": {
           "type": "string"
         },
@@ -334,6 +340,14 @@
         },
         "web_search": {
           "$ref": "#/definitions/WebSearchMode"
+        },
+        "windows": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WindowsToml"
+            }
+          ],
+          "default": null
         }
       },
       "type": "object"
@@ -1148,6 +1162,22 @@
       ],
       "type": "string"
     },
+    "WindowsSandboxModeToml": {
+      "enum": [
+        "elevated",
+        "unelevated"
+      ],
+      "type": "string"
+    },
+    "WindowsToml": {
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "$ref": "#/definitions/WindowsSandboxModeToml"
+        }
+      },
+      "type": "object"
+    },
     "WireApi": {
       "description": "Wire protocol that the provider speaks.",
       "oneOf": [
@@ -1279,6 +1309,9 @@
         "include_apply_patch_tool": {
           "type": "boolean"
         },
+        "js_repl": {
+          "type": "boolean"
+        },
         "memory_tool": {
           "type": "boolean"
         },
@@ -1403,6 +1436,14 @@
     "instructions": {
       "description": "System instructions.",
       "type": "string"
+    },
+    "js_repl_node_path": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional absolute path to the Node runtime used by `js_repl`."
     },
     "log_dir": {
       "allOf": [
@@ -1642,6 +1683,15 @@
         }
       ],
       "description": "Controls the web search tool mode: disabled, cached, or live."
+    },
+    "windows": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/WindowsToml"
+        }
+      ],
+      "default": null,
+      "description": "Windows-specific configuration."
     },
     "windows_wsl_setup_acknowledged": {
       "description": "Tracks whether the Windows onboarding screen has been acknowledged.",
