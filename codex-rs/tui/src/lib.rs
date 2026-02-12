@@ -1093,6 +1093,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_rebuild_changes_trust_defaults_with_cwd() -> std::io::Result<()> {
+        use codex_protocol::config_types::TrustLevel;
+
         let temp_dir = TempDir::new()?;
         let codex_home = temp_dir.path().to_path_buf();
         let trusted = temp_dir.path().join("trusted");
@@ -1122,9 +1124,10 @@ trust_level = "untrusted"
             .harness_overrides(trusted_overrides.clone())
             .build()
             .await?;
+        assert_eq!(trusted_config.active_project.trust_level, Some(TrustLevel::Trusted));
         assert_eq!(
             trusted_config.approval_policy.value(),
-            AskForApproval::OnRequest
+            AskForApproval::OnFailure
         );
 
         let untrusted_overrides = ConfigOverrides {
@@ -1137,8 +1140,12 @@ trust_level = "untrusted"
             .build()
             .await?;
         assert_eq!(
+            untrusted_config.active_project.trust_level,
+            Some(TrustLevel::Untrusted)
+        );
+        assert_eq!(
             untrusted_config.approval_policy.value(),
-            AskForApproval::UnlessTrusted
+            AskForApproval::OnFailure
         );
         Ok(())
     }

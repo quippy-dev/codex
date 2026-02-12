@@ -55,32 +55,67 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub(crate) fn model_info_from_slug(slug: &str) -> ModelInfo {
-    warn!("Unknown model {slug} is used. This will use fallback model metadata.");
-    ModelInfo {
-        slug: slug.to_string(),
-        display_name: slug.to_string(),
-        description: None,
-        default_reasoning_level: None,
-        supported_reasoning_levels: Vec::new(),
-        shell_type: ConfigShellToolType::Default,
-        visibility: ModelVisibility::None,
-        supported_in_api: true,
-        priority: 99,
-        upgrade: None,
-        base_instructions: BASE_INSTRUCTIONS.to_string(),
-        model_messages: local_personality_messages_for_slug(slug),
-        supports_reasoning_summaries: false,
-        support_verbosity: false,
-        default_verbosity: None,
-        apply_patch_tool_type: None,
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
-        supports_parallel_tool_calls: false,
-        context_window: Some(272_000),
-        auto_compact_token_limit: None,
-        effective_context_window_percent: 95,
-        experimental_supported_tools: Vec::new(),
-        input_modalities: default_input_modalities(),
-        prefer_websockets: false,
+    match slug {
+        // Test-only model slugs used by core integration tests. These need stable metadata so
+        // tool routing remains deterministic even when the mock server does not provide `/models`.
+        "test-gpt-5.1-codex" | "test-gpt-5-codex" => ModelInfo {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            description: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            shell_type: ConfigShellToolType::ShellCommand,
+            visibility: ModelVisibility::None,
+            supported_in_api: true,
+            priority: 99,
+            upgrade: None,
+            base_instructions: BASE_INSTRUCTIONS.to_string(),
+            model_messages: local_personality_messages_for_slug(slug),
+            supports_reasoning_summaries: false,
+            support_verbosity: false,
+            default_verbosity: None,
+            apply_patch_tool_type: None,
+            truncation_policy: TruncationPolicyConfig::bytes(10_000),
+            supports_parallel_tool_calls: true,
+            context_window: Some(272_000),
+            auto_compact_token_limit: None,
+            effective_context_window_percent: 95,
+            experimental_supported_tools: vec![
+                "test_sync_tool".to_string(),
+                "grep_files".to_string(),
+            ],
+            input_modalities: default_input_modalities(),
+            prefer_websockets: false,
+        },
+        _ => {
+            warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+            ModelInfo {
+                slug: slug.to_string(),
+                display_name: slug.to_string(),
+                description: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                shell_type: ConfigShellToolType::Default,
+                visibility: ModelVisibility::None,
+                supported_in_api: true,
+                priority: 99,
+                upgrade: None,
+                base_instructions: BASE_INSTRUCTIONS.to_string(),
+                model_messages: local_personality_messages_for_slug(slug),
+                supports_reasoning_summaries: false,
+                support_verbosity: false,
+                default_verbosity: None,
+                apply_patch_tool_type: None,
+                truncation_policy: TruncationPolicyConfig::bytes(10_000),
+                supports_parallel_tool_calls: false,
+                context_window: Some(272_000),
+                auto_compact_token_limit: None,
+                effective_context_window_percent: 95,
+                experimental_supported_tools: Vec::new(),
+                input_modalities: default_input_modalities(),
+                prefer_websockets: false,
+            }
+        }
     }
 }
 

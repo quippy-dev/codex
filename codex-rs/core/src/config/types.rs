@@ -37,6 +37,15 @@ pub struct WindowsToml {
     pub sandbox: Option<WindowsSandboxModeToml>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CollabInboxDeliveryRole {
+    Developer,
+    #[default]
+    Tool,
+    Assistant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerDisabledReason {
     Unknown,

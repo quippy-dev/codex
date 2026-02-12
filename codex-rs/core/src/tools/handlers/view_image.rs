@@ -74,6 +74,7 @@ impl ToolHandler for ViewImageHandler {
         })?;
 
         if !metadata.is_file() {
+            session.mark_pending_invalid_image_error();
             return Err(FunctionCallError::RespondToModel(format!(
                 "image path `{}` is not a file",
                 abs_path.display()

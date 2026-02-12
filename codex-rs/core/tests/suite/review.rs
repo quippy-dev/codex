@@ -793,6 +793,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     run_git(repo_path, &["init", "-b", "main"]);
     run_git(repo_path, &["config", "user.email", "test@example.com"]);
     run_git(repo_path, &["config", "user.name", "Test User"]);
+    run_git(repo_path, &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo_path.join("file.txt"), "hello\n").unwrap();
     run_git(repo_path, &["add", "."]);
     run_git(repo_path, &["commit", "-m", "initial"]);

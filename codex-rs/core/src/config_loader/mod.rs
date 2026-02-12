@@ -107,6 +107,7 @@ pub async fn load_config_layers_state(
     cloud_requirements: CloudRequirementsLoader,
 ) -> io::Result<ConfigLayerStack> {
     let ignore_system_requirements = overrides.ignore_system_requirements;
+    let ignore_system_config = overrides.ignore_system_config;
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
     if let Some(requirements) = cloud_requirements.get().await {
@@ -155,9 +156,16 @@ pub async fn load_config_layers_state(
     };
 
     // Include an entry for the "system" config folder, loading its config.toml,
-    // if it exists.
+    // if it exists (unless explicitly disabled by overrides).
     let system_config_toml_file = system_config_toml_file()?;
-    let system_layer =
+    let system_layer = if ignore_system_config {
+        ConfigLayerEntry::new(
+            ConfigLayerSource::System {
+                file: system_config_toml_file.clone(),
+            },
+            TomlValue::Table(toml::map::Map::new()),
+        )
+    } else {
         load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
             ConfigLayerEntry::new(
                 ConfigLayerSource::System {
@@ -166,7 +174,8 @@ pub async fn load_config_layers_state(
                 config_toml,
             )
         })
-        .await?;
+        .await?
+    };
     layers.push(system_layer);
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file

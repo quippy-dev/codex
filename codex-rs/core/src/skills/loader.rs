@@ -251,10 +251,32 @@ pub(crate) fn skill_roots_from_layer_stack_with_agents(
     config_layer_stack: &ConfigLayerStack,
     cwd: &Path,
 ) -> Vec<SkillRoot> {
-    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir().as_deref());
+    let agents_home_dir = agents_skills_home_dir(config_layer_stack);
+    let mut roots =
+        skill_roots_from_layer_stack_inner(config_layer_stack, agents_home_dir.as_deref());
     roots.extend(repo_agents_skill_roots(config_layer_stack, cwd));
     dedupe_skill_roots_by_path(&mut roots);
     roots
+}
+
+fn agents_skills_home_dir(config_layer_stack: &ConfigLayerStack) -> Option<PathBuf> {
+    // Prefer deriving `$HOME` from the user config layer location (typically `$HOME/.codex/`).
+    // This keeps skill discovery stable under test harnesses that set `codex_home` to a temp dir.
+    for layer in
+        config_layer_stack.get_layers(ConfigLayerStackOrdering::HighestPrecedenceFirst, true)
+    {
+        if !matches!(layer.name, ConfigLayerSource::User { .. }) {
+            continue;
+        }
+        let Some(config_folder) = layer.config_folder() else {
+            continue;
+        };
+        if let Some(parent) = config_folder.as_path().parent() {
+            return Some(parent.to_path_buf());
+        }
+    }
+
+    home_dir()
 }
 
 fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>) {
