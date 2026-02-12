@@ -36,7 +36,7 @@ const MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT: usize = 5_000;
 ///
 /// Keeping this below 100% leaves room for system instructions, prompt framing,
 /// and model output.
-const STAGE_ONE_CONTEXT_WINDOW_PERCENT: i64 = 70;
+const STAGE_ONE_CONTEXT_WINDOW_PERCENT: i64 = 75;
 /// Maximum rollout age considered for phase-1 extraction.
 const PHASE_ONE_MAX_ROLLOUT_AGE_DAYS: i64 = 30;
 /// Minimum rollout idle time required before phase-1 extraction.

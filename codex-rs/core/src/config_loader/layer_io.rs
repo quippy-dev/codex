@@ -79,10 +79,9 @@ pub(super) async fn load_config_layers_internal(
     let managed_preferences = if ignore_system_config && managed_preferences_base64.is_none() {
         None
     } else {
-        load_managed_admin_config_layer(managed_preferences_base64.as_deref())
-            .await?
+        load_managed_admin_config_layer(managed_preferences_base64.as_deref()).await?
     }
-            .map(map_managed_admin_layer);
+    .map(map_managed_admin_layer);
 
     #[cfg(not(target_os = "macos"))]
     let managed_preferences = None;
