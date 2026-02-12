@@ -111,6 +111,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         prompt,
         output_schema: output_schema_path,
         config_overrides,
+        auth_file,
     } = cli;
 
     let (stdout_with_ansi, stderr_with_ansi) = match color {
@@ -195,11 +196,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     };
 
-    let cloud_auth_manager = AuthManager::shared(
+    let cloud_auth_manager = AuthManager::shared_with_auth_file(
         codex_home.clone(),
         false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
-    );
+        auth_file.clone(),
+    )
+    .map_err(|err| anyhow::anyhow!("Error resolving auth storage path: {err}"))?;
     let chatgpt_base_url = config_toml
         .chatgpt_base_url
         .clone()
@@ -347,11 +350,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         std::process::exit(1);
     }
 
-    let auth_manager = AuthManager::shared(
+    let auth_manager = AuthManager::shared_with_auth_file(
         config.codex_home.clone(),
         true,
         config.cli_auth_credentials_store_mode,
-    );
+        auth_file.clone(),
+    )
+    .map_err(|err| anyhow::anyhow!("Error resolving auth storage path: {err}"))?;
     let thread_manager = Arc::new(ThreadManager::new(
         config.codex_home.clone(),
         auth_manager.clone(),

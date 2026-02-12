@@ -316,7 +316,7 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
 }
 
 fn resolve_auth_storage_home_or_exit(config: &Config, auth_file: Option<PathBuf>) -> PathBuf {
-    ServerOptions::resolve_auth_storage_home(
+    codex_core::auth::resolve_auth_storage_home(
         config.codex_home.clone(),
         auth_file.as_deref(),
         config.cli_auth_credentials_store_mode,

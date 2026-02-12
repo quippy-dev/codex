@@ -396,14 +396,46 @@ pub fn validate_auth_file_override(
             AuthCredentialsStoreMode::Auto | AuthCredentialsStoreMode::Keyring
         )
     {
+        let mode = match auth_credentials_store_mode {
+            AuthCredentialsStoreMode::Auto => "auto",
+            AuthCredentialsStoreMode::Keyring => "keyring",
+            _ => unreachable!(),
+        };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "auth file override is not supported with {auth_credentials_store_mode:?} storage mode"
+                "--auth-file cannot be used when `cli_auth_credentials_store` is `{mode}`. Set `-c cli_auth_credentials_store=file` (or `ephemeral`) and retry."
             ),
         ));
     }
     Ok(())
+}
+
+pub fn resolve_auth_storage_home(
+    codex_home: PathBuf,
+    auth_file: Option<&Path>,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<PathBuf> {
+    validate_auth_file_override(auth_credentials_store_mode, auth_file)?;
+
+    let Some(auth_file) = auth_file else {
+        return Ok(codex_home);
+    };
+
+    if auth_file.file_name().and_then(|name| name.to_str()) != Some("auth.json") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "--auth-file must point to a file named `auth.json` so it can map to core auth storage. Got: {}",
+                auth_file.display()
+            ),
+        ));
+    }
+
+    Ok(auth_file
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".")))
 }
 
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
@@ -1642,11 +1674,23 @@ mod tests {
         )
         .expect_err("keyring mode should reject auth file override");
         assert_eq!(keyring_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            keyring_error
+                .to_string()
+                .contains("cli_auth_credentials_store")
+        );
+        assert!(keyring_error.to_string().contains("keyring"));
 
         let auto_error =
             validate_auth_file_override(AuthCredentialsStoreMode::Auto, Some(auth_file.as_path()))
                 .expect_err("auto mode should reject auth file override");
         assert_eq!(auto_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            auto_error
+                .to_string()
+                .contains("cli_auth_credentials_store")
+        );
+        assert!(auto_error.to_string().contains("auto"));
     }
 
     #[test]
@@ -1659,6 +1703,40 @@ mod tests {
         )?;
         validate_auth_file_override(AuthCredentialsStoreMode::Auto, None)?;
         Ok(())
+    }
+
+    #[test]
+    fn resolve_auth_storage_home_without_override_returns_codex_home() -> std::io::Result<()> {
+        let codex_home = PathBuf::from("/tmp/codex-home");
+        let resolved =
+            resolve_auth_storage_home(codex_home.clone(), None, AuthCredentialsStoreMode::File)?;
+        assert_eq!(resolved, codex_home);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_auth_storage_home_with_auth_json_returns_parent() -> std::io::Result<()> {
+        let auth_file = PathBuf::from("/tmp/auth-state/auth.json");
+        let resolved = resolve_auth_storage_home(
+            PathBuf::from("/unused"),
+            Some(auth_file.as_path()),
+            AuthCredentialsStoreMode::File,
+        )?;
+        assert_eq!(resolved, PathBuf::from("/tmp/auth-state"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_auth_storage_home_rejects_non_auth_json_file() {
+        let auth_file = PathBuf::from("/tmp/auth-state/custom.json");
+        let err = resolve_auth_storage_home(
+            PathBuf::from("/unused"),
+            Some(auth_file.as_path()),
+            AuthCredentialsStoreMode::File,
+        )
+        .expect_err("custom file name should be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("auth.json"));
     }
 
     #[test]

@@ -40,7 +40,6 @@ use codex_core::check_execpolicy_for_warnings;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::TextRange as CoreTextRange;
 use codex_feedback::CodexFeedback;
-use codex_login::ServerOptions as LoginServerOptions;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
@@ -274,7 +273,7 @@ pub async fn run_main_with_transport(
                 }
             }
 
-            let auth_storage_home = LoginServerOptions::resolve_auth_storage_home(
+            let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
                 config.codex_home.clone(),
                 auth_file.as_deref(),
                 config.cli_auth_credentials_store_mode,
@@ -317,7 +316,7 @@ pub async fn run_main_with_transport(
             })?
         }
     };
-    let auth_storage_home = LoginServerOptions::resolve_auth_storage_home(
+    let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
         config.codex_home.clone(),
         auth_file.as_deref(),
         config.cli_auth_credentials_store_mode,
