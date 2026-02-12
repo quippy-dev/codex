@@ -543,7 +543,7 @@ async fn python_tool_surfaces_sandbox_denial_output() -> Result<()> {
         config.features.enable(Feature::PythonTool);
     });
     let test = builder.build(&server).await?;
-    test.submit_turn_with_policy("run denied python", SandboxPolicy::ReadOnly)
+    test.submit_turn_with_policy("run denied python", SandboxPolicy::new_read_only_policy())
         .await?;
 
     let output = mock

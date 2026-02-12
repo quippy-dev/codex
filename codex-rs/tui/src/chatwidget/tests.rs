@@ -120,7 +120,7 @@ async fn test_config() -> Config {
         .await
         .expect("config");
     config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-    config.sandbox_policy = Constrained::allow_any(SandboxPolicy::ReadOnly);
+    config.sandbox_policy = Constrained::allow_any(SandboxPolicy::new_read_only_policy());
     config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
     config.notices.hide_rate_limit_model_nudge = Some(false);
     config.active_project = ProjectConfig { trust_level: None };
@@ -563,12 +563,13 @@ async fn submission_expands_directory_mentions() {
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
         approval_policy: AskForApproval::Never,
-        sandbox_policy: SandboxPolicy::ReadOnly,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: project_root.path().to_path_buf(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
         history_entry_count: 0,
         initial_messages: None,
+        network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
     };
     chat.handle_codex_event(Event {

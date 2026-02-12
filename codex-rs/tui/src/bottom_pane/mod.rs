@@ -93,7 +93,6 @@ mod scroll_state;
 mod selection_popup_common;
 mod textarea;
 mod unified_exec_footer;
-mod voice_input;
 pub(crate) use feedback_view::FeedbackNoteView;
 
 /// How long the "press again to quit" hint stays visible.
@@ -315,14 +314,6 @@ impl BottomPane {
 
     /// Forward a key event to the active view or the composer.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> InputResult {
-        if self.composer.is_recording() {
-            let (_result, needs_redraw) = self.composer.handle_key_event(key_event);
-            if needs_redraw {
-                self.request_redraw();
-            }
-            return InputResult::None;
-        }
-
         // If a modal/view is active, handle it here; otherwise forward to composer.
         if !self.view_stack.is_empty() {
             // We need three pieces of information after routing the key:
@@ -428,7 +419,6 @@ impl BottomPane {
             }
         } else {
             let needs_redraw = self.composer.handle_paste(pasted);
-            self.composer.sync_popups();
             if needs_redraw {
                 self.request_redraw();
             }
@@ -437,7 +427,6 @@ impl BottomPane {
 
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.composer.insert_str(text);
-        self.composer.sync_popups();
         self.request_redraw();
     }
     /// Replace the composer text with `text`.
@@ -455,31 +444,6 @@ impl BottomPane {
             .set_text_content(text, text_elements, local_image_paths);
         self.composer.move_cursor_to_end();
         self.request_redraw();
-    }
-
-    pub(crate) fn replace_transcription(&mut self, id: &str, text: &str) {
-        self.composer.replace_transcription(id, text);
-        self.composer.sync_popups();
-        self.request_redraw();
-    }
-    pub(crate) fn update_transcription_in_place(&mut self, id: &str, text: &str) -> bool {
-        let updated = self.composer.update_transcription_in_place(id, text);
-        if updated {
-            self.request_redraw();
-        }
-        updated
-    }
-
-    pub(crate) fn remove_transcription_placeholder(&mut self, id: &str) {
-        self.composer.remove_transcription_placeholder(id);
-        self.composer.sync_popups();
-        self.request_redraw();
-    }
-
-    pub(crate) fn on_space_hold_timeout(&mut self, id: &str) {
-        if self.composer.on_space_hold_timeout(id) {
-            self.request_redraw();
-        }
     }
 
     /// Replace the composer text while preserving mention link targets.
@@ -896,7 +860,6 @@ impl BottomPane {
             .on_history_entry_response(log_id, offset, entry);
 
         if updated {
-            self.composer.sync_popups();
             self.request_redraw();
         }
     }

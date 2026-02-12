@@ -1543,31 +1543,6 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
             }
-            AppEvent::InsertComposerText(text) => {
-                self.chat_widget.insert_str(&text);
-                tui.frame_requester().schedule_frame();
-            }
-            #[cfg(not(target_os = "linux"))]
-            AppEvent::SpaceHoldTimeout { id } => {
-                self.chat_widget.bottom_pane_on_space_hold_timeout(&id);
-                tui.frame_requester().schedule_frame();
-            }
-            #[cfg(not(target_os = "linux"))]
-            AppEvent::TranscriptionComplete { id, text } => {
-                self.chat_widget.replace_transcription(&id, &text);
-                tui.frame_requester().schedule_frame();
-            }
-            #[cfg(not(target_os = "linux"))]
-            AppEvent::TranscriptionFailed { id, error: _ } => {
-                self.chat_widget.remove_transcription_placeholder(&id);
-                tui.frame_requester().schedule_frame();
-            }
-            #[cfg(not(target_os = "linux"))]
-            AppEvent::RecordingMeter { id, text } => {
-                // Update in place to preserve the element id for subsequent frames.
-                self.chat_widget.update_transcription_in_place(&id, &text);
-                tui.frame_requester().schedule_frame();
-            }
             AppEvent::StartCommitAnimation => {
                 if self
                     .commit_anim_running
@@ -2621,14 +2596,6 @@ impl App {
                 }
                 self.chat_widget.handle_key_event(key_event);
             }
-            #[cfg(not(target_os = "linux"))]
-            KeyEvent {
-                code: KeyCode::Char(' '),
-                kind: KeyEventKind::Release,
-                ..
-            } => {
-                self.chat_widget.handle_key_event(key_event);
-            }
             _ => {
                 // Ignore Release key events.
             }
@@ -2683,7 +2650,6 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config_loader::LoaderOverrides;
-    use codex_core::models_manager::manager::ModelsManager;
     use codex_core::protocol::AskForApproval;
     use codex_core::protocol::Event;
     use codex_core::protocol::EventMsg;
