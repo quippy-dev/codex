@@ -30,13 +30,15 @@ pub async fn login_with_chatgpt(
     codex_home: PathBuf,
     forced_chatgpt_workspace_id: Option<String>,
     cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let opts = ServerOptions::new(
         codex_home,
         CLIENT_ID.to_string(),
         forced_chatgpt_workspace_id,
         cli_auth_credentials_store_mode,
-    );
+    )
+    .with_auth_file_override(auth_file)?;
     let server = run_login_server(opts)?;
 
     print_login_server_start(server.actual_port, &server.auth_url);
@@ -44,7 +46,10 @@ pub async fn login_with_chatgpt(
     server.block_until_done().await
 }
 
-pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) -> ! {
+pub async fn run_login_with_chatgpt(
+    cli_config_overrides: CliConfigOverrides,
+    auth_file: Option<PathBuf>,
+) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
 
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
@@ -58,6 +63,7 @@ pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) ->
         config.codex_home,
         forced_chatgpt_workspace_id,
         config.cli_auth_credentials_store_mode,
+        auth_file,
     )
     .await
     {
@@ -75,6 +81,7 @@ pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) ->
 pub async fn run_login_with_api_key(
     cli_config_overrides: CliConfigOverrides,
     api_key: String,
+    auth_file: Option<PathBuf>,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
 
@@ -83,8 +90,10 @@ pub async fn run_login_with_api_key(
         std::process::exit(1);
     }
 
+    let auth_storage_home = resolve_auth_storage_home_or_exit(&config, auth_file);
+
     match login_with_api_key(
-        &config.codex_home,
+        &auth_storage_home,
         &api_key,
         config.cli_auth_credentials_store_mode,
     ) {
@@ -131,6 +140,7 @@ pub async fn run_login_with_device_code(
     cli_config_overrides: CliConfigOverrides,
     issuer_base_url: Option<String>,
     client_id: Option<String>,
+    auth_file: Option<PathBuf>,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
@@ -143,7 +153,12 @@ pub async fn run_login_with_device_code(
         client_id.unwrap_or(CLIENT_ID.to_string()),
         forced_chatgpt_workspace_id,
         config.cli_auth_credentials_store_mode,
-    );
+    )
+    .with_auth_file_override(auth_file)
+    .unwrap_or_else(|err| {
+        eprintln!("Error logging in with device code: {err}");
+        std::process::exit(1);
+    });
     if let Some(iss) = issuer_base_url {
         opts.issuer = iss;
     }
@@ -167,6 +182,7 @@ pub async fn run_login_with_device_code_fallback_to_browser(
     cli_config_overrides: CliConfigOverrides,
     issuer_base_url: Option<String>,
     client_id: Option<String>,
+    auth_file: Option<PathBuf>,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
     if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
@@ -180,7 +196,12 @@ pub async fn run_login_with_device_code_fallback_to_browser(
         client_id.unwrap_or(CLIENT_ID.to_string()),
         forced_chatgpt_workspace_id,
         config.cli_auth_credentials_store_mode,
-    );
+    )
+    .with_auth_file_override(auth_file)
+    .unwrap_or_else(|err| {
+        eprintln!("Error logging in with device code: {err}");
+        std::process::exit(1);
+    });
     if let Some(iss) = issuer_base_url {
         opts.issuer = iss;
     }
@@ -221,10 +242,14 @@ pub async fn run_login_with_device_code_fallback_to_browser(
     }
 }
 
-pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
+pub async fn run_login_status(
+    cli_config_overrides: CliConfigOverrides,
+    auth_file: Option<PathBuf>,
+) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
+    let auth_storage_home = resolve_auth_storage_home_or_exit(&config, auth_file);
 
-    match CodexAuth::from_auth_storage(&config.codex_home, config.cli_auth_credentials_store_mode) {
+    match CodexAuth::from_auth_storage(&auth_storage_home, config.cli_auth_credentials_store_mode) {
         Ok(Some(auth)) => match auth.auth_mode() {
             AuthMode::ApiKey => match auth.get_token() {
                 Ok(api_key) => {
@@ -252,10 +277,11 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
     }
 }
 
-pub async fn run_logout(cli_config_overrides: CliConfigOverrides) -> ! {
+pub async fn run_logout(cli_config_overrides: CliConfigOverrides, auth_file: Option<PathBuf>) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
+    let auth_storage_home = resolve_auth_storage_home_or_exit(&config, auth_file);
 
-    match logout(&config.codex_home, config.cli_auth_credentials_store_mode) {
+    match logout(&auth_storage_home, config.cli_auth_credentials_store_mode) {
         Ok(true) => {
             eprintln!("Successfully logged out");
             std::process::exit(0);
@@ -289,6 +315,18 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
     }
 }
 
+fn resolve_auth_storage_home_or_exit(config: &Config, auth_file: Option<PathBuf>) -> PathBuf {
+    ServerOptions::resolve_auth_storage_home(
+        config.codex_home.clone(),
+        auth_file.as_deref(),
+        config.cli_auth_credentials_store_mode,
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("Error resolving auth storage path: {err}");
+        std::process::exit(1);
+    })
+}
+
 fn safe_format_key(key: &str) -> String {
     if key.len() <= 13 {
         return "***".to_string();
@@ -301,6 +339,10 @@ fn safe_format_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::safe_format_key;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use codex_login::ServerOptions;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn formats_long_key() {
@@ -312,5 +354,40 @@ mod tests {
     fn short_key_returns_stars() {
         let key = "sk-proj-12345";
         assert_eq!(safe_format_key(key), "***");
+    }
+
+    #[test]
+    fn resolve_auth_storage_home_uses_parent_for_auth_json() {
+        let tmp = tempdir().expect("tmpdir");
+        let auth_file = tmp.path().join("auth.json");
+        let resolved = ServerOptions::resolve_auth_storage_home(
+            PathBuf::from("/unused"),
+            Some(auth_file.as_path()),
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("resolve auth storage home");
+        assert_eq!(resolved, tmp.path());
+    }
+
+    #[test]
+    fn resolve_auth_storage_home_rejects_keyring_mode() {
+        let err = ServerOptions::resolve_auth_storage_home(
+            PathBuf::from("/unused"),
+            Some(PathBuf::from("/tmp/auth.json").as_path()),
+            AuthCredentialsStoreMode::Keyring,
+        )
+        .expect_err("keyring should fail");
+        assert!(err.to_string().contains("cli_auth_credentials_store"));
+    }
+
+    #[test]
+    fn resolve_auth_storage_home_rejects_non_auth_json_file() {
+        let err = ServerOptions::resolve_auth_storage_home(
+            PathBuf::from("/unused"),
+            Some(PathBuf::from("/tmp/custom.json").as_path()),
+            AuthCredentialsStoreMode::File,
+        )
+        .expect_err("custom filename should fail");
+        assert!(err.to_string().contains("auth.json"));
     }
 }

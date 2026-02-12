@@ -25,6 +25,11 @@ struct AppServerArgs {
         default_value = AppServerTransport::DEFAULT_LISTEN_URL
     )]
     listen: AppServerTransport,
+
+    /// Override the auth storage location used by app-server auth flows.
+    /// Must point to an `auth.json` path.
+    #[arg(long = "auth-file", value_name = "PATH")]
+    auth_file: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -44,6 +49,7 @@ fn main() -> anyhow::Result<()> {
             CliConfigOverrides::default(),
             loader_overrides,
             false,
+            args.auth_file,
             transport,
         )
         .await?;

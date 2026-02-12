@@ -127,6 +127,7 @@ pub(crate) struct ConnectionSessionState {
 pub(crate) struct MessageProcessorArgs {
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
+    pub(crate) auth_storage_home: PathBuf,
     pub(crate) config: Arc<Config>,
     pub(crate) cli_overrides: Vec<(String, TomlValue)>,
     pub(crate) loader_overrides: LoaderOverrides,
@@ -142,6 +143,7 @@ impl MessageProcessor {
         let MessageProcessorArgs {
             outgoing,
             codex_linux_sandbox_exe,
+            auth_storage_home,
             config,
             cli_overrides,
             loader_overrides,
@@ -150,7 +152,7 @@ impl MessageProcessor {
             config_warnings,
         } = args;
         let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
+            auth_storage_home.clone(),
             false,
             config.cli_auth_credentials_store_mode,
         );
@@ -169,6 +171,7 @@ impl MessageProcessor {
             thread_manager,
             outgoing: outgoing.clone(),
             codex_linux_sandbox_exe,
+            auth_storage_home,
             config: Arc::clone(&config),
             cli_overrides: cli_overrides.clone(),
             loader_overrides: loader_overrides.clone(),

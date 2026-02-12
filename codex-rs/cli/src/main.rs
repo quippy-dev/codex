@@ -258,6 +258,10 @@ struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
+    /// Override the auth storage location. Must point to an `auth.json` path.
+    #[arg(long = "auth-file", value_name = "PATH")]
+    auth_file: Option<PathBuf>,
+
     #[arg(
         long = "with-api-key",
         help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
@@ -298,6 +302,10 @@ enum LoginSubcommand {
 struct LogoutCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
+
+    /// Override the auth storage location. Must point to an `auth.json` path.
+    #[arg(long = "auth-file", value_name = "PATH")]
+    auth_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -332,6 +340,11 @@ struct AppServerCommand {
     /// See https://developers.openai.com/codex/config-advanced/#metrics for more details.
     #[arg(long = "analytics-default-enabled")]
     analytics_default_enabled: bool,
+
+    /// Override the auth storage location used by app-server auth flows.
+    /// Must point to an `auth.json` path.
+    #[arg(long = "auth-file", value_name = "PATH")]
+    auth_file: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -602,6 +615,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     root_config_overrides,
                     codex_core::config_loader::LoaderOverrides::default(),
                     app_server_cli.analytics_default_enabled,
+                    app_server_cli.auth_file,
                     transport,
                 )
                 .await?;
@@ -669,7 +683,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             );
             match login_cli.action {
                 Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides).await;
+                    run_login_status(login_cli.config_overrides, login_cli.auth_file).await;
                 }
                 None => {
                     if login_cli.use_device_code {
@@ -677,6 +691,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                             login_cli.config_overrides,
                             login_cli.issuer_base_url,
                             login_cli.client_id,
+                            login_cli.auth_file,
                         )
                         .await;
                     } else if login_cli.api_key.is_some() {
@@ -686,9 +701,15 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                         std::process::exit(1);
                     } else if login_cli.with_api_key {
                         let api_key = read_api_key_from_stdin();
-                        run_login_with_api_key(login_cli.config_overrides, api_key).await;
+                        run_login_with_api_key(
+                            login_cli.config_overrides,
+                            api_key,
+                            login_cli.auth_file,
+                        )
+                        .await;
                     } else {
-                        run_login_with_chatgpt(login_cli.config_overrides).await;
+                        run_login_with_chatgpt(login_cli.config_overrides, login_cli.auth_file)
+                            .await;
                     }
                 }
             }
@@ -698,7 +719,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides).await;
+            run_logout(logout_cli.config_overrides, logout_cli.auth_file).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
@@ -1115,6 +1136,22 @@ mod tests {
         app_server
     }
 
+    fn login_from_args(args: &[&str]) -> LoginCommand {
+        let cli = MultitoolCli::try_parse_from(args).expect("parse");
+        let Subcommand::Login(login) = cli.subcommand.expect("login present") else {
+            unreachable!()
+        };
+        login
+    }
+
+    fn logout_from_args(args: &[&str]) -> LogoutCommand {
+        let cli = MultitoolCli::try_parse_from(args).expect("parse");
+        let Subcommand::Logout(logout) = cli.subcommand.expect("logout present") else {
+            unreachable!()
+        };
+        logout
+    }
+
     fn sample_exit_info(conversation_id: Option<&str>, thread_name: Option<&str>) -> AppExitInfo {
         let token_usage = TokenUsage {
             output_tokens: 2,
@@ -1380,6 +1417,47 @@ mod tests {
         let parse_result =
             MultitoolCli::try_parse_from(["codex", "app-server", "--listen", "http://foo"]);
         assert!(parse_result.is_err());
+    }
+
+    #[test]
+    fn app_server_auth_file_parses() {
+        let app_server =
+            app_server_from_args(["codex", "app-server", "--auth-file", "/tmp/auth.json"].as_ref());
+        assert_eq!(
+            app_server.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+    }
+
+    #[test]
+    fn login_auth_file_parses() {
+        let login = login_from_args(["codex", "login", "--auth-file", "/tmp/auth.json"].as_ref());
+        assert_eq!(
+            login.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+        assert!(login.action.is_none());
+    }
+
+    #[test]
+    fn login_status_auth_file_parses() {
+        let login =
+            login_from_args(["codex", "login", "--auth-file", "/tmp/auth.json", "status"].as_ref());
+        assert_eq!(
+            login.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+        assert_matches!(login.action, Some(LoginSubcommand::Status));
+    }
+
+    #[test]
+    fn logout_auth_file_parses() {
+        let logout =
+            logout_from_args(["codex", "logout", "--auth-file", "/tmp/auth.json"].as_ref());
+        assert_eq!(
+            logout.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
     }
 
     #[test]

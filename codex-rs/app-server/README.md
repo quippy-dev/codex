@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Protocol](#protocol)
+- [Auth File Override](#auth-file-override)
 - [Message Schema](#message-schema)
 - [Core Primitives](#core-primitives)
 - [Lifecycle Overview](#lifecycle-overview)
@@ -33,6 +34,20 @@ Backpressure behavior:
 - The server uses bounded queues between transport ingress, request processing, and outbound writes.
 - When request ingress is saturated, new requests are rejected with a JSON-RPC error code `-32001` and message `"Server overloaded; retry later."`.
 - Clients should treat this as retryable and use exponential backoff with jitter.
+
+## Auth File Override
+
+Use `--auth-file` to point app-server auth flows (login/logout/status) at a specific `auth.json` path:
+
+```bash
+codex app-server --auth-file /tmp/codex-auth/auth.json
+```
+
+When `--auth-file` is set, `cli_auth_credentials_store` must be `file` (or `ephemeral`). `keyring` and `auto` are rejected. If needed, set:
+
+```bash
+codex app-server --auth-file /tmp/codex-auth/auth.json -c cli_auth_credentials_store=file
+```
 
 ## Message Schema
 

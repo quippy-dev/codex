@@ -62,6 +62,58 @@ impl ServerOptions {
             cli_auth_credentials_store_mode,
         }
     }
+
+    pub fn with_auth_file_override(mut self, auth_file: Option<PathBuf>) -> io::Result<Self> {
+        self.codex_home = Self::resolve_auth_storage_home(
+            self.codex_home,
+            auth_file.as_deref(),
+            self.cli_auth_credentials_store_mode,
+        )?;
+        Ok(self)
+    }
+
+    pub fn resolve_auth_storage_home(
+        codex_home: PathBuf,
+        auth_file: Option<&Path>,
+        cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> io::Result<PathBuf> {
+        let Some(auth_file) = auth_file else {
+            return Ok(codex_home);
+        };
+
+        if matches!(
+            cli_auth_credentials_store_mode,
+            AuthCredentialsStoreMode::Auto | AuthCredentialsStoreMode::Keyring
+        ) {
+            let mode = match cli_auth_credentials_store_mode {
+                AuthCredentialsStoreMode::Auto => "auto",
+                AuthCredentialsStoreMode::Keyring => "keyring",
+                _ => unreachable!(),
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--auth-file cannot be used when `cli_auth_credentials_store` is `{mode}`. Set `-c cli_auth_credentials_store=file` (or `ephemeral`) and retry."
+                ),
+            ));
+        }
+
+        if auth_file.file_name().and_then(|name| name.to_str()) != Some("auth.json") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--auth-file must point to a file named `auth.json` so it can map to core auth storage. Got: {}",
+                    auth_file.display()
+                ),
+            ));
+        }
+
+        let parent = auth_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ok(parent)
+    }
 }
 
 pub struct LoginServer {

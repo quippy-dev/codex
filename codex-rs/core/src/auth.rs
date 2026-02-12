@@ -23,6 +23,7 @@ pub use crate::auth::storage::AuthCredentialsStoreMode;
 pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
+use crate::auth::storage::create_auth_storage_with_auth_file;
 use crate::config::Config;
 use crate::error::RefreshTokenFailedError;
 use crate::error::RefreshTokenFailedReason;
@@ -160,6 +161,7 @@ impl CodexAuth {
         codex_home: &Path,
         auth_dot_json: AuthDotJson,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_file: Option<PathBuf>,
         client: CodexHttpClient,
     ) -> std::io::Result<Self> {
         let auth_mode = auth_dot_json.resolved_mode();
@@ -178,7 +180,12 @@ impl CodexAuth {
 
         match auth_mode {
             ApiAuthMode::Chatgpt => {
-                let storage = create_auth_storage(codex_home.to_path_buf(), storage_mode);
+                validate_auth_file_override(storage_mode, auth_file.as_deref())?;
+                let storage = create_auth_storage_with_auth_file(
+                    codex_home.to_path_buf(),
+                    storage_mode,
+                    auth_file,
+                );
                 Ok(Self::Chatgpt(ChatgptAuth { state, storage }))
             }
             ApiAuthMode::ChatgptAuthTokens => {
@@ -193,7 +200,15 @@ impl CodexAuth {
         codex_home: &Path,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> std::io::Result<Option<Self>> {
-        load_auth(codex_home, false, auth_credentials_store_mode)
+        Self::from_auth_storage_with_auth_file(codex_home, auth_credentials_store_mode, None)
+    }
+
+    pub fn from_auth_storage_with_auth_file(
+        codex_home: &Path,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_file: Option<PathBuf>,
+    ) -> std::io::Result<Option<Self>> {
+        load_auth_with_auth_file(codex_home, false, auth_credentials_store_mode, auth_file)
     }
 
     pub fn auth_mode(&self) -> AuthMode {
@@ -371,13 +386,46 @@ pub fn read_codex_api_key_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub fn validate_auth_file_override(
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<&Path>,
+) -> std::io::Result<()> {
+    if auth_file.is_some()
+        && matches!(
+            auth_credentials_store_mode,
+            AuthCredentialsStoreMode::Auto | AuthCredentialsStoreMode::Keyring
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "auth file override is not supported with {auth_credentials_store_mode:?} storage mode"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
 pub fn logout(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<bool> {
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    logout_with_auth_file(codex_home, auth_credentials_store_mode, None)
+}
+
+pub fn logout_with_auth_file(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<PathBuf>,
+) -> std::io::Result<bool> {
+    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
+    let storage = create_auth_storage_with_auth_file(
+        codex_home.to_path_buf(),
+        auth_credentials_store_mode,
+        auth_file,
+    );
     storage.delete()
 }
 
@@ -421,7 +469,21 @@ pub fn save_auth(
     auth: &AuthDotJson,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<()> {
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    save_auth_with_auth_file(codex_home, auth, auth_credentials_store_mode, None)
+}
+
+pub fn save_auth_with_auth_file(
+    codex_home: &Path,
+    auth: &AuthDotJson,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<PathBuf>,
+) -> std::io::Result<()> {
+    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
+    let storage = create_auth_storage_with_auth_file(
+        codex_home.to_path_buf(),
+        auth_credentials_store_mode,
+        auth_file,
+    );
     storage.save(auth)
 }
 
@@ -434,7 +496,20 @@ pub fn load_auth_dot_json(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<Option<AuthDotJson>> {
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    load_auth_dot_json_with_auth_file(codex_home, auth_credentials_store_mode, None)
+}
+
+pub fn load_auth_dot_json_with_auth_file(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<PathBuf>,
+) -> std::io::Result<Option<AuthDotJson>> {
+    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
+    let storage = create_auth_storage_with_auth_file(
+        codex_home.to_path_buf(),
+        auth_credentials_store_mode,
+        auth_file,
+    );
     storage.load()
 }
 
@@ -530,11 +605,23 @@ fn logout_all_stores(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<bool> {
+    logout_all_stores_with_auth_file(codex_home, auth_credentials_store_mode, None)
+}
+
+fn logout_all_stores_with_auth_file(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<&Path>,
+) -> std::io::Result<bool> {
     if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
         return logout(codex_home, AuthCredentialsStoreMode::Ephemeral);
     }
     let removed_ephemeral = logout(codex_home, AuthCredentialsStoreMode::Ephemeral)?;
-    let removed_managed = logout(codex_home, auth_credentials_store_mode)?;
+    let removed_managed = logout_with_auth_file(
+        codex_home,
+        auth_credentials_store_mode,
+        auth_file.map(Path::to_path_buf),
+    )?;
     Ok(removed_ephemeral || removed_managed)
 }
 
@@ -543,9 +630,31 @@ fn load_auth(
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<Option<CodexAuth>> {
+    load_auth_with_auth_file(
+        codex_home,
+        enable_codex_api_key_env,
+        auth_credentials_store_mode,
+        None,
+    )
+}
+
+fn load_auth_with_auth_file(
+    codex_home: &Path,
+    enable_codex_api_key_env: bool,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<PathBuf>,
+) -> std::io::Result<Option<CodexAuth>> {
+    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
+
     let build_auth = |auth_dot_json: AuthDotJson, storage_mode| {
         let client = crate::default_client::create_client();
-        CodexAuth::from_auth_dot_json(codex_home, auth_dot_json, storage_mode, client)
+        CodexAuth::from_auth_dot_json(
+            codex_home,
+            auth_dot_json,
+            storage_mode,
+            auth_file.clone(),
+            client,
+        )
     };
 
     // API key via env var takes precedence over any other auth method.
@@ -559,9 +668,10 @@ fn load_auth(
 
     // External ChatGPT auth tokens live in the in-memory (ephemeral) store. Always check this
     // first so external auth takes precedence over any persisted credentials.
-    let ephemeral_storage = create_auth_storage(
+    let ephemeral_storage = create_auth_storage_with_auth_file(
         codex_home.to_path_buf(),
         AuthCredentialsStoreMode::Ephemeral,
+        auth_file.clone(),
     );
     if let Some(auth_dot_json) = ephemeral_storage.load()? {
         let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral)?;
@@ -574,7 +684,11 @@ fn load_auth(
     }
 
     // Fall back to the configured persistent store (file/keyring/auto) for managed auth.
-    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let storage = create_auth_storage_with_auth_file(
+        codex_home.to_path_buf(),
+        auth_credentials_store_mode,
+        auth_file.clone(),
+    );
     let auth_dot_json = match storage.load()? {
         Some(auth) => auth,
         None => return Ok(None),
@@ -949,6 +1063,7 @@ pub struct AuthManager {
     inner: RwLock<CachedAuth>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<PathBuf>,
     forced_chatgpt_workspace_id: RwLock<Option<String>>,
 }
 
@@ -962,10 +1077,40 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Self {
-        let managed_auth = load_auth(
+        Self::new_impl(
+            codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+            None,
+        )
+    }
+
+    pub fn new_with_auth_file(
+        codex_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_file: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
+        Ok(Self::new_impl(
+            codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+            auth_file,
+        ))
+    }
+
+    fn new_impl(
+        codex_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_file: Option<PathBuf>,
+    ) -> Self {
+        let managed_auth = load_auth_with_auth_file(
             &codex_home,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
+            auth_file.clone(),
         )
         .ok()
         .flatten();
@@ -977,6 +1122,7 @@ impl AuthManager {
             }),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
+            auth_file,
             forced_chatgpt_workspace_id: RwLock::new(None),
         }
     }
@@ -993,6 +1139,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+            auth_file: None,
             forced_chatgpt_workspace_id: RwLock::new(None),
         })
     }
@@ -1011,6 +1158,7 @@ impl AuthManager {
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+            auth_file: None,
             forced_chatgpt_workspace_id: RwLock::new(None),
         })
     }
@@ -1073,10 +1221,11 @@ impl AuthManager {
     }
 
     fn load_auth_from_storage(&self) -> Option<CodexAuth> {
-        load_auth(
+        load_auth_with_auth_file(
             &self.codex_home,
             self.enable_codex_api_key_env,
             self.auth_credentials_store_mode,
+            self.auth_file.clone(),
         )
         .ok()
         .flatten()
@@ -1140,6 +1289,20 @@ impl AuthManager {
         ))
     }
 
+    pub fn shared_with_auth_file(
+        codex_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_file: Option<PathBuf>,
+    ) -> std::io::Result<Arc<Self>> {
+        Ok(Arc::new(Self::new_with_auth_file(
+            codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+            auth_file,
+        )?))
+    }
+
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
@@ -1180,7 +1343,11 @@ impl AuthManager {
     /// reloads the in‑memory auth cache so callers immediately observe the
     /// unauthenticated state.
     pub fn logout(&self) -> std::io::Result<bool> {
-        let removed = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
+        let removed = logout_all_stores_with_auth_file(
+            &self.codex_home,
+            self.auth_credentials_store_mode,
+            self.auth_file.as_deref(),
+        )?;
         // Always reload to clear any cached auth (even if file absent).
         self.reload();
         Ok(removed)
@@ -1462,6 +1629,147 @@ mod tests {
         let auth_file = get_auth_file(dir.path());
         assert!(auth_file.exists());
         assert!(logout(dir.path(), AuthCredentialsStoreMode::File)?);
+        assert!(!auth_file.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn auth_file_override_validation_disallows_keyring_and_auto() {
+        let auth_file = PathBuf::from("/tmp/auth-override.json");
+        let keyring_error = validate_auth_file_override(
+            AuthCredentialsStoreMode::Keyring,
+            Some(auth_file.as_path()),
+        )
+        .expect_err("keyring mode should reject auth file override");
+        assert_eq!(keyring_error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let auto_error =
+            validate_auth_file_override(AuthCredentialsStoreMode::Auto, Some(auth_file.as_path()))
+                .expect_err("auto mode should reject auth file override");
+        assert_eq!(auto_error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn auth_file_override_validation_allows_file_and_ephemeral() -> std::io::Result<()> {
+        let auth_file = PathBuf::from("/tmp/auth-override.json");
+        validate_auth_file_override(AuthCredentialsStoreMode::File, Some(auth_file.as_path()))?;
+        validate_auth_file_override(
+            AuthCredentialsStoreMode::Ephemeral,
+            Some(auth_file.as_path()),
+        )?;
+        validate_auth_file_override(AuthCredentialsStoreMode::Auto, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn auth_storage_calls_with_auth_file_override_use_custom_file() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let auth_file = dir.path().join("nested").join("auth-override.json");
+        let auth_dot_json = AuthDotJson {
+            auth_mode: Some(ApiAuthMode::ApiKey),
+            openai_api_key: Some("sk-override".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+
+        save_auth_with_auth_file(
+            dir.path(),
+            &auth_dot_json,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+
+        assert!(auth_file.exists());
+        assert!(!get_auth_file(dir.path()).exists());
+
+        let loaded = load_auth_dot_json_with_auth_file(
+            dir.path(),
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+        assert_eq!(loaded, Some(auth_dot_json));
+
+        let removed = logout_with_auth_file(
+            dir.path(),
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+        assert!(removed);
+        assert!(!auth_file.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn from_auth_storage_with_auth_file_loads_override_path() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let auth_file = dir.path().join("auth-override.json");
+        let auth_dot_json = AuthDotJson {
+            auth_mode: Some(ApiAuthMode::ApiKey),
+            openai_api_key: Some("sk-from-override".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+        save_auth_with_auth_file(
+            dir.path(),
+            &auth_dot_json,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+
+        let default_auth =
+            CodexAuth::from_auth_storage(dir.path(), AuthCredentialsStoreMode::File)?;
+        assert_eq!(default_auth, None);
+
+        let override_auth = CodexAuth::from_auth_storage_with_auth_file(
+            dir.path(),
+            AuthCredentialsStoreMode::File,
+            Some(auth_file),
+        )?;
+        assert_eq!(
+            override_auth
+                .as_ref()
+                .and_then(CodexAuth::api_key)
+                .map(str::to_string),
+            Some("sk-from-override".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auth_manager_new_with_auth_file_uses_override() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let auth_file = dir.path().join("custom").join("auth.json");
+        let auth_dot_json = AuthDotJson {
+            auth_mode: Some(ApiAuthMode::ApiKey),
+            openai_api_key: Some("sk-manager".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+        save_auth_with_auth_file(
+            dir.path(),
+            &auth_dot_json,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+
+        let manager = AuthManager::new_with_auth_file(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+        assert_eq!(manager.auth_mode(), Some(AuthMode::ApiKey));
+
+        let shared = AuthManager::shared_with_auth_file(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+        assert_eq!(shared.auth_mode(), Some(AuthMode::ApiKey));
+
+        let removed = manager.logout()?;
+        assert!(removed);
         assert!(!auth_file.exists());
         Ok(())
     }

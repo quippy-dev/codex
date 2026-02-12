@@ -297,6 +297,7 @@ pub(crate) struct CodexMessageProcessor {
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
     codex_linux_sandbox_exe: Option<PathBuf>,
+    auth_storage_home: PathBuf,
     config: Arc<Config>,
     cli_overrides: Vec<(String, TomlValue)>,
     loader_overrides: LoaderOverrides,
@@ -320,6 +321,7 @@ pub(crate) struct CodexMessageProcessorArgs {
     pub(crate) thread_manager: Arc<ThreadManager>,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
+    pub(crate) auth_storage_home: PathBuf,
     pub(crate) config: Arc<Config>,
     pub(crate) cli_overrides: Vec<(String, TomlValue)>,
     pub(crate) loader_overrides: LoaderOverrides,
@@ -357,6 +359,7 @@ impl CodexMessageProcessor {
             thread_manager,
             outgoing,
             codex_linux_sandbox_exe,
+            auth_storage_home,
             config,
             cli_overrides,
             loader_overrides,
@@ -368,6 +371,7 @@ impl CodexMessageProcessor {
             thread_manager,
             outgoing,
             codex_linux_sandbox_exe,
+            auth_storage_home,
             config,
             cli_overrides,
             loader_overrides,
@@ -847,7 +851,7 @@ impl CodexMessageProcessor {
         }
 
         match login_with_api_key(
-            &self.config.codex_home,
+            &self.auth_storage_home,
             &params.api_key,
             self.config.cli_auth_credentials_store_mode,
         ) {
@@ -950,7 +954,7 @@ impl CodexMessageProcessor {
         Ok(LoginServerOptions {
             open_browser: false,
             ..LoginServerOptions::new(
-                config.codex_home.clone(),
+                self.auth_storage_home.clone(),
                 CLIENT_ID.to_string(),
                 config.forced_chatgpt_workspace_id.clone(),
                 config.cli_auth_credentials_store_mode,
@@ -1285,7 +1289,7 @@ impl CodexMessageProcessor {
         }
 
         if let Err(err) = login_with_chatgpt_auth_tokens(
-            &self.config.codex_home,
+            &self.auth_storage_home,
             &access_token,
             &chatgpt_account_id,
             chatgpt_plan_type.as_deref(),
