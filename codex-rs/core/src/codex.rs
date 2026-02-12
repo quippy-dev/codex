@@ -1436,7 +1436,8 @@ impl Session {
     }
 
     pub(crate) fn take_pending_invalid_image_error(&self) -> bool {
-        self.pending_invalid_image_error.swap(false, Ordering::AcqRel)
+        self.pending_invalid_image_error
+            .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn reset_turn_collab_send_input_flag(&self) {

@@ -963,7 +963,7 @@ fn build_agent_spawn_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AuthManager;
+
     use crate::CodexAuth;
     use crate::ThreadManager;
     use crate::agent::MAX_THREAD_SPAWN_DEPTH;
@@ -978,10 +978,7 @@ mod tests {
     use crate::protocol::SubAgentSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
-    use codex_protocol::protocol::InitialHistory;
-    use codex_protocol::protocol::RolloutItem;
+
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;

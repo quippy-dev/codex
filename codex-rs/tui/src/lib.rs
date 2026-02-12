@@ -1128,7 +1128,10 @@ trust_level = "untrusted"
             .harness_overrides(trusted_overrides.clone())
             .build()
             .await?;
-        assert_eq!(trusted_config.active_project.trust_level, Some(TrustLevel::Trusted));
+        assert_eq!(
+            trusted_config.active_project.trust_level,
+            Some(TrustLevel::Trusted)
+        );
         assert_eq!(
             trusted_config.approval_policy.value(),
             AskForApproval::OnFailure
