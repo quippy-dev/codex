@@ -82,6 +82,9 @@ pub struct Cli {
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 
+    #[clap(skip)]
+    pub auth_file: Option<PathBuf>,
+
     /// Specifies color settings for use in the output.
     #[arg(long = "color", value_enum, default_value_t = Color::Auto)]
     pub color: Color,

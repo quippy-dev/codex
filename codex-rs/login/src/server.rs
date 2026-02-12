@@ -77,42 +77,11 @@ impl ServerOptions {
         auth_file: Option<&Path>,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> io::Result<PathBuf> {
-        let Some(auth_file) = auth_file else {
-            return Ok(codex_home);
-        };
-
-        if matches!(
+        codex_core::auth::resolve_auth_storage_home(
+            codex_home,
+            auth_file,
             cli_auth_credentials_store_mode,
-            AuthCredentialsStoreMode::Auto | AuthCredentialsStoreMode::Keyring
-        ) {
-            let mode = match cli_auth_credentials_store_mode {
-                AuthCredentialsStoreMode::Auto => "auto",
-                AuthCredentialsStoreMode::Keyring => "keyring",
-                _ => unreachable!(),
-            };
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "--auth-file cannot be used when `cli_auth_credentials_store` is `{mode}`. Set `-c cli_auth_credentials_store=file` (or `ephemeral`) and retry."
-                ),
-            ));
-        }
-
-        if auth_file.file_name().and_then(|name| name.to_str()) != Some("auth.json") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "--auth-file must point to a file named `auth.json` so it can map to core auth storage. Got: {}",
-                    auth_file.display()
-                ),
-            ));
-        }
-
-        let parent = auth_file
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Ok(parent)
+        )
     }
 }
 

@@ -216,11 +216,13 @@ pub async fn run_main(
         tracing::warn!(error = %err, "failed to run personality migration");
     }
 
-    let cloud_auth_manager = AuthManager::shared(
+    let cloud_auth_manager = AuthManager::shared_with_auth_file(
         codex_home.to_path_buf(),
         false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
-    );
+        cli.auth_file.clone(),
+    )
+    .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
     let chatgpt_base_url = config_toml
         .chatgpt_base_url
         .clone()
@@ -464,11 +466,13 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let auth_manager = AuthManager::shared(
+    let auth_manager = AuthManager::shared_with_auth_file(
         initial_config.codex_home.clone(),
         false,
         initial_config.cli_auth_credentials_store_mode,
-    );
+        cli.auth_file.clone(),
+    )
+    .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
     let login_status = get_login_status(&initial_config);
     let should_show_trust_screen_flag = should_show_trust_screen(&initial_config);
     let should_show_onboarding =

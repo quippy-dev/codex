@@ -71,6 +71,10 @@ struct MultitoolCli {
     #[clap(flatten)]
     pub feature_toggles: FeatureToggles,
 
+    /// Override the auth storage location. Must point to an `auth.json` path.
+    #[arg(long = "auth-file", value_name = "PATH", global = true)]
+    auth_file: Option<PathBuf>,
+
     #[clap(flatten)]
     interactive: TuiCli,
 
@@ -258,10 +262,6 @@ struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
-    /// Override the auth storage location. Must point to an `auth.json` path.
-    #[arg(long = "auth-file", value_name = "PATH")]
-    auth_file: Option<PathBuf>,
-
     #[arg(
         long = "with-api-key",
         help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
@@ -302,10 +302,6 @@ enum LoginSubcommand {
 struct LogoutCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
-
-    /// Override the auth storage location. Must point to an `auth.json` path.
-    #[arg(long = "auth-file", value_name = "PATH")]
-    auth_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -340,11 +336,6 @@ struct AppServerCommand {
     /// See https://developers.openai.com/codex/config-advanced/#metrics for more details.
     #[arg(long = "analytics-default-enabled")]
     analytics_default_enabled: bool,
-
-    /// Override the auth storage location used by app-server auth flows.
-    /// Must point to an `auth.json` path.
-    #[arg(long = "auth-file", value_name = "PATH")]
-    auth_file: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -566,6 +557,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
+        auth_file,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
@@ -580,6 +572,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 &mut interactive.config_overrides,
                 root_config_overrides.clone(),
             );
+            interactive.auth_file = auth_file.clone();
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
         }
@@ -588,6 +581,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
             );
+            exec_cli.auth_file = auth_file.clone();
             codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
         }
         Some(Subcommand::Review(review_args)) => {
@@ -597,6 +591,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
             );
+            exec_cli.auth_file = auth_file.clone();
             codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
         }
         Some(Subcommand::McpServer) => {
@@ -615,7 +610,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     root_config_overrides,
                     codex_core::config_loader::LoaderOverrides::default(),
                     app_server_cli.analytics_default_enabled,
-                    app_server_cli.auth_file,
+                    auth_file.clone(),
                     transport,
                 )
                 .await?;
@@ -655,6 +650,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 last,
                 all,
                 config_overrides,
+                auth_file.clone(),
             );
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
@@ -672,6 +668,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 last,
                 all,
                 config_overrides,
+                auth_file.clone(),
             );
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
@@ -683,7 +680,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             );
             match login_cli.action {
                 Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides, login_cli.auth_file).await;
+                    run_login_status(login_cli.config_overrides, auth_file.clone()).await;
                 }
                 None => {
                     if login_cli.use_device_code {
@@ -691,7 +688,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                             login_cli.config_overrides,
                             login_cli.issuer_base_url,
                             login_cli.client_id,
-                            login_cli.auth_file,
+                            auth_file.clone(),
                         )
                         .await;
                     } else if login_cli.api_key.is_some() {
@@ -704,12 +701,11 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                         run_login_with_api_key(
                             login_cli.config_overrides,
                             api_key,
-                            login_cli.auth_file,
+                            auth_file.clone(),
                         )
                         .await;
                     } else {
-                        run_login_with_chatgpt(login_cli.config_overrides, login_cli.auth_file)
-                            .await;
+                        run_login_with_chatgpt(login_cli.config_overrides, auth_file.clone()).await;
                     }
                 }
             }
@@ -719,7 +715,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides, logout_cli.auth_file).await;
+            run_logout(logout_cli.config_overrides, auth_file.clone()).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
@@ -953,6 +949,7 @@ fn finalize_resume_interactive(
     last: bool,
     show_all: bool,
     resume_cli: TuiCli,
+    auth_file: Option<PathBuf>,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
     // configuration surface area as `codex` without additional flags.
@@ -967,6 +964,7 @@ fn finalize_resume_interactive(
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
     prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
+    interactive.auth_file = auth_file;
 
     interactive
 }
@@ -979,6 +977,7 @@ fn finalize_fork_interactive(
     last: bool,
     show_all: bool,
     fork_cli: TuiCli,
+    auth_file: Option<PathBuf>,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so fork shares the same
     // configuration surface area as `codex` without additional flags.
@@ -993,6 +992,7 @@ fn finalize_fork_interactive(
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
     prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
+    interactive.auth_file = auth_file;
 
     interactive
 }
@@ -1064,6 +1064,7 @@ mod tests {
         let MultitoolCli {
             interactive,
             config_overrides: root_overrides,
+            auth_file,
             subcommand,
             feature_toggles: _,
         } = cli;
@@ -1085,6 +1086,7 @@ mod tests {
             last,
             all,
             resume_cli,
+            auth_file,
         )
     }
 
@@ -1093,6 +1095,7 @@ mod tests {
         let MultitoolCli {
             interactive,
             config_overrides: root_overrides,
+            auth_file,
             subcommand,
             feature_toggles: _,
         } = cli;
@@ -1107,7 +1110,15 @@ mod tests {
             unreachable!()
         };
 
-        finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
+        finalize_fork_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all,
+            fork_cli,
+            auth_file,
+        )
     }
 
     #[test]
@@ -1144,12 +1155,9 @@ mod tests {
         login
     }
 
-    fn logout_from_args(args: &[&str]) -> LogoutCommand {
+    fn auth_file_from_args(args: &[&str]) -> Option<std::path::PathBuf> {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
-        let Subcommand::Logout(logout) = cli.subcommand.expect("logout present") else {
-            unreachable!()
-        };
-        logout
+        cli.auth_file
     }
 
     fn sample_exit_info(conversation_id: Option<&str>, thread_name: Option<&str>) -> AppExitInfo {
@@ -1266,6 +1274,17 @@ mod tests {
     }
 
     #[test]
+    fn resume_inherits_global_auth_file_override() {
+        let interactive = finalize_resume_from_args(
+            ["codex", "--auth-file", "/tmp/auth.json", "resume"].as_ref(),
+        );
+        assert_eq!(
+            interactive.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+    }
+
+    #[test]
     fn resume_merges_option_flags_and_full_auto() {
         let interactive = finalize_resume_from_args(
             [
@@ -1373,6 +1392,16 @@ mod tests {
     }
 
     #[test]
+    fn fork_inherits_global_auth_file_override() {
+        let interactive =
+            finalize_fork_from_args(["codex", "--auth-file", "/tmp/auth.json", "fork"].as_ref());
+        assert_eq!(
+            interactive.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+    }
+
+    #[test]
     fn app_server_analytics_default_disabled_without_flag() {
         let app_server = app_server_from_args(["codex", "app-server"].as_ref());
         assert!(!app_server.analytics_default_enabled);
@@ -1421,19 +1450,45 @@ mod tests {
 
     #[test]
     fn app_server_auth_file_parses() {
-        let app_server =
-            app_server_from_args(["codex", "app-server", "--auth-file", "/tmp/auth.json"].as_ref());
+        let cli =
+            MultitoolCli::try_parse_from(["codex", "app-server", "--auth-file", "/tmp/auth.json"])
+                .expect("parse");
+        let Some(Subcommand::AppServer(_)) = cli.subcommand else {
+            panic!("expected app-server subcommand");
+        };
         assert_eq!(
-            app_server.auth_file,
+            cli.auth_file,
             Some(std::path::PathBuf::from("/tmp/auth.json"))
         );
+    }
+
+    #[test]
+    fn interactive_auth_file_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "--auth-file", "/tmp/auth.json"])
+            .expect("parse");
+        assert_eq!(
+            cli.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+        assert!(cli.subcommand.is_none());
+    }
+
+    #[test]
+    fn exec_auth_file_parses_as_global_flag() {
+        let cli = MultitoolCli::try_parse_from(["codex", "exec", "--auth-file", "/tmp/auth.json"])
+            .expect("parse");
+        assert_eq!(
+            cli.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+        assert_matches!(cli.subcommand, Some(Subcommand::Exec(_)));
     }
 
     #[test]
     fn login_auth_file_parses() {
         let login = login_from_args(["codex", "login", "--auth-file", "/tmp/auth.json"].as_ref());
         assert_eq!(
-            login.auth_file,
+            auth_file_from_args(["codex", "login", "--auth-file", "/tmp/auth.json"].as_ref()),
             Some(std::path::PathBuf::from("/tmp/auth.json"))
         );
         assert!(login.action.is_none());
@@ -1444,7 +1499,9 @@ mod tests {
         let login =
             login_from_args(["codex", "login", "--auth-file", "/tmp/auth.json", "status"].as_ref());
         assert_eq!(
-            login.auth_file,
+            auth_file_from_args(
+                ["codex", "login", "--auth-file", "/tmp/auth.json", "status"].as_ref()
+            ),
             Some(std::path::PathBuf::from("/tmp/auth.json"))
         );
         assert_matches!(login.action, Some(LoginSubcommand::Status));
@@ -1452,10 +1509,14 @@ mod tests {
 
     #[test]
     fn logout_auth_file_parses() {
-        let logout =
-            logout_from_args(["codex", "logout", "--auth-file", "/tmp/auth.json"].as_ref());
+        let cli =
+            MultitoolCli::try_parse_from(["codex", "logout", "--auth-file", "/tmp/auth.json"])
+                .expect("parse");
+        let Some(Subcommand::Logout(_)) = cli.subcommand else {
+            panic!("expected logout subcommand");
+        };
         assert_eq!(
-            logout.auth_file,
+            cli.auth_file,
             Some(std::path::PathBuf::from("/tmp/auth.json"))
         );
     }
