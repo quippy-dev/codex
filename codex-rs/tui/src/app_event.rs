@@ -238,6 +238,7 @@ pub(crate) enum AppEvent {
     UpdateFeatureFlags {
         updates: Vec<(Feature, bool)>,
     },
+
     /// Update whether the full access warning prompt has been acknowledged.
     UpdateFullAccessWarningAcknowledged(bool),
 
@@ -288,8 +289,10 @@ pub(crate) enum AppEvent {
 
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
+
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),
+
     /// Open the commit picker option from the review popup.
     OpenReviewCommitPicker(PathBuf),
 
@@ -300,39 +303,6 @@ pub(crate) enum AppEvent {
     SubmitUserMessageWithMode {
         text: String,
         collaboration_mode: CollaborationModeMask,
-    },
-
-    /// Insert transcribed text from voice input into the composer.
-    InsertComposerText(String),
-
-    /// Voice transcription finished for the given placeholder id.
-    #[cfg(not(target_os = "linux"))]
-    TranscriptionComplete {
-        id: String,
-        text: String,
-    },
-
-    /// Voice transcription failed; remove the placeholder identified by `id`.
-    #[cfg(not(target_os = "linux"))]
-    TranscriptionFailed {
-        id: String,
-        #[allow(dead_code)]
-        error: String,
-    },
-
-    /// Internal: Fired 500ms after a Space key press to trigger hold-to-talk
-    /// if the space is still held. Carries a unique id to avoid races.
-    #[cfg(not(target_os = "linux"))]
-    SpaceHoldTimeout {
-        id: String,
-    },
-
-    /// Live update for the in-progress voice recording placeholder. Carries
-    /// the placeholder `id` and the text to display (e.g., an ASCII meter).
-    #[cfg(not(target_os = "linux"))]
-    RecordingMeter {
-        id: String,
-        text: String,
     },
 
     /// Open the approval popup.

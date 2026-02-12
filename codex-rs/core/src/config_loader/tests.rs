@@ -420,7 +420,7 @@ allowed_sandbox_modes = ["read-only"]
     );
     assert_eq!(
         *state.requirements().sandbox_policy.get(),
-        SandboxPolicy::ReadOnly
+        SandboxPolicy::new_read_only_policy()
     );
     assert!(
         state
@@ -435,6 +435,7 @@ allowed_sandbox_modes = ["read-only"]
             .sandbox_policy
             .can_set(&SandboxPolicy::WorkspaceWrite {
                 writable_roots: Vec::new(),
+                read_only_access: Default::default(),
                 network_access: false,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,

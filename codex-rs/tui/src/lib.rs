@@ -109,8 +109,6 @@ pub mod update_action;
 mod update_prompt;
 mod updates;
 mod version;
-#[cfg(not(target_os = "linux"))]
-mod voice;
 
 mod wrapping;
 
@@ -925,8 +923,7 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
-    use codex_core::config_loader::LoaderOverrides;
-    use codex_protocol::config_types::TrustLevel;
+    use codex_core::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
     use codex_protocol::protocol::SessionMeta;
@@ -938,11 +935,6 @@ mod tests {
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
-            .loader_overrides(LoaderOverrides {
-                ignore_system_config: true,
-                ignore_system_requirements: true,
-                ..LoaderOverrides::default()
-            })
             .build()
             .await
     }
@@ -1128,16 +1120,11 @@ trust_level = "untrusted"
         let trusted_config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .harness_overrides(trusted_overrides.clone())
-            .loader_overrides(LoaderOverrides {
-                ignore_system_config: true,
-                ignore_system_requirements: true,
-                ..LoaderOverrides::default()
-            })
             .build()
             .await?;
         assert_eq!(
-            trusted_config.active_project.trust_level,
-            Some(TrustLevel::Trusted)
+            trusted_config.approval_policy.value(),
+            AskForApproval::OnRequest
         );
 
         let untrusted_overrides = ConfigOverrides {
@@ -1147,16 +1134,11 @@ trust_level = "untrusted"
         let untrusted_config = ConfigBuilder::default()
             .codex_home(codex_home)
             .harness_overrides(untrusted_overrides)
-            .loader_overrides(LoaderOverrides {
-                ignore_system_config: true,
-                ignore_system_requirements: true,
-                ..LoaderOverrides::default()
-            })
             .build()
             .await?;
         assert_eq!(
-            untrusted_config.active_project.trust_level,
-            Some(TrustLevel::Untrusted)
+            untrusted_config.approval_policy.value(),
+            AskForApproval::UnlessTrusted
         );
         Ok(())
     }
