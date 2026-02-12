@@ -423,17 +423,6 @@ Use `turn/steer` to append additional user input to the currently active turn. T
 
 `expectedTurnId` is required. If there is no active turn (or `expectedTurnId` does not match the active turn), the request fails with an `invalid request` error.
 
-### Example: Clean background terminals
-
-Use `thread/backgroundTerminals/clean` to terminate all running background terminals associated with a thread.
-
-```json
-{ "method": "thread/backgroundTerminals/clean", "id": 35, "params": {
-    "threadId": "thr_123"
-} }
-{ "id": 35, "result": {} }
-```
-
 ### Example: Request a code review
 
 Use `review/start` to run Codex’s reviewer on the currently checked-out project. The request takes the thread id plus a `target` describing what should be reviewed:

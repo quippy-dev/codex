@@ -1634,6 +1634,7 @@ mod tests {
             input_schema: std::sync::Arc::new(rmcp::model::object(input_schema)),
             output_schema: None,
             annotations: None,
+            execution: None,
             icons: None,
             meta: None,
         }
@@ -1651,6 +1652,7 @@ mod tests {
             input_schema: std::sync::Arc::new(schema),
             output_schema: None,
             annotations: None,
+            execution: None,
             icons: None,
             meta: None,
         };
