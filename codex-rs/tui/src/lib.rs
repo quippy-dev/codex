@@ -9,7 +9,6 @@ pub use app::AppExitInfo;
 pub use app::ExitReason;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
-use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
 use codex_core::ThreadSortKey;
@@ -473,7 +472,7 @@ async fn run_ratatui_app(
         cli.auth_file.clone(),
     )
     .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
-    let login_status = get_login_status(&initial_config);
+    let login_status = get_login_status(&initial_config, auth_manager.as_ref());
     let should_show_trust_screen_flag = should_show_trust_screen(&initial_config);
     let should_show_onboarding =
         should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
@@ -837,18 +836,11 @@ pub enum LoginStatus {
     NotAuthenticated,
 }
 
-fn get_login_status(config: &Config) -> LoginStatus {
+fn get_login_status(config: &Config, auth_manager: &AuthManager) -> LoginStatus {
     if config.model_provider.requires_openai_auth {
-        // Reading the OpenAI API key is an async operation because it may need
-        // to refresh the token. Block on it.
-        let codex_home = config.codex_home.clone();
-        match CodexAuth::from_auth_storage(&codex_home, config.cli_auth_credentials_store_mode) {
-            Ok(Some(auth)) => LoginStatus::AuthMode(auth.auth_mode()),
-            Ok(None) => LoginStatus::NotAuthenticated,
-            Err(err) => {
-                error!("Failed to read auth.json: {err}");
-                LoginStatus::NotAuthenticated
-            }
+        match auth_manager.auth_cached() {
+            Some(auth) => LoginStatus::AuthMode(auth.auth_mode()),
+            None => LoginStatus::NotAuthenticated,
         }
     } else {
         LoginStatus::NotAuthenticated
