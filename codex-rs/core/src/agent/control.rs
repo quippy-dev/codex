@@ -22,6 +22,7 @@ use codex_protocol::user_input::UserInput;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
@@ -113,7 +114,7 @@ impl AgentControl {
         let new_thread = match session_source {
             Some(session_source) => {
                 state
-                    .spawn_new_thread_with_source(config, self.clone(), session_source)
+                    .spawn_new_thread_with_source(config, self.clone(), session_source, false)
                     .await?
             }
             None => state.spawn_new_thread(config, self.clone()).await?,
@@ -146,7 +147,7 @@ impl AgentControl {
         let new_thread = match session_source {
             Some(session_source) => {
                 state
-                    .spawn_new_thread_with_source(config, self.clone(), session_source)
+                    .spawn_new_thread_with_source(config, self.clone(), session_source, false)
                     .await?
             }
             None => state.spawn_new_thread(config, self.clone()).await?,
@@ -155,6 +156,30 @@ impl AgentControl {
 
         // Notify a new thread has been created. This notification will be processed by clients
         // to subscribe or drain this newly created thread.
+        state.notify_thread_created(new_thread.thread_id);
+
+        Ok(new_thread.thread_id)
+    }
+
+    /// Resume an agent thread from a rollout file, re-registering it with the thread manager.
+    pub(crate) async fn resume_agent_handle(
+        &self,
+        config: Config,
+        rollout_path: PathBuf,
+        session_source: SessionSource,
+    ) -> CodexResult<ThreadId> {
+        let state = self.upgrade()?;
+        let reservation = self.guards.reserve_spawn_slot(config.agent_max_threads)?;
+
+        let new_thread = state
+            .resume_thread_from_rollout_with_source(
+                config,
+                rollout_path,
+                self.clone(),
+                session_source,
+            )
+            .await?;
+        reservation.commit(new_thread.thread_id);
         state.notify_thread_created(new_thread.thread_id);
 
         Ok(new_thread.thread_id)
@@ -187,6 +212,8 @@ impl AgentControl {
                 self.clone(),
                 rollout_path,
                 session_source,
+                Vec::new(),
+                false,
             )
             .await?;
         reservation.commit(new_thread.thread_id);
