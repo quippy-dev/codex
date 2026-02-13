@@ -5,6 +5,7 @@ use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::features::Feature;
 use crate::features::Features;
+use crate::mcp_connection_manager::ToolInfo;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::SEARCH_TOOL_BM25_DEFAULT_LIMIT;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
@@ -27,6 +28,9 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+
+const SEARCH_TOOL_BM25_DESCRIPTION_TEMPLATE: &str =
+    include_str!("../../templates/search_tool/tool_description.md");
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
@@ -886,12 +890,12 @@ fn create_grep_files_tool() -> ToolSpec {
     })
 }
 
-fn create_search_tool_bm25_tool() -> ToolSpec {
+fn create_search_tool_bm25_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "query".to_string(),
             JsonSchema::String {
-                description: Some("Search query for MCP tools.".to_string()),
+                description: Some("Search query for apps tools.".to_string()),
             },
         ),
         (
@@ -903,10 +907,20 @@ fn create_search_tool_bm25_tool() -> ToolSpec {
             },
         ),
     ]);
+    let mut app_names = app_tools
+        .values()
+        .filter_map(|tool| tool.connector_name.clone())
+        .collect::<Vec<_>>();
+    app_names.sort();
+    app_names.dedup();
+    let app_names = app_names.join(", ");
+
+    let description =
+        SEARCH_TOOL_BM25_DESCRIPTION_TEMPLATE.replace("{{app_names}}", app_names.as_str());
 
     ToolSpec::Function(ResponsesApiTool {
         name: "search_tool_bm25".to_string(),
-        description: "Searches MCP tool metadata with BM25 and exposes matching tools for the next model call.".to_string(),
+        description,
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1396,6 +1410,7 @@ fn sanitize_json_schema(value: &mut JsonValue) {
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
+    app_tools: Option<HashMap<String, ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
@@ -1498,8 +1513,10 @@ pub(crate) fn build_specs(
         builder.register_handler("request_user_input", request_user_input_handler);
     }
 
-    if config.search_tool {
-        builder.push_spec_with_parallel_support(create_search_tool_bm25_tool(), true);
+    if config.search_tool
+        && let Some(app_tools) = app_tools
+    {
+        builder.push_spec_with_parallel_support(create_search_tool_bm25_tool(&app_tools), true);
         builder.register_handler("search_tool_bm25", search_tool_handler);
     }
 
@@ -1805,7 +1822,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
         });
-        let (tools, _) = build_specs(&config, None, &[]).build();
+        let (tools, _) = build_specs(&config, None, None, &[]).build();
 
         // Build actual map name -> spec
         use std::collections::BTreeMap;
@@ -1870,7 +1887,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(
             &tools,
             &[
@@ -1895,7 +1912,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert!(
             !tools.iter().any(|t| t.spec.name() == "request_user_input"),
             "request_user_input should be disabled when collaboration_modes feature is off"
@@ -1907,7 +1924,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(&tools, &["request_user_input"]);
     }
 
@@ -1923,7 +1940,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         assert!(
             !tools.iter().any(|tool| tool.spec.name() == "js_repl"),
@@ -1948,7 +1965,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(&tools, &["js_repl", "js_repl_reset"]);
     }
 
@@ -1966,7 +1983,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         let filtered = filter_tools_for_model(
             tools.iter().map(|tool| tool.spec.clone()).collect(),
             &tools_config,
@@ -2004,7 +2021,7 @@ mod tests {
                 "additionalProperties": false
             }),
         }];
-        let (tools, _) = build_specs(&tools_config, None, &dynamic_tools).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &dynamic_tools).build();
         assert!(
             tools.iter().any(|tool| tool.spec.name() == "dynamic_echo"),
             "expected dynamic tool in full router specs"
@@ -2035,7 +2052,7 @@ mod tests {
             features,
             web_search_mode,
         });
-        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), &[]).build();
+        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
         let tool_names = tools.iter().map(|t| t.spec.name()).collect::<Vec<_>>();
         assert_eq!(&tool_names, &expected_tools,);
     }
@@ -2068,7 +2085,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         let tool = find_tool(&tools, "web_search");
         assert_eq!(
@@ -2091,7 +2108,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         let tool = find_tool(&tools, "web_search");
         assert_eq!(
@@ -2316,7 +2333,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
         });
-        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), &[]).build();
+        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
 
         // Only check the shell variant and a couple of core tools.
         let mut subset = vec!["exec_command", "write_stdin", "update_plan"];
@@ -2339,7 +2356,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         assert!(find_tool(&tools, "exec_command").supports_parallel_tool_calls);
         assert!(!find_tool(&tools, "write_stdin").supports_parallel_tool_calls);
@@ -2363,7 +2380,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         assert!(
             tools
@@ -2419,6 +2436,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2496,7 +2514,7 @@ mod tests {
             ),
         ]);
 
-        let (tools, _) = build_specs(&tools_config, Some(tools_map), &[]).build();
+        let (tools, _) = build_specs(&tools_config, Some(tools_map), None, &[]).build();
 
         // Only assert that the MCP tools themselves are sorted by fully-qualified name.
         let mcp_names: Vec<_> = tools
@@ -2510,6 +2528,73 @@ mod tests {
             "test_server/something".to_string(),
         ];
         assert_eq!(mcp_names, expected);
+    }
+
+    #[test]
+    fn search_tool_description_includes_only_codex_apps_connector_names() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Apps);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+
+        let (tools, _) = build_specs(
+            &tools_config,
+            Some(HashMap::from([
+                (
+                    "mcp__codex_apps__calendar_create_event".to_string(),
+                    mcp_tool(
+                        "calendar_create_event",
+                        "Create calendar event",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                ),
+                (
+                    "mcp__rmcp__echo".to_string(),
+                    mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
+                ),
+            ])),
+            Some(HashMap::from([
+                (
+                    "mcp__codex_apps__calendar_create_event".to_string(),
+                    ToolInfo {
+                        server_name: crate::mcp::CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                        tool_name: "calendar_create_event".to_string(),
+                        tool: mcp_tool(
+                            "calendar_create_event",
+                            "Create calendar event",
+                            serde_json::json!({"type": "object"}),
+                        ),
+                        connector_id: Some("calendar".to_string()),
+                        connector_name: Some("Calendar".to_string()),
+                    },
+                ),
+                (
+                    "mcp__rmcp__echo".to_string(),
+                    ToolInfo {
+                        server_name: "rmcp".to_string(),
+                        tool_name: "echo".to_string(),
+                        tool: mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
+                        connector_id: None,
+                        connector_name: None,
+                    },
+                ),
+            ])),
+            &[],
+        )
+        .build();
+
+        let search_tool = find_tool(&tools, "search_tool_bm25");
+        let ToolSpec::Function(ResponsesApiTool { description, .. }) = &search_tool.spec else {
+            panic!("expected function tool");
+        };
+        assert!(description.contains("Calendar"));
+        assert!(!description.contains("mcp__rmcp__echo"));
     }
 
     #[test]
@@ -2540,6 +2625,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2591,6 +2677,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2641,6 +2728,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2695,6 +2783,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2821,6 +2910,7 @@ Examples of valid command strings:
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
