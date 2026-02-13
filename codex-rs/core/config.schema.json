@@ -258,6 +258,9 @@
             "python_tool": {
               "type": "boolean"
             },
+            "prevent_idle_sleep": {
+              "type": "boolean"
+            },
             "remote_models": {
               "type": "boolean"
             },
@@ -1387,6 +1390,9 @@
           "type": "boolean"
         },
         "python_tool": {
+          "type": "boolean"
+        },
+        "prevent_idle_sleep": {
           "type": "boolean"
         },
         "remote_models": {
