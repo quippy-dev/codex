@@ -2,8 +2,6 @@ use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
 use codex_core::protocol::AgentStatus;
-use codex_core::protocol::CollabAgentInteractionEndEvent;
-use codex_core::protocol::CollabAgentSpawnEndEvent;
 use codex_core::protocol::CollabCloseEndEvent;
 use codex_core::protocol::CollabResumeBeginEvent;
 use codex_core::protocol::CollabResumeEndEvent;
@@ -15,51 +13,8 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use std::collections::HashMap;
 
-const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
-
-pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
-    let CollabAgentSpawnEndEvent {
-        call_id,
-        sender_thread_id: _,
-        new_thread_id,
-        prompt,
-        status,
-        ..
-    } = ev;
-    let new_agent = new_thread_id
-        .map(|id| Span::from(id.to_string()))
-        .unwrap_or_else(|| Span::from("not created").dim());
-    let mut details = vec![
-        detail_line("call", call_id),
-        detail_line("agent", new_agent),
-        status_line(&status),
-    ];
-    if let Some(line) = prompt_line(&prompt) {
-        details.push(line);
-    }
-    collab_event("Agent spawned", details)
-}
-
-pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistoryCell {
-    let CollabAgentInteractionEndEvent {
-        call_id,
-        sender_thread_id: _,
-        receiver_thread_id,
-        prompt,
-        status,
-    } = ev;
-    let mut details = vec![
-        detail_line("call", call_id),
-        detail_line("receiver", receiver_thread_id.to_string()),
-        status_line(&status),
-    ];
-    if let Some(line) = prompt_line(&prompt) {
-        details.push(line);
-    }
-    collab_event("Input sent", details)
-}
 
 pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
     let CollabWaitingBeginEvent {
@@ -154,18 +109,6 @@ fn status_span(status: &AgentStatus) -> Span<'static> {
         AgentStatus::Errored(_) => Span::from("errored").red(),
         AgentStatus::Shutdown => Span::from("shutdown").dim(),
         AgentStatus::NotFound => Span::from("not found").red(),
-    }
-}
-
-fn prompt_line(prompt: &str) -> Option<Line<'static>> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(detail_line(
-            "prompt",
-            Span::from(truncate_text(trimmed, COLLAB_PROMPT_PREVIEW_GRAPHEMES)).dim(),
-        ))
     }
 }
 

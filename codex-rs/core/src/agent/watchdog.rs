@@ -424,7 +424,7 @@ impl WatchdogManager {
         removed_targets
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) async fn set_active_helper_for_tests(
         &self,
@@ -442,7 +442,7 @@ impl WatchdogManager {
         entry.active_helper_id = Some(helper_thread_id);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) async fn force_due_for_tests(&self, target_thread_id: ThreadId) {
         let mut registrations = self.registrations.lock().await;
