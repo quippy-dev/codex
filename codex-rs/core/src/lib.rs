@@ -7,6 +7,7 @@
 
 mod analytics_client;
 pub mod api_bridge;
+mod api_error_envelope;
 mod apply_patch;
 mod apps;
 pub mod auth;
@@ -26,6 +27,7 @@ pub mod config_loader;
 pub mod connectors;
 mod context_manager;
 pub mod custom_prompts;
+pub(crate) mod encrypted_content_fallback;
 pub mod env;
 mod environment_context;
 pub mod error;

@@ -101,7 +101,6 @@ use tracing::field;
 use tracing::info;
 use tracing::info_span;
 use tracing::instrument;
-use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 use uuid::Uuid;
@@ -124,6 +123,7 @@ use crate::config::types::McpServerConfig;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
+use crate::encrypted_content_fallback::apply_invalid_encrypted_content_fallback;
 use crate::environment_context::EnvironmentContext;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -4791,7 +4791,7 @@ async fn run_sampling_request(
         crate::tools::spec::filter_tools_for_model(router.specs(), &turn_context.tools_config);
     let base_instructions = sess.get_base_instructions().await;
 
-    let prompt = Prompt {
+    let mut prompt = Prompt {
         input,
         tools,
         parallel_tool_calls: model_supports_parallel,
@@ -4800,6 +4800,7 @@ async fn run_sampling_request(
         output_schema: turn_context.final_output_json_schema.clone(),
     };
 
+    let mut retried_invalid_encrypted_content = false;
     let mut retries = 0;
     loop {
         let err = match try_run_sampling_request(
@@ -4830,6 +4831,15 @@ async fn run_sampling_request(
             }
             Err(err) => err,
         };
+
+        if apply_invalid_encrypted_content_fallback(
+            &mut retried_invalid_encrypted_content,
+            &err,
+            &mut prompt.input,
+        ) {
+            warn!("invalid_encrypted_content - retrying once with sanitized prompt input");
+            continue;
+        }
 
         if !err.is_retryable() {
             return Err(err);
