@@ -7,6 +7,7 @@ use crate::compact::context_trim::trim_function_call_history_to_fit_context_wind
 use crate::compact::extract_trailing_model_switch_update_for_compaction_request;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
+use crate::encrypted_content_fallback::apply_invalid_encrypted_content_fallback;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -16,7 +17,6 @@ use crate::protocol::TurnStartedEvent;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
-use futures::TryFutureExt;
 use tracing::error;
 use tracing::info;
 
@@ -98,28 +98,46 @@ async fn run_remote_compact_task_inner_impl(
         personality: turn_context.personality,
         output_schema: None,
     };
-
-    let mut new_history = sess
-        .services
-        .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            &turn_context.otel_manager,
-        )
-        .or_else(|err| async {
-            let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
-            let compact_request_log_data =
-                build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
-            log_remote_compact_failure(
-                turn_context,
-                &compact_request_log_data,
-                total_usage_breakdown,
-                &err,
-            );
-            Err(err)
-        })
-        .await?;
+    let mut retried_invalid_encrypted_content = false;
+    let mut compact_prompt = prompt.clone();
+    let mut new_history = loop {
+        let result = sess
+            .services
+            .model_client
+            .compact_conversation_history(
+                &compact_prompt,
+                &turn_context.model_info,
+                &turn_context.otel_manager,
+            )
+            .await;
+        match result {
+            Ok(new_history) => break new_history,
+            Err(err) => {
+                if apply_invalid_encrypted_content_fallback(
+                    &mut retried_invalid_encrypted_content,
+                    &err,
+                    &mut compact_prompt.input,
+                ) {
+                    tracing::warn!(
+                        "invalid_encrypted_content during remote compact - retrying once with sanitized prompt input"
+                    );
+                    continue;
+                }
+                let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
+                let compact_request_log_data = build_compact_request_log_data(
+                    &compact_prompt.input,
+                    &compact_prompt.base_instructions.text,
+                );
+                log_remote_compact_failure(
+                    turn_context,
+                    &compact_request_log_data,
+                    total_usage_breakdown,
+                    &err,
+                );
+                return Err(err);
+            }
+        }
+    };
     new_history = sess
         .process_compacted_history(turn_context, new_history)
         .await;
