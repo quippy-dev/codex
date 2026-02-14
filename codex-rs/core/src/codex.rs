@@ -31,15 +31,13 @@ use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::rollout::session_index;
-use crate::sandbox_tags::sandbox_tag;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::terminal;
 use crate::truncate::TruncationPolicy;
-use crate::turn_metadata::build_turn_metadata_header;
-use crate::turn_metadata::resolve_turn_metadata_header_with_timeout;
+use crate::turn_metadata::TurnMetadataState;
 use crate::util::error_or_panic;
 use async_channel::Receiver;
 use async_channel::Sender;
@@ -92,7 +90,6 @@ use rmcp::model::RequestId;
 use serde_json;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -173,6 +170,7 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::McpServerRefreshConfig;
+use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::RateLimitSnapshot;
@@ -226,6 +224,9 @@ use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::js_repl::JsReplHandle;
+use crate::tools::network_approval::NetworkApprovalService;
+use crate::tools::network_approval::build_blocked_request_observer;
+use crate::tools::network_approval::build_network_policy_decider;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::tools::spec::ToolsConfig;
@@ -524,7 +525,6 @@ pub(crate) struct Session {
     js_repl: Arc<JsReplHandle>,
     next_internal_sub_id: AtomicU64,
 }
-
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub(crate) struct TurnContext {
@@ -560,7 +560,7 @@ pub(crate) struct TurnContext {
     pub(crate) truncation_policy: TruncationPolicy,
     pub(crate) js_repl: Arc<JsReplHandle>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
-    turn_metadata_header: OnceCell<Option<String>>,
+    pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
 }
 impl TurnContext {
     pub(crate) fn model_context_window(&self) -> Option<i64> {
@@ -640,7 +640,7 @@ impl TurnContext {
             truncation_policy,
             js_repl: Arc::clone(&self.js_repl),
             dynamic_tools: self.dynamic_tools.clone(),
-            turn_metadata_header: self.turn_metadata_header.clone(),
+            turn_metadata_state: self.turn_metadata_state.clone(),
         }
     }
 
@@ -689,41 +689,6 @@ impl TurnContext {
             allowed_domains: network.allowed_domains.clone().unwrap_or_default(),
             denied_domains: network.denied_domains.clone().unwrap_or_default(),
         })
-    }
-
-    async fn build_turn_metadata_header(&self) -> Option<String> {
-        let sandbox = sandbox_tag(&self.sandbox_policy, self.windows_sandbox_level);
-        self.turn_metadata_header
-            .get_or_init(|| async {
-                build_turn_metadata_header(self.cwd.as_path(), Some(sandbox)).await
-            })
-            .await
-            .clone()
-    }
-
-    /// Resolves the per-turn metadata header under a shared timeout policy.
-    ///
-    /// This uses the same timeout helper as websocket startup prewarm so both turn execution and
-    /// background prewarm observe identical "timeout means best-effort fallback" behavior.
-    pub async fn resolve_turn_metadata_header(&self) -> Option<String> {
-        resolve_turn_metadata_header_with_timeout(
-            self.build_turn_metadata_header(),
-            self.turn_metadata_header.get().cloned().flatten(),
-        )
-        .await
-    }
-
-    /// Starts best-effort background computation of turn metadata.
-    ///
-    /// This warms the cached value used by [`TurnContext::resolve_turn_metadata_header`] so turns
-    /// and websocket prewarm are less likely to pay metadata construction latency on demand.
-    pub fn spawn_turn_metadata_header_task(self: &Arc<Self>) {
-        let context = Arc::clone(self);
-        tokio::spawn(async move {
-            trace!("Spawning turn metadata calculation task");
-            context.build_turn_metadata_header().await;
-            trace!("Turn metadata calculation task completed");
-        });
     }
 }
 
@@ -862,6 +827,33 @@ impl Session {
         }
     }
 
+    async fn start_managed_network_proxy(
+        spec: &crate::config::NetworkProxySpec,
+        sandbox_policy: &SandboxPolicy,
+        network_policy_decider: Option<Arc<dyn codex_network_proxy::NetworkPolicyDecider>>,
+        blocked_request_observer: Option<Arc<dyn codex_network_proxy::BlockedRequestObserver>>,
+        managed_network_requirements_enabled: bool,
+    ) -> anyhow::Result<(StartedNetworkProxy, SessionNetworkProxyRuntime)> {
+        let network_proxy = spec
+            .start_proxy(
+                sandbox_policy,
+                network_policy_decider,
+                blocked_request_observer,
+                managed_network_requirements_enabled,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to start managed network proxy: {err}"))?;
+        let session_network_proxy = {
+            let proxy = network_proxy.proxy();
+            SessionNetworkProxyRuntime {
+                http_addr: proxy.http_addr().to_string(),
+                socks_addr: proxy.socks_addr().to_string(),
+                admin_addr: proxy.admin_addr().to_string(),
+            }
+        };
+        Ok((network_proxy, session_network_proxy))
+    }
+
     /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
     pub(crate) fn build_per_turn_config(session_configuration: &SessionConfiguration) -> Config {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
@@ -950,6 +942,12 @@ impl Session {
         });
 
         let cwd = session_configuration.cwd.clone();
+        let turn_metadata_state = Arc::new(TurnMetadataState::new(
+            sub_id.clone(),
+            cwd.clone(),
+            session_configuration.sandbox_policy.get(),
+            session_configuration.windows_sandbox_level,
+        ));
         TurnContext {
             sub_id,
             config: per_turn_config.clone(),
@@ -980,7 +978,7 @@ impl Session {
             truncation_policy: model_info.truncation_policy.into(),
             js_repl,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
-            turn_metadata_header: OnceCell::new(),
+            turn_metadata_state,
         }
     }
 
@@ -1212,21 +1210,50 @@ impl Session {
             };
         session_configuration.thread_name = thread_name.clone();
         let mut state = SessionState::new(session_configuration.clone());
-        let network_proxy =
-            match config.permissions.network.as_ref() {
-                Some(spec) => Some(spec.start_proxy().await.map_err(|err| {
-                    anyhow::anyhow!("failed to start managed network proxy: {err}")
-                })?),
-                None => None,
+        let managed_network_requirements_enabled = config.managed_network_requirements_enabled();
+        let network_approval = Arc::new(NetworkApprovalService::default());
+        // The managed proxy can call back into core for allowlist-miss decisions.
+        let network_policy_decider_session = if managed_network_requirements_enabled {
+            config
+                .permissions
+                .network
+                .as_ref()
+                .map(|_| Arc::new(RwLock::new(std::sync::Weak::<Session>::new())))
+        } else {
+            None
+        };
+        let blocked_request_observer = if managed_network_requirements_enabled {
+            config
+                .permissions
+                .network
+                .as_ref()
+                .map(|_| build_blocked_request_observer(Arc::clone(&network_approval)))
+        } else {
+            None
+        };
+        let network_policy_decider =
+            network_policy_decider_session
+                .as_ref()
+                .map(|network_policy_decider_session| {
+                    build_network_policy_decider(
+                        Arc::clone(&network_approval),
+                        Arc::clone(network_policy_decider_session),
+                    )
+                });
+        let (network_proxy, session_network_proxy) =
+            if let Some(spec) = config.permissions.network.as_ref() {
+                let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
+                    spec,
+                    config.permissions.sandbox_policy.get(),
+                    network_policy_decider.as_ref().map(Arc::clone),
+                    blocked_request_observer.as_ref().map(Arc::clone),
+                    managed_network_requirements_enabled,
+                )
+                .await?;
+                (Some(network_proxy), Some(session_network_proxy))
+            } else {
+                (None, None)
             };
-        let session_network_proxy = network_proxy.as_ref().map(|started| {
-            let proxy = started.proxy();
-            SessionNetworkProxyRuntime {
-                http_addr: proxy.http_addr().to_string(),
-                socks_addr: proxy.socks_addr().to_string(),
-                admin_addr: proxy.admin_addr().to_string(),
-            }
-        });
 
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
@@ -1252,6 +1279,7 @@ impl Session {
             file_watcher,
             agent_control,
             network_proxy,
+            network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
@@ -1275,17 +1303,10 @@ impl Session {
         let prewarm_model_info = models_manager
             .get_model_info(session_configuration.collaboration_mode.model(), &config)
             .await;
-        let prewarm_cwd = session_configuration.cwd.clone();
-        let turn_metadata_header = resolve_turn_metadata_header_with_timeout(
-            async move { build_turn_metadata_header(prewarm_cwd.as_path(), None).await },
-            None,
-        )
-        .boxed();
         let startup_regular_task = RegularTask::with_startup_prewarm(
             services.model_client.clone(),
             services.otel_manager.clone(),
             prewarm_model_info,
-            turn_metadata_header,
         );
         state.set_startup_regular_task(startup_regular_task);
 
@@ -1301,6 +1322,10 @@ impl Session {
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
         });
+        if let Some(network_policy_decider_session) = network_policy_decider_session {
+            let mut guard = network_policy_decider_session.write().await;
+            *guard = Arc::downgrade(&sess);
+        }
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
         // If resuming, include converted initial messages in the payload so UIs can render them immediately.
@@ -1781,7 +1806,7 @@ impl Session {
             turn_context.final_output_json_schema = final_schema;
         }
         let turn_context = Arc::new(turn_context);
-        turn_context.spawn_turn_metadata_header_task();
+        turn_context.turn_metadata_state.spawn_git_enrichment_task();
         turn_context
     }
 
@@ -1973,6 +1998,19 @@ impl Session {
         Some(DeveloperInstructions::model_switch_message(model_instructions).into())
     }
 
+    pub(crate) fn is_model_switch_developer_message(item: &ResponseItem) -> bool {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return false;
+        };
+        role == "developer"
+            && content.iter().any(|content_item| {
+                matches!(
+                    content_item,
+                    ContentItem::InputText { text } if text.starts_with("<model_switch>")
+                )
+            })
+    }
+
     fn build_settings_update_items(
         &self,
         previous_context: Option<&Arc<TurnContext>>,
@@ -2110,7 +2148,7 @@ impl Session {
         Ok(())
     }
 
-    async fn turn_context_for_sub_id(&self, sub_id: &str) -> Option<Arc<TurnContext>> {
+    pub(crate) async fn turn_context_for_sub_id(&self, sub_id: &str) -> Option<Arc<TurnContext>> {
         let active = self.active_turn.lock().await;
         active
             .as_ref()
@@ -2172,6 +2210,7 @@ impl Session {
         command: Vec<String>,
         cwd: PathBuf,
         reason: Option<String>,
+        network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     ) -> ReviewDecision {
         // Add the tx_approve callback to the map before sending the request.
@@ -2198,6 +2237,7 @@ impl Session {
             command,
             cwd,
             reason,
+            network_approval_context,
             proposed_execpolicy_amendment,
             parsed_cmd,
         });
@@ -4031,9 +4071,16 @@ async fn spawn_review_thread(
     let session_source = parent_turn_context.session_source.clone();
 
     let per_turn_config = Arc::new(per_turn_config);
+    let review_turn_id = sub_id.to_string();
+    let turn_metadata_state = Arc::new(TurnMetadataState::new(
+        review_turn_id.clone(),
+        parent_turn_context.cwd.clone(),
+        &parent_turn_context.sandbox_policy,
+        parent_turn_context.windows_sandbox_level,
+    ));
 
     let review_turn_context = TurnContext {
-        sub_id: sub_id.to_string(),
+        sub_id: review_turn_id,
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
@@ -4062,7 +4109,7 @@ async fn spawn_review_thread(
         js_repl: Arc::clone(&sess.js_repl),
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
         truncation_policy: model_info.truncation_policy.into(),
-        turn_metadata_header: parent_turn_context.turn_metadata_header.clone(),
+        turn_metadata_state,
     };
 
     // Seed the child task with the review prompt as the initial user message.
@@ -4072,6 +4119,7 @@ async fn spawn_review_thread(
         text_elements: Vec::new(),
     }];
     let tc = Arc::new(review_turn_context);
+    tc.turn_metadata_state.spawn_git_enrichment_task();
     sess.spawn_task(tc.clone(), input, ReviewTask::new()).await;
 
     // Announce entering review mode so UIs can switch modes.
@@ -4303,7 +4351,6 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
-    let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     let mut client_session =
@@ -4355,6 +4402,7 @@ pub(crate) async fn run_turn(
             })
             .map(|user_message| user_message.message())
             .collect::<Vec<String>>();
+        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -4466,6 +4514,12 @@ async fn run_pre_sampling_compact(
     Ok(())
 }
 
+/// Runs pre-sampling compaction against the previous model when switching to a smaller
+/// context-window model.
+///
+/// Returns `Ok(())` when compaction either completed successfully or was skipped because the
+/// model/context-window preconditions were not met. Returns `Err(_)` only when compaction was
+/// attempted and failed.
 async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -7029,6 +7083,7 @@ mod tests {
         let mut state = SessionState::new(session_configuration.clone());
         mark_state_initial_context_seeded(&mut state);
         let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
+        let network_approval = Arc::new(NetworkApprovalService::default());
 
         let file_watcher = Arc::new(FileWatcher::noop());
         let services = SessionServices {
@@ -7055,6 +7110,7 @@ mod tests {
             file_watcher,
             agent_control,
             network_proxy: None,
+            network_approval: Arc::clone(&network_approval),
             state_db: None,
             model_client: ModelClient::new(
                 Some(auth_manager.clone()),
@@ -7175,6 +7231,7 @@ mod tests {
         let mut state = SessionState::new(session_configuration.clone());
         mark_state_initial_context_seeded(&mut state);
         let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
+        let network_approval = Arc::new(NetworkApprovalService::default());
 
         let file_watcher = Arc::new(FileWatcher::noop());
         let services = SessionServices {
@@ -7201,6 +7258,7 @@ mod tests {
             file_watcher,
             agent_control,
             network_proxy: None,
+            network_approval: Arc::clone(&network_approval),
             state_db: None,
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
@@ -7963,6 +8021,7 @@ mod tests {
             expiration: timeout_ms.into(),
             env: HashMap::new(),
             network: None,
+            network_attempt_id: None,
             sandbox_permissions,
             windows_sandbox_level: turn_context.windows_sandbox_level,
             justification: Some("test".to_string()),
@@ -7976,6 +8035,7 @@ mod tests {
             expiration: timeout_ms.into(),
             env: HashMap::new(),
             network: None,
+            network_attempt_id: None,
             windows_sandbox_level: turn_context.windows_sandbox_level,
             justification: params.justification.clone(),
             arg0: None,
