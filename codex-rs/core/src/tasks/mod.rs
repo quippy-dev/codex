@@ -198,7 +198,7 @@ impl Session {
         last_agent_message: Option<String>,
     ) {
         self.snapshot_collab_send_input_on_turn_complete();
-        
+
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
