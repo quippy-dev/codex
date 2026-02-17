@@ -249,16 +249,19 @@
             "memory_tool": {
               "type": "boolean"
             },
+            "multi_agent": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
             "powershell_utf8": {
               "type": "boolean"
             },
-            "python_tool": {
+            "prevent_idle_sleep": {
               "type": "boolean"
             },
-            "prevent_idle_sleep": {
+            "python_tool": {
               "type": "boolean"
             },
             "remote_models": {
@@ -1383,16 +1386,19 @@
         "memory_tool": {
           "type": "boolean"
         },
+        "multi_agent": {
+          "type": "boolean"
+        },
         "personality": {
           "type": "boolean"
         },
         "powershell_utf8": {
           "type": "boolean"
         },
-        "python_tool": {
+        "prevent_idle_sleep": {
           "type": "boolean"
         },
-        "prevent_idle_sleep": {
+        "python_tool": {
           "type": "boolean"
         },
         "remote_models": {

@@ -2,6 +2,9 @@ use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
 use codex_core::protocol::AgentStatus;
+use codex_core::protocol::CollabAgentInteractionEndEvent;
+use codex_core::protocol::CollabAgentSpawnEndEvent;
+use codex_core::protocol::CollabAgentSpawnMode;
 use codex_core::protocol::CollabCloseEndEvent;
 use codex_core::protocol::CollabResumeBeginEvent;
 use codex_core::protocol::CollabResumeEndEvent;
@@ -15,6 +18,50 @@ use std::collections::HashMap;
 
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
+
+pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
+    let CollabAgentSpawnEndEvent {
+        call_id,
+        sender_thread_id: _,
+        new_thread_id,
+        prompt: _,
+        spawn_mode,
+        status,
+    } = ev;
+    let mut details = vec![
+        detail_line("call", call_id),
+        detail_line("mode", format_spawn_mode(spawn_mode)),
+        status_line(&status),
+    ];
+    match new_thread_id {
+        Some(thread_id) => details.push(detail_line("agent", thread_id.to_string())),
+        None => details.push(detail_line("agent", Span::from("not created").dim())),
+    }
+    collab_event("Agent spawned", details)
+}
+
+pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistoryCell {
+    let CollabAgentInteractionEndEvent {
+        call_id,
+        sender_thread_id: _,
+        receiver_thread_id,
+        prompt,
+        status,
+    } = ev;
+    let mut details = vec![
+        detail_line("call", call_id),
+        detail_line("receiver", receiver_thread_id.to_string()),
+        status_line(&status),
+    ];
+    if !prompt.trim().is_empty() {
+        let preview = truncate_text(
+            &prompt.split_whitespace().collect::<Vec<_>>().join(" "),
+            COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES,
+        );
+        details.push(detail_line("prompt", preview));
+    }
+    collab_event("Agent response", details)
+}
 
 pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
     let CollabWaitingBeginEvent {
@@ -109,6 +156,14 @@ fn status_span(status: &AgentStatus) -> Span<'static> {
         AgentStatus::Errored(_) => Span::from("errored").red(),
         AgentStatus::Shutdown => Span::from("shutdown").dim(),
         AgentStatus::NotFound => Span::from("not found").red(),
+    }
+}
+
+fn format_spawn_mode(mode: CollabAgentSpawnMode) -> Span<'static> {
+    match mode {
+        CollabAgentSpawnMode::Spawn => Span::from("spawn"),
+        CollabAgentSpawnMode::Fork => Span::from("fork"),
+        CollabAgentSpawnMode::Watchdog => Span::from("watchdog"),
     }
 }
 

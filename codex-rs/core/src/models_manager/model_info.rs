@@ -20,8 +20,10 @@ const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective so
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 
 pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> ModelInfo {
-    if let Some(supports_reasoning_summaries) = config.model_supports_reasoning_summaries {
-        model.supports_reasoning_summaries = supports_reasoning_summaries;
+    if let Some(supports_reasoning_summaries) = config.model_supports_reasoning_summaries
+        && supports_reasoning_summaries
+    {
+        model.supports_reasoning_summaries = true;
     }
     if let Some(context_window) = config.model_context_window {
         model.context_window = Some(context_window);
@@ -55,67 +57,33 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub(crate) fn model_info_from_slug(slug: &str) -> ModelInfo {
-    match slug {
-        // Test-only model slugs used by core integration tests. These need stable metadata so
-        // tool routing remains deterministic even when the mock server does not provide `/models`.
-        "test-gpt-5.1-codex" | "test-gpt-5-codex" => ModelInfo {
-            slug: slug.to_string(),
-            display_name: slug.to_string(),
-            description: None,
-            default_reasoning_level: None,
-            supported_reasoning_levels: Vec::new(),
-            shell_type: ConfigShellToolType::ShellCommand,
-            visibility: ModelVisibility::None,
-            supported_in_api: true,
-            priority: 99,
-            upgrade: None,
-            base_instructions: BASE_INSTRUCTIONS.to_string(),
-            model_messages: local_personality_messages_for_slug(slug),
-            supports_reasoning_summaries: false,
-            support_verbosity: false,
-            default_verbosity: None,
-            apply_patch_tool_type: None,
-            truncation_policy: TruncationPolicyConfig::bytes(10_000),
-            supports_parallel_tool_calls: true,
-            context_window: Some(272_000),
-            auto_compact_token_limit: None,
-            effective_context_window_percent: 95,
-            experimental_supported_tools: vec![
-                "test_sync_tool".to_string(),
-                "grep_files".to_string(),
-            ],
-            input_modalities: default_input_modalities(),
-            prefer_websockets: false,
-        },
-        _ => {
-            warn!("Unknown model {slug} is used. This will use fallback model metadata.");
-            ModelInfo {
-                slug: slug.to_string(),
-                display_name: slug.to_string(),
-                description: None,
-                default_reasoning_level: None,
-                supported_reasoning_levels: Vec::new(),
-                shell_type: ConfigShellToolType::Default,
-                visibility: ModelVisibility::None,
-                supported_in_api: true,
-                priority: 99,
-                upgrade: None,
-                base_instructions: BASE_INSTRUCTIONS.to_string(),
-                model_messages: local_personality_messages_for_slug(slug),
-                supports_reasoning_summaries: false,
-                support_verbosity: false,
-                default_verbosity: None,
-                apply_patch_tool_type: None,
-                truncation_policy: TruncationPolicyConfig::bytes(10_000),
-                supports_parallel_tool_calls: false,
-                context_window: Some(272_000),
-                auto_compact_token_limit: None,
-                effective_context_window_percent: 95,
-                experimental_supported_tools: Vec::new(),
-                input_modalities: default_input_modalities(),
-                prefer_websockets: false,
-            }
-        }
+    warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+    ModelInfo {
+        slug: slug.to_string(),
+        display_name: slug.to_string(),
+        description: None,
+        default_reasoning_level: None,
+        supported_reasoning_levels: Vec::new(),
+        shell_type: ConfigShellToolType::Default,
+        visibility: ModelVisibility::None,
+        supported_in_api: true,
+        priority: 99,
+        upgrade: None,
+        base_instructions: BASE_INSTRUCTIONS.to_string(),
+        model_messages: local_personality_messages_for_slug(slug),
+        supports_reasoning_summaries: false,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: None,
+        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        supports_parallel_tool_calls: false,
+        context_window: Some(272_000),
+        auto_compact_token_limit: None,
+        effective_context_window_percent: 95,
+        experimental_supported_tools: Vec::new(),
+        input_modalities: default_input_modalities(),
+        prefer_websockets: false,
+        used_fallback_model_metadata: true, // this is the fallback model metadata
     }
 }
 
@@ -132,5 +100,48 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
             }),
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_config;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn reasoning_summaries_override_true_enables_support() {
+        let model = model_info_from_slug("unknown-model");
+        let mut config = test_config();
+        config.model_supports_reasoning_summaries = Some(true);
+
+        let updated = with_config_overrides(model.clone(), &config);
+        let mut expected = model;
+        expected.supports_reasoning_summaries = true;
+
+        assert_eq!(updated, expected);
+    }
+
+    #[test]
+    fn reasoning_summaries_override_false_does_not_disable_support() {
+        let mut model = model_info_from_slug("unknown-model");
+        model.supports_reasoning_summaries = true;
+        let mut config = test_config();
+        config.model_supports_reasoning_summaries = Some(false);
+
+        let updated = with_config_overrides(model.clone(), &config);
+
+        assert_eq!(updated, model);
+    }
+
+    #[test]
+    fn reasoning_summaries_override_false_is_noop_when_model_is_false() {
+        let model = model_info_from_slug("unknown-model");
+        let mut config = test_config();
+        config.model_supports_reasoning_summaries = Some(false);
+
+        let updated = with_config_overrides(model.clone(), &config);
+
+        assert_eq!(updated, model);
     }
 }

@@ -209,6 +209,7 @@ use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::markdown::append_markdown;
+use crate::multi_agents;
 use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::FlexRenderable;
@@ -2171,6 +2172,12 @@ impl ChatWidget {
             self.add_to_history(history_cell::new_web_search_call(call_id, query, action));
         }
         self.had_work_activity = true;
+    }
+
+    fn on_collab_event(&mut self, cell: PlainHistoryCell) {
+        self.flush_answer_stream_with_separator();
+        self.add_to_history(cell);
+        self.request_redraw();
     }
 
     fn on_get_history_entry_response(
@@ -4315,15 +4322,19 @@ impl ChatWidget {
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
             EventMsg::CollabAgentSpawnBegin(_) => {}
-            EventMsg::CollabAgentSpawnEnd(_) => {}
+            EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}
-            EventMsg::CollabAgentInteractionEnd(_) => {}
-            EventMsg::CollabWaitingBegin(_) => {}
-            EventMsg::CollabWaitingEnd(_) => {}
+            EventMsg::CollabAgentInteractionEnd(ev) => {
+                self.on_collab_event(multi_agents::interaction_end(ev))
+            }
+            EventMsg::CollabWaitingBegin(ev) => {
+                self.on_collab_event(multi_agents::waiting_begin(ev))
+            }
+            EventMsg::CollabWaitingEnd(ev) => self.on_collab_event(multi_agents::waiting_end(ev)),
             EventMsg::CollabCloseBegin(_) => {}
-            EventMsg::CollabCloseEnd(ev) => self.add_to_history(crate::collab::close_end(ev)),
-            EventMsg::CollabResumeBegin(ev) => self.add_to_history(crate::collab::resume_begin(ev)),
-            EventMsg::CollabResumeEnd(ev) => self.add_to_history(crate::collab::resume_end(ev)),
+            EventMsg::CollabCloseEnd(ev) => self.on_collab_event(multi_agents::close_end(ev)),
+            EventMsg::CollabResumeBegin(ev) => self.on_collab_event(multi_agents::resume_begin(ev)),
+            EventMsg::CollabResumeEnd(ev) => self.on_collab_event(multi_agents::resume_end(ev)),
             EventMsg::ThreadRolledBack(rollback) => {
                 if from_replay {
                     self.app_event_tx.send(AppEvent::ApplyThreadRollback {

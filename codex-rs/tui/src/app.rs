@@ -11,7 +11,6 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
-use crate::collab;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -29,6 +28,7 @@ use crate::history_cell::new_subagent_update_cell;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
+use crate::multi_agents;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -1370,16 +1370,20 @@ impl App {
                     }
                 }
                 EventMsg::CollabWaitingBegin(ev) => {
-                    self.emit_or_queue_subagent_history(Box::new(collab::waiting_begin(
+                    self.emit_or_queue_subagent_history(Box::new(multi_agents::waiting_begin(
                         ev.clone(),
                     )));
                 }
                 EventMsg::CollabWaitingEnd(ev) => {
                     self.subagents.on_wait_end(ev);
-                    self.emit_or_queue_subagent_history(Box::new(collab::waiting_end(ev.clone())));
+                    self.emit_or_queue_subagent_history(Box::new(multi_agents::waiting_end(
+                        ev.clone(),
+                    )));
                 }
                 EventMsg::CollabCloseEnd(ev) => {
-                    self.emit_or_queue_subagent_history(Box::new(collab::close_end(ev.clone())));
+                    self.emit_or_queue_subagent_history(Box::new(multi_agents::close_end(
+                        ev.clone(),
+                    )));
                     if let Some(cell) = self.subagents.on_close_end(ev) {
                         self.emit_or_queue_subagent_history(cell);
                     }
@@ -1625,6 +1629,27 @@ impl App {
         self.refresh_status_line();
     }
 
+    fn should_wait_for_initial_session(session_selection: &SessionSelection) -> bool {
+        matches!(
+            session_selection,
+            SessionSelection::StartFresh | SessionSelection::Exit
+        )
+    }
+
+    fn should_handle_active_thread_events(
+        waiting_for_initial_session_configured: bool,
+        has_active_thread_receiver: bool,
+    ) -> bool {
+        has_active_thread_receiver && !waiting_for_initial_session_configured
+    }
+
+    fn should_stop_waiting_for_initial_session(
+        waiting_for_initial_session_configured: bool,
+        primary_thread_id: Option<ThreadId>,
+    ) -> bool {
+        waiting_for_initial_session_configured && primary_thread_id.is_some()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         tui: &mut tui::Tui,
@@ -1715,6 +1740,8 @@ impl App {
         let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
+        let wait_for_initial_session_configured =
+            Self::should_wait_for_initial_session(&session_selection);
         let mut chat_widget = match session_selection {
             SessionSelection::StartFresh | SessionSelection::Exit => {
                 let init = crate::chatwidget::ChatWidgetInit {
@@ -1902,6 +1929,7 @@ impl App {
 
         let mut thread_created_rx = thread_manager.subscribe_thread_created();
         let mut listen_for_threads = true;
+        let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
         let exit_reason = loop {
             let control = select! {
@@ -1914,7 +1942,10 @@ impl App {
                     } else {
                         None
                     }
-                }, if app.active_thread_rx.is_some() => {
+                }, if App::should_handle_active_thread_events(
+                    waiting_for_initial_session_configured,
+                    app.active_thread_rx.is_some()
+                ) => {
                     if let Some(event) = active {
                         app.handle_active_thread_event(tui, event).await?;
                     } else {
@@ -1941,6 +1972,12 @@ impl App {
                     AppRunControl::Continue
                 }
             };
+            if App::should_stop_waiting_for_initial_session(
+                waiting_for_initial_session_configured,
+                app.primary_thread_id,
+            ) {
+                waiting_for_initial_session_configured = false;
+            }
             match control {
                 AppRunControl::Continue => {}
                 AppRunControl::Exit(reason) => break reason,
@@ -3603,6 +3640,76 @@ mod tests {
             vec![base_cwd.join("rel")]
         );
         Ok(())
+    }
+
+    #[test]
+    fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::StartFresh),
+            true
+        );
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::Exit),
+            true
+        );
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::Resume(PathBuf::from(
+                "/tmp/restore"
+            ))),
+            false
+        );
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::Fork(PathBuf::from(
+                "/tmp/fork"
+            ))),
+            false
+        );
+    }
+
+    #[test]
+    fn startup_waiting_gate_holds_active_thread_events_until_primary_thread_configured() {
+        let mut wait_for_initial_session =
+            App::should_wait_for_initial_session(&SessionSelection::StartFresh);
+        assert_eq!(wait_for_initial_session, true);
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_initial_session, true),
+            false
+        );
+
+        assert_eq!(
+            App::should_stop_waiting_for_initial_session(wait_for_initial_session, None),
+            false
+        );
+        if App::should_stop_waiting_for_initial_session(
+            wait_for_initial_session,
+            Some(ThreadId::new()),
+        ) {
+            wait_for_initial_session = false;
+        }
+        assert_eq!(wait_for_initial_session, false);
+
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_initial_session, true),
+            true
+        );
+    }
+
+    #[test]
+    fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+        let wait_for_resume = App::should_wait_for_initial_session(&SessionSelection::Resume(
+            PathBuf::from("/tmp/restore"),
+        ));
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_resume, true),
+            true
+        );
+        let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
+            PathBuf::from("/tmp/fork"),
+        ));
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_fork, true),
+            true
+        );
     }
 
     #[tokio::test]

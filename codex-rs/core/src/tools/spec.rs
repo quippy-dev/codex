@@ -1,4 +1,3 @@
-use crate::agent::AgentRole;
 use crate::client_common::tools::FreeformTool;
 use crate::client_common::tools::FreeformToolFormat;
 use crate::client_common::tools::ResponsesApiTool;
@@ -8,11 +7,12 @@ use crate::features::Features;
 use crate::mcp_connection_manager::ToolInfo;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::SEARCH_TOOL_BM25_DEFAULT_LIMIT;
+use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
-use crate::tools::handlers::collab::DEFAULT_WAIT_TIMEOUT_MS;
-use crate::tools::handlers::collab::MAX_WAIT_TIMEOUT_MS;
-use crate::tools::handlers::collab::MIN_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents::DEFAULT_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents::MAX_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
 use crate::tools::python::register_python_tool;
 use crate::tools::registry::ToolRegistryBuilder;
@@ -216,7 +216,8 @@ pub(crate) fn create_approval_parameters(
                     Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future.
                     Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"]."#.to_string(),
                 ),
-            });
+            },
+        );
     }
 
     properties
@@ -533,43 +534,41 @@ fn create_collab_input_items_schema() -> JsonSchema {
 }
 
 fn create_spawn_agent_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "message".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Initial plain-text task for the new agent. Use either message or items."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert("items".to_string(), create_collab_input_items_schema());
-    properties.insert(
-        "agent_type".to_string(),
-        JsonSchema::String {
-            description: Some(format!(
-                "Optional agent type ({}). Use an explicit type when delegating.",
-                AgentRole::enum_values().join(", ")
-            )),
-        },
-    );
-    properties.insert(
-        "spawn_mode".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Spawn behavior: spawn (default), fork (preserve history), or watchdog (idle-time check-ins)."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "interval_s".to_string(),
-        JsonSchema::Number {
-            description: Some(
-                "Watchdog interval in seconds; used only when spawn_mode = watchdog.".to_string(),
-            ),
-        },
-    );
+    let properties = BTreeMap::from([
+        (
+            "message".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Initial plain-text task for the new agent. Use either message or items."
+                        .to_string(),
+                ),
+            },
+        ),
+        ("items".to_string(), create_collab_input_items_schema()),
+        (
+            "agent_type".to_string(),
+            JsonSchema::String {
+                description: Some(crate::agent::role::spawn_tool_spec::build()),
+            },
+        ),
+        (
+            "spawn_mode".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Spawn behavior: spawn (default), fork (preserve history), or watchdog (idle-time check-ins)."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "interval_s".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Watchdog interval in seconds; used only when spawn_mode = watchdog.".to_string(),
+                ),
+            },
+        ),
+    ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
@@ -625,6 +624,26 @@ fn create_send_input_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_resume_agent_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some("Agent id to resume (from spawn_agent)".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "resume_agent".to_string(),
+        description: "Resume a previously closed agent thread by id.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["id".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -981,7 +1000,7 @@ fn create_search_tool_bm25_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSp
         SEARCH_TOOL_BM25_DESCRIPTION_TEMPLATE.replace("{{app_names}}", app_names.as_str());
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "search_tool_bm25".to_string(),
+        name: SEARCH_TOOL_BM25_TOOL_NAME.to_string(),
         description,
         strict: false,
         parameters: JsonSchema::Object {
@@ -1476,7 +1495,6 @@ pub(crate) fn build_specs(
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
-    use crate::tools::handlers::CollabHandler;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::JsReplHandler;
@@ -1484,6 +1502,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
+    use crate::tools::handlers::MultiAgentHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::RequestUserInputHandler;
@@ -1553,12 +1572,14 @@ pub(crate) fn build_specs(
         register_python_tool(&mut builder, config.request_rule_enabled);
     }
 
-    builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
-    builder.push_spec_with_parallel_support(create_list_mcp_resource_templates_tool(), true);
-    builder.push_spec_with_parallel_support(create_read_mcp_resource_tool(), true);
-    builder.register_handler("list_mcp_resources", mcp_resource_handler.clone());
-    builder.register_handler("list_mcp_resource_templates", mcp_resource_handler.clone());
-    builder.register_handler("read_mcp_resource", mcp_resource_handler);
+    if mcp_tools.is_some() {
+        builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
+        builder.push_spec_with_parallel_support(create_list_mcp_resource_templates_tool(), true);
+        builder.push_spec_with_parallel_support(create_read_mcp_resource_tool(), true);
+        builder.register_handler("list_mcp_resources", mcp_resource_handler.clone());
+        builder.register_handler("list_mcp_resource_templates", mcp_resource_handler.clone());
+        builder.register_handler("read_mcp_resource", mcp_resource_handler);
+    }
 
     builder.push_spec(PLAN_TOOL.clone());
     builder.register_handler("update_plan", plan_handler);
@@ -1579,7 +1600,7 @@ pub(crate) fn build_specs(
         && let Some(app_tools) = app_tools
     {
         builder.push_spec_with_parallel_support(create_search_tool_bm25_tool(&app_tools), true);
-        builder.register_handler("search_tool_bm25", search_tool_handler);
+        builder.register_handler(SEARCH_TOOL_BM25_TOOL_NAME, search_tool_handler);
     }
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
@@ -1649,19 +1670,21 @@ pub(crate) fn build_specs(
     builder.register_handler("view_image", view_image_handler);
 
     if config.collab_tools {
-        let collab_handler = Arc::new(CollabHandler);
+        let multi_agent_handler = Arc::new(MultiAgentHandler);
         builder.push_spec(create_spawn_agent_tool());
         builder.push_spec(create_send_input_tool());
+        builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_compact_parent_context_tool());
         builder.push_spec(create_list_agents_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
-        builder.register_handler("spawn_agent", collab_handler.clone());
-        builder.register_handler("send_input", collab_handler.clone());
-        builder.register_handler("compact_parent_context", collab_handler.clone());
-        builder.register_handler("list_agents", collab_handler.clone());
-        builder.register_handler("wait", collab_handler.clone());
-        builder.register_handler("close_agent", collab_handler);
+        builder.register_handler("spawn_agent", multi_agent_handler.clone());
+        builder.register_handler("send_input", multi_agent_handler.clone());
+        builder.register_handler("resume_agent", multi_agent_handler.clone());
+        builder.register_handler("compact_parent_context", multi_agent_handler.clone());
+        builder.register_handler("list_agents", multi_agent_handler.clone());
+        builder.register_handler("wait", multi_agent_handler.clone());
+        builder.register_handler("close_agent", multi_agent_handler);
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -1907,11 +1930,8 @@ mod tests {
         // Build expected from the same helpers used by the builder.
         let mut expected: BTreeMap<String, ToolSpec> = BTreeMap::from([]);
         for spec in [
-            create_exec_command_tool(true),
+            create_exec_command_tool(config.request_rule_enabled),
             create_write_stdin_tool(),
-            create_list_mcp_resources_tool(),
-            create_list_mcp_resource_templates_tool(),
-            create_read_mcp_resource_tool(),
             PLAN_TOOL.clone(),
             create_request_user_input_tool(),
             create_apply_patch_freeform_tool(),
@@ -2110,7 +2130,7 @@ mod tests {
             features,
             web_search_mode,
         });
-        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         let tool_names = tools.iter().map(|t| t.spec.name()).collect::<Vec<_>>();
         assert_eq!(&tool_names, &expected_tools,);
     }
@@ -2178,6 +2198,53 @@ mod tests {
     }
 
     #[test]
+    fn mcp_resource_tools_are_hidden_without_mcp_servers() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::CollaborationModes);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert!(
+            !tools.iter().any(|tool| matches!(
+                tool.spec.name(),
+                "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource"
+            )),
+            "MCP resource tools should be omitted when no MCP servers are configured"
+        );
+    }
+
+    #[test]
+    fn mcp_resource_tools_are_included_when_mcp_servers_are_present() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::CollaborationModes);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
+
+        assert_contains_tool_names(
+            &tools,
+            &[
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+            ],
+        );
+    }
+
+    #[test]
     fn test_build_specs_gpt5_codex_default() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
@@ -2187,9 +2254,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2209,9 +2273,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2233,9 +2294,6 @@ mod tests {
             &[
                 "exec_command",
                 "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2257,9 +2315,6 @@ mod tests {
             &[
                 "exec_command",
                 "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2279,9 +2334,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2301,9 +2353,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2323,9 +2372,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "web_search",
@@ -2344,9 +2390,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2368,9 +2411,6 @@ mod tests {
             &[
                 "exec_command",
                 "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2647,7 +2687,7 @@ mod tests {
         )
         .build();
 
-        let search_tool = find_tool(&tools, "search_tool_bm25");
+        let search_tool = find_tool(&tools, SEARCH_TOOL_BM25_TOOL_NAME);
         let ToolSpec::Function(ResponsesApiTool { description, .. }) = &search_tool.spec else {
             panic!("expected function tool");
         };
@@ -2867,7 +2907,7 @@ mod tests {
 
     #[test]
     fn test_shell_tool() {
-        let tool = super::create_shell_tool(true);
+        let tool = super::create_shell_tool(false);
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool
@@ -2897,7 +2937,7 @@ Examples of valid command strings:
 
     #[test]
     fn test_shell_command_tool() {
-        let tool = super::create_shell_command_tool(true);
+        let tool = super::create_shell_command_tool(false);
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool

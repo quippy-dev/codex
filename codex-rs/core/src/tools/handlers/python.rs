@@ -145,6 +145,7 @@ impl ToolHandler for PythonHandler {
             cwd,
             timeout_ms,
             env,
+            explicit_env_overrides: turn.shell_environment_policy.r#set.clone(),
             network: turn.network.clone(),
             sandbox_permissions,
             justification,

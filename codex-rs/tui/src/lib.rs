@@ -63,7 +63,6 @@ mod bottom_pane;
 mod chatwidget;
 mod cli;
 mod clipboard_paste;
-mod collab;
 mod collaboration_modes;
 mod color;
 pub mod custom_terminal;
@@ -85,6 +84,7 @@ mod markdown_render;
 mod markdown_stream;
 mod mention_codec;
 mod model_migration;
+mod multi_agents;
 mod notifications;
 pub mod onboarding;
 mod oss_selection;
@@ -936,6 +936,8 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
+    use codex_core::config_loader::CloudRequirementsLoader;
+    use codex_core::config_loader::LoaderOverrides;
     use codex_core::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
@@ -1136,6 +1138,12 @@ trust_level = "untrusted"
         let trusted_config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .harness_overrides(trusted_overrides.clone())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
+            .cloud_requirements(CloudRequirementsLoader::new(async { None }))
             .build()
             .await?;
         assert_eq!(
@@ -1144,7 +1152,7 @@ trust_level = "untrusted"
         );
         assert_eq!(
             trusted_config.permissions.approval_policy.value(),
-            AskForApproval::OnFailure
+            AskForApproval::OnRequest
         );
 
         let untrusted_overrides = ConfigOverrides {
@@ -1154,6 +1162,12 @@ trust_level = "untrusted"
         let untrusted_config = ConfigBuilder::default()
             .codex_home(codex_home)
             .harness_overrides(untrusted_overrides)
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
+            .cloud_requirements(CloudRequirementsLoader::new(async { None }))
             .build()
             .await?;
         assert_eq!(
