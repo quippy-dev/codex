@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::SandboxPermissions;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 use crate::exec_env::create_env;
 use crate::exec_policy::ExecApprovalRequest;
@@ -145,6 +146,7 @@ impl ToolHandler for PythonHandler {
             cwd,
             timeout_ms,
             env,
+            explicit_env_overrides: HashMap::new(),
             network: turn.network.clone(),
             sandbox_permissions,
             justification,

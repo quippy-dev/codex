@@ -17,6 +17,7 @@ use crate::analytics_client::AnalyticsEventsClient;
 use crate::analytics_client::AppInvocation;
 use crate::analytics_client::build_track_events_context;
 use crate::apps::render_apps_section;
+use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
@@ -44,6 +45,7 @@ use async_channel::Sender;
 use codex_hooks::HookEvent;
 use codex_hooks::HookEventAfterAgent;
 use codex_hooks::HookPayload;
+use codex_hooks::HookResult;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_network_proxy::NetworkProxy;
@@ -150,6 +152,7 @@ use crate::mcp::with_codex_apps_mcp;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::mcp_connection_manager::filter_codex_apps_mcp_tools_only;
 use crate::mcp_connection_manager::filter_mcp_tools_by_name;
+use crate::mcp_connection_manager::filter_non_codex_apps_mcp_tools_only;
 use crate::memories;
 use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
@@ -170,6 +173,8 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::McpServerRefreshConfig;
+use crate::protocol::ModelRerouteEvent;
+use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
@@ -223,6 +228,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
@@ -278,6 +284,8 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
+const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
+const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -324,15 +332,11 @@ impl Codex {
 
         let config = Arc::new(config);
         let _ = models_manager
-            .list_models(
-                &config,
-                crate::models_manager::manager::RefreshStrategy::OnlineIfUncached,
-            )
+            .list_models(crate::models_manager::manager::RefreshStrategy::OnlineIfUncached)
             .await;
         let model = models_manager
             .get_default_model(
                 &config.model,
-                &config,
                 crate::models_manager::manager::RefreshStrategy::OnlineIfUncached,
             )
             .await;
@@ -605,7 +609,8 @@ impl TurnContext {
             model_info: &model_info,
             features: &features,
             web_search_mode: self.tools_config.web_search_mode,
-        });
+        })
+        .with_agent_roles(config.agent_roles.clone());
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -939,7 +944,8 @@ impl Session {
             model_info: &model_info,
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
-        });
+        })
+        .with_agent_roles(per_turn_config.agent_roles.clone());
 
         let cwd = session_configuration.cwd.clone();
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
@@ -1491,6 +1497,11 @@ impl Session {
         state.merge_mcp_tool_selection(tool_names)
     }
 
+    pub(crate) async fn set_mcp_tool_selection(&self, tool_names: Vec<String>) {
+        let mut state = self.state.lock().await;
+        state.set_mcp_tool_selection(tool_names);
+    }
+
     pub(crate) async fn get_mcp_tool_selection(&self) -> Option<Vec<String>> {
         let state = self.state.lock().await;
         state.get_mcp_tool_selection()
@@ -1524,6 +1535,7 @@ impl Session {
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
+        self.clear_mcp_tool_selection().await;
         match conversation_history {
             InitialHistory::New => {
                 // Build and record initial items (user instructions + environment context)
@@ -1539,6 +1551,8 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
+                let restored_tool_selection =
+                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
                 let previous_model = Self::last_rollout_model_name(&rollout_items)
                     .map(std::string::ToString::to_string);
                 {
@@ -1580,12 +1594,17 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
+                if let Some(selected_tools) = restored_tool_selection {
+                    self.set_mcp_tool_selection(selected_tools).await;
+                }
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
                 self.flush_rollout().await;
             }
             InitialHistory::Forked(rollout_items) => {
+                let restored_tool_selection =
+                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
                 let previous_model = Self::last_rollout_model_name(&rollout_items)
                     .map(std::string::ToString::to_string);
                 self.set_previous_model(previous_model).await;
@@ -1604,6 +1623,9 @@ impl Session {
                 if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
+                }
+                if let Some(selected_tools) = restored_tool_selection {
+                    self.set_mcp_tool_selection(selected_tools).await;
                 }
 
                 // If persisting, persist all rollout items as-is (recorder filters)
@@ -1644,6 +1666,54 @@ impl Session {
             RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
             _ => None,
         })
+    }
+
+    fn extract_mcp_tool_selection_from_rollout(
+        rollout_items: &[RolloutItem],
+    ) -> Option<Vec<String>> {
+        let mut search_call_ids = HashSet::new();
+        let mut active_selected_tools: Option<Vec<String>> = None;
+
+        for item in rollout_items {
+            let RolloutItem::ResponseItem(response_item) = item else {
+                continue;
+            };
+            match response_item {
+                ResponseItem::FunctionCall { name, call_id, .. } => {
+                    if name == SEARCH_TOOL_BM25_TOOL_NAME {
+                        search_call_ids.insert(call_id.clone());
+                    }
+                }
+                ResponseItem::FunctionCallOutput { call_id, output } => {
+                    if !search_call_ids.contains(call_id) {
+                        continue;
+                    }
+                    let Some(content) = output.body.to_text() else {
+                        continue;
+                    };
+                    let Ok(payload) = serde_json::from_str::<Value>(&content) else {
+                        continue;
+                    };
+                    let Some(selected_tools) = payload
+                        .get("active_selected_tools")
+                        .and_then(Value::as_array)
+                    else {
+                        continue;
+                    };
+                    let Some(selected_tools) = selected_tools
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    active_selected_tools = Some(selected_tools);
+                }
+                _ => {}
+            }
+        }
+
+        active_selected_tools
     }
 
     async fn previous_model(&self) -> Option<String> {
@@ -1813,6 +1883,21 @@ impl Session {
         turn_context
     }
 
+    pub(crate) async fn maybe_emit_unknown_model_warning_for_turn(&self, tc: &TurnContext) {
+        if tc.model_info.used_fallback_model_metadata {
+            self.send_event(
+                tc,
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Model metadata for `{}` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.",
+                        tc.model_info.slug
+                    ),
+                }),
+            )
+            .await;
+        }
+    }
+
     pub(crate) async fn new_default_turn(&self) -> Arc<TurnContext> {
         self.new_default_turn_with_sub_id(self.next_internal_sub_id())
             .await
@@ -1887,120 +1972,6 @@ impl Session {
         state.session_configuration.collaboration_mode.clone()
     }
 
-    fn build_environment_update_item(
-        &self,
-        previous: Option<&Arc<TurnContext>>,
-        next: &TurnContext,
-    ) -> Option<ResponseItem> {
-        let prev = previous?;
-
-        let shell = self.user_shell();
-        let prev_context = EnvironmentContext::from_turn_context(prev.as_ref(), shell.as_ref());
-        let next_context = EnvironmentContext::from_turn_context(next, shell.as_ref());
-        if prev_context.equals_except_shell(&next_context) {
-            return None;
-        }
-        Some(ResponseItem::from(EnvironmentContext::diff(
-            prev.as_ref(),
-            next,
-            shell.as_ref(),
-        )))
-    }
-
-    fn build_permissions_update_item(
-        &self,
-        previous: Option<&Arc<TurnContext>>,
-        next: &TurnContext,
-    ) -> Option<ResponseItem> {
-        let prev = previous?;
-        if prev.sandbox_policy == next.sandbox_policy
-            && prev.approval_policy == next.approval_policy
-        {
-            return None;
-        }
-
-        Some(
-            DeveloperInstructions::from_policy(
-                &next.sandbox_policy,
-                next.approval_policy,
-                self.services.exec_policy.current().as_ref(),
-                self.features.enabled(Feature::RequestRule),
-                &next.cwd,
-            )
-            .into(),
-        )
-    }
-
-    fn build_personality_update_item(
-        &self,
-        previous: Option<&Arc<TurnContext>>,
-        next: &TurnContext,
-    ) -> Option<ResponseItem> {
-        if !self.features.enabled(Feature::Personality) {
-            return None;
-        }
-        let previous = previous?;
-        if next.model_info.slug != previous.model_info.slug {
-            return None;
-        }
-
-        // if a personality is specified and it's different from the previous one, build a personality update item
-        if let Some(personality) = next.personality
-            && next.personality != previous.personality
-        {
-            let model_info = &next.model_info;
-            let personality_message = Self::personality_message_for(model_info, personality);
-            personality_message.map(|personality_message| {
-                DeveloperInstructions::personality_spec_message(personality_message).into()
-            })
-        } else {
-            None
-        }
-    }
-
-    fn personality_message_for(model_info: &ModelInfo, personality: Personality) -> Option<String> {
-        model_info
-            .model_messages
-            .as_ref()
-            .and_then(|spec| spec.get_personality_message(Some(personality)))
-            .filter(|message| !message.is_empty())
-    }
-
-    fn build_collaboration_mode_update_item(
-        &self,
-        previous: Option<&Arc<TurnContext>>,
-        next: &TurnContext,
-    ) -> Option<ResponseItem> {
-        let prev = previous?;
-        if prev.collaboration_mode != next.collaboration_mode {
-            // If the next mode has empty developer instructions, this returns None and we emit no
-            // update, so prior collaboration instructions remain in the prompt history.
-            Some(DeveloperInstructions::from_collaboration_mode(&next.collaboration_mode)?.into())
-        } else {
-            None
-        }
-    }
-
-    fn build_model_instructions_update_item(
-        &self,
-        previous: Option<&Arc<TurnContext>>,
-        resumed_model: Option<&str>,
-        next: &TurnContext,
-    ) -> Option<ResponseItem> {
-        let previous_model =
-            resumed_model.or_else(|| previous.map(|prev| prev.model_info.slug.as_str()))?;
-        if previous_model == next.model_info.slug {
-            return None;
-        }
-
-        let model_instructions = next.model_info.get_model_instructions(next.personality);
-        if model_instructions.is_empty() {
-            return None;
-        }
-
-        Some(DeveloperInstructions::model_switch_message(model_instructions).into())
-    }
-
     pub(crate) fn is_model_switch_developer_message(item: &ResponseItem) -> bool {
         let ResponseItem::Message { role, content, .. } = item else {
             return false;
@@ -2013,42 +1984,26 @@ impl Session {
                 )
             })
     }
-
     fn build_settings_update_items(
         &self,
         previous_context: Option<&Arc<TurnContext>>,
         resumed_model: Option<&str>,
         current_context: &TurnContext,
     ) -> Vec<ResponseItem> {
-        let mut update_items = Vec::new();
-        if let Some(env_item) =
-            self.build_environment_update_item(previous_context, current_context)
-        {
-            update_items.push(env_item);
-        }
-        if let Some(permissions_item) =
-            self.build_permissions_update_item(previous_context, current_context)
-        {
-            update_items.push(permissions_item);
-        }
-        if let Some(collaboration_mode_item) =
-            self.build_collaboration_mode_update_item(previous_context, current_context)
-        {
-            update_items.push(collaboration_mode_item);
-        }
-        if let Some(model_instructions_item) = self.build_model_instructions_update_item(
-            previous_context,
+        // TODO: Make context updates a pure diff of persisted previous/current TurnContextItem
+        // state so replay/backtracking is deterministic. Runtime inputs that affect model-visible
+        // context (shell, exec policy, feature gates, resumed model bridge) should be persisted
+        // state or explicit non-state replay events.
+        let shell = self.user_shell();
+        let exec_policy = self.services.exec_policy.current();
+        crate::context_manager::updates::build_settings_update_items(
+            previous_context.map(Arc::as_ref),
             resumed_model,
             current_context,
-        ) {
-            update_items.push(model_instructions_item);
-        }
-        if let Some(personality_item) =
-            self.build_personality_update_item(previous_context, current_context)
-        {
-            update_items.push(personality_item);
-        }
-        update_items
+            shell.as_ref(),
+            exec_policy.as_ref(),
+            self.features.enabled(Feature::Personality),
+        )
     }
 
     /// Persist the event to rollout and send it to clients.
@@ -2481,6 +2436,45 @@ impl Session {
         self.record_conversation_items(ctx, &[item]).await;
     }
 
+    async fn maybe_warn_on_server_model_mismatch(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        server_model: String,
+    ) -> bool {
+        let requested_model = turn_context.model_info.slug.clone();
+        if server_model == requested_model {
+            info!("server reported model {server_model} (matches requested model)");
+            return false;
+        }
+
+        warn!("server reported model {server_model} while requested model was {requested_model}");
+
+        let warning_message = format!(
+            "Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}"
+        );
+
+        self.send_event(
+            turn_context,
+            EventMsg::ModelReroute(ModelRerouteEvent {
+                from_model: requested_model.clone(),
+                to_model: server_model.clone(),
+                reason: ModelRerouteReason::HighRiskCyberActivity,
+            }),
+        )
+        .await;
+
+        self.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: warning_message.clone(),
+            }),
+        )
+        .await;
+        self.record_model_warning(warning_message, turn_context)
+            .await;
+        true
+    }
+
     pub(crate) async fn replace_history(&self, items: Vec<ResponseItem>) {
         let mut state = self.state.lock().await;
         state.replace_history(items);
@@ -2544,7 +2538,6 @@ impl Session {
                 &turn_context.sandbox_policy,
                 turn_context.approval_policy,
                 self.services.exec_policy.current().as_ref(),
-                self.features.enabled(Feature::RequestRule),
                 &turn_context.cwd,
             )
             .into(),
@@ -2583,7 +2576,10 @@ impl Session {
                 && base_instructions == model_info.get_model_instructions(Some(personality));
             if !has_baked_personality
                 && let Some(personality_message) =
-                    Self::personality_message_for(&model_info, personality)
+                    crate::context_manager::updates::personality_message_for(
+                        &model_info,
+                        personality,
+                    )
             {
                 items.push(
                     DeveloperInstructions::personality_spec_message(personality_message).into(),
@@ -2592,6 +2588,13 @@ impl Session {
         }
         if turn_context.features.enabled(Feature::Apps) {
             items.push(DeveloperInstructions::new(render_apps_section()).into());
+        }
+        if turn_context.features.enabled(Feature::CodexGitCommit)
+            && let Some(commit_message_instruction) = commit_message_trailer_instruction(
+                turn_context.config.commit_attribution.as_deref(),
+            )
+        {
+            items.push(DeveloperInstructions::new(commit_message_instruction).into());
         }
         if let Some(user_instructions) = turn_context.user_instructions.as_deref() {
             items.push(
@@ -3180,21 +3183,23 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::ListSkills { cwds, force_reload } => {
                 handlers::list_skills(&sess, sub.id.clone(), cwds, force_reload).await;
             }
-            Op::ListRemoteSkills => {
-                handlers::list_remote_skills(&sess, &config, sub.id.clone()).await;
-            }
-            Op::DownloadRemoteSkill {
-                hazelnut_id,
-                is_preload,
+            Op::ListRemoteSkills {
+                hazelnut_scope,
+                product_surface,
+                enabled,
             } => {
-                handlers::download_remote_skill(
+                handlers::list_remote_skills(
                     &sess,
                     &config,
                     sub.id.clone(),
-                    hazelnut_id,
-                    is_preload,
+                    hazelnut_scope,
+                    product_surface,
+                    enabled,
                 )
                 .await;
+            }
+            Op::DownloadRemoteSkill { hazelnut_id } => {
+                handlers::export_remote_skill(&sess, &config, sub.id.clone(), hazelnut_id).await;
             }
             Op::Undo => {
                 handlers::undo(&sess, sub.id.clone()).await;
@@ -3275,6 +3280,8 @@ mod handlers {
     use codex_protocol::protocol::McpServerRefreshConfig;
     use codex_protocol::protocol::Op;
     use codex_protocol::protocol::RemoteSkillDownloadedEvent;
+    use codex_protocol::protocol::RemoteSkillHazelnutScope;
+    use codex_protocol::protocol::RemoteSkillProductSurface;
     use codex_protocol::protocol::RemoteSkillSummary;
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::ReviewRequest;
@@ -3384,6 +3391,8 @@ mod handlers {
             // new_turn_with_sub_id already emits the error event.
             return;
         };
+        sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
+            .await;
         current_context.otel_manager.user_prompt(&items);
 
         // Attempt to inject input into current task.
@@ -3669,19 +3678,33 @@ mod handlers {
         sess.send_event_raw(event).await;
     }
 
-    pub async fn list_remote_skills(sess: &Session, config: &Arc<Config>, sub_id: String) {
-        let response = crate::skills::remote::list_remote_skills(config)
-            .await
-            .map(|skills| {
-                skills
-                    .into_iter()
-                    .map(|skill| RemoteSkillSummary {
-                        id: skill.id,
-                        name: skill.name,
-                        description: skill.description,
-                    })
-                    .collect::<Vec<_>>()
-            });
+    pub async fn list_remote_skills(
+        sess: &Session,
+        config: &Arc<Config>,
+        sub_id: String,
+        hazelnut_scope: RemoteSkillHazelnutScope,
+        product_surface: RemoteSkillProductSurface,
+        enabled: Option<bool>,
+    ) {
+        let auth = sess.services.auth_manager.auth().await;
+        let response = crate::skills::remote::list_remote_skills(
+            config,
+            auth.as_ref(),
+            hazelnut_scope,
+            product_surface,
+            enabled,
+        )
+        .await
+        .map(|skills| {
+            skills
+                .into_iter()
+                .map(|skill| RemoteSkillSummary {
+                    id: skill.id,
+                    name: skill.name,
+                    description: skill.description,
+                })
+                .collect::<Vec<_>>()
+        });
 
         match response {
             Ok(skills) => {
@@ -3706,22 +3729,27 @@ mod handlers {
         }
     }
 
-    pub async fn download_remote_skill(
+    pub async fn export_remote_skill(
         sess: &Session,
         config: &Arc<Config>,
         sub_id: String,
         hazelnut_id: String,
-        is_preload: bool,
     ) {
-        match crate::skills::remote::download_remote_skill(config, hazelnut_id.as_str(), is_preload)
-            .await
+        let auth = sess.services.auth_manager.auth().await;
+        match crate::skills::remote::export_remote_skill(
+            config,
+            auth.as_ref(),
+            hazelnut_id.as_str(),
+        )
+        .await
         {
             Ok(result) => {
+                let id = result.id;
                 let event = Event {
                     id: sub_id,
                     msg: EventMsg::RemoteSkillDownloaded(RemoteSkillDownloadedEvent {
-                        id: result.id,
-                        name: result.name,
+                        id: id.clone(),
+                        name: id,
                         path: result.path,
                     }),
                 };
@@ -3731,7 +3759,7 @@ mod handlers {
                 let event = Event {
                     id: sub_id,
                     msg: EventMsg::Error(ErrorEvent {
-                        message: format!("failed to download remote skill {hazelnut_id}: {err}"),
+                        message: format!("failed to export remote skill {hazelnut_id}: {err}"),
                         codex_error_info: Some(CodexErrorInfo::Other),
                     }),
                 };
@@ -3988,6 +4016,8 @@ mod handlers {
         review_request: ReviewRequest,
     ) {
         let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        sess.maybe_emit_unknown_model_warning_for_turn(turn_context.as_ref())
+            .await;
         sess.refresh_mcp_servers_if_requested(&turn_context).await;
         match resolve_review_request(review_request, turn_context.cwd.as_path()) {
             Ok(resolved) => {
@@ -4041,7 +4071,8 @@ async fn spawn_review_thread(
         model_info: &review_model_info,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
-    });
+    })
+    .with_agent_roles(config.agent_roles.clone());
 
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
@@ -4356,6 +4387,7 @@ pub(crate) async fn run_turn(
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let mut server_model_warning_emitted_for_turn = false;
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -4418,6 +4450,7 @@ pub(crate) async fn run_turn(
             sampling_request_input,
             &explicitly_enabled_connectors,
             skills_outcome.as_ref(),
+            &mut server_model_warning_emitted_for_turn,
             cancellation_token.child_token(),
         )
         .await
@@ -4445,7 +4478,8 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
-                    sess.hooks()
+                    let hook_outcomes = sess
+                        .hooks()
                         .dispatch(HookPayload {
                             session_id: sess.conversation_id,
                             cwd: turn_context.cwd.clone(),
@@ -4460,6 +4494,47 @@ pub(crate) async fn run_turn(
                             },
                         })
                         .await;
+
+                    let mut abort_message = None;
+                    for hook_outcome in hook_outcomes {
+                        let hook_name = hook_outcome.hook_name;
+                        match hook_outcome.result {
+                            HookResult::Success => {}
+                            HookResult::FailedContinue(error) => {
+                                warn!(
+                                    turn_id = %turn_context.sub_id,
+                                    hook_name = %hook_name,
+                                    error = %error,
+                                    "after_agent hook failed; continuing"
+                                );
+                            }
+                            HookResult::FailedAbort(error) => {
+                                let message = format!(
+                                    "after_agent hook '{hook_name}' failed and aborted turn completion: {error}"
+                                );
+                                warn!(
+                                    turn_id = %turn_context.sub_id,
+                                    hook_name = %hook_name,
+                                    error = %error,
+                                    "after_agent hook failed; aborting operation"
+                                );
+                                if abort_message.is_none() {
+                                    abort_message = Some(message);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(message) = abort_message {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Error(ErrorEvent {
+                                message,
+                                codex_error_info: None,
+                            }),
+                        )
+                        .await;
+                        return None;
+                    }
                     break;
                 }
                 continue;
@@ -4773,6 +4848,7 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     explicitly_enabled_connectors: &HashSet<String>,
     skills_outcome: Option<&SkillLoadOutcome>,
+    server_model_warning_emitted_for_turn: &mut bool,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let router = built_tools(
@@ -4810,6 +4886,7 @@ async fn run_sampling_request(
             client_session,
             turn_metadata_header,
             Arc::clone(&turn_diff_tracker),
+            server_model_warning_emitted_for_turn,
             &prompt,
             cancellation_token.child_token(),
         )
@@ -4908,14 +4985,13 @@ async fn built_tools(
     skills_outcome: Option<&SkillLoadOutcome>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
-    let mut mcp_tools = sess
-        .services
-        .mcp_connection_manager
-        .read()
-        .await
+    let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
+    let has_mcp_servers = mcp_connection_manager.has_servers();
+    let mut mcp_tools = mcp_connection_manager
         .list_all_tools()
         .or_cancel(cancellation_token)
         .await?;
+    drop(mcp_connection_manager);
 
     let mut effective_explicitly_enabled_connectors = explicitly_enabled_connectors.clone();
     effective_explicitly_enabled_connectors.extend(sess.get_connector_selection().await);
@@ -4929,6 +5005,10 @@ async fn built_tools(
         None
     };
 
+    let app_tools = connectors
+        .as_ref()
+        .map(|connectors| filter_codex_apps_mcp_tools(&mcp_tools, connectors));
+
     if let Some(connectors) = connectors.as_ref() {
         let skill_name_counts_lower = skills_outcome.map_or_else(HashMap::new, |outcome| {
             build_skill_name_counts(&outcome.skills, &outcome.disabled_paths).1
@@ -4941,32 +5021,28 @@ async fn built_tools(
             &skill_name_counts_lower,
         );
 
-        let mut selected_mcp_tools =
-            if let Some(selected_tools) = sess.get_mcp_tool_selection().await {
-                filter_mcp_tools_by_name(&mcp_tools, &selected_tools)
-            } else {
-                HashMap::new()
-            };
+        let mut selected_mcp_tools = filter_non_codex_apps_mcp_tools_only(&mcp_tools);
 
-        let apps_mcp_tools =
-            filter_codex_apps_mcp_tools_only(&mcp_tools, explicitly_enabled.as_ref());
-        selected_mcp_tools.extend(apps_mcp_tools);
+        if let Some(selected_tools) = sess.get_mcp_tool_selection().await {
+            selected_mcp_tools.extend(filter_mcp_tools_by_name(&mcp_tools, &selected_tools));
+        }
+
+        selected_mcp_tools.extend(filter_codex_apps_mcp_tools_only(
+            &mcp_tools,
+            explicitly_enabled.as_ref(),
+        ));
 
         mcp_tools = selected_mcp_tools;
     }
 
-    let app_tools = connectors
-        .as_ref()
-        .map(|connectors| filter_codex_apps_mcp_tools(&mcp_tools, connectors));
-
     Ok(Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
-        Some(
+        has_mcp_servers.then(|| {
             mcp_tools
                 .into_iter()
                 .map(|(name, tool)| (name, tool.tool))
-                .collect(),
-        ),
+                .collect()
+        }),
         app_tools,
         turn_context.dynamic_tools.as_slice(),
     )))
@@ -5399,6 +5475,7 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     turn_diff_tracker: SharedTurnDiffTracker,
+    server_model_warning_emitted_for_turn: &mut bool,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -5563,6 +5640,15 @@ async fn try_run_sampling_request(
                     active_item = Some(turn_item);
                 }
             }
+            ResponseEvent::ServerModel(server_model) => {
+                if !*server_model_warning_emitted_for_turn
+                    && sess
+                        .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
+                        .await
+                {
+                    *server_model_warning_emitted_for_turn = true;
+                }
+            }
             ResponseEvent::ServerReasoningIncluded(included) => {
                 sess.set_server_reasoning_included(included).await;
             }
@@ -5573,11 +5659,7 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
-                let config = sess.get_config().await;
-                sess.services
-                    .models_manager
-                    .refresh_if_new_etag(etag, &config)
-                    .await;
+                sess.services.models_manager.refresh_if_new_etag(etag).await;
             }
             ResponseEvent::Completed {
                 response_id: _,
@@ -5828,6 +5910,9 @@ mod tests {
             logo_url: None,
             logo_url_dark: None,
             distribution_channel: None,
+            branding: None,
+            app_metadata: None,
+            labels: None,
             install_url: None,
             is_accessible: true,
             is_enabled: true,
@@ -5857,6 +5942,22 @@ mod tests {
             connector_id: connector_id.map(str::to_string),
             connector_name: connector_name.map(str::to_string),
         }
+    }
+
+    fn function_call_rollout_item(name: &str, call_id: &str) -> RolloutItem {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+            call_id: call_id.to_string(),
+        })
+    }
+
+    fn function_call_output_rollout_item(call_id: &str, output: &str) -> RolloutItem {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(output.to_string()),
+        })
     }
 
     #[tokio::test]
@@ -6049,6 +6150,46 @@ mod tests {
     }
 
     #[test]
+    fn non_app_mcp_tools_remain_visible_without_search_selection() {
+        let mcp_tools = HashMap::from([
+            (
+                "mcp__codex_apps__calendar_create_event".to_string(),
+                make_mcp_tool(
+                    CODEX_APPS_MCP_SERVER_NAME,
+                    "calendar_create_event",
+                    Some("calendar"),
+                    Some("Calendar"),
+                ),
+            ),
+            (
+                "mcp__rmcp__echo".to_string(),
+                make_mcp_tool("rmcp", "echo", None, None),
+            ),
+        ]);
+
+        let mut selected_mcp_tools = mcp_tools
+            .iter()
+            .filter(|(_, tool)| tool.server_name != CODEX_APPS_MCP_SERVER_NAME)
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
+        let explicitly_enabled_connectors = HashSet::new();
+        let connectors = filter_connectors_for_input(
+            &connectors,
+            &[user_message("run echo")],
+            &explicitly_enabled_connectors,
+            &HashMap::new(),
+        );
+        let apps_mcp_tools = filter_codex_apps_mcp_tools_only(&mcp_tools, &connectors);
+        selected_mcp_tools.extend(apps_mcp_tools);
+
+        let mut tool_names: Vec<String> = selected_mcp_tools.into_keys().collect();
+        tool_names.sort();
+        assert_eq!(tool_names, vec!["mcp__rmcp__echo".to_string()]);
+    }
+
+    #[test]
     fn search_tool_selection_keeps_codex_apps_tools_without_mentions() {
         let selected_tool_names = vec![
             "mcp__codex_apps__calendar_create_event".to_string(),
@@ -6133,6 +6274,106 @@ mod tests {
                 "mcp__rmcp__echo".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn extract_mcp_tool_selection_from_rollout_reads_search_tool_output() {
+        let rollout_items = vec![
+            function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1"),
+            function_call_output_rollout_item(
+                "search-1",
+                &json!({
+                    "active_selected_tools": [
+                        "mcp__codex_apps__calendar_create_event",
+                        "mcp__codex_apps__calendar_list_events",
+                    ],
+                })
+                .to_string(),
+            ),
+        ];
+
+        let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
+        assert_eq!(
+            selected,
+            Some(vec![
+                "mcp__codex_apps__calendar_create_event".to_string(),
+                "mcp__codex_apps__calendar_list_events".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn extract_mcp_tool_selection_from_rollout_latest_valid_payload_wins() {
+        let rollout_items = vec![
+            function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1"),
+            function_call_output_rollout_item(
+                "search-1",
+                &json!({
+                    "active_selected_tools": ["mcp__codex_apps__calendar_create_event"],
+                })
+                .to_string(),
+            ),
+            function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-2"),
+            function_call_output_rollout_item(
+                "search-2",
+                &json!({
+                    "active_selected_tools": ["mcp__codex_apps__calendar_delete_event"],
+                })
+                .to_string(),
+            ),
+        ];
+
+        let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
+        assert_eq!(
+            selected,
+            Some(vec!["mcp__codex_apps__calendar_delete_event".to_string(),])
+        );
+    }
+
+    #[test]
+    fn extract_mcp_tool_selection_from_rollout_ignores_non_search_and_malformed_payloads() {
+        let rollout_items = vec![
+            function_call_rollout_item("shell", "shell-1"),
+            function_call_output_rollout_item(
+                "shell-1",
+                &json!({
+                    "active_selected_tools": ["mcp__codex_apps__should_be_ignored"],
+                })
+                .to_string(),
+            ),
+            function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1"),
+            function_call_output_rollout_item("search-1", "{not-json"),
+            function_call_output_rollout_item(
+                "unknown-search-call",
+                &json!({
+                    "active_selected_tools": ["mcp__codex_apps__also_ignored"],
+                })
+                .to_string(),
+            ),
+            function_call_output_rollout_item(
+                "search-1",
+                &json!({
+                    "active_selected_tools": ["mcp__codex_apps__calendar_list_events"],
+                })
+                .to_string(),
+            ),
+        ];
+
+        let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
+        assert_eq!(
+            selected,
+            Some(vec!["mcp__codex_apps__calendar_list_events".to_string(),])
+        );
+    }
+
+    #[test]
+    fn extract_mcp_tool_selection_from_rollout_returns_none_without_valid_search_output() {
+        let rollout_items = vec![function_call_rollout_item(
+            SEARCH_TOOL_BM25_TOOL_NAME,
+            "search-1",
+        )];
+        let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
+        assert_eq!(selected, None);
     }
 
     #[tokio::test]
