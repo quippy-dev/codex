@@ -41,9 +41,8 @@ pub struct WindowsToml {
     pub sandbox: Option<WindowsSandboxModeToml>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[derive(Default)]
 pub enum CollabInboxDeliveryRole {
     Developer,
     #[default]

@@ -115,6 +115,8 @@ async fn returns_config_error_for_invalid_managed_config_toml() {
 
     let overrides = LoaderOverrides {
         managed_config_path: Some(managed_path.clone()),
+        ignore_system_config: true,
+        ignore_system_requirements: true,
         ..Default::default()
     };
 
@@ -205,6 +207,8 @@ extra = true
         #[cfg(target_os = "macos")]
         managed_preferences_base64: None,
         macos_managed_config_requirements_base64: None,
+        ignore_system_config: true,
+        ignore_system_requirements: true,
     };
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
@@ -244,6 +248,8 @@ async fn returns_empty_when_all_layers_missing() {
         // inherit non-empty machine-specific managed state.
         managed_preferences_base64: Some(String::new()),
         macos_managed_config_requirements_base64: None,
+        ignore_system_config: true,
+        ignore_system_requirements: true,
     };
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
@@ -341,6 +347,8 @@ flag = false
             base64::prelude::BASE64_STANDARD.encode(raw_managed_preferences.as_bytes()),
         ),
         macos_managed_config_requirements_base64: None,
+        ignore_system_config: true,
+        ignore_system_requirements: true,
     };
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
@@ -401,6 +409,8 @@ allowed_sandbox_modes = ["read-only"]
                     .as_bytes(),
                 ),
             ),
+            ignore_system_config: true,
+            ignore_system_requirements: true,
         },
         CloudRequirementsLoader::default(),
     )
@@ -463,6 +473,8 @@ allowed_approval_policies = ["never"]
                     .as_bytes(),
                 ),
             ),
+            ignore_system_config: true,
+            ignore_system_requirements: true,
         },
         CloudRequirementsLoader::default(),
     )
@@ -573,6 +585,8 @@ allowed_approval_policies = ["on-request"]
                     .as_bytes(),
                 ),
             ),
+            ignore_system_config: true,
+            ignore_system_requirements: true,
             ..LoaderOverrides::default()
         },
         CloudRequirementsLoader::new(async {

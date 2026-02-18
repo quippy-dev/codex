@@ -93,6 +93,7 @@ mod permissions_messages;
 mod personality;
 mod personality_migration;
 mod prompt_caching;
+mod python_tool;
 mod quota_exceeded;
 mod read_file;
 mod remote_models;

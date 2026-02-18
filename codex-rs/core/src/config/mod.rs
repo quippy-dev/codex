@@ -306,14 +306,14 @@ pub struct Config {
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
 
+    /// How inbound collaboration messages are delivered to non-subagent threads.
+    pub collab_inbox_delivery_role: CollabInboxDeliveryRole,
+
     /// User-defined role declarations keyed by role name.
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
 
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
-
-    /// How inbound collaboration messages are delivered to non-subagent threads.
-    pub collab_inbox_delivery_role: CollabInboxDeliveryRole,
 
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
@@ -342,6 +342,8 @@ pub struct Config {
 
     /// Optional absolute path to the Node runtime used by `js_repl`.
     pub js_repl_node_path: Option<PathBuf>,
+    /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
+    pub zsh_path: Option<PathBuf>,
 
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
@@ -981,6 +983,8 @@ pub struct ConfigToml {
 
     /// Optional absolute path to the Node runtime used by `js_repl`.
     pub js_repl_node_path: Option<AbsolutePathBuf>,
+    /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
+    pub zsh_path: Option<AbsolutePathBuf>,
 
     /// Profile to use from the `profiles` map.
     pub profile: Option<String>,
@@ -1362,6 +1366,7 @@ pub struct ConfigOverrides {
     pub config_profile: Option<String>,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub js_repl_node_path: Option<PathBuf>,
+    pub zsh_path: Option<PathBuf>,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
     pub personality: Option<Personality>,
@@ -1489,6 +1494,7 @@ impl Config {
             config_profile: config_profile_key,
             codex_linux_sandbox_exe,
             js_repl_node_path: js_repl_node_path_override,
+            zsh_path: zsh_path_override,
             base_instructions,
             developer_instructions,
             personality,
@@ -1754,6 +1760,9 @@ impl Config {
         let js_repl_node_path = js_repl_node_path_override
             .or(config_profile.js_repl_node_path.map(Into::into))
             .or(cfg.js_repl_node_path.map(Into::into));
+        let zsh_path = zsh_path_override
+            .or(config_profile.zsh_path.map(Into::into))
+            .or(cfg.zsh_path.map(Into::into));
 
         let review_model = override_review_model.or(cfg.review_model);
 
@@ -1868,9 +1877,9 @@ impl Config {
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
             agent_max_threads,
+            collab_inbox_delivery_role,
             agent_roles,
             memories: cfg.memories.unwrap_or_default().into(),
-            collab_inbox_delivery_role,
             codex_home,
             log_dir,
             config_layer_stack,
@@ -1879,6 +1888,7 @@ impl Config {
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             codex_linux_sandbox_exe,
             js_repl_node_path,
+            zsh_path,
 
             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
             show_raw_agent_reasoning: cfg
@@ -2977,6 +2987,8 @@ profile = "project"
             #[cfg(target_os = "macos")]
             managed_preferences_base64: None,
             macos_managed_config_requirements_base64: None,
+            ignore_system_config: false,
+            ignore_system_requirements: false,
         };
 
         let cwd = AbsolutePathBuf::try_from(codex_home.path())?;
@@ -3107,6 +3119,8 @@ profile = "project"
             #[cfg(target_os = "macos")]
             managed_preferences_base64: None,
             macos_managed_config_requirements_base64: None,
+            ignore_system_config: false,
+            ignore_system_requirements: false,
         };
 
         let cwd = AbsolutePathBuf::try_from(codex_home.path())?;
@@ -4198,9 +4212,9 @@ model_verbosity = "high"
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+                collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
                 agent_roles: BTreeMap::new(),
                 memories: MemoriesConfig::default(),
-                collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
                 codex_home: fixture.codex_home(),
                 log_dir: fixture.codex_home().join("log"),
                 config_layer_stack: Default::default(),
@@ -4210,6 +4224,7 @@ model_verbosity = "high"
                 file_opener: UriBasedFileOpener::VsCode,
                 codex_linux_sandbox_exe: None,
                 js_repl_node_path: None,
+                zsh_path: None,
                 hide_agent_reasoning: false,
                 show_raw_agent_reasoning: false,
                 model_reasoning_effort: Some(ReasoningEffort::High),
@@ -4312,9 +4327,9 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
             agent_roles: BTreeMap::new(),
             memories: MemoriesConfig::default(),
-            collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4324,6 +4339,7 @@ model_verbosity = "high"
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
             js_repl_node_path: None,
+            zsh_path: None,
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
@@ -4424,9 +4440,9 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
             agent_roles: BTreeMap::new(),
             memories: MemoriesConfig::default(),
-            collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4436,6 +4452,7 @@ model_verbosity = "high"
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
             js_repl_node_path: None,
+            zsh_path: None,
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
@@ -4522,9 +4539,9 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
             agent_roles: BTreeMap::new(),
             memories: MemoriesConfig::default(),
-            collab_inbox_delivery_role: CollabInboxDeliveryRole::Tool,
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4534,6 +4551,7 @@ model_verbosity = "high"
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
             js_repl_node_path: None,
+            zsh_path: None,
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: Some(ReasoningEffort::High),

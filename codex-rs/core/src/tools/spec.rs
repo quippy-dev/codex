@@ -15,6 +15,7 @@ use crate::tools::handlers::multi_agents::DEFAULT_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
+use crate::tools::python::register_python_tool;
 use crate::tools::registry::ToolRegistryBuilder;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -38,6 +39,8 @@ pub(crate) struct ToolsConfig {
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
+    pub python_tool: bool,
+    pub request_rule_enabled: bool,
     pub search_tool: bool,
     pub js_repl_enabled: bool,
     pub js_repl_tools_only: bool,
@@ -63,12 +66,16 @@ impl ToolsConfig {
         let include_js_repl = features.enabled(Feature::JsRepl);
         let include_js_repl_tools_only =
             include_js_repl && features.enabled(Feature::JsReplToolsOnly);
+        let include_python_tool = features.enabled(Feature::PythonTool);
+        let request_rule_enabled = features.enabled(Feature::RequestRule);
         let include_collab_tools = features.enabled(Feature::Collab);
         let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
         let include_search_tool = features.enabled(Feature::Apps);
 
-        let shell_type = if !features.enabled(Feature::ShellTool) {
+        let shell_type = if include_python_tool || !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
+        } else if features.enabled(Feature::ShellZshFork) {
+            ConfigShellToolType::ShellCommand
         } else if features.enabled(Feature::UnifiedExec) {
             // If ConPTY not supported (for old Windows versions), fallback on ShellCommand.
             if codex_utils_pty::conpty_supported() {
@@ -97,6 +104,8 @@ impl ToolsConfig {
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
             agent_roles: BTreeMap::new(),
+            python_tool: include_python_tool,
+            request_rule_enabled,
             search_tool: include_search_tool,
             js_repl_enabled: include_js_repl,
             js_repl_tools_only: include_js_repl_tools_only,
@@ -179,7 +188,9 @@ impl From<JsonSchema> for AdditionalProperties {
     }
 }
 
-fn create_approval_parameters() -> BTreeMap<String, JsonSchema> {
+pub(crate) fn create_approval_parameters(
+    include_prefix_rule: bool,
+) -> BTreeMap<String, JsonSchema> {
     let mut properties = BTreeMap::from([
         (
             "sandbox_permissions".to_string(),
@@ -205,22 +216,24 @@ fn create_approval_parameters() -> BTreeMap<String, JsonSchema> {
         ),
     ]);
 
-    properties.insert(
-        "prefix_rule".to_string(),
-        JsonSchema::Array {
-            items: Box::new(JsonSchema::String { description: None }),
-            description: Some(
-                r#"Only specify when sandbox_permissions is `require_escalated`.
+    if include_prefix_rule {
+        properties.insert(
+            "prefix_rule".to_string(),
+            JsonSchema::Array {
+                items: Box::new(JsonSchema::String { description: None }),
+                description: Some(
+                    r#"Only specify when sandbox_permissions is `require_escalated`.
                     Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future.
                     Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"]."#.to_string(),
-            ),
-        },
-    );
+                ),
+            },
+        );
+    }
 
     properties
 }
 
-fn create_exec_command_tool() -> ToolSpec {
+fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
@@ -278,7 +291,7 @@ fn create_exec_command_tool() -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters());
+    properties.extend(create_approval_parameters(include_prefix_rule));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
@@ -341,7 +354,7 @@ fn create_write_stdin_tool() -> ToolSpec {
     })
 }
 
-fn create_shell_tool() -> ToolSpec {
+fn create_shell_tool(include_prefix_rule: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
@@ -363,7 +376,7 @@ fn create_shell_tool() -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters());
+    properties.extend(create_approval_parameters(include_prefix_rule));
 
     let description  = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
@@ -394,7 +407,7 @@ Examples of valid command strings:
     })
 }
 
-fn create_shell_command_tool() -> ToolSpec {
+fn create_shell_command_tool(include_prefix_rule: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
@@ -426,7 +439,7 @@ fn create_shell_command_tool() -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters());
+    properties.extend(create_approval_parameters(include_prefix_rule));
 
     let description = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output.
@@ -1542,13 +1555,19 @@ pub(crate) fn build_specs(
 
     match &config.shell_type {
         ConfigShellToolType::Default => {
-            builder.push_spec_with_parallel_support(create_shell_tool(), true);
+            builder.push_spec_with_parallel_support(
+                create_shell_tool(config.request_rule_enabled),
+                true,
+            );
         }
         ConfigShellToolType::Local => {
             builder.push_spec_with_parallel_support(ToolSpec::LocalShell {}, true);
         }
         ConfigShellToolType::UnifiedExec => {
-            builder.push_spec_with_parallel_support(create_exec_command_tool(), true);
+            builder.push_spec_with_parallel_support(
+                create_exec_command_tool(config.request_rule_enabled),
+                true,
+            );
             builder.push_spec(create_write_stdin_tool());
             builder.register_handler("exec_command", unified_exec_handler.clone());
             builder.register_handler("write_stdin", unified_exec_handler);
@@ -1557,7 +1576,10 @@ pub(crate) fn build_specs(
             // Do nothing.
         }
         ConfigShellToolType::ShellCommand => {
-            builder.push_spec_with_parallel_support(create_shell_command_tool(), true);
+            builder.push_spec_with_parallel_support(
+                create_shell_command_tool(config.request_rule_enabled),
+                true,
+            );
         }
     }
 
@@ -1591,6 +1613,10 @@ pub(crate) fn build_specs(
     if config.collaboration_modes_tools {
         builder.push_spec(create_request_user_input_tool());
         builder.register_handler("request_user_input", request_user_input_handler);
+    }
+
+    if config.python_tool {
+        register_python_tool(&mut builder, config.request_rule_enabled);
     }
 
     if config.search_tool
@@ -1927,7 +1953,7 @@ mod tests {
         // Build expected from the same helpers used by the builder.
         let mut expected: BTreeMap<String, ToolSpec> = BTreeMap::from([]);
         for spec in [
-            create_exec_command_tool(),
+            create_exec_command_tool(config.request_rule_enabled),
             create_write_stdin_tool(),
             PLAN_TOOL.clone(),
             create_request_user_input_tool(),
@@ -2445,6 +2471,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
+        let config = test_config();
+        let model_info = ModelsManager::construct_model_info_offline_for_tests("o3", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::UnifiedExec);
+        features.enable(Feature::ShellZshFork);
+
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Live),
+        });
+
+        assert_eq!(tools_config.shell_type, ConfigShellToolType::ShellCommand);
+    }
+
+    #[test]
     #[ignore]
     fn test_parallel_support_flags() {
         let config = test_config();
@@ -2910,7 +2953,7 @@ mod tests {
 
     #[test]
     fn test_shell_tool() {
-        let tool = super::create_shell_tool();
+        let tool = super::create_shell_tool(false);
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool
@@ -2940,7 +2983,7 @@ Examples of valid command strings:
 
     #[test]
     fn test_shell_command_tool() {
-        let tool = super::create_shell_command_tool();
+        let tool = super::create_shell_command_tool(false);
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool

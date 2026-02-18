@@ -245,6 +245,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::util::backoff;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use crate::zsh_exec_bridge::ZshExecBridge;
 use codex_async_utils::OrCancelExt;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
@@ -588,6 +589,9 @@ pub(crate) struct Session {
     turn_used_collab_send_input: AtomicBool,
     /// Snapshots whether the last completed turn used collab send_input.
     last_completed_turn_used_collab_send_input: AtomicBool,
+    /// If set, emit the standard "invalid image" error event after the next /responses request
+    /// has started (avoids racing with follow-up request assertions in tests).
+    pending_invalid_image_error: AtomicBool,
 }
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -1325,10 +1329,17 @@ impl Session {
                 (None, None)
             };
 
+        let zsh_exec_bridge =
+            ZshExecBridge::new(config.zsh_path.clone(), config.codex_home.clone());
+        zsh_exec_bridge
+            .initialize_for_session(&conversation_id.to_string())
+            .await;
+
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
             unified_exec_manager: UnifiedExecProcessManager::default(),
+            zsh_exec_bridge,
             analytics_events_client: AnalyticsEventsClient::new(
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
@@ -1393,6 +1404,7 @@ impl Session {
             next_internal_sub_id: AtomicU64::new(0),
             turn_used_collab_send_input: AtomicBool::new(false),
             last_completed_turn_used_collab_send_input: AtomicBool::new(false),
+            pending_invalid_image_error: AtomicBool::new(false),
         });
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
@@ -1515,6 +1527,16 @@ impl Session {
     pub(crate) fn mark_turn_used_collab_send_input(&self) {
         self.turn_used_collab_send_input
             .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn mark_pending_invalid_image_error(&self) {
+        self.pending_invalid_image_error
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_pending_invalid_image_error(&self) -> bool {
+        self.pending_invalid_image_error
+            .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn reset_turn_collab_send_input_flag(&self) {
@@ -2270,7 +2292,7 @@ impl Session {
 
     /// Emit an exec approval request event and await the user's decision.
     ///
-    /// The request is keyed by `call_id` so matching responses are delivered
+    /// The request is keyed by `call_id` + `approval_id` so matching responses are delivered
     /// to the correct in-flight turn. If the task is aborted, this returns the
     /// default `ReviewDecision` (`Denied`).
     #[allow(clippy::too_many_arguments)]
@@ -2278,32 +2300,36 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         call_id: String,
+        approval_id: Option<String>,
         command: Vec<String>,
         cwd: PathBuf,
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     ) -> ReviewDecision {
+        // command-level approvals use `call_id`.
+        // `approval_id` is only present for subcommand callbacks (execve intercept).
+        let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
-        let approval_id = call_id.clone();
         let prev_entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(approval_id.clone(), tx_approve)
+                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
                 }
                 None => None,
             }
         };
         if prev_entry.is_some() {
-            warn!("Overwriting existing pending approval for call_id: {approval_id}");
+            warn!("Overwriting existing pending approval for call_id: {effective_approval_id}");
         }
 
         let parsed_cmd = parse_command(&command);
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
+            approval_id,
             turn_id: turn_context.sub_id.clone(),
             command,
             cwd,
@@ -5717,6 +5743,18 @@ async fn try_run_sampling_request(
         .or_cancel(&cancellation_token)
         .await??;
 
+    if sess.take_pending_invalid_image_error() {
+        sess.send_event(
+            &turn_context,
+            EventMsg::Error(ErrorEvent {
+                message: "Invalid image in your last message. Please remove it and try again."
+                    .to_string(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            }),
+        )
+        .await;
+    }
+
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
         Arc::clone(&sess),
@@ -7529,6 +7567,7 @@ mod tests {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
             unified_exec_manager: UnifiedExecProcessManager::default(),
+            zsh_exec_bridge: ZshExecBridge::default(),
             analytics_events_client: AnalyticsEventsClient::new(
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
@@ -7596,6 +7635,7 @@ mod tests {
             next_internal_sub_id: AtomicU64::new(0),
             turn_used_collab_send_input: AtomicBool::new(false),
             last_completed_turn_used_collab_send_input: AtomicBool::new(false),
+            pending_invalid_image_error: AtomicBool::new(false),
         };
 
         (session, turn_context)
@@ -7679,6 +7719,7 @@ mod tests {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
             unified_exec_manager: UnifiedExecProcessManager::default(),
+            zsh_exec_bridge: ZshExecBridge::default(),
             analytics_events_client: AnalyticsEventsClient::new(
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
@@ -7746,6 +7787,7 @@ mod tests {
             next_internal_sub_id: AtomicU64::new(0),
             turn_used_collab_send_input: AtomicBool::new(false),
             last_completed_turn_used_collab_send_input: AtomicBool::new(false),
+            pending_invalid_image_error: AtomicBool::new(false),
         });
 
         (session, turn_context, rx_event)

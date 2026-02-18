@@ -23,8 +23,10 @@ use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintError;
+use codex_core::config::ProjectConfig;
 #[cfg(target_os = "windows")]
 use codex_core::config::types::WindowsSandboxModeToml;
+use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::RequirementSource;
 use codex_core::features::Feature;
 use codex_core::models_manager::manager::ModelsManager;
@@ -118,11 +120,23 @@ use toml::Value as TomlValue;
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
     let codex_home = std::env::temp_dir();
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
-        .expect("config")
+        .expect("config");
+    config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    config.permissions.sandbox_policy =
+        Constrained::allow_any(SandboxPolicy::new_read_only_policy());
+    config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
+    config.notices.hide_rate_limit_model_nudge = Some(false);
+    config.active_project = ProjectConfig { trust_level: None };
+    config
 }
 
 fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError {
@@ -977,6 +991,83 @@ async fn blocked_image_restore_preserves_mention_bindings() {
         warning.contains("does not support image inputs"),
         "expected image warning, got: {warning:?}"
     );
+}
+
+async fn submission_expands_directory_mentions() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    let project_root = tempdir().unwrap();
+    std::fs::create_dir_all(project_root.path().join("docs")).unwrap();
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        cwd: project_root.path().to_path_buf(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: None,
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+    drain_insert_history(&mut rx);
+    chat.config.cwd = project_root.path().to_path_buf();
+
+    let text = "docs/ review".to_string();
+    let text_elements = vec![TextElement::new(
+        (0.."docs/".len()).into(),
+        Some("docs/".into()),
+    )];
+    chat.bottom_pane
+        .set_composer_text(text.clone(), text_elements.clone(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+
+    let abs_docs = format!(
+        "{}/",
+        project_root
+            .path()
+            .join("docs")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    assert_eq!(
+        items,
+        vec![UserInput::Text {
+            text: format!("docs/ (path: {abs_docs}) review"),
+            text_elements: Vec::new(),
+        }],
+    );
+
+    let mut user_cell = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev
+            && let Some(cell) = cell.as_any().downcast_ref::<UserHistoryCell>()
+        {
+            user_cell = Some((cell.message.clone(), cell.text_elements.clone()));
+            break;
+        }
+    }
+
+    let (stored_message, stored_elements) =
+        user_cell.expect("expected submitted user history cell");
+    assert_eq!(stored_message, text);
+    assert_eq!(stored_elements, text_elements);
 }
 
 #[tokio::test]
@@ -2167,9 +2258,29 @@ async fn plan_implementation_popup_no_selected_snapshot() {
 }
 
 #[tokio::test]
-async fn plan_implementation_popup_yes_emits_submit_message_event() {
+async fn plan_implementation_popup_execute_emits_submit_message_event() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.open_plan_implementation_prompt();
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let event = rx.try_recv().expect("expected AppEvent");
+    let AppEvent::SubmitUserMessageWithMode {
+        text,
+        collaboration_mode,
+    } = event
+    else {
+        panic!("expected SubmitUserMessageWithMode, got {event:?}");
+    };
+    assert_eq!(text, PLAN_IMPLEMENTATION_CODING_MESSAGE);
+    assert_eq!(collaboration_mode.mode, Some(ModeKind::Execute));
+}
+
+#[tokio::test]
+async fn plan_implementation_popup_default_emits_submit_message_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.open_plan_implementation_prompt();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
@@ -2511,6 +2622,7 @@ async fn exec_approval_emits_proposed_command_and_decision_history() {
     // Trigger an exec approval request with a short, single-line command
     let ev = ExecApprovalRequestEvent {
         call_id: "call-short".into(),
+        approval_id: Some("call-short".into()),
         turn_id: "turn-short".into(),
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -2556,6 +2668,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
     // Multiline command: modal should show full command, history records decision only
     let ev_multi = ExecApprovalRequestEvent {
         call_id: "call-multi".into(),
+        approval_id: Some("call-multi".into()),
         turn_id: "turn-multi".into(),
         command: vec!["bash".into(), "-lc".into(), "echo line1\necho line2".into()],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -2609,6 +2722,7 @@ async fn exec_approval_decision_truncates_multiline_and_long_commands() {
     let long = format!("echo {}", "a".repeat(200));
     let ev_long = ExecApprovalRequestEvent {
         call_id: "call-long".into(),
+        approval_id: Some("call-long".into()),
         turn_id: "turn-long".into(),
         command: vec!["bash".into(), "-lc".into(), long],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -3603,6 +3717,10 @@ async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
     chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Execute);
+    assert_eq!(chat.current_collaboration_mode(), &initial);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
     assert_eq!(chat.current_collaboration_mode(), &initial);
 
@@ -3740,6 +3858,11 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
             "features.collaboration_modes".to_string(),
             TomlValue::Boolean(true),
         )])
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("config");
@@ -3789,6 +3912,11 @@ async fn experimental_mode_plan_applies_on_startup() {
                 TomlValue::String("plan".to_string()),
             ),
         ])
+        .loader_overrides(LoaderOverrides {
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        })
         .build()
         .await
         .expect("config");
@@ -5723,6 +5851,7 @@ async fn approval_modal_exec_snapshot() -> anyhow::Result<()> {
     // Inject an exec approval request to display the approval modal.
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd".into(),
+        approval_id: Some("call-approve-cmd".into()),
         turn_id: "turn-approve-cmd".into(),
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -5782,6 +5911,7 @@ async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
 
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd-noreason".into(),
+        approval_id: Some("call-approve-cmd-noreason".into()),
         turn_id: "turn-approve-cmd-noreason".into(),
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -5830,6 +5960,7 @@ async fn approval_modal_exec_multiline_prefix_hides_execpolicy_option_snapshot()
     let command = vec!["bash".into(), "-lc".into(), script];
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd-multiline-trunc".into(),
+        approval_id: Some("call-approve-cmd-multiline-trunc".into()),
         turn_id: "turn-approve-cmd-multiline-trunc".into(),
         command: command.clone(),
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -6188,6 +6319,7 @@ async fn status_widget_and_approval_modal_snapshot() {
     // Now show an approval modal (e.g. exec approval).
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-exec".into(),
+        approval_id: Some("call-approve-exec".into()),
         turn_id: "turn-approve-exec".into(),
         command: vec!["echo".into(), "hello world".into()],
         cwd: PathBuf::from("/tmp"),

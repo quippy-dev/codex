@@ -375,7 +375,8 @@ mod tests {
         assert!(
             shell_path == Path::new("/bin/bash")
                 || shell_path == Path::new("/usr/bin/bash")
-                || shell_path == Path::new("/usr/local/bin/bash"),
+                || shell_path == Path::new("/usr/local/bin/bash")
+                || shell_path == Path::new("/opt/homebrew/bin/bash"),
             "shell path: {shell_path:?}",
         );
     }

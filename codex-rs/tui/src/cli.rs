@@ -112,4 +112,7 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+
+    #[clap(skip)]
+    pub auth_file: Option<PathBuf>,
 }

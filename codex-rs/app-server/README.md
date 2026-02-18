@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Protocol](#protocol)
+- [Auth File Override](#auth-file-override)
 - [Message Schema](#message-schema)
 - [Core Primitives](#core-primitives)
 - [Lifecycle Overview](#lifecycle-overview)
@@ -33,6 +34,20 @@ Backpressure behavior:
 - The server uses bounded queues between transport ingress, request processing, and outbound writes.
 - When request ingress is saturated, new requests are rejected with a JSON-RPC error code `-32001` and message `"Server overloaded; retry later."`.
 - Clients should treat this as retryable and use exponential backoff with jitter.
+
+## Auth File Override
+
+Use `--auth-file` to point app-server auth flows (login/logout/status) at a specific `auth.json` path:
+
+```bash
+codex app-server --auth-file /tmp/codex-auth/auth.json
+```
+
+When `--auth-file` is set, `cli_auth_credentials_store` must be `file` (or `ephemeral`). `keyring` and `auto` are rejected. If needed, set:
+
+```bash
+codex app-server --auth-file /tmp/codex-auth/auth.json -c cli_auth_credentials_store=file
+```
 
 ## Message Schema
 
@@ -637,7 +652,7 @@ Certain actions (shell commands or modifying files) may require explicit user ap
 Order of messages:
 
 1. `item/started` — shows the pending `commandExecution` item with `command`, `cwd`, and other fields so you can render the proposed action.
-2. `item/commandExecution/requestApproval` (request) — carries the same `itemId`, `threadId`, `turnId`, optionally `reason`, plus `command`, `cwd`, and `commandActions` for friendly display.
+2. `item/commandExecution/requestApproval` (request) — carries the same `itemId`, `threadId`, `turnId`, optionally `approvalId` (for subcommand callbacks), `reason`, plus `command`, `cwd`, and `commandActions` for friendly display.
 3. Client response — `{ "decision": "accept", "acceptSettings": { "forSession": false } }` or `{ "decision": "decline" }`.
 4. `item/completed` — final `commandExecution` item with `status: "completed" | "failed" | "declined"` and execution output. Render this as the authoritative result.
 

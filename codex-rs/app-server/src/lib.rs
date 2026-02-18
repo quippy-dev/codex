@@ -208,6 +208,7 @@ pub async fn run_main(
         cli_config_overrides,
         loader_overrides,
         default_analytics_enabled,
+        None,
         AppServerTransport::Stdio,
     )
     .await
@@ -218,6 +219,7 @@ pub async fn run_main_with_transport(
     cli_config_overrides: CliConfigOverrides,
     loader_overrides: LoaderOverrides,
     default_analytics_enabled: bool,
+    auth_file: Option<PathBuf>,
     transport: AppServerTransport,
 ) -> IoResult<()> {
     let (transport_event_tx, mut transport_event_rx) =
@@ -271,8 +273,13 @@ pub async fn run_main_with_transport(
                 }
             }
 
-            let auth_manager = AuthManager::shared(
+            let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
                 config.codex_home.clone(),
+                auth_file.as_deref(),
+                config.cli_auth_credentials_store_mode,
+            )?;
+            let auth_manager = AuthManager::shared(
+                auth_storage_home,
                 false,
                 config.cli_auth_credentials_store_mode,
             );
@@ -309,6 +316,11 @@ pub async fn run_main_with_transport(
             })?
         }
     };
+    let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
+        config.codex_home.clone(),
+        auth_file.as_deref(),
+        config.cli_auth_credentials_store_mode,
+    )?;
 
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         let (path, range) = exec_policy_warning_location(&err);
@@ -437,6 +449,7 @@ pub async fn run_main_with_transport(
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
             outgoing: outgoing_message_sender,
             codex_linux_sandbox_exe,
+            auth_storage_home,
             config: Arc::new(config),
             cli_overrides,
             loader_overrides,

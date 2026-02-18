@@ -9,7 +9,6 @@ pub use app::AppExitInfo;
 pub use app::ExitReason;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
-use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
 use codex_core::ThreadSortKey;
@@ -219,11 +218,13 @@ pub async fn run_main(
         tracing::warn!(error = %err, "failed to run personality migration");
     }
 
-    let cloud_auth_manager = AuthManager::shared(
+    let cloud_auth_manager = AuthManager::shared_with_auth_file(
         codex_home.to_path_buf(),
         false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
-    );
+        cli.auth_file.clone(),
+    )
+    .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
     let chatgpt_base_url = config_toml
         .chatgpt_base_url
         .clone()
@@ -482,12 +483,14 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let auth_manager = AuthManager::shared(
+    let auth_manager = AuthManager::shared_with_auth_file(
         initial_config.codex_home.clone(),
         false,
         initial_config.cli_auth_credentials_store_mode,
-    );
-    let login_status = get_login_status(&initial_config);
+        cli.auth_file.clone(),
+    )
+    .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
+    let login_status = get_login_status(&initial_config, auth_manager.as_ref());
     let should_show_trust_screen_flag = should_show_trust_screen(&initial_config);
     let should_show_onboarding =
         should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
@@ -875,18 +878,11 @@ pub enum LoginStatus {
     NotAuthenticated,
 }
 
-fn get_login_status(config: &Config) -> LoginStatus {
+fn get_login_status(config: &Config, auth_manager: &AuthManager) -> LoginStatus {
     if config.model_provider.requires_openai_auth {
-        // Reading the OpenAI API key is an async operation because it may need
-        // to refresh the token. Block on it.
-        let codex_home = config.codex_home.clone();
-        match CodexAuth::from_auth_storage(&codex_home, config.cli_auth_credentials_store_mode) {
-            Ok(Some(auth)) => LoginStatus::AuthMode(auth.auth_mode()),
-            Ok(None) => LoginStatus::NotAuthenticated,
-            Err(err) => {
-                error!("Failed to read auth.json: {err}");
-                LoginStatus::NotAuthenticated
-            }
+        match auth_manager.auth_cached() {
+            Some(auth) => LoginStatus::AuthMode(auth.auth_mode()),
+            None => LoginStatus::NotAuthenticated,
         }
     } else {
         LoginStatus::NotAuthenticated
@@ -965,6 +961,8 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
+    use codex_core::config_loader::CloudRequirementsLoader;
+    use codex_core::config_loader::LoaderOverrides;
     use codex_core::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
@@ -1136,6 +1134,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_rebuild_changes_trust_defaults_with_cwd() -> std::io::Result<()> {
+        use codex_protocol::config_types::TrustLevel;
+
         let temp_dir = TempDir::new()?;
         let codex_home = temp_dir.path().to_path_buf();
         let trusted = temp_dir.path().join("trusted");
@@ -1163,8 +1163,18 @@ trust_level = "untrusted"
         let trusted_config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .harness_overrides(trusted_overrides.clone())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
+            .cloud_requirements(CloudRequirementsLoader::new(async { None }))
             .build()
             .await?;
+        assert_eq!(
+            trusted_config.active_project.trust_level,
+            Some(TrustLevel::Trusted)
+        );
         assert_eq!(
             trusted_config.permissions.approval_policy.value(),
             AskForApproval::OnRequest
@@ -1177,8 +1187,18 @@ trust_level = "untrusted"
         let untrusted_config = ConfigBuilder::default()
             .codex_home(codex_home)
             .harness_overrides(untrusted_overrides)
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
+            .cloud_requirements(CloudRequirementsLoader::new(async { None }))
             .build()
             .await?;
+        assert_eq!(
+            untrusted_config.active_project.trust_level,
+            Some(TrustLevel::Untrusted)
+        );
         assert_eq!(
             untrusted_config.permissions.approval_policy.value(),
             AskForApproval::UnlessTrusted

@@ -62,6 +62,27 @@ impl ServerOptions {
             cli_auth_credentials_store_mode,
         }
     }
+
+    pub fn with_auth_file_override(mut self, auth_file: Option<PathBuf>) -> io::Result<Self> {
+        self.codex_home = Self::resolve_auth_storage_home(
+            self.codex_home,
+            auth_file.as_deref(),
+            self.cli_auth_credentials_store_mode,
+        )?;
+        Ok(self)
+    }
+
+    pub fn resolve_auth_storage_home(
+        codex_home: PathBuf,
+        auth_file: Option<&Path>,
+        cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> io::Result<PathBuf> {
+        codex_core::auth::resolve_auth_storage_home(
+            codex_home,
+            auth_file,
+            cli_auth_credentials_store_mode,
+        )
+    }
 }
 
 pub struct LoginServer {

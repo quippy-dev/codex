@@ -8,7 +8,12 @@ use std::path::PathBuf;
 
 // Debug-only test hook: lets integration tests point the server at a temporary
 // managed config file without writing to /etc.
+#[cfg(debug_assertions)]
 const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH";
+#[cfg(debug_assertions)]
+const IGNORE_SYSTEM_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_IGNORE_SYSTEM_CONFIG";
+#[cfg(debug_assertions)]
+const IGNORE_SYSTEM_REQUIREMENTS_ENV_VAR: &str = "CODEX_APP_SERVER_IGNORE_SYSTEM_REQUIREMENTS";
 
 #[derive(Debug, Parser)]
 struct AppServerArgs {
@@ -20,14 +25,24 @@ struct AppServerArgs {
         default_value = AppServerTransport::DEFAULT_LISTEN_URL
     )]
     listen: AppServerTransport,
+
+    /// Override the auth storage location used by app-server auth flows.
+    /// Must point to an `auth.json` path.
+    #[arg(long = "auth-file", value_name = "PATH")]
+    auth_file: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
+    if codex_core::maybe_run_zsh_exec_wrapper_mode()? {
+        return Ok(());
+    }
     arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
         let args = AppServerArgs::parse();
         let managed_config_path = managed_config_path_from_debug_env();
         let loader_overrides = LoaderOverrides {
             managed_config_path,
+            ignore_system_config: ignore_system_config_from_debug_env(),
+            ignore_system_requirements: ignore_system_requirements_from_debug_env(),
             ..Default::default()
         };
         let transport = args.listen;
@@ -37,6 +52,7 @@ fn main() -> anyhow::Result<()> {
             CliConfigOverrides::default(),
             loader_overrides,
             false,
+            args.auth_file,
             transport,
         )
         .await?;
@@ -44,17 +60,50 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+#[cfg(debug_assertions)]
 fn managed_config_path_from_debug_env() -> Option<PathBuf> {
-    #[cfg(debug_assertions)]
-    {
-        if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
-            return if value.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(value))
-            };
-        }
+    if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
+        return if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        };
     }
-
     None
+}
+
+#[cfg(not(debug_assertions))]
+fn managed_config_path_from_debug_env() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(debug_assertions)]
+fn ignore_system_config_from_debug_env() -> bool {
+    bool_from_debug_env(IGNORE_SYSTEM_CONFIG_ENV_VAR)
+}
+
+#[cfg(not(debug_assertions))]
+fn ignore_system_config_from_debug_env() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn ignore_system_requirements_from_debug_env() -> bool {
+    bool_from_debug_env(IGNORE_SYSTEM_REQUIREMENTS_ENV_VAR)
+}
+
+#[cfg(not(debug_assertions))]
+fn ignore_system_requirements_from_debug_env() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn bool_from_debug_env(name: &str) -> bool {
+    if let Ok(value) = std::env::var(name) {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    false
 }
