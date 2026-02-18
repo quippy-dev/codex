@@ -19,6 +19,7 @@ use crate::analytics_client::AnalyticsEventsClient;
 use crate::analytics_client::AppInvocation;
 use crate::analytics_client::build_track_events_context;
 use crate::apps::render_apps_section;
+use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
@@ -175,6 +176,8 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::McpServerRefreshConfig;
+use crate::protocol::ModelRerouteEvent;
+use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
@@ -363,15 +366,11 @@ impl Codex {
 
         let config = Arc::new(config);
         let _ = models_manager
-            .list_models(
-                &config,
-                crate::models_manager::manager::RefreshStrategy::OnlineIfUncached,
-            )
+            .list_models(crate::models_manager::manager::RefreshStrategy::OnlineIfUncached)
             .await;
         let model = models_manager
             .get_default_model(
                 &config.model,
-                &config,
                 crate::models_manager::manager::RefreshStrategy::OnlineIfUncached,
             )
             .await;
@@ -674,7 +673,8 @@ impl TurnContext {
             model_info: &model_info,
             features: &features,
             web_search_mode: self.tools_config.web_search_mode,
-        });
+        })
+        .with_agent_roles(config.agent_roles.clone());
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -1011,7 +1011,8 @@ impl Session {
             model_info: &model_info,
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
-        });
+        })
+        .with_agent_roles(per_turn_config.agent_roles.clone());
 
         let cwd = session_configuration.cwd.clone();
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
@@ -2278,7 +2279,7 @@ impl Session {
 
     /// Emit an exec approval request event and await the user's decision.
     ///
-    /// The request is keyed by `call_id` so matching responses are delivered
+    /// The request is keyed by `call_id` + `approval_id` so matching responses are delivered
     /// to the correct in-flight turn. If the task is aborted, this returns the
     /// default `ReviewDecision` (`Denied`).
     #[allow(clippy::too_many_arguments)]
@@ -2286,32 +2287,36 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         call_id: String,
+        approval_id: Option<String>,
         command: Vec<String>,
         cwd: PathBuf,
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     ) -> ReviewDecision {
+        //  command-level approvals use `call_id`.
+        // `approval_id` is only present for subcommand callbacks (execve intercept)
+        let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
-        let approval_id = call_id.clone();
         let prev_entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(approval_id.clone(), tx_approve)
+                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
                 }
                 None => None,
             }
         };
         if prev_entry.is_some() {
-            warn!("Overwriting existing pending approval for call_id: {approval_id}");
+            warn!("Overwriting existing pending approval for call_id: {effective_approval_id}");
         }
 
         let parsed_cmd = parse_command(&command);
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
+            approval_id,
             turn_id: turn_context.sub_id.clone(),
             command,
             cwd,
@@ -2617,8 +2622,10 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         server_model: String,
     ) -> bool {
-        let requested_model = turn_context.model_info.slug.as_str();
-        if server_model == requested_model {
+        let requested_model = turn_context.model_info.slug.clone();
+        let server_model_normalized = server_model.to_ascii_lowercase();
+        let requested_model_normalized = requested_model.to_ascii_lowercase();
+        if server_model_normalized == requested_model_normalized {
             info!("server reported model {server_model} (matches requested model)");
             return false;
         }
@@ -2628,6 +2635,16 @@ impl Session {
         let warning_message = format!(
             "Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}"
         );
+
+        self.send_event(
+            turn_context,
+            EventMsg::ModelReroute(ModelRerouteEvent {
+                from_model: requested_model.clone(),
+                to_model: server_model.clone(),
+                reason: ModelRerouteReason::HighRiskCyberActivity,
+            }),
+        )
+        .await;
 
         self.send_event(
             turn_context,
@@ -2754,6 +2771,13 @@ impl Session {
         }
         if turn_context.features.enabled(Feature::Apps) {
             items.push(DeveloperInstructions::new(render_apps_section()).into());
+        }
+        if turn_context.features.enabled(Feature::CodexGitCommit)
+            && let Some(commit_message_instruction) = commit_message_trailer_instruction(
+                turn_context.config.commit_attribution.as_deref(),
+            )
+        {
+            items.push(DeveloperInstructions::new(commit_message_instruction).into());
         }
         if let Some(user_instructions) = turn_context.user_instructions.as_deref() {
             items.push(
@@ -3351,21 +3375,23 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::ListSkills { cwds, force_reload } => {
                 handlers::list_skills(&sess, sub.id.clone(), cwds, force_reload).await;
             }
-            Op::ListRemoteSkills => {
-                handlers::list_remote_skills(&sess, &config, sub.id.clone()).await;
-            }
-            Op::DownloadRemoteSkill {
-                hazelnut_id,
-                is_preload,
+            Op::ListRemoteSkills {
+                hazelnut_scope,
+                product_surface,
+                enabled,
             } => {
-                handlers::download_remote_skill(
+                handlers::list_remote_skills(
                     &sess,
                     &config,
                     sub.id.clone(),
-                    hazelnut_id,
-                    is_preload,
+                    hazelnut_scope,
+                    product_surface,
+                    enabled,
                 )
                 .await;
+            }
+            Op::DownloadRemoteSkill { hazelnut_id } => {
+                handlers::export_remote_skill(&sess, &config, sub.id.clone(), hazelnut_id).await;
             }
             Op::Undo => {
                 handlers::undo(&sess, sub.id.clone()).await;
@@ -3447,6 +3473,8 @@ mod handlers {
     use codex_protocol::protocol::McpServerRefreshConfig;
     use codex_protocol::protocol::Op;
     use codex_protocol::protocol::RemoteSkillDownloadedEvent;
+    use codex_protocol::protocol::RemoteSkillHazelnutScope;
+    use codex_protocol::protocol::RemoteSkillProductSurface;
     use codex_protocol::protocol::RemoteSkillSummary;
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::ReviewRequest;
@@ -3912,19 +3940,33 @@ mod handlers {
         sess.send_event_raw(event).await;
     }
 
-    pub async fn list_remote_skills(sess: &Session, config: &Arc<Config>, sub_id: String) {
-        let response = crate::skills::remote::list_remote_skills(config)
-            .await
-            .map(|skills| {
-                skills
-                    .into_iter()
-                    .map(|skill| RemoteSkillSummary {
-                        id: skill.id,
-                        name: skill.name,
-                        description: skill.description,
-                    })
-                    .collect::<Vec<_>>()
-            });
+    pub async fn list_remote_skills(
+        sess: &Session,
+        config: &Arc<Config>,
+        sub_id: String,
+        hazelnut_scope: RemoteSkillHazelnutScope,
+        product_surface: RemoteSkillProductSurface,
+        enabled: Option<bool>,
+    ) {
+        let auth = sess.services.auth_manager.auth().await;
+        let response = crate::skills::remote::list_remote_skills(
+            config,
+            auth.as_ref(),
+            hazelnut_scope,
+            product_surface,
+            enabled,
+        )
+        .await
+        .map(|skills| {
+            skills
+                .into_iter()
+                .map(|skill| RemoteSkillSummary {
+                    id: skill.id,
+                    name: skill.name,
+                    description: skill.description,
+                })
+                .collect::<Vec<_>>()
+        });
 
         match response {
             Ok(skills) => {
@@ -3949,22 +3991,27 @@ mod handlers {
         }
     }
 
-    pub async fn download_remote_skill(
+    pub async fn export_remote_skill(
         sess: &Session,
         config: &Arc<Config>,
         sub_id: String,
         hazelnut_id: String,
-        is_preload: bool,
     ) {
-        match crate::skills::remote::download_remote_skill(config, hazelnut_id.as_str(), is_preload)
-            .await
+        let auth = sess.services.auth_manager.auth().await;
+        match crate::skills::remote::export_remote_skill(
+            config,
+            auth.as_ref(),
+            hazelnut_id.as_str(),
+        )
+        .await
         {
             Ok(result) => {
+                let id = result.id;
                 let event = Event {
                     id: sub_id,
                     msg: EventMsg::RemoteSkillDownloaded(RemoteSkillDownloadedEvent {
-                        id: result.id,
-                        name: result.name,
+                        id: id.clone(),
+                        name: id,
                         path: result.path,
                     }),
                 };
@@ -3974,7 +4021,7 @@ mod handlers {
                 let event = Event {
                     id: sub_id,
                     msg: EventMsg::Error(ErrorEvent {
-                        message: format!("failed to download remote skill {hazelnut_id}: {err}"),
+                        message: format!("failed to export remote skill {hazelnut_id}: {err}"),
                         codex_error_info: Some(CodexErrorInfo::Other),
                     }),
                 };
@@ -4286,7 +4333,8 @@ async fn spawn_review_thread(
         model_info: &review_model_info,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
-    });
+    })
+    .with_agent_roles(config.agent_roles.clone());
 
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
@@ -5882,11 +5930,7 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
-                let config = sess.get_config().await;
-                sess.services
-                    .models_manager
-                    .refresh_if_new_etag(etag, &config)
-                    .await;
+                sess.services.models_manager.refresh_if_new_etag(etag).await;
             }
             ResponseEvent::Completed {
                 response_id: _,
@@ -6137,6 +6181,9 @@ mod tests {
             logo_url: None,
             logo_url_dark: None,
             distribution_channel: None,
+            branding: None,
+            app_metadata: None,
+            labels: None,
             install_url: None,
             is_accessible: true,
             is_enabled: true,

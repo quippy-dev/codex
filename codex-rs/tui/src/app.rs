@@ -1680,11 +1680,11 @@ impl App {
         ));
         let mut model = thread_manager
             .get_models_manager()
-            .get_default_model(&config.model, &config, RefreshStrategy::Offline)
+            .get_default_model(&config.model, RefreshStrategy::Offline)
             .await;
         let available_models = thread_manager
             .get_models_manager()
-            .list_models(&config, RefreshStrategy::Offline)
+            .list_models(RefreshStrategy::Offline)
             .await;
         let exit_info = handle_model_migration_prompt_if_needed(
             tui,
@@ -2106,8 +2106,11 @@ impl App {
                         )
                         .await?
                         {
-                            Some(cwd) => cwd,
-                            None => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Exit => {
+                                return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+                            }
                         };
                         let mut resume_config = if crate::cwds_differ(&current_cwd, &resume_cwd) {
                             match self.rebuild_config_for_cwd(resume_cwd).await {

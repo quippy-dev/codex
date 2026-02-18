@@ -2,6 +2,7 @@ use crate::client_common::tools::FreeformTool;
 use crate::client_common::tools::FreeformToolFormat;
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
+use crate::config::AgentRoleConfig;
 use crate::features::Feature;
 use crate::features::Features;
 use crate::mcp_connection_manager::ToolInfo;
@@ -37,13 +38,14 @@ pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
+    pub agent_roles: BTreeMap<String, AgentRoleConfig>,
     pub python_tool: bool,
+    pub request_rule_enabled: bool,
     pub search_tool: bool,
     pub js_repl_enabled: bool,
     pub js_repl_tools_only: bool,
     pub collab_tools: bool,
     pub collaboration_modes_tools: bool,
-    pub request_rule_enabled: bool,
     pub experimental_supported_tools: Vec<String>,
 }
 
@@ -62,12 +64,12 @@ impl ToolsConfig {
         } = params;
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
         let include_js_repl = features.enabled(Feature::JsRepl);
-        let include_python_tool = features.enabled(Feature::PythonTool);
         let include_js_repl_tools_only =
             include_js_repl && features.enabled(Feature::JsReplToolsOnly);
+        let include_python_tool = features.enabled(Feature::PythonTool);
+        let request_rule_enabled = features.enabled(Feature::RequestRule);
         let include_collab_tools = features.enabled(Feature::Collab);
         let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
-        let request_rule_enabled = features.enabled(Feature::RequestRule);
         let include_search_tool = features.enabled(Feature::Apps);
 
         let shell_type = if include_python_tool || !features.enabled(Feature::ShellTool) {
@@ -99,15 +101,21 @@ impl ToolsConfig {
             shell_type,
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
+            agent_roles: BTreeMap::new(),
             python_tool: include_python_tool,
+            request_rule_enabled,
             search_tool: include_search_tool,
             js_repl_enabled: include_js_repl,
             js_repl_tools_only: include_js_repl_tools_only,
             collab_tools: include_collab_tools,
             collaboration_modes_tools: include_collaboration_modes_tools,
-            request_rule_enabled,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
         }
+    }
+
+    pub fn with_agent_roles(mut self, agent_roles: BTreeMap<String, AgentRoleConfig>) -> Self {
+        self.agent_roles = agent_roles;
+        self
     }
 }
 
@@ -533,7 +541,7 @@ fn create_collab_input_items_schema() -> JsonSchema {
     }
 }
 
-fn create_spawn_agent_tool() -> ToolSpec {
+fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "message".to_string(),
@@ -548,24 +556,9 @@ fn create_spawn_agent_tool() -> ToolSpec {
         (
             "agent_type".to_string(),
             JsonSchema::String {
-                description: Some(crate::agent::role::spawn_tool_spec::build()),
-            },
-        ),
-        (
-            "spawn_mode".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Spawn behavior: spawn (default), fork (preserve history), or watchdog (idle-time check-ins)."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "interval_s".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Watchdog interval in seconds; used only when spawn_mode = watchdog.".to_string(),
-                ),
+                description: Some(crate::agent::role::spawn_tool_spec::build(
+                    &config.agent_roles,
+                )),
             },
         ),
     ]);
@@ -585,35 +578,33 @@ fn create_spawn_agent_tool() -> ToolSpec {
 }
 
 fn create_send_input_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "id".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Agent id to message (from spawn_agent). Optional: omit (or use \"parent\") to message the parent thread when available."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "message".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Legacy plain-text message to send to the agent. Use either message or items."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert("items".to_string(), create_collab_input_items_schema());
-    properties.insert(
-        "interrupt".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
-                    .to_string(),
-            ),
-        },
-    );
+    let properties = BTreeMap::from([
+        (
+            "id".to_string(),
+            JsonSchema::String {
+                description: Some("Agent id to message (from spawn_agent).".to_string()),
+            },
+        ),
+        (
+            "message".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Legacy plain-text message to send to the agent. Use either message or items."
+                        .to_string(),
+                ),
+            },
+        ),
+        ("items".to_string(), create_collab_input_items_schema()),
+        (
+            "interrupt".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                        .to_string(),
+                ),
+            },
+        ),
+    ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_input".to_string(),
@@ -623,94 +614,30 @@ fn create_send_input_tool() -> ToolSpec {
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        },
-    })
-}
-
-fn create_resume_agent_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
-        "id".to_string(),
-        JsonSchema::String {
-            description: Some("Agent id to resume (from spawn_agent)".to_string()),
-        },
-    )]);
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "resume_agent".to_string(),
-        description: "Resume a previously closed agent thread by id.".to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
             required: Some(vec!["id".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
 }
 
-fn create_compact_parent_context_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "reason".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Optional short reason describing why the parent appears stuck (for example, repeated non-progress loop)."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "evidence".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Optional concrete evidence of non-progress (for example, repeated identical replies with no tool/file actions)."
-                    .to_string(),
-            ),
-        },
-    );
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "compact_parent_context".to_string(),
-        description: "Watchdog-only: request context compaction for the watchdog's parent thread when it is idle and appears stuck in a non-progress loop."
-            .to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        },
-    })
-}
-
-fn create_list_agents_tool() -> ToolSpec {
+fn create_resume_agent_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
         "id".to_string(),
         JsonSchema::String {
-            description: Some(
-                "Identifier of the parent agent whose spawned agents to list. Defaults to the current agent."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "recursive".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "When true (default), include all descendants recursively. When false, include only direct children."
-                    .to_string(),
-            ),
+            description: Some("Agent id to resume.".to_string()),
         },
     );
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "list_agents".to_string(),
-        description: "List agents spawned by an agent, optionally recursively.".to_string(),
+        name: "resume_agent".to_string(),
+        description:
+            "Resume a previously closed agent by id so it can receive send_input and wait calls."
+                .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: None,
+            required: Some(vec!["id".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1568,10 +1495,6 @@ pub(crate) fn build_specs(
         builder.register_handler("shell_command", shell_command_handler);
     }
 
-    if config.python_tool {
-        register_python_tool(&mut builder, config.request_rule_enabled);
-    }
-
     if mcp_tools.is_some() {
         builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
         builder.push_spec_with_parallel_support(create_list_mcp_resource_templates_tool(), true);
@@ -1594,6 +1517,10 @@ pub(crate) fn build_specs(
     if config.collaboration_modes_tools {
         builder.push_spec(create_request_user_input_tool());
         builder.register_handler("request_user_input", request_user_input_handler);
+    }
+
+    if config.python_tool {
+        register_python_tool(&mut builder, config.request_rule_enabled);
     }
 
     if config.search_tool
@@ -1671,18 +1598,14 @@ pub(crate) fn build_specs(
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
-        builder.push_spec(create_spawn_agent_tool());
+        builder.push_spec(create_spawn_agent_tool(config));
         builder.push_spec(create_send_input_tool());
         builder.push_spec(create_resume_agent_tool());
-        builder.push_spec(create_compact_parent_context_tool());
-        builder.push_spec(create_list_agents_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
-        builder.register_handler("compact_parent_context", multi_agent_handler.clone());
-        builder.register_handler("list_agents", multi_agent_handler.clone());
         builder.register_handler("wait", multi_agent_handler.clone());
         builder.register_handler("close_agent", multi_agent_handler);
     }
@@ -1974,7 +1897,13 @@ mod tests {
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(
             &tools,
-            &["spawn_agent", "send_input", "wait", "close_agent"],
+            &[
+                "spawn_agent",
+                "send_input",
+                "resume_agent",
+                "wait",
+                "close_agent",
+            ],
         );
     }
 
