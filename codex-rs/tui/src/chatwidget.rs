@@ -3772,6 +3772,7 @@ impl ChatWidget {
             // flush it into history every time another cell is inserted, the
             // transcript gets spammed with repeated identical "Subagents ..." blocks.
             if active.as_any().is::<SubagentStatusCell>() {
+                self.active_cell = Some(active);
                 return;
             }
             self.needs_final_message_separator = true;
