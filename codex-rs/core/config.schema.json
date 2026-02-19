@@ -537,15 +537,6 @@
       },
       "type": "object"
     },
-    "ModeKind": {
-      "description": "Initial collaboration mode to use when the TUI starts.",
-      "enum": [
-        "plan",
-        "default",
-        "execute"
-      ],
-      "type": "string"
-    },
     "ModelProviderInfo": {
       "additionalProperties": false,
       "description": "Serializable representation of a provider definition.",

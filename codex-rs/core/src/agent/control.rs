@@ -3,10 +3,12 @@ use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
 use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
+use crate::agent::status::is_final;
 use crate::config::Config;
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
+use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
@@ -110,6 +112,7 @@ impl AgentControl {
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
+        let notification_source = session_source.clone();
         let reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
@@ -129,7 +132,7 @@ impl AgentControl {
         // to subscribe or drain this newly created thread.
         // TODO(jif) add helper for drain
         state.notify_thread_created(new_thread.thread_id);
-
+        self.maybe_start_completion_watcher(new_thread.thread_id, notification_source);
         self.send_input(new_thread.thread_id, items).await?;
 
         Ok(new_thread.thread_id)
@@ -177,6 +180,7 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
+        let notification_source = session_source.clone();
         let reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
@@ -201,7 +205,7 @@ impl AgentControl {
             .await?;
         reservation.commit(new_thread.thread_id);
         state.notify_thread_created(new_thread.thread_id);
-
+        self.maybe_start_completion_watcher(new_thread.thread_id, Some(notification_source));
         self.send_input(new_thread.thread_id, items).await?;
 
         Ok(new_thread.thread_id)
@@ -215,6 +219,7 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
+        let notification_source = session_source.clone();
         let reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
@@ -231,6 +236,7 @@ impl AgentControl {
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state.notify_thread_created(resumed_thread.thread_id);
+        self.maybe_start_completion_watcher(resumed_thread.thread_id, Some(notification_source));
 
         Ok(resumed_thread.thread_id)
     }
@@ -367,6 +373,54 @@ impl AgentControl {
             return None;
         };
         thread.total_token_usage().await
+    }
+
+    /// Starts a detached watcher for sub-agents spawned from another thread.
+    ///
+    /// This is only enabled for `SubAgentSource::ThreadSpawn`, where a parent thread exists and
+    /// can receive completion notifications.
+    fn maybe_start_completion_watcher(
+        &self,
+        child_thread_id: ThreadId,
+        session_source: Option<SessionSource>,
+    ) {
+        let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id, ..
+        })) = session_source
+        else {
+            return;
+        };
+        let control = self.clone();
+        tokio::spawn(async move {
+            let mut status_rx = match control.subscribe_status(child_thread_id).await {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
+            let mut status = status_rx.borrow().clone();
+            while !is_final(&status) {
+                if status_rx.changed().await.is_err() {
+                    status = control.get_status(child_thread_id).await;
+                    break;
+                }
+                status = status_rx.borrow().clone();
+            }
+            if !is_final(&status) {
+                return;
+            }
+
+            let Ok(state) = control.upgrade() else {
+                return;
+            };
+            let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
+                return;
+            };
+            parent_thread
+                .inject_user_message_without_turn(format_subagent_notification_message(
+                    &child_thread_id.to_string(),
+                    &status,
+                ))
+                .await;
+        });
     }
 
     pub(crate) async fn watchdog_targets(&self, agent_ids: &[ThreadId]) -> HashSet<ThreadId> {
