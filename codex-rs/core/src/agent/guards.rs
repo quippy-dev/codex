@@ -21,6 +21,14 @@ pub(crate) struct Guards {
     total_count: AtomicUsize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadCapSnapshot {
+    pub(crate) tracked_thread_ids: Vec<ThreadId>,
+    pub(crate) tracked_count: usize,
+    pub(crate) total_count: usize,
+    pub(crate) in_flight_reservations: usize,
+}
+
 /// Initial agent is depth 0.
 pub(crate) const MAX_THREAD_SPAWN_DEPTH: i32 = 1;
 
@@ -64,6 +72,19 @@ impl Guards {
             state: Arc::clone(self),
             active: true,
         })
+    }
+
+    pub(crate) fn thread_cap_snapshot(&self) -> ThreadCapSnapshot {
+        let mut tracked_thread_ids = self.tracked_thread_ids();
+        tracked_thread_ids.sort_by_key(ToString::to_string);
+        let tracked_count = tracked_thread_ids.len();
+        let total_count = self.total_count.load(Ordering::Acquire);
+        ThreadCapSnapshot {
+            tracked_thread_ids,
+            tracked_count,
+            total_count,
+            in_flight_reservations: total_count.saturating_sub(tracked_count),
+        }
     }
 
     pub(crate) fn release_spawned_thread(&self, thread_id: ThreadId) {
@@ -242,5 +263,35 @@ mod tests {
             .reserve_spawn_slot(Some(1))
             .expect("slot released after second thread removal");
         drop(reservation);
+    }
+
+    #[test]
+    fn thread_cap_snapshot_reports_in_flight_reservations() {
+        let guards = Arc::new(Guards::default());
+
+        let reservation = guards.reserve_spawn_slot(Some(2)).expect("reserve slot");
+        let snapshot = guards.thread_cap_snapshot();
+        assert_eq!(
+            snapshot,
+            ThreadCapSnapshot {
+                tracked_thread_ids: Vec::new(),
+                tracked_count: 0,
+                total_count: 1,
+                in_flight_reservations: 1,
+            }
+        );
+
+        let thread_id = ThreadId::new();
+        reservation.commit(thread_id);
+        let snapshot = guards.thread_cap_snapshot();
+        assert_eq!(
+            snapshot,
+            ThreadCapSnapshot {
+                tracked_thread_ids: vec![thread_id],
+                tracked_count: 1,
+                total_count: 1,
+                in_flight_reservations: 0,
+            }
+        );
     }
 }

@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Control-plane handle for multi-agent operations.
@@ -132,8 +133,9 @@ impl AgentControl {
         // to subscribe or drain this newly created thread.
         // TODO(jif) add helper for drain
         state.notify_thread_created(new_thread.thread_id);
+        self.submit_initial_input_or_cleanup(&state, new_thread.thread_id, items)
+            .await?;
         self.maybe_start_completion_watcher(new_thread.thread_id, notification_source);
-        self.send_input(new_thread.thread_id, items).await?;
 
         Ok(new_thread.thread_id)
     }
@@ -205,8 +207,9 @@ impl AgentControl {
             .await?;
         reservation.commit(new_thread.thread_id);
         state.notify_thread_created(new_thread.thread_id);
+        self.submit_initial_input_or_cleanup(&state, new_thread.thread_id, items)
+            .await?;
         self.maybe_start_completion_watcher(new_thread.thread_id, Some(notification_source));
-        self.send_input(new_thread.thread_id, items).await?;
 
         Ok(new_thread.thread_id)
     }
@@ -620,20 +623,62 @@ impl AgentControl {
             .ok_or_else(|| CodexErr::UnsupportedOperation("thread manager dropped".to_string()))
     }
 
+    async fn submit_initial_input_or_cleanup(
+        &self,
+        state: &ThreadManagerState,
+        thread_id: ThreadId,
+        items: Vec<UserInput>,
+    ) -> CodexResult<()> {
+        if let Err(err) = self.send_input(thread_id, items).await {
+            let _ = state.send_op(thread_id, Op::Shutdown {}).await;
+            let _ = state.remove_thread(&thread_id).await;
+            self.guards.release_spawned_thread(thread_id);
+            return Err(err);
+        }
+        Ok(())
+    }
+
     async fn reserve_spawn_slot_with_reconcile(
         &self,
         state: &ThreadManagerState,
         max_threads: Option<usize>,
     ) -> CodexResult<crate::agent::guards::SpawnReservation> {
         self.reconcile_stale_guard_slots(state).await;
-        match self.guards.reserve_spawn_slot(max_threads) {
-            Ok(reservation) => Ok(reservation),
-            Err(CodexErr::AgentLimitReached { .. }) => {
-                self.reconcile_stale_guard_slots(state).await;
-                self.guards.reserve_spawn_slot(max_threads)
-            }
-            Err(err) => Err(err),
+        let first_attempt = self.guards.reserve_spawn_slot(max_threads);
+        match first_attempt {
+            Ok(reservation) => return Ok(reservation),
+            Err(CodexErr::AgentLimitReached { .. }) => {}
+            Err(err) => return Err(err),
         }
+
+        self.reconcile_stale_guard_slots(state).await;
+        let second_attempt = self.guards.reserve_spawn_slot(max_threads);
+        if let Err(CodexErr::AgentLimitReached { max_threads }) = second_attempt.as_ref() {
+            let live_thread_ids = state
+                .list_threads()
+                .await
+                .into_iter()
+                .map(|(thread_id, _)| thread_id)
+                .collect::<HashSet<_>>();
+            let snapshot = self.guards.thread_cap_snapshot();
+            let stale_tracked = snapshot
+                .tracked_thread_ids
+                .iter()
+                .filter(|thread_id| !live_thread_ids.contains(thread_id))
+                .count();
+            warn!(
+                max_threads,
+                guard_total_count = snapshot.total_count,
+                guard_tracked_count = snapshot.tracked_count,
+                guard_in_flight_reservations = snapshot.in_flight_reservations,
+                live_thread_count = live_thread_ids.len(),
+                stale_tracked_count = stale_tracked,
+                tracked_thread_ids = ?snapshot.tracked_thread_ids,
+                live_thread_ids = ?live_thread_ids,
+                "agent thread cap reached after stale-slot reconciliation"
+            );
+        }
+        second_attempt
     }
 
     async fn reconcile_stale_guard_slots(&self, state: &ThreadManagerState) {
@@ -1243,6 +1288,42 @@ mod tests {
             .shutdown_agent(replacement_agent_id)
             .await
             .expect("shutdown replacement agent");
+    }
+
+    #[tokio::test]
+    async fn submit_initial_input_cleanup_releases_guard_slot_after_send_error() {
+        let max_threads = 1usize;
+        let (_home, config) = test_config_with_cli_overrides(vec![(
+            "agents.max_threads".to_string(),
+            TomlValue::Integer(max_threads as i64),
+        )])
+        .await;
+        let manager = ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.clone(),
+        );
+        let control = manager.agent_control();
+
+        let missing_thread_id = ThreadId::new();
+        let reservation = control
+            .guards
+            .reserve_spawn_slot(Some(max_threads))
+            .expect("reserve slot");
+        reservation.commit(missing_thread_id);
+
+        let state = control.upgrade().expect("thread manager state");
+        let err = control
+            .submit_initial_input_or_cleanup(&state, missing_thread_id, text_input("hello"))
+            .await
+            .expect_err("send_input should fail for missing thread");
+        assert_matches!(err, CodexErr::ThreadNotFound(id) if id == missing_thread_id);
+
+        let replacement = control
+            .spawn_agent(config, text_input("replacement"), None)
+            .await
+            .expect("slot should be released after cleanup");
+        let _ = control.shutdown_agent(replacement).await;
     }
 
     #[tokio::test]

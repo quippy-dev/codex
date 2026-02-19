@@ -372,6 +372,17 @@ mod send_input {
             })?,
         };
         let input_items = parse_multi_agent_input(args.message, args.items)?;
+        if session
+            .services
+            .agent_control
+            .watchdog_targets(&[receiver_thread_id])
+            .await
+            .contains(&receiver_thread_id)
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "send_input cannot target watchdog handle {receiver_thread_id}; target the watchdog owner agent instead"
+            )));
+        }
         let prompt = input_preview(&input_items);
         if args.interrupt {
             session
@@ -696,6 +707,10 @@ mod list_agents {
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
         let owner_thread_id = match args.id.as_deref().map(str::trim) {
+            Some(id) if !id.is_empty() && matches!(id, "parent" | "root") => session
+                .parent_thread_id()
+                .await
+                .unwrap_or(session.conversation_id),
             Some(id) if !id.is_empty() && !matches!(id, "self") => agent_id(id)?,
             _ => session.conversation_id,
         };
@@ -1023,62 +1038,59 @@ pub mod close_agent {
                 .into(),
             )
             .await;
-        let status = match session
+        if let Err(err) = session
             .services
             .agent_control
             .subscribe_status(agent_id)
             .await
         {
-            Ok(mut status_rx) => status_rx.borrow_and_update().clone(),
-            Err(err) => {
-                let removed_watchdog = session
-                    .services
-                    .agent_control
-                    .unregister_watchdog(agent_id)
-                    .await;
-                if let Some(helper_id) = removed_watchdog.and_then(|entry| entry.active_helper_id) {
-                    let _ = session
-                        .services
-                        .agent_control
-                        .shutdown_agent(helper_id)
-                        .await;
-                }
+            let removed_watchdog = session
+                .services
+                .agent_control
+                .unregister_watchdog(agent_id)
+                .await;
+            if let Some(helper_id) = removed_watchdog.and_then(|entry| entry.active_helper_id) {
                 let _ = session
                     .services
                     .agent_control
-                    .shutdown_agent(agent_id)
+                    .shutdown_agent(helper_id)
                     .await;
-                let status = session.services.agent_control.get_status(agent_id).await;
-                session
-                    .send_event(
-                        &turn,
-                        CollabCloseEndEvent {
-                            call_id: call_id.clone(),
-                            sender_thread_id: session.conversation_id,
-                            receiver_thread_id: agent_id,
-                            status: status.clone(),
-                        }
-                        .into(),
-                    )
-                    .await;
-                return if matches!(err, CodexErr::ThreadNotFound(_)) {
-                    let content = serde_json::to_string(&CloseAgentResult { status }).map_err(
-                        |serialize_err| {
-                            FunctionCallError::Fatal(format!(
-                                "failed to serialize close_agent result: {serialize_err}"
-                            ))
-                        },
-                    )?;
-
-                    Ok(ToolOutput::Function {
-                        body: FunctionCallOutputBody::Text(content),
-                        success: Some(true),
-                    })
-                } else {
-                    Err(multi_agent_tool_error(agent_id, err))
-                };
             }
-        };
+            let _ = session
+                .services
+                .agent_control
+                .shutdown_agent(agent_id)
+                .await;
+            let status = session.services.agent_control.get_status(agent_id).await;
+            session
+                .send_event(
+                    &turn,
+                    CollabCloseEndEvent {
+                        call_id: call_id.clone(),
+                        sender_thread_id: session.conversation_id,
+                        receiver_thread_id: agent_id,
+                        status: status.clone(),
+                    }
+                    .into(),
+                )
+                .await;
+            return if matches!(err, CodexErr::ThreadNotFound(_)) {
+                let content = serde_json::to_string(&CloseAgentResult { status }).map_err(
+                    |serialize_err| {
+                        FunctionCallError::Fatal(format!(
+                            "failed to serialize close_agent result: {serialize_err}"
+                        ))
+                    },
+                )?;
+
+                Ok(ToolOutput::Function {
+                    body: FunctionCallOutputBody::Text(content),
+                    success: Some(true),
+                })
+            } else {
+                Err(multi_agent_tool_error(agent_id, err))
+            };
+        }
         let removed_watchdog = session
             .services
             .agent_control
@@ -1100,6 +1112,7 @@ pub mod close_agent {
             Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => Ok(()),
             Err(err) => Err(multi_agent_tool_error(agent_id, err)),
         };
+        let status = session.services.agent_control.get_status(agent_id).await;
         session
             .send_event(
                 &turn,
@@ -1136,6 +1149,11 @@ fn multi_agent_spawn_error(err: CodexErr) -> FunctionCallError {
             FunctionCallError::RespondToModel("multi-agent manager unavailable".to_string())
         }
         CodexErr::UnsupportedOperation(reason) => FunctionCallError::RespondToModel(reason),
+        CodexErr::AgentLimitReached { max_threads } => FunctionCallError::RespondToModel(format!(
+            "multi-agent spawn failed: agent thread limit reached (max {max_threads}). \
+                 Close completed agents with close_agent, or inspect active threads with \
+                 list_agents(all=true)."
+        )),
         err => FunctionCallError::RespondToModel(format!("multi-agent spawn failed: {err}")),
     }
 }
@@ -1346,6 +1364,19 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResultForTest {
         agent_id: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct ListAgentsResultForTest {
+        agents: Vec<ListAgentEntryForTest>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct ListAgentEntryForTest {
+        id: String,
+        parent_id: String,
+        status: AgentStatus,
+        depth: usize,
     }
 
     async fn spawn_watchdog_for_test(
@@ -1669,6 +1700,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_agents_accepts_root_alias_for_subagents() {
+        let (mut root_session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        root_session.services.agent_control = manager.agent_control();
+        let parent_thread_id = root_session.conversation_id;
+        let child_id = manager
+            .agent_control()
+            .spawn_agent_handle(
+                turn.config.as_ref().clone(),
+                Some(thread_spawn_source(parent_thread_id, 1)),
+            )
+            .await
+            .expect("spawn child handle");
+        let child_session = manager
+            .get_thread(child_id)
+            .await
+            .expect("child thread should exist")
+            .codex
+            .session
+            .clone();
+
+        let invocation = invocation(
+            child_session.clone(),
+            Arc::new(turn),
+            "list_agents",
+            function_payload(json!({
+                "id": "root",
+                "recursive": false
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("list_agents should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: ListAgentsResultForTest =
+            serde_json::from_str(&content).expect("list_agents result should be json");
+        let expected_status = manager.agent_control().get_status(child_id).await;
+        assert_eq!(
+            result,
+            ListAgentsResultForTest {
+                agents: vec![ListAgentEntryForTest {
+                    id: child_id.to_string(),
+                    parent_id: parent_thread_id.to_string(),
+                    status: expected_status,
+                    depth: 1,
+                }],
+            }
+        );
+        assert_eq!(success, Some(true));
+
+        let _ = child_session
+            .services
+            .agent_control
+            .shutdown_agent(child_id)
+            .await;
+    }
+
+    #[tokio::test]
     async fn send_input_interrupts_before_prompt() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
@@ -1707,6 +1804,106 @@ mod tests {
             .submit(Op::Shutdown {})
             .await
             .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn send_input_rejects_watchdog_handle_target() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let owner_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start owner thread");
+        session.conversation_id = owner_thread.thread_id;
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let watchdog_id = spawn_watchdog_for_test(session.clone(), turn.clone()).await;
+
+        let invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "send_input",
+            function_payload(json!({
+                "id": watchdog_id.to_string(),
+                "message": "hi"
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("send_input should reject watchdog handles");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "send_input cannot target watchdog handle {watchdog_id}; target the watchdog owner agent instead"
+            ))
+        );
+
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(watchdog_id)
+            .await;
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(owner_thread.thread_id)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn send_input_interrupt_rejects_watchdog_handle_target() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let owner_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start owner thread");
+        session.conversation_id = owner_thread.thread_id;
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let watchdog_id = spawn_watchdog_for_test(session.clone(), turn.clone()).await;
+
+        let invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "send_input",
+            function_payload(json!({
+                "id": watchdog_id.to_string(),
+                "message": "hi",
+                "interrupt": true
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("send_input should reject watchdog handles");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(format!(
+                "send_input cannot target watchdog handle {watchdog_id}; target the watchdog owner agent instead"
+            ))
+        );
+        let interrupted_watchdog = manager
+            .captured_ops()
+            .iter()
+            .any(|(id, op)| *id == watchdog_id && matches!(op, Op::Interrupt));
+        assert_eq!(interrupted_watchdog, false);
+
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(watchdog_id)
+            .await;
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(owner_thread.thread_id)
+            .await;
     }
 
     #[tokio::test]
@@ -2395,7 +2592,9 @@ mod tests {
         };
         let result: close_agent::CloseAgentResult =
             serde_json::from_str(&content).expect("close_agent result should be json");
-        assert_eq!(result.status, status_before);
+        let status_after = manager.agent_control().get_status(agent_id).await;
+        assert_eq!(result.status, status_after);
+        assert_ne!(result.status, status_before);
         assert_eq!(success, Some(true));
 
         let ops = manager.captured_ops();
@@ -2404,7 +2603,6 @@ mod tests {
             .any(|(id, op)| *id == agent_id && matches!(op, Op::Shutdown));
         assert_eq!(submitted_shutdown, true);
 
-        let status_after = manager.agent_control().get_status(agent_id).await;
         assert_eq!(status_after, AgentStatus::NotFound);
     }
 

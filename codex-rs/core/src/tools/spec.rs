@@ -590,7 +590,7 @@ fn create_send_input_tool() -> ToolSpec {
         "id".to_string(),
         JsonSchema::String {
             description: Some(
-                "Agent id to message (from spawn_agent). Optional: omit (or use \"parent\"/\"root\") to message the parent thread when available."
+                "Agent id to message (from spawn_agent). Optional: omit (or use \"parent\"/\"root\") to message the parent thread when available. Watchdog handle ids are rejected."
                     .to_string(),
             ),
         },
@@ -692,7 +692,7 @@ fn create_list_agents_tool() -> ToolSpec {
         "id".to_string(),
         JsonSchema::String {
             description: Some(
-                "Identifier of the parent agent whose spawned agents to list. Defaults to the current agent."
+                "Identifier of the parent agent whose spawned agents to list. Defaults to the current agent; pass \"root\" to target the root agent."
                     .to_string(),
             ),
         },
@@ -710,7 +710,7 @@ fn create_list_agents_tool() -> ToolSpec {
         "all".to_string(),
         JsonSchema::Boolean {
             description: Some(
-                "When true, ignore id/recursive and return all tracked open agents that currently count toward this session's agent limit."
+                "When true, ignore id/recursive and return all tracked agents that currently count toward this session's agent-thread cap (useful for limit diagnostics)."
                     .to_string(),
             ),
         },
@@ -854,8 +854,9 @@ fn create_close_agent_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "close_agent".to_string(),
-        description: "Close an agent when it is no longer needed and return its last known status."
-            .to_string(),
+        description:
+            "Close an agent when it is no longer needed. Returns the status observed at close time."
+                .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
