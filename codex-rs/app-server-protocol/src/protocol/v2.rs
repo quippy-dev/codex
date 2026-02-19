@@ -18,6 +18,7 @@ use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::mcp::Resource as McpResource;
 use codex_protocol::mcp::ResourceTemplate as McpResourceTemplate;
 use codex_protocol::mcp::Tool as McpTool;
+use codex_protocol::models::MessagePhase as CoreMessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -1837,6 +1838,29 @@ pub struct ThreadLoadedListResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum ThreadStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Active {
+        active_flags: Vec<ThreadActiveFlag>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadActiveFlag {
+    WaitingOnApproval,
+    WaitingOnUserInput,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadReadParams {
@@ -2152,6 +2176,8 @@ pub struct Thread {
     /// Unix timestamp (in seconds) when the thread was last updated.
     #[ts(type = "number")]
     pub updated_at: i64,
+    /// Current runtime status for the thread.
+    pub status: ThreadStatus,
     /// [UNSTABLE] Path to the thread on disk.
     pub path: Option<PathBuf>,
     /// Working directory captured for the thread.
@@ -2550,6 +2576,24 @@ impl From<CoreUserInput> for UserInput {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum MessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+impl From<CoreMessagePhase> for MessagePhase {
+    fn from(value: CoreMessagePhase) -> Self {
+        match value {
+            CoreMessagePhase::Commentary => Self::Commentary,
+            CoreMessagePhase::FinalAnswer => Self::FinalAnswer,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
@@ -2559,7 +2603,12 @@ pub enum ThreadItem {
     UserMessage { id: String, content: Vec<UserInput> },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
-    AgentMessage { id: String, text: String },
+    AgentMessage {
+        id: String,
+        text: String,
+        #[serde(default)]
+        phase: Option<MessagePhase>,
+    },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     /// EXPERIMENTAL - proposed plan item content. The completed plan item is
@@ -2710,7 +2759,11 @@ impl From<CoreTurnItem> for ThreadItem {
                         CoreAgentMessageContent::Text { text } => text,
                     })
                     .collect::<String>();
-                ThreadItem::AgentMessage { id: agent.id, text }
+                ThreadItem::AgentMessage {
+                    id: agent.id,
+                    text,
+                    phase: agent.phase.map(Into::into),
+                }
             }
             CoreTurnItem::Plan(plan) => ThreadItem::Plan {
                 id: plan.id,
@@ -2911,6 +2964,14 @@ pub struct McpToolCallError {
 #[ts(export_to = "v2/")]
 pub struct ThreadStartedNotification {
     pub thread: Thread,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadStatusChangedNotification {
+    pub thread_id: String,
+    pub status: ThreadStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -3163,6 +3224,37 @@ pub struct WindowsWorldWritableWarningNotification {
     pub sample_paths: Vec<String>,
     pub extra_count: usize,
     pub failed_scan: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum WindowsSandboxSetupMode {
+    Elevated,
+    Unelevated,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WindowsSandboxSetupStartParams {
+    pub mode: WindowsSandboxSetupMode,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WindowsSandboxSetupStartResponse {
+    pub started: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct WindowsSandboxSetupCompletedNotification {
+    pub mode: WindowsSandboxSetupMode,
+    pub success: bool,
+    pub error: Option<String>,
 }
 
 /// Deprecated: Use `ContextCompaction` item type instead.
@@ -3485,6 +3577,7 @@ mod tests {
     use codex_protocol::items::TurnItem;
     use codex_protocol::items::UserMessageItem;
     use codex_protocol::items::WebSearchItem;
+    use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
     use codex_protocol::protocol::ReadOnlyAccess as CoreReadOnlyAccess;
@@ -3685,6 +3778,24 @@ mod tests {
             ThreadItem::AgentMessage {
                 id: "agent-1".to_string(),
                 text: "Hello world".to_string(),
+                phase: None,
+            }
+        );
+
+        let agent_item_with_phase = TurnItem::AgentMessage(AgentMessageItem {
+            id: "agent-2".to_string(),
+            content: vec![AgentMessageContent::Text {
+                text: "final".to_string(),
+            }],
+            phase: Some(CoreMessagePhase::FinalAnswer),
+        });
+
+        assert_eq!(
+            ThreadItem::from(agent_item_with_phase),
+            ThreadItem::AgentMessage {
+                id: "agent-2".to_string(),
+                text: "final".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
             }
         );
 

@@ -4,6 +4,7 @@ use crate::codex::SteerInputError;
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::Result as CodexResult;
 use crate::features::Feature;
+use crate::file_watcher::WatchRegistration;
 use crate::protocol::Event;
 use crate::protocol::Op;
 use crate::protocol::Submission;
@@ -12,6 +13,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -34,15 +36,21 @@ pub struct ThreadConfigSnapshot {
 pub struct CodexThread {
     codex: Codex,
     rollout_path: Option<PathBuf>,
+    _watch_registration: WatchRegistration,
 }
 
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
-    pub(crate) fn new(codex: Codex, rollout_path: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        codex: Codex,
+        rollout_path: Option<PathBuf>,
+        watch_registration: WatchRegistration,
+    ) -> Self {
         Self {
             codex,
             rollout_path,
+            _watch_registration: watch_registration,
         }
     }
 
@@ -81,6 +89,10 @@ impl CodexThread {
 
     pub(crate) fn last_completed_turn_used_collab_send_input(&self) -> bool {
         self.codex.last_completed_turn_used_collab_send_input()
+    }
+
+    pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
+        self.codex.session.total_token_usage().await
     }
 
     pub fn rollout_path(&self) -> Option<PathBuf> {
