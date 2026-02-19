@@ -3716,17 +3716,54 @@ async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
 
     chat.set_feature_enabled(Feature::CollaborationModes, true);
 
+    let default_footer = render_bottom_popup(&chat, 120);
+    assert!(
+        !default_footer.contains("Default mode"),
+        "default mode footer indicator should remain hidden: {default_footer:?}"
+    );
+    assert!(
+        !default_footer.contains("Plan mode"),
+        "default mode footer should not show plan label: {default_footer:?}"
+    );
+    assert!(
+        !default_footer.contains("Execute mode"),
+        "default mode footer should not show execute label: {default_footer:?}"
+    );
+
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Execute);
     assert_eq!(chat.current_collaboration_mode(), &initial);
+    let execute_footer = render_bottom_popup(&chat, 120);
+    assert!(
+        execute_footer.contains("Execute mode (shift+tab to cycle)"),
+        "execute mode footer indicator should be visible: {execute_footer:?}"
+    );
 
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
     assert_eq!(chat.current_collaboration_mode(), &initial);
+    let plan_footer = render_bottom_popup(&chat, 120);
+    assert!(
+        plan_footer.contains("Plan mode (shift+tab to cycle)"),
+        "plan mode footer indicator should be visible: {plan_footer:?}"
+    );
 
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
     assert_eq!(chat.current_collaboration_mode(), &initial);
+    let cycled_default_footer = render_bottom_popup(&chat, 120);
+    assert!(
+        !cycled_default_footer.contains("Default mode"),
+        "default mode footer indicator should remain hidden: {cycled_default_footer:?}"
+    );
+    assert!(
+        !cycled_default_footer.contains("Plan mode"),
+        "default mode footer should not show plan label: {cycled_default_footer:?}"
+    );
+    assert!(
+        !cycled_default_footer.contains("Execute mode"),
+        "default mode footer should not show execute label: {cycled_default_footer:?}"
+    );
 
     chat.on_task_started();
     let before = chat.active_collaboration_mode_kind();
