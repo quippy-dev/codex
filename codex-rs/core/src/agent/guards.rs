@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 #[derive(Default)]
 pub(crate) struct Guards {
     threads_set: Mutex<HashSet<ThreadId>>,
+    known_threads_set: Mutex<HashSet<ThreadId>>,
     total_count: AtomicUsize,
 }
 
@@ -55,6 +56,14 @@ impl Guards {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         threads.iter().copied().collect()
+    }
+
+    pub(crate) fn was_spawned_thread(&self, thread_id: ThreadId) -> bool {
+        let known_threads = self
+            .known_threads_set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        known_threads.contains(&thread_id)
     }
 
     pub(crate) fn reserve_spawn_slot(
@@ -106,6 +115,11 @@ impl Guards {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         threads.insert(thread_id);
+        let mut known_threads = self
+            .known_threads_set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        known_threads.insert(thread_id);
     }
 
     fn try_increment_spawned(&self, max_threads: usize) -> bool {
@@ -293,5 +307,16 @@ mod tests {
                 in_flight_reservations: 0,
             }
         );
+    }
+
+    #[test]
+    fn was_spawned_thread_tracks_released_thread_ids() {
+        let guards = Arc::new(Guards::default());
+        let reservation = guards.reserve_spawn_slot(Some(1)).expect("reserve slot");
+        let thread_id = ThreadId::new();
+        reservation.commit(thread_id);
+        guards.release_spawned_thread(thread_id);
+
+        assert_eq!(guards.was_spawned_thread(thread_id), true);
     }
 }

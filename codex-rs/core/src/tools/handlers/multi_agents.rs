@@ -391,6 +391,12 @@ mod send_input {
                 .interrupt_agent(receiver_thread_id)
                 .await
                 .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))?;
+            let _ = session
+                .services
+                .agent_control
+                .drop_pending_input(receiver_thread_id)
+                .await
+                .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))?;
         }
         session
             .send_event(
@@ -1012,11 +1018,29 @@ pub(crate) mod wait {
 
 pub mod close_agent {
     use super::*;
+    use crate::rollout::find_thread_path_by_id_str;
     use std::sync::Arc;
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) enum CloseAgentOutcome {
+        Closed,
+        AlreadyClosed,
+        NotFound,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
     pub(super) struct CloseAgentResult {
         pub(super) status: AgentStatus,
+        pub(super) close_result: CloseAgentOutcome,
+    }
+
+    fn not_found_outcome(was_known: bool) -> CloseAgentOutcome {
+        if was_known {
+            CloseAgentOutcome::AlreadyClosed
+        } else {
+            CloseAgentOutcome::NotFound
+        }
     }
 
     pub async fn handle(
@@ -1027,6 +1051,24 @@ pub mod close_agent {
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
         let agent_id = agent_id(&args.id)?;
+        let status_before = session.services.agent_control.get_status(agent_id).await;
+        let was_known = if matches!(status_before, AgentStatus::NotFound) {
+            let listed = session
+                .services
+                .agent_control
+                .list_agents(session.conversation_id, true, true)
+                .await
+                .map(|agents| agents.into_iter().any(|agent| agent.thread_id == agent_id))
+                .unwrap_or(false);
+            let spawned = session.services.agent_control.was_spawned_thread(agent_id);
+            let recorded = find_thread_path_by_id_str(turn.config.codex_home.as_path(), &args.id)
+                .await
+                .map(|path| path.is_some())
+                .unwrap_or(false);
+            listed || spawned || recorded
+        } else {
+            true
+        };
         session
             .send_event(
                 &turn,
@@ -1075,13 +1117,15 @@ pub mod close_agent {
                 )
                 .await;
             return if matches!(err, CodexErr::ThreadNotFound(_)) {
-                let content = serde_json::to_string(&CloseAgentResult { status }).map_err(
-                    |serialize_err| {
-                        FunctionCallError::Fatal(format!(
-                            "failed to serialize close_agent result: {serialize_err}"
-                        ))
-                    },
-                )?;
+                let content = serde_json::to_string(&CloseAgentResult {
+                    status,
+                    close_result: not_found_outcome(was_known),
+                })
+                .map_err(|serialize_err| {
+                    FunctionCallError::Fatal(format!(
+                        "failed to serialize close_agent result: {serialize_err}"
+                    ))
+                })?;
 
                 Ok(ToolOutput::Function {
                     body: FunctionCallOutputBody::Text(content),
@@ -1103,13 +1147,16 @@ pub mod close_agent {
                 .shutdown_agent(helper_id)
                 .await;
         }
-        let result = match session
+        let close_result = match session
             .services
             .agent_control
             .shutdown_agent(agent_id)
             .await
         {
-            Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => Ok(()),
+            Ok(_) => Ok(CloseAgentOutcome::Closed),
+            Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {
+                Ok(not_found_outcome(was_known))
+            }
             Err(err) => Err(multi_agent_tool_error(agent_id, err)),
         };
         let status = session.services.agent_control.get_status(agent_id).await;
@@ -1125,9 +1172,13 @@ pub mod close_agent {
                 .into(),
             )
             .await;
-        result?;
+        let close_result = close_result?;
 
-        let content = serde_json::to_string(&CloseAgentResult { status }).map_err(|err| {
+        let content = serde_json::to_string(&CloseAgentResult {
+            status,
+            close_result,
+        })
+        .map_err(|err| {
             FunctionCallError::Fatal(format!("failed to serialize close_agent result: {err}"))
         })?;
 
@@ -1151,7 +1202,7 @@ fn multi_agent_spawn_error(err: CodexErr) -> FunctionCallError {
         CodexErr::UnsupportedOperation(reason) => FunctionCallError::RespondToModel(reason),
         CodexErr::AgentLimitReached { max_threads } => FunctionCallError::RespondToModel(format!(
             "multi-agent spawn failed: agent thread limit reached (max {max_threads}). \
-                 Close completed agents with close_agent, or inspect active threads with \
+                 Close completed agents with close_agent (idempotent), or inspect tracked threads with \
                  list_agents(all=true)."
         )),
         err => FunctionCallError::RespondToModel(format!("multi-agent spawn failed: {err}")),
@@ -2594,6 +2645,7 @@ mod tests {
             serde_json::from_str(&content).expect("close_agent result should be json");
         let status_after = manager.agent_control().get_status(agent_id).await;
         assert_eq!(result.status, status_after);
+        assert_eq!(result.close_result, close_agent::CloseAgentOutcome::Closed);
         assert_ne!(result.status, status_before);
         assert_eq!(success, Some(true));
 
@@ -2604,6 +2656,89 @@ mod tests {
         assert_eq!(submitted_shutdown, true);
 
         assert_eq!(status_after, AgentStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn close_agent_reports_already_closed_for_known_id() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let agent_id = session
+            .services
+            .agent_control
+            .spawn_agent_handle(config, None)
+            .await
+            .expect("spawn agent handle");
+
+        session
+            .services
+            .agent_control
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown agent");
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("close_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: close_agent::CloseAgentResult =
+            serde_json::from_str(&content).expect("close_agent result should be json");
+        assert_eq!(result.status, AgentStatus::NotFound);
+        assert_eq!(
+            result.close_result,
+            close_agent::CloseAgentOutcome::AlreadyClosed
+        );
+        assert_eq!(success, Some(true));
+    }
+
+    #[tokio::test]
+    async fn close_agent_reports_not_found_for_unknown_id() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let unknown_id = ThreadId::new();
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"id": unknown_id.to_string()})),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("close_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: close_agent::CloseAgentResult =
+            serde_json::from_str(&content).expect("close_agent result should be json");
+        assert_eq!(result.status, AgentStatus::NotFound);
+        assert_eq!(
+            result.close_result,
+            close_agent::CloseAgentOutcome::NotFound
+        );
+        assert_eq!(success, Some(true));
     }
 
     #[tokio::test]

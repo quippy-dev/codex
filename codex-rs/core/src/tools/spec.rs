@@ -855,7 +855,7 @@ fn create_close_agent_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "close_agent".to_string(),
         description:
-            "Close an agent when it is no longer needed. Returns the status observed at close time."
+            "Close an agent when it is no longer needed. Returns `close_result` (`closed`, `already_closed`, or `not_found`) and the observed status."
                 .to_string(),
         strict: false,
         parameters: JsonSchema::Object {

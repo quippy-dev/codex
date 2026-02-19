@@ -3095,6 +3095,17 @@ impl Session {
         }
     }
 
+    pub async fn drop_pending_input(&self) -> bool {
+        let active = self.active_turn.lock().await;
+        match active.as_ref() {
+            Some(at) => {
+                let mut ts = at.turn_state.lock().await;
+                !ts.take_pending_input().is_empty()
+            }
+            None => false,
+        }
+    }
+
     pub async fn list_resources(
         &self,
         server: &str,

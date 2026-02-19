@@ -283,6 +283,16 @@ impl AgentControl {
         result
     }
 
+    pub(crate) async fn drop_pending_input(&self, agent_id: ThreadId) -> CodexResult<bool> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        Ok(thread.codex.session.drop_pending_input().await)
+    }
+
+    pub(crate) fn was_spawned_thread(&self, agent_id: ThreadId) -> bool {
+        self.guards.was_spawned_thread(agent_id)
+    }
+
     /// Send a prompt to an existing agent thread using the configured collab inbox delivery role.
     pub(crate) async fn send_collab_message(
         &self,
@@ -895,6 +905,39 @@ mod tests {
             err.to_string(),
             "unsupported operation: thread manager dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn drop_pending_input_clears_buffered_items() {
+        let harness = AgentControlHarness::new().await;
+        let (agent_id, thread) = harness.start_thread().await;
+
+        {
+            let mut active = thread.codex.session.active_turn.lock().await;
+            *active = Some(crate::state::ActiveTurn::default());
+        }
+
+        thread
+            .codex
+            .session
+            .inject_response_items(vec![ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "queued".to_string(),
+                }],
+            }])
+            .await
+            .expect("inject pending input");
+
+        let dropped = harness
+            .control
+            .drop_pending_input(agent_id)
+            .await
+            .expect("drop pending input should succeed");
+        assert_eq!(dropped, true);
+        assert_eq!(thread.codex.session.has_pending_input().await, false);
+
+        let _ = harness.control.shutdown_agent(agent_id).await;
     }
 
     #[tokio::test]
