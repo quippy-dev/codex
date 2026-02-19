@@ -107,6 +107,7 @@ mod spawn {
     use codex_protocol::protocol::SubAgentSource;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use tracing::info;
 
     #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
     #[serde(rename_all = "snake_case")]
@@ -332,7 +333,14 @@ mod spawn {
         }
         let mut thread_ids = to_shutdown.into_iter().collect::<Vec<_>>();
         thread_ids.sort_by_key(ToString::to_string);
+        if !thread_ids.is_empty() {
+            info!(
+                removed_thread_count = thread_ids.len(),
+                "cleaning up superseded watchdog threads"
+            );
+        }
         for thread_id in thread_ids {
+            info!(thread_id = %thread_id, "shutting down superseded watchdog thread");
             let _ = agent_control.shutdown_agent(thread_id).await;
         }
     }
@@ -1052,7 +1060,7 @@ pub mod close_agent {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
         let agent_id = agent_id(&args.id)?;
         let status_before = session.services.agent_control.get_status(agent_id).await;
-        let was_known = if matches!(status_before, AgentStatus::NotFound) {
+        let mut was_known = if matches!(status_before, AgentStatus::NotFound) {
             let listed = session
                 .services
                 .agent_control
@@ -1091,6 +1099,9 @@ pub mod close_agent {
                 .agent_control
                 .unregister_watchdog(agent_id)
                 .await;
+            if removed_watchdog.is_some() {
+                was_known = true;
+            }
             if let Some(helper_id) = removed_watchdog.and_then(|entry| entry.active_helper_id) {
                 let _ = session
                     .services
@@ -1140,6 +1151,9 @@ pub mod close_agent {
             .agent_control
             .unregister_watchdog(agent_id)
             .await;
+        if removed_watchdog.is_some() {
+            was_known = true;
+        }
         if let Some(helper_id) = removed_watchdog.and_then(|entry| entry.active_helper_id) {
             let _ = session
                 .services
@@ -2739,6 +2753,56 @@ mod tests {
             close_agent::CloseAgentOutcome::NotFound
         );
         assert_eq!(success, Some(true));
+    }
+
+    #[tokio::test]
+    async fn close_agent_reports_already_closed_for_registered_watchdog_without_live_thread() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let owner_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start owner thread");
+        session.conversation_id = owner_thread.thread_id;
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let watchdog_id = spawn_watchdog_for_test(session.clone(), turn.clone()).await;
+        let _ = manager.remove_thread(&watchdog_id).await;
+
+        let invocation = invocation(
+            session.clone(),
+            turn,
+            "close_agent",
+            function_payload(json!({"id": watchdog_id.to_string()})),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("close_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: close_agent::CloseAgentResult =
+            serde_json::from_str(&content).expect("close_agent result should be json");
+        assert_eq!(result.status, AgentStatus::NotFound);
+        assert_eq!(
+            result.close_result,
+            close_agent::CloseAgentOutcome::AlreadyClosed
+        );
+        assert_eq!(success, Some(true));
+
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(owner_thread.thread_id)
+            .await;
     }
 
     #[tokio::test]

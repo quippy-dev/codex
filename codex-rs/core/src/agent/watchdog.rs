@@ -187,6 +187,12 @@ impl WatchdogManager {
             Err(_) => AgentStatus::NotFound,
         };
         if is_watchdog_terminated(&owner_status) {
+            info!(
+                target_thread_id = %target_thread_id,
+                owner_thread_id = %snapshot.owner_thread_id,
+                owner_status = ?owner_status,
+                "removing watchdog registration because owner is in a final state"
+            );
             self.remove_if_generation(target_thread_id, generation)
                 .await;
             return;
