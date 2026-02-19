@@ -201,7 +201,6 @@ impl Session {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
-        self.snapshot_collab_send_input_on_turn_complete();
         let mut active = self.active_turn.lock().await;
         let mut pending_input = Vec::<ResponseInputItem>::new();
         let mut should_clear_active_turn = false;
@@ -320,4 +319,19 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::codex::make_session_and_context_with_rx;
+
+    #[tokio::test]
+    async fn on_task_finished_snapshots_collab_send_input_once() {
+        let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+        session.mark_turn_used_collab_send_input();
+
+        session
+            .on_task_finished(Arc::clone(&turn_context), None)
+            .await;
+
+        assert!(session.last_completed_turn_used_collab_send_input());
+    }
+}

@@ -20,6 +20,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
@@ -124,9 +126,11 @@ pub async fn load_config_layers_state(
     )
     .await?;
 
-    // Honor the system requirements.toml location.
-    let requirements_toml_file = system_requirements_toml_file()?;
-    load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
+    if !ignore_system_requirements {
+        // Honor the system requirements.toml location.
+        let requirements_toml_file = system_requirements_toml_file()?;
+        load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
+    }
 
     // Make a best-effort to support the legacy `managed_config.toml` as a
     // requirements specification.
@@ -387,13 +391,57 @@ async fn load_requirements_toml(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE: RefCell<Option<AbsolutePathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct SystemRequirementsTomlFileOverrideGuard;
+
+#[cfg(test)]
+pub(crate) fn override_system_requirements_toml_file_for_test(
+    requirements_toml_file: impl AsRef<Path>,
+) -> io::Result<SystemRequirementsTomlFileOverrideGuard> {
+    let requirements_toml_file =
+        AbsolutePathBuf::from_absolute_path(requirements_toml_file.as_ref())?;
+    SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE.with(|override_file| {
+        *override_file.borrow_mut() = Some(requirements_toml_file);
+    });
+    Ok(SystemRequirementsTomlFileOverrideGuard)
+}
+
+#[cfg(test)]
+impl Drop for SystemRequirementsTomlFileOverrideGuard {
+    fn drop(&mut self) {
+        SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE.with(|override_file| {
+            *override_file.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(test)]
+fn system_requirements_toml_file_override() -> Option<AbsolutePathBuf> {
+    SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE.with(|override_file| override_file.borrow().clone())
+}
+
 #[cfg(unix)]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    #[cfg(test)]
+    if let Some(requirements_toml_file) = system_requirements_toml_file_override() {
+        return Ok(requirements_toml_file);
+    }
+
     AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
 }
 
 #[cfg(windows)]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    #[cfg(test)]
+    if let Some(requirements_toml_file) = system_requirements_toml_file_override() {
+        return Ok(requirements_toml_file);
+    }
+
     windows_system_requirements_toml_file()
 }
 
