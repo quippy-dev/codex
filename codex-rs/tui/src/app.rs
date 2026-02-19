@@ -640,9 +640,9 @@ impl SubagentRegistry {
                     info.notified_terminal = true;
                     let summary = last_agent_message
                         .as_deref()
-                        .map(|message| {
-                            truncate_text(message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET)
-                        })
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                        .map(ToString::to_string)
                         .unwrap_or_else(|| "completed".to_string());
                     history.push(Box::new(new_subagent_update_cell(
                         &info.name,
@@ -666,7 +666,12 @@ impl SubagentRegistry {
             }
             EventMsg::Error(ErrorEvent { message, .. }) => {
                 info.inflight_message.clear();
-                let summary = truncate_text(message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
+                let summary = message.trim();
+                let summary = if summary.is_empty() {
+                    "errored".to_string()
+                } else {
+                    summary.to_string()
+                };
                 info.status = AgentStatus::Errored(summary.clone());
                 if !info.notified_terminal {
                     info.notified_terminal = true;
@@ -807,11 +812,21 @@ fn is_terminal_status(status: &AgentStatus) -> bool {
 fn terminal_summary(status: &AgentStatus) -> String {
     match status {
         AgentStatus::Completed(Some(message)) => {
-            truncate_text(message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET)
+            let message = message.trim();
+            if message.is_empty() {
+                "completed".to_string()
+            } else {
+                message.to_string()
+            }
         }
         AgentStatus::Completed(None) => "completed".to_string(),
         AgentStatus::Errored(message) => {
-            truncate_text(message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET)
+            let message = message.trim();
+            if message.is_empty() {
+                "errored".to_string()
+            } else {
+                message.to_string()
+            }
         }
         AgentStatus::Shutdown => "shutdown".to_string(),
         AgentStatus::NotFound => "not found".to_string(),
@@ -3565,12 +3580,14 @@ mod tests {
     use codex_core::protocol::CollabCloseEndEvent;
     use codex_core::protocol::CollabWaitingBeginEvent;
     use codex_core::protocol::CollabWaitingEndEvent;
+    use codex_core::protocol::ErrorEvent;
     use codex_core::protocol::Event;
     use codex_core::protocol::EventMsg;
     use codex_core::protocol::SandboxPolicy;
     use codex_core::protocol::SessionConfiguredEvent;
     use codex_core::protocol::SessionSource;
     use codex_core::protocol::ThreadRolledBackEvent;
+    use codex_core::protocol::TurnCompleteEvent;
     use codex_core::protocol::UserMessageEvent;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
@@ -4799,6 +4816,99 @@ mod tests {
             .map(|info| info.status.clone())
             .expect("status for first subagent");
         assert_eq!(status, AgentStatus::Completed(Some("done".to_string())));
+    }
+
+    #[test]
+    fn subagent_registry_turn_complete_history_keeps_full_message() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            prompt: "Summarize merge findings".to_string(),
+            spawn_mode: CollabAgentSpawnMode::Spawn,
+            status: AgentStatus::PendingInit,
+        });
+        assert!(spawned.is_some(), "expected spawn cell for new subagent");
+
+        let tail = format!("tail-{}", "a".repeat(SUBAGENT_UPDATE_PREVIEW_BUDGET + 40));
+        let message = format!("top candidate\ndetails line\n{tail}");
+        let updates = registry.on_agent_event(
+            subagent_thread_id,
+            &EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".to_string(),
+                last_agent_message: Some(message.clone()),
+            }),
+        );
+
+        assert_eq!(updates.len(), 1);
+        let status = registry
+            .agents
+            .get(&subagent_thread_id)
+            .map(|info| info.status.clone())
+            .expect("status for first subagent");
+        assert_eq!(status, AgentStatus::Completed(Some(message.clone())));
+
+        let rendered = updates[0]
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Subagent update:"));
+        assert!(rendered.contains("top candidate"));
+        assert!(rendered.contains("details line"));
+        assert!(rendered.contains(tail.as_str()));
+    }
+
+    #[test]
+    fn subagent_registry_error_history_keeps_full_message() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            prompt: "Summarize merge findings".to_string(),
+            spawn_mode: CollabAgentSpawnMode::Spawn,
+            status: AgentStatus::PendingInit,
+        });
+        assert!(spawned.is_some(), "expected spawn cell for new subagent");
+
+        let tail = format!("error-{}", "z".repeat(SUBAGENT_UPDATE_PREVIEW_BUDGET + 40));
+        let message = format!("fatal mismatch\n{tail}");
+        let updates = registry.on_agent_event(
+            subagent_thread_id,
+            &EventMsg::Error(ErrorEvent {
+                message: message.clone(),
+                codex_error_info: None,
+            }),
+        );
+
+        assert_eq!(updates.len(), 1);
+        let status = registry
+            .agents
+            .get(&subagent_thread_id)
+            .map(|info| info.status.clone())
+            .expect("status for first subagent");
+        assert_eq!(status, AgentStatus::Errored(message.clone()));
+
+        let rendered = updates[0]
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Subagent update:"));
+        assert!(rendered.contains("fatal mismatch"));
+        assert!(rendered.contains(tail.as_str()));
     }
 
     #[test]

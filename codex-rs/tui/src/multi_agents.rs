@@ -294,3 +294,39 @@ fn detail_line_spans(label: &str, mut value: Vec<Span<'static>>) -> Line<'static
     spans.append(&mut value);
     spans.into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history_cell::HistoryCell;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn waiting_end_truncates_long_completed_message_preview() {
+        let receiver = ThreadId::new();
+        let mut statuses = HashMap::new();
+        let long_message = format!("top {}", "a".repeat(420));
+        let compact_long_message = long_message
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        statuses.insert(receiver, AgentStatus::Completed(Some(long_message)));
+
+        let cell = waiting_end(CollabWaitingEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: ThreadId::new(),
+            statuses,
+        });
+        let rendered = cell
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Wait complete"));
+        assert!(rendered.contains("completed"));
+        assert_eq!(rendered.matches(compact_long_message.as_str()).count(), 0);
+        assert!(rendered.contains("..."));
+    }
+}

@@ -622,21 +622,24 @@ pub(crate) fn new_subagent_update_cell(
     status: &AgentStatus,
     summary: &str,
 ) -> PlainHistoryCell {
-    let mut spans: Vec<Span<'static>> = vec![
+    let mut lines = vec![Line::from(vec![
         "• ".dim(),
         "Subagent update: ".into(),
         Span::from(name.to_string()).bold(),
         " ".into(),
         status_label_span(status),
-    ];
+    ])];
 
-    let summary = truncate_text(summary.trim(), 240);
+    let summary = summary.trim();
     if !summary.is_empty() {
-        spans.push(" — ".dim());
-        spans.push(Span::from(summary));
+        let summary_lines = summary
+            .lines()
+            .map(|line| Line::from(line.to_string()))
+            .collect::<Vec<_>>();
+        lines.extend(prefix_lines(summary_lines, "  └ ".dim(), "    ".into()));
     }
 
-    PlainHistoryCell::new(vec![Line::from(spans)])
+    PlainHistoryCell::new(lines)
 }
 
 fn running_preview_budget(width: u16) -> usize {
@@ -2737,6 +2740,32 @@ mod tests {
         let cell = SubagentStatusCell::new(state, true);
 
         assert_eq!(cell.transcript_animation_tick(), None);
+    }
+
+    #[test]
+    fn subagent_update_cell_preserves_multiline_summary_snapshot() {
+        let cell = new_subagent_update_cell(
+            "users-dev-codex-worker",
+            &AgentStatus::Completed(Some("done".to_string())),
+            "Top candidate: `abc123`\nthis change collapsed mode handling\n\nnext steps:\n- restore execute mode\n- add snapshot coverage",
+        );
+        let rendered = render_transcript(&cell).join("\n");
+
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn subagent_update_cell_does_not_truncate_long_summary() {
+        let long_summary = "a".repeat(420);
+        let cell = new_subagent_update_cell(
+            "users-dev-codex-worker",
+            &AgentStatus::Completed(Some("done".to_string())),
+            long_summary.as_str(),
+        );
+        let rendered = render_transcript(&cell).join("\n");
+
+        assert!(rendered.contains(long_summary.as_str()));
+        assert!(!rendered.contains("..."));
     }
 
     fn image_block(data: &str) -> serde_json::Value {
