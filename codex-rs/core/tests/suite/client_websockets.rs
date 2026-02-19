@@ -8,6 +8,7 @@ use codex_core::Prompt;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
+use codex_core::X_CODEX_TURN_METADATA_HEADER;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
@@ -715,7 +716,7 @@ async fn responses_websocket_appends_on_prefix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_forwards_turn_metadata_on_create_and_append() {
+async fn responses_websocket_sends_turn_metadata_in_headers_only() {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![
@@ -758,29 +759,22 @@ async fn responses_websocket_forwards_turn_metadata_on_create_and_append() {
     assert_eq!(connection.len(), 2);
     let first = connection.first().expect("missing request").body_json();
     let second = connection.get(1).expect("missing request").body_json();
+    let handshake = server.single_handshake();
 
     assert_eq!(first["type"].as_str(), Some("response.create"));
     assert_eq!(
-        first["client_metadata"]["x-codex-turn-metadata"].as_str(),
-        Some(first_turn_metadata)
+        handshake.header(X_CODEX_TURN_METADATA_HEADER),
+        Some(first_turn_metadata.to_string())
     );
-    assert_eq!(second["type"].as_str(), Some("response.append"));
+    assert!(first.get("client_metadata").is_none());
     assert_eq!(
-        second["client_metadata"]["x-codex-turn-metadata"].as_str(),
-        Some(enriched_turn_metadata)
+        second,
+        serde_json::json!({
+            "type": "response.append",
+            "input": serde_json::to_value(&prompt_two.input[2..]).expect("serialize append items"),
+        })
     );
-
-    let first_metadata: serde_json::Value =
-        serde_json::from_str(first_turn_metadata).expect("first metadata should be valid json");
-    let second_metadata: serde_json::Value = serde_json::from_str(enriched_turn_metadata)
-        .expect("enriched metadata should be valid json");
-
-    assert_eq!(first_metadata["turn_id"].as_str(), Some("turn-123"));
-    assert_eq!(second_metadata["turn_id"].as_str(), Some("turn-123"));
-    assert_eq!(
-        second_metadata["workspaces"][0]["has_changes"].as_bool(),
-        Some(true)
-    );
+    assert!(second.get("client_metadata").is_none());
 
     server.shutdown().await;
 }
