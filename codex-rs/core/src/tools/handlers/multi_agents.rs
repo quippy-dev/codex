@@ -97,7 +97,6 @@ mod spawn {
     use super::*;
     use crate::agent::AgentControl;
     use crate::agent::DEFAULT_WATCHDOG_INTERVAL_S;
-    use crate::agent::MAX_THREAD_SPAWN_DEPTH;
     use crate::agent::WatchdogRegistration;
     use crate::agent::exceeds_thread_spawn_depth_limit;
     use crate::agent::next_thread_spawn_depth;
@@ -163,6 +162,7 @@ mod spawn {
         let input_items = parse_multi_agent_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
         let session_source = turn.session_source.clone();
+        let child_depth = next_thread_spawn_depth(&session_source);
         if matches!(spawn_mode, SpawnMode::Watchdog)
             && matches!(session_source, SessionSource::SubAgent(_))
         {
@@ -170,10 +170,10 @@ mod spawn {
                 "watchdogs can only be spawned by root agents".to_string(),
             ));
         }
-        let child_depth = next_thread_spawn_depth(&session_source);
-        if exceeds_thread_spawn_depth_limit(child_depth) {
+        let max_depth = turn.config.agent_max_depth;
+        if exceeds_thread_spawn_depth_limit(child_depth, max_depth) {
             return Err(FunctionCallError::RespondToModel(format!(
-                "agent depth limit reached: max depth is {MAX_THREAD_SPAWN_DEPTH}"
+                "agent depth limit reached: max depth is {max_depth}"
             )));
         }
         session
@@ -458,7 +458,6 @@ mod send_input {
 
 mod resume_agent {
     use super::*;
-    use crate::agent::MAX_THREAD_SPAWN_DEPTH;
     use crate::agent::exceeds_thread_spawn_depth_limit;
     use crate::agent::next_thread_spawn_depth;
     use crate::rollout::find_thread_path_by_id_str;
@@ -483,9 +482,10 @@ mod resume_agent {
         let args: ResumeAgentArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = agent_id(&args.id)?;
         let child_depth = next_thread_spawn_depth(&turn.session_source);
-        if exceeds_thread_spawn_depth_limit(child_depth) {
+        let max_depth = turn.config.agent_max_depth;
+        if exceeds_thread_spawn_depth_limit(child_depth, max_depth) {
             return Err(FunctionCallError::RespondToModel(format!(
-                "agent depth limit reached: max depth is {MAX_THREAD_SPAWN_DEPTH}"
+                "agent depth limit reached: max depth is {max_depth}"
             )));
         }
 
@@ -1310,7 +1310,10 @@ fn build_agent_spawn_config(
             config.developer_instructions = base_config.developer_instructions.clone();
             // At max depth, a freshly spawned context-free child cannot spawn further descendants.
             // Hide multi-agent tools to match that capability boundary.
-            if crate::agent::exceeds_thread_spawn_depth_limit(child_depth + 1) {
+            if crate::agent::exceeds_thread_spawn_depth_limit(
+                child_depth + 1,
+                config.agent_max_depth,
+            ) {
                 config.features.disable(Feature::Collab);
             }
         }
@@ -1362,7 +1365,9 @@ fn build_agent_shared_config(
 
 fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    let _ = child_depth;
+    if crate::agent::exceeds_thread_spawn_depth_limit(child_depth + 1, config.agent_max_depth) {
+        config.features.disable(Feature::Collab);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1377,9 +1382,9 @@ mod tests {
     use crate::AuthManager;
     use crate::CodexAuth;
     use crate::ThreadManager;
-    use crate::agent::MAX_THREAD_SPAWN_DEPTH;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
+    use crate::config::DEFAULT_AGENT_MAX_DEPTH;
     use crate::config::types::ShellEnvironmentPolicy;
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
@@ -1643,7 +1648,7 @@ mod tests {
 
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
-            depth: MAX_THREAD_SPAWN_DEPTH,
+            depth: DEFAULT_AGENT_MAX_DEPTH,
         });
 
         let invocation = invocation(
@@ -1659,6 +1664,49 @@ mod tests {
             panic!("expected respond-to-model error");
         };
         assert!(message.contains("depth limit reached"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let mut config = (*turn.config).clone();
+        config.agent_max_depth = DEFAULT_AGENT_MAX_DEPTH + 1;
+        turn.config = Arc::new(config);
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: session.conversation_id,
+            depth: DEFAULT_AGENT_MAX_DEPTH,
+        });
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({"message": "hello"})),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn should succeed within configured depth");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        assert!(!result.agent_id.is_empty());
+        assert_eq!(success, Some(true));
     }
 
     #[tokio::test]
@@ -2205,7 +2253,7 @@ mod tests {
 
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
-            depth: MAX_THREAD_SPAWN_DEPTH,
+            depth: DEFAULT_AGENT_MAX_DEPTH,
         });
 
         let invocation = invocation(
@@ -2940,13 +2988,9 @@ mod tests {
             text: "base".to_string(),
         };
 
-        let config = build_agent_spawn_config(
-            &base_instructions,
-            &turn,
-            MAX_THREAD_SPAWN_DEPTH,
-            SpawnConfigStrategy::ForkLike,
-        )
-        .expect("fork-like spawn config");
+        let config =
+            build_agent_spawn_config(&base_instructions, &turn, 0, SpawnConfigStrategy::ForkLike)
+                .expect("fork-like spawn config");
 
         assert_eq!(config.developer_instructions, turn.developer_instructions);
         assert_eq!(
@@ -2968,7 +3012,7 @@ mod tests {
         let config = build_agent_spawn_config(
             &base_instructions,
             &turn,
-            MAX_THREAD_SPAWN_DEPTH,
+            DEFAULT_AGENT_MAX_DEPTH,
             SpawnConfigStrategy::ContextFreeSpawn,
         )
         .expect("context-free spawn config");

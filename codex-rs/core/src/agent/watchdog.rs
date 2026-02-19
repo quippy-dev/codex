@@ -1,6 +1,5 @@
 use super::control::AgentControl;
 use super::guards::Guards;
-use super::guards::MAX_THREAD_SPAWN_DEPTH;
 use super::guards::exceeds_thread_spawn_depth_limit;
 use super::status::is_final;
 use crate::codex::load_watchdog_prompt;
@@ -96,9 +95,10 @@ impl WatchdogManager {
         self: &Arc<Self>,
         registration: WatchdogRegistration,
     ) -> CodexResult<Vec<RemovedWatchdog>> {
-        if exceeds_thread_spawn_depth_limit(registration.child_depth) {
+        let max_depth = registration.config.agent_max_depth;
+        if exceeds_thread_spawn_depth_limit(registration.child_depth, max_depth) {
             return Err(CodexErr::UnsupportedOperation(format!(
-                "agent depth limit reached: max depth is {MAX_THREAD_SPAWN_DEPTH}"
+                "agent depth limit reached: max depth is {max_depth}"
             )));
         }
         let interval = interval_duration(registration.interval_s)?;

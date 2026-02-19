@@ -1076,6 +1076,7 @@ mod tests {
             .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
                 AgentMessageEvent {
                     message: "buffered-event".to_string(),
+                    phase: None,
                 },
             ))])
             .await?;

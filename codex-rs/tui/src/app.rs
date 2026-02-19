@@ -626,7 +626,7 @@ impl SubagentRegistry {
                     truncate_text(info.inflight_message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
                 info.update_preview(preview);
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
                 info.inflight_message.clear();
                 let preview = truncate_text(message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
                 info.update_preview(preview);
@@ -1664,6 +1664,7 @@ impl App {
             config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::Cli,
+            config.model_catalog.clone(),
         ));
         let mut model = thread_manager
             .get_models_manager()
