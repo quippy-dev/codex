@@ -524,6 +524,7 @@ pub(crate) struct ChatWidget {
     codex_op_tx: UnboundedSender<Op>,
     bottom_pane: BottomPane,
     active_cell: Option<Box<dyn HistoryCell>>,
+    pending_subagent_panel: Option<Arc<SubagentStatusCell>>,
     /// Monotonic-ish counter used to invalidate transcript overlay caching.
     ///
     /// The transcript overlay appends a cached "live tail" for the current active cell. Most
@@ -2275,6 +2276,7 @@ impl ChatWidget {
         if let Some(active) = self.active_cell.as_mut()
             && let Some(existing) = active.as_any_mut().downcast_mut::<SubagentStatusCell>()
         {
+            self.pending_subagent_panel = None;
             if existing.matches_state(&state_handle) {
                 self.bump_active_cell_revision();
                 self.request_redraw();
@@ -2287,13 +2289,18 @@ impl ChatWidget {
         }
 
         if self.active_cell.is_none() {
+            self.pending_subagent_panel = None;
             self.active_cell = Some(Box::new(panel.as_ref().clone()));
             self.bump_active_cell_revision();
             self.request_redraw();
+            return;
         }
+
+        self.pending_subagent_panel = Some(panel);
     }
 
     pub(crate) fn clear_subagent_panel(&mut self) {
+        self.pending_subagent_panel = None;
         if self
             .active_cell
             .as_ref()
@@ -2314,6 +2321,36 @@ impl ChatWidget {
             self.bump_active_cell_revision();
             self.request_redraw();
         }
+    }
+
+    fn maybe_apply_pending_subagent_panel(&mut self) {
+        let Some(panel) = self.pending_subagent_panel.take() else {
+            return;
+        };
+
+        if let Some(active) = self.active_cell.as_mut()
+            && let Some(existing) = active.as_any_mut().downcast_mut::<SubagentStatusCell>()
+        {
+            let state_handle = panel.state_handle();
+            if existing.matches_state(&state_handle) {
+                self.bump_active_cell_revision();
+                self.request_redraw();
+                return;
+            }
+            *existing = panel.as_ref().clone();
+            self.bump_active_cell_revision();
+            self.request_redraw();
+            return;
+        }
+
+        if self.active_cell.is_none() {
+            self.active_cell = Some(Box::new(panel.as_ref().clone()));
+            self.bump_active_cell_revision();
+            self.request_redraw();
+            return;
+        }
+
+        self.pending_subagent_panel = Some(panel);
     }
 
     /// Runs a regular periodic commit tick.
@@ -2742,6 +2779,7 @@ impl ChatWidget {
                 skills: None,
             }),
             active_cell,
+            pending_subagent_panel: None,
             active_cell_revision: 0,
             config,
             skills_all: Vec::new(),
@@ -2905,6 +2943,7 @@ impl ChatWidget {
                 skills: None,
             }),
             active_cell,
+            pending_subagent_panel: None,
             active_cell_revision: 0,
             config,
             skills_all: Vec::new(),
@@ -3057,6 +3096,7 @@ impl ChatWidget {
                 skills: None,
             }),
             active_cell: None,
+            pending_subagent_panel: None,
             active_cell_revision: 0,
             config,
             skills_all: Vec::new(),
@@ -3773,11 +3813,12 @@ impl ChatWidget {
             // transcript gets spammed with repeated identical "Subagents ..." blocks.
             if active.as_any().is::<SubagentStatusCell>() {
                 self.active_cell = Some(active);
-                return;
+            } else {
+                self.needs_final_message_separator = true;
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             }
-            self.needs_final_message_separator = true;
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
         }
+        self.maybe_apply_pending_subagent_panel();
     }
 
     pub(crate) fn add_to_history(&mut self, cell: impl HistoryCell + 'static) {

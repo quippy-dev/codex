@@ -1694,6 +1694,7 @@ async fn make_chatwidget_manual(
         codex_op_tx: op_tx,
         bottom_pane: bottom,
         active_cell: None,
+        pending_subagent_panel: None,
         active_cell_revision: 0,
         config: cfg,
         current_collaboration_mode,
@@ -1865,10 +1866,7 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
     s
 }
 
-#[tokio::test]
-async fn subagent_panel_is_not_flushed_into_transcript_history() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-
+fn make_watchdog_panel_cell(preview: &str) -> Arc<SubagentStatusCell> {
     let state = Arc::new(StdMutex::new(SubagentPanelState {
         started_at: Instant::now(),
         total_agents: 1,
@@ -1878,11 +1876,17 @@ async fn subagent_panel_is_not_flushed_into_transcript_history() {
             name: "user-request-derisk-implement".to_string(),
             status: AgentStatus::PendingInit,
             is_watchdog: true,
-            preview: "watchdog idle".to_string(),
+            preview: preview.to_string(),
             latest_update_at: Instant::now(),
         }],
     }));
-    chat.on_subagent_panel_updated(Arc::new(SubagentStatusCell::new(state, true)));
+    Arc::new(SubagentStatusCell::new(state, true))
+}
+
+#[tokio::test]
+async fn subagent_panel_is_not_flushed_into_transcript_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_subagent_panel_updated(make_watchdog_panel_cell("watchdog idle"));
 
     chat.add_to_history(history_cell::new_error_event("follow-up cell".to_string()));
 
@@ -1895,6 +1899,63 @@ async fn subagent_panel_is_not_flushed_into_transcript_history() {
     let rendered = lines_to_single_string(&inserted[0]);
     assert!(rendered.contains("follow-up cell"));
     assert!(!rendered.contains("Subagents"));
+}
+
+#[tokio::test]
+async fn subagent_panel_update_is_applied_after_busy_cell_flush() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.active_cell = Some(Box::new(history_cell::new_error_event(
+        "busy cell".to_string(),
+    )));
+
+    chat.on_subagent_panel_updated(make_watchdog_panel_cell("watchdog idle"));
+
+    assert!(chat.pending_subagent_panel.is_some());
+    assert!(
+        chat.active_cell
+            .as_ref()
+            .is_some_and(|cell| !cell.as_any().is::<SubagentStatusCell>())
+    );
+
+    chat.add_to_history(history_cell::new_error_event("follow-up cell".to_string()));
+
+    assert!(chat.pending_subagent_panel.is_none());
+    assert!(
+        chat.active_cell
+            .as_ref()
+            .is_some_and(|cell| cell.as_any().is::<SubagentStatusCell>())
+    );
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 2);
+    let rendered = inserted
+        .iter()
+        .map(Vec::as_slice)
+        .map(lines_to_single_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("busy cell"));
+    assert!(rendered.contains("follow-up cell"));
+    assert!(!rendered.contains("Subagents"));
+}
+
+#[tokio::test]
+async fn clear_subagent_panel_clears_active_and_pending_state() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.active_cell = None;
+
+    chat.on_subagent_panel_updated(make_watchdog_panel_cell("watchdog active"));
+    assert!(
+        chat.active_cell
+            .as_ref()
+            .is_some_and(|cell| cell.as_any().is::<SubagentStatusCell>())
+    );
+
+    chat.pending_subagent_panel = Some(make_watchdog_panel_cell("watchdog pending"));
+    chat.clear_subagent_panel();
+
+    assert!(chat.active_cell.is_none());
+    assert!(chat.pending_subagent_panel.is_none());
 }
 
 fn make_token_info(total_tokens: i64, context_window: i64) -> TokenUsageInfo {
