@@ -204,6 +204,8 @@ mod spawn {
         let spawn_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
             depth: child_depth,
+            agent_nickname: None,
+            agent_role: None,
         });
         let agent_control = &session.services.agent_control;
         let result = match spawn_mode {
@@ -253,6 +255,8 @@ mod spawn {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     new_thread_id,
+                    new_agent_nickname: None,
+                    new_agent_role: None,
                     prompt,
                     spawn_mode: spawn_mode.into(),
                     status,
@@ -436,6 +440,8 @@ mod send_input {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
                     prompt,
                     status,
                 }
@@ -496,6 +502,8 @@ mod resume_agent {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
                 }
                 .into(),
             )
@@ -540,6 +548,8 @@ mod resume_agent {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
                     status: status.clone(),
                 }
                 .into(),
@@ -847,6 +857,7 @@ pub(crate) mod wait {
                 CollabWaitingBeginEvent {
                     sender_thread_id: session.conversation_id,
                     receiver_thread_ids: event_receiver_thread_ids,
+                    receiver_agents: Vec::new(),
                     call_id: call_id.clone(),
                 }
                 .into(),
@@ -861,6 +872,7 @@ pub(crate) mod wait {
                     CollabWaitingEndEvent {
                         sender_thread_id: session.conversation_id,
                         call_id,
+                        agent_statuses: Vec::new(),
                         statuses: statuses_map.clone(),
                     }
                     .into(),
@@ -905,6 +917,7 @@ pub(crate) mod wait {
                             CollabWaitingEndEvent {
                                 sender_thread_id: session.conversation_id,
                                 call_id: call_id.clone(),
+                                agent_statuses: Vec::new(),
                                 statuses,
                             }
                             .into(),
@@ -968,6 +981,7 @@ pub(crate) mod wait {
                 CollabWaitingEndEvent {
                     sender_thread_id: session.conversation_id,
                     call_id,
+                    agent_statuses: Vec::new(),
                     statuses: statuses_map,
                 }
                 .into(),
@@ -1122,6 +1136,8 @@ pub mod close_agent {
                         call_id: call_id.clone(),
                         sender_thread_id: session.conversation_id,
                         receiver_thread_id: agent_id,
+                        receiver_agent_nickname: None,
+                        receiver_agent_role: None,
                         status: status.clone(),
                     }
                     .into(),
@@ -1181,6 +1197,8 @@ pub mod close_agent {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id: agent_id,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
                     status: status.clone(),
                 }
                 .into(),
@@ -1242,6 +1260,8 @@ fn thread_spawn_source(parent_thread_id: ThreadId, depth: i32) -> SessionSource 
     SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id,
         depth,
+        agent_nickname: None,
+        agent_role: None,
     })
 }
 
@@ -1618,7 +1638,7 @@ mod tests {
             .expect("spawned agent thread should exist")
             .config_snapshot()
             .await;
-        assert_eq!(snapshot.model, "gpt-5.1-codex-mini");
+        assert_eq!(snapshot.model, "gpt-5.2-codex");
         assert_eq!(snapshot.approval_policy, AskForApproval::Never);
     }
 
@@ -1649,6 +1669,8 @@ mod tests {
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
             depth: DEFAULT_AGENT_MAX_DEPTH,
+            agent_nickname: None,
+            agent_role: None,
         });
 
         let invocation = invocation(
@@ -1683,6 +1705,8 @@ mod tests {
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
             depth: DEFAULT_AGENT_MAX_DEPTH,
+            agent_nickname: None,
+            agent_role: None,
         });
 
         let invocation = invocation(
@@ -2254,6 +2278,8 @@ mod tests {
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
             depth: DEFAULT_AGENT_MAX_DEPTH,
+            agent_nickname: None,
+            agent_role: None,
         });
 
         let invocation = invocation(

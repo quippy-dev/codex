@@ -670,6 +670,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 receiver_thread_id,
                 prompt,
                 status,
+                ..
             }) => {
                 let success = !is_collab_status_failure(&status);
                 let title_style = if success { self.green } else { self.red };
@@ -688,6 +689,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 sender_thread_id: _,
                 receiver_thread_ids,
                 call_id,
+                ..
             }) => {
                 ts_msg!(
                     self,
@@ -704,6 +706,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 sender_thread_id: _,
                 call_id,
                 statuses,
+                ..
             }) => {
                 if statuses.is_empty() {
                     ts_msg!(
@@ -756,6 +759,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 sender_thread_id: _,
                 receiver_thread_id,
                 status,
+                ..
             }) => {
                 let success = !is_collab_status_failure(&status);
                 let title_style = if success { self.green } else { self.red };

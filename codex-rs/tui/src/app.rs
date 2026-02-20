@@ -1446,38 +1446,57 @@ impl App {
 
     async fn open_agent_picker(&mut self) {
         let thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
+        let mut agent_threads = Vec::new();
         for thread_id in thread_ids {
-            if self.server.get_thread(thread_id).await.is_err() {
-                self.thread_event_channels.remove(&thread_id);
+            match self.server.get_thread(thread_id).await {
+                Ok(thread) => {
+                    let session_source = thread.config_snapshot().await.session_source;
+                    agent_threads.push((
+                        thread_id,
+                        session_source.get_nickname(),
+                        session_source.get_agent_role(),
+                    ));
+                }
+                Err(_) => {
+                    self.thread_event_channels.remove(&thread_id);
+                }
             }
         }
 
-        if self.thread_event_channels.is_empty() {
+        if agent_threads.is_empty() {
             self.chat_widget
                 .add_info_message("No agents available yet.".to_string(), None);
             return;
         }
 
-        let mut thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
-        thread_ids.sort_by_key(ToString::to_string);
+        agent_threads.sort_by(|(left, ..), (right, ..)| left.to_string().cmp(&right.to_string()));
 
         let mut initial_selected_idx = None;
-        let items: Vec<SelectionItem> = thread_ids
+        let items: Vec<SelectionItem> = agent_threads
             .iter()
             .enumerate()
-            .map(|(idx, thread_id)| {
+            .map(|(idx, (thread_id, agent_nickname, agent_role))| {
                 if self.active_thread_id == Some(*thread_id) {
                     initial_selected_idx = Some(idx);
                 }
                 let id = *thread_id;
+                let is_primary = self.primary_thread_id == Some(*thread_id);
+                let name = format_agent_picker_item_name(
+                    *thread_id,
+                    agent_nickname.as_deref(),
+                    agent_role.as_deref(),
+                    is_primary,
+                );
+                let uuid = thread_id.to_string();
                 SelectionItem {
-                    name: thread_id.to_string(),
+                    name: name.clone(),
+                    description: Some(uuid.clone()),
                     is_current: self.active_thread_id == Some(*thread_id),
                     actions: vec![Box::new(move |tx| {
                         tx.send(AppEvent::SelectAgentThread(id));
                     })],
                     dismiss_on_select: true,
-                    search_value: Some(thread_id.to_string()),
+                    search_value: Some(format!("{name} {uuid}")),
                     ..Default::default()
                 }
             })
@@ -3559,6 +3578,28 @@ impl App {
     }
 }
 
+fn format_agent_picker_item_name(
+    _thread_id: ThreadId,
+    agent_nickname: Option<&str>,
+    agent_role: Option<&str>,
+    is_primary: bool,
+) -> String {
+    if is_primary {
+        return "Main [default]".to_string();
+    }
+
+    let agent_nickname = agent_nickname
+        .map(str::trim)
+        .filter(|nickname| !nickname.is_empty());
+    let agent_role = agent_role.map(str::trim).filter(|role| !role.is_empty());
+    match (agent_nickname, agent_role) {
+        (Some(agent_nickname), Some(agent_role)) => format!("{agent_nickname} [{agent_role}]"),
+        (Some(agent_nickname), None) => agent_nickname.to_string(),
+        (None, Some(agent_role)) => format!("[{agent_role}]"),
+        (None, None) => "Agent".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3746,6 +3787,41 @@ mod tests {
 
         assert_eq!(app.thread_event_channels.contains_key(&thread_id), false);
         Ok(())
+    }
+
+    #[test]
+    fn agent_picker_item_name_snapshot() {
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
+        let snapshot = [
+            format!(
+                "{} | {}",
+                format_agent_picker_item_name(thread_id, Some("Robie"), Some("explorer"), true),
+                thread_id
+            ),
+            format!(
+                "{} | {}",
+                format_agent_picker_item_name(thread_id, Some("Robie"), Some("explorer"), false),
+                thread_id
+            ),
+            format!(
+                "{} | {}",
+                format_agent_picker_item_name(thread_id, Some("Robie"), None, false),
+                thread_id
+            ),
+            format!(
+                "{} | {}",
+                format_agent_picker_item_name(thread_id, None, Some("explorer"), false),
+                thread_id
+            ),
+            format!(
+                "{} | {}",
+                format_agent_picker_item_name(thread_id, None, None, false),
+                thread_id
+            ),
+        ]
+        .join("\n");
+        assert_snapshot!("agent_picker_item_name", snapshot);
     }
 
     #[tokio::test]
@@ -4754,6 +4830,8 @@ mod tests {
             call_id: "call-1".to_string(),
             sender_thread_id: root_thread_id,
             new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: None,
+            new_agent_role: None,
             prompt: "Solve a problem".to_string(),
             spawn_mode: CollabAgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
@@ -4794,6 +4872,8 @@ mod tests {
             call_id: "call-1".to_string(),
             sender_thread_id: root_thread_id,
             new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: None,
+            new_agent_role: None,
             prompt: "Collect data".to_string(),
             spawn_mode: CollabAgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
@@ -4808,6 +4888,7 @@ mod tests {
         registry.on_wait_end(&CollabWaitingEndEvent {
             sender_thread_id: root_thread_id,
             call_id: "wait-1".to_string(),
+            agent_statuses: Vec::new(),
             statuses,
         });
 
@@ -4830,6 +4911,8 @@ mod tests {
             call_id: "call-1".to_string(),
             sender_thread_id: root_thread_id,
             new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: None,
+            new_agent_role: None,
             prompt: "Summarize merge findings".to_string(),
             spawn_mode: CollabAgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
@@ -4852,7 +4935,7 @@ mod tests {
             .get(&subagent_thread_id)
             .map(|info| info.status.clone())
             .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Completed(Some(message.clone())));
+        assert_eq!(status, AgentStatus::Completed(Some(message)));
 
         let rendered = updates[0]
             .display_lines(u16::MAX)
@@ -4877,6 +4960,8 @@ mod tests {
             call_id: "call-1".to_string(),
             sender_thread_id: root_thread_id,
             new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: None,
+            new_agent_role: None,
             prompt: "Summarize merge findings".to_string(),
             spawn_mode: CollabAgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
@@ -4899,7 +4984,7 @@ mod tests {
             .get(&subagent_thread_id)
             .map(|info| info.status.clone())
             .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Errored(message.clone()));
+        assert_eq!(status, AgentStatus::Errored(message));
 
         let rendered = updates[0]
             .display_lines(u16::MAX)
@@ -4924,6 +5009,8 @@ mod tests {
             call_id: "call-1".to_string(),
             sender_thread_id: root_thread_id,
             new_thread_id: Some(watchdog_a),
+            new_agent_nickname: None,
+            new_agent_role: None,
             prompt: "watchdog A".to_string(),
             spawn_mode: CollabAgentSpawnMode::Watchdog,
             status: AgentStatus::PendingInit,
@@ -4935,6 +5022,8 @@ mod tests {
             call_id: "call-2".to_string(),
             sender_thread_id: root_thread_id,
             new_thread_id: Some(watchdog_b),
+            new_agent_nickname: None,
+            new_agent_role: None,
             prompt: "watchdog B".to_string(),
             spawn_mode: CollabAgentSpawnMode::Watchdog,
             status: AgentStatus::PendingInit,
@@ -4974,6 +5063,8 @@ mod tests {
                     call_id: "call-1".to_string(),
                     sender_thread_id: root_thread_id,
                     new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: None,
+                    new_agent_role: None,
                     prompt: "compute pi".to_string(),
                     spawn_mode: CollabAgentSpawnMode::Spawn,
                     status: AgentStatus::PendingInit,
@@ -4993,6 +5084,7 @@ mod tests {
                 msg: EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
                     sender_thread_id: root_thread_id,
                     receiver_thread_ids: vec![subagent_thread_id],
+                    receiver_agents: Vec::new(),
                     call_id: "call-2".to_string(),
                 }),
             },
@@ -5015,6 +5107,7 @@ mod tests {
                 msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
                     sender_thread_id: root_thread_id,
                     call_id: "call-2".to_string(),
+                    agent_statuses: Vec::new(),
                     statuses,
                 }),
             },
@@ -5035,6 +5128,8 @@ mod tests {
                     call_id: "call-3".to_string(),
                     sender_thread_id: root_thread_id,
                     receiver_thread_id: subagent_thread_id,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
                     status: AgentStatus::Completed(Some("3.1415926535".to_string())),
                 }),
             },

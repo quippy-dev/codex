@@ -1891,6 +1891,10 @@ pub enum SubAgentSource {
     ThreadSpawn {
         parent_thread_id: ThreadId,
         depth: i32,
+        #[serde(default)]
+        agent_nickname: Option<String>,
+        #[serde(default, alias = "agent_type")]
+        agent_role: Option<String>,
     },
     MemoryConsolidation,
     Other(String),
@@ -1909,6 +1913,26 @@ impl fmt::Display for SessionSource {
     }
 }
 
+impl SessionSource {
+    pub fn get_nickname(&self) -> Option<String> {
+        match self {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_nickname, .. }) => {
+                agent_nickname.clone()
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_agent_role(&self) -> Option<String> {
+        match self {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+                agent_role.clone()
+            }
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for SubAgentSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1918,6 +1942,7 @@ impl fmt::Display for SubAgentSource {
             SubAgentSource::ThreadSpawn {
                 parent_thread_id,
                 depth,
+                ..
             } => {
                 write!(f, "thread_spawn_{parent_thread_id}_d{depth}")
             }
@@ -1942,6 +1967,12 @@ pub struct SessionMeta {
     pub cli_version: String,
     #[serde(default)]
     pub source: SessionSource,
+    /// Optional random unique nickname assigned to an AgentControl-spawned sub-agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
     pub model_provider: Option<String>,
     /// base_instructions for the session. This *should* always be present when creating a new session,
     /// but may be missing for older sessions. If not present, fall back to rendering the base_instructions
@@ -1961,6 +1992,8 @@ impl Default for SessionMeta {
             originator: String::new(),
             cli_version: String::new(),
             source: SessionSource::default(),
+            agent_nickname: None,
+            agent_role: None,
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,
@@ -2761,6 +2794,32 @@ pub enum CollabAgentSpawnMode {
     Watchdog,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CollabAgentRef {
+    /// Thread ID of the receiver/new agent.
+    pub thread_id: ThreadId,
+    /// Optional nickname assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CollabAgentStatusEntry {
+    /// Thread ID of the receiver/new agent.
+    pub thread_id: ThreadId,
+    /// Optional nickname assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    /// Last known status of the agent.
+    pub status: AgentStatus,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct CollabAgentSpawnEndEvent {
     /// Identifier for the collab tool call.
@@ -2769,6 +2828,12 @@ pub struct CollabAgentSpawnEndEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the newly spawned agent, if it was created.
     pub new_thread_id: Option<ThreadId>,
+    /// Optional nickname assigned to the new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_nickname: Option<String>,
+    /// Optional role assigned to the new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_role: Option<String>,
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
@@ -2800,6 +2865,12 @@ pub struct CollabAgentInteractionEndEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
     pub receiver_thread_id: ThreadId,
+    /// Optional nickname assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_nickname: Option<String>,
+    /// Optional role assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_role: Option<String>,
     /// Prompt sent from the sender to the receiver. Can be empty to prevent CoT
     /// leaking at the beginning.
     pub prompt: String,
@@ -2813,6 +2884,9 @@ pub struct CollabWaitingBeginEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receivers.
     pub receiver_thread_ids: Vec<ThreadId>,
+    /// Optional receiver metadata paired with receiver thread IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receiver_agents: Vec<CollabAgentRef>,
     /// ID of the waiting call.
     pub call_id: String,
 }
@@ -2823,6 +2897,9 @@ pub struct CollabWaitingEndEvent {
     pub sender_thread_id: ThreadId,
     /// ID of the waiting call.
     pub call_id: String,
+    /// Optional receiver metadata paired with final statuses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_statuses: Vec<CollabAgentStatusEntry>,
     /// Last known status of the receiver agents reported to the sender agent.
     pub statuses: HashMap<ThreadId, AgentStatus>,
 }
@@ -2845,6 +2922,12 @@ pub struct CollabCloseEndEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
     pub receiver_thread_id: ThreadId,
+    /// Optional nickname assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_nickname: Option<String>,
+    /// Optional role assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_role: Option<String>,
     /// Last known status of the receiver agent reported to the sender agent before
     /// the close.
     pub status: AgentStatus,
@@ -2858,6 +2941,12 @@ pub struct CollabResumeBeginEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
     pub receiver_thread_id: ThreadId,
+    /// Optional nickname assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_nickname: Option<String>,
+    /// Optional role assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -2868,6 +2957,12 @@ pub struct CollabResumeEndEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
     pub receiver_thread_id: ThreadId,
+    /// Optional nickname assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_nickname: Option<String>,
+    /// Optional role assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_role: Option<String>,
     /// Last known status of the receiver agent reported to the sender agent after
     /// resume.
     pub status: AgentStatus,

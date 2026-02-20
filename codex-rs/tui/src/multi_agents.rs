@@ -49,6 +49,7 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
         receiver_thread_id,
         prompt,
         status,
+        ..
     } = ev;
     let mut details = vec![
         detail_line("call", call_id),
@@ -66,6 +67,7 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
         call_id,
         sender_thread_id: _,
         receiver_thread_ids,
+        ..
     } = ev;
     let details = vec![
         detail_line("call", call_id),
@@ -79,6 +81,7 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         call_id,
         sender_thread_id: _,
         statuses,
+        ..
     } = ev;
     let mut details = vec![detail_line("call", call_id)];
     details.extend(wait_complete_lines(&statuses));
@@ -91,6 +94,7 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
         sender_thread_id: _,
         receiver_thread_id,
         status,
+        ..
     } = ev;
     let details = vec![
         detail_line("call", call_id),
@@ -105,6 +109,7 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
         call_id,
         sender_thread_id: _,
         receiver_thread_id,
+        ..
     } = ev;
     let details = vec![
         detail_line("call", call_id),
@@ -119,6 +124,7 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
         sender_thread_id: _,
         receiver_thread_id,
         status,
+        ..
     } = ev;
     let details = vec![
         detail_line("call", call_id),
@@ -315,6 +321,7 @@ mod tests {
         let cell = waiting_end(CollabWaitingEndEvent {
             call_id: "call-1".to_string(),
             sender_thread_id: ThreadId::new(),
+            agent_statuses: Vec::new(),
             statuses,
         });
         let rendered = cell

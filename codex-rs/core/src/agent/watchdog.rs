@@ -282,6 +282,8 @@ impl WatchdogManager {
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: snapshot.owner_thread_id,
             depth: snapshot.child_depth,
+            agent_nickname: None,
+            agent_role: None,
         });
         let mut helper_config = snapshot.config.clone();
         // Watchdog helpers are short-lived check-ins. Keep their state in-memory and
