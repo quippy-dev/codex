@@ -5,7 +5,6 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_core::CodexAuth;
 use codex_core::features::Feature;
 use codex_protocol::config_types::ReasoningSummary;
-use codex_protocol::models::local_image_open_tag_text;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
@@ -32,18 +31,15 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_event_with_timeout;
 use image::GenericImageView;
 use image::ImageBuffer;
 use image::Rgba;
 use image::load_from_memory;
-use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::time::Duration;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
-use wiremock::ResponseTemplate;
 
 fn find_image_message(body: &Value) -> Option<&Value> {
     body.get("input")
@@ -457,15 +453,7 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
         })
         .await?;
 
-    let error_message = wait_for_event_match(&codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
-    assert_eq!(
-        error_message,
-        "Invalid image in your last message. Please remove it and try again."
-    );
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let req = mock.single_request();
     let body_with_tool_output = req.body_json();
@@ -781,13 +769,22 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
     const INVALID_IMAGE_ERROR: &str =
         "The image data you provided does not represent a valid image";
 
-    let response_mock = responses::mount_response_once(
+    let invalid_image_mock = responses::mount_response_once_match(
         &server,
+        body_string_contains("\"input_image\""),
         ResponseTemplate::new(400)
             .insert_header("content-type", "text/plain")
             .set_body_string(INVALID_IMAGE_ERROR),
     )
     .await;
+
+    let success_response = sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+
+    let completion_mock = responses::mount_sse_once(&server, success_response).await;
 
     let TestCodex {
         codex,
@@ -825,20 +822,20 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 1);
-    let first_body = requests[0].body_json();
+    let first_body = invalid_image_mock.single_request().body_json();
     assert!(
         find_image_message(&first_body).is_some(),
         "initial request should include the uploaded image"
     );
 
-    let user_texts = requests[0].message_input_texts("user");
-    let open_tag = local_image_open_tag_text(1);
+    let second_request = completion_mock.single_request();
+    let second_body = second_request.body_json();
     assert!(
-        user_texts.iter().any(|text| text == &open_tag),
-        "expected the user message to include {open_tag}"
+        find_image_message(&second_body).is_none(),
+        "second request should replace the invalid image"
     );
+    let user_texts = second_request.message_input_texts("user");
+    assert!(user_texts.iter().any(|text| text == "Invalid image"));
 
     Ok(())
 }

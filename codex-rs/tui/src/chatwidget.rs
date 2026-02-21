@@ -133,7 +133,6 @@ use codex_protocol::protocol::WebSearchEndEvent;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_sleep_inhibitor::SleepInhibitor;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -156,8 +155,8 @@ use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
-const PLAN_IMPLEMENTATION_EXECUTE: &str = "Yes, implement this plan";
-const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
+const PLAN_IMPLEMENTATION_EXECUTE: &str = "Yes, implement in Execute mode";
+const PLAN_IMPLEMENTATION_DEFAULT: &str = "Yes, implement in Default mode";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
@@ -1484,7 +1483,7 @@ impl ChatWidget {
                 ..Default::default()
             },
             SelectionItem {
-                name: PLAN_IMPLEMENTATION_YES.to_string(),
+                name: PLAN_IMPLEMENTATION_DEFAULT.to_string(),
                 description: Some("Switch to Default and start coding.".to_string()),
                 selected_description: None,
                 is_current: false,
@@ -3825,27 +3824,20 @@ impl ChatWidget {
             });
         }
 
-        let (model_text, model_text_elements) =
-            self.expand_directory_mentions_for_model(&text, &text_elements);
-
         for image in &local_images {
             items.push(UserInput::LocalImage {
                 path: image.path.clone(),
             });
         }
 
-        if !model_text.is_empty() {
+        if !text.is_empty() {
             items.push(UserInput::Text {
-                text: model_text,
-                text_elements: model_text_elements,
+                text: text.clone(),
+                text_elements: text_elements.clone(),
             });
         }
 
-        let mention_paths: HashMap<String, String> = mention_bindings
-            .iter()
-            .map(|binding| (binding.mention.clone(), binding.path.clone()))
-            .collect();
-        let mentions = collect_tool_mentions(&text, &mention_paths);
+        let mentions = collect_tool_mentions(&text, &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
             .map(|binding| binding.mention.clone())
@@ -4020,78 +4012,6 @@ impl ChatWidget {
             self.image_inputs_not_supported_message(),
         ));
         self.request_redraw();
-    }
-
-    fn expand_directory_mentions_for_model(
-        &self,
-        text: &str,
-        text_elements: &[TextElement],
-    ) -> (String, Vec<TextElement>) {
-        use std::fs;
-
-        if text.is_empty() || text_elements.is_empty() {
-            return (text.to_string(), text_elements.to_vec());
-        }
-
-        fn normalize_dir_path_for_prompt(path: &Path) -> String {
-            let mut s = path.to_string_lossy().replace('\\', "/");
-            if !s.ends_with('/') {
-                s.push('/');
-            }
-            s
-        }
-
-        let mut elements = text_elements.to_vec();
-        elements.sort_by_key(|e| e.byte_range.start);
-
-        let mut rebuilt = String::with_capacity(text.len());
-        let mut rebuilt_elements = Vec::with_capacity(elements.len());
-        let mut cursor = 0usize;
-
-        for elem in elements {
-            let start = elem.byte_range.start.min(text.len());
-            let end = elem.byte_range.end.min(text.len());
-            if start > end {
-                continue;
-            }
-            if start > cursor {
-                rebuilt.push_str(&text[cursor..start]);
-            }
-
-            let elem_text = &text[start..end];
-            let payload = elem.placeholder(text).map(str::to_string);
-            let resolved_dir = payload
-                .as_deref()
-                .filter(|payload| payload.ends_with('/'))
-                .and_then(|payload| {
-                    AbsolutePathBuf::resolve_path_against_base(payload, &self.config.cwd).ok()
-                })
-                .and_then(|abs| {
-                    fs::metadata(abs.as_path())
-                        .ok()
-                        .and_then(|meta| meta.is_dir().then_some(abs))
-                });
-
-            if let Some(abs) = resolved_dir {
-                let abs_dir = normalize_dir_path_for_prompt(abs.as_path());
-                rebuilt.push_str(elem_text);
-                rebuilt.push_str(&format!(" (path: {abs_dir})"));
-            } else {
-                let new_start = rebuilt.len();
-                rebuilt.push_str(elem_text);
-                let new_end = rebuilt.len();
-                let placeholder = payload.or_else(|| Some(elem_text.to_string()));
-                rebuilt_elements.push(TextElement::new((new_start..new_end).into(), placeholder));
-            }
-
-            cursor = end;
-        }
-
-        if cursor < text.len() {
-            rebuilt.push_str(&text[cursor..]);
-        }
-
-        (rebuilt, rebuilt_elements)
     }
 
     /// Replay a subset of initial events into the UI to seed the transcript when

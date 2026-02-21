@@ -177,7 +177,7 @@ impl From<JsonSchema> for AdditionalProperties {
     }
 }
 
-pub(crate) fn create_approval_parameters() -> BTreeMap<String, JsonSchema> {
+fn create_approval_parameters() -> BTreeMap<String, JsonSchema> {
     let mut properties = BTreeMap::from([
         (
             "sandbox_permissions".to_string(),

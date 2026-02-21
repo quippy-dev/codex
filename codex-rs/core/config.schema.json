@@ -364,9 +364,6 @@
             "prevent_idle_sleep": {
               "type": "boolean"
             },
-            "python_tool": {
-              "type": "boolean"
-            },
             "remote_models": {
               "type": "boolean"
             },
@@ -1630,9 +1627,6 @@
           "type": "boolean"
         },
         "prevent_idle_sleep": {
-          "type": "boolean"
-        },
-        "python_tool": {
           "type": "boolean"
         },
         "remote_models": {

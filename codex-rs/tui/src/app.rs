@@ -934,6 +934,7 @@ impl App {
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
     }
+
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
         let Some(mut rx) = self.active_thread_rx.take() else {
             return Ok(());
@@ -2999,7 +3000,6 @@ mod tests {
     use codex_core::CodexAuth;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
-    use codex_core::config_loader::LoaderOverrides;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::AskForApproval;
@@ -3549,11 +3549,6 @@ mod tests {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
-            .loader_overrides(LoaderOverrides {
-                ignore_system_config: true,
-                ignore_system_requirements: true,
-                ..LoaderOverrides::default()
-            })
             .build()
             .await
             .expect("config");

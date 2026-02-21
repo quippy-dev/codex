@@ -438,6 +438,7 @@ impl BottomPane {
         self.composer.insert_str(text);
         self.request_redraw();
     }
+
     /// Replace the composer text with `text`.
     ///
     /// This is intended for fresh input where mention linkage does not need to
