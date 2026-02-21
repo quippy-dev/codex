@@ -97,6 +97,7 @@ mod prompt_caching;
 mod python_tool;
 mod quota_exceeded;
 mod read_file;
+mod realtime_conversation;
 mod remote_models;
 mod request_compression;
 mod request_user_input;

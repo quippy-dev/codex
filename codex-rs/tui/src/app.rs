@@ -52,27 +52,6 @@ use codex_core::features::Feature;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
-use codex_core::protocol::AgentMessageDeltaEvent;
-use codex_core::protocol::AgentMessageEvent;
-use codex_core::protocol::AgentStatus;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::CollabAgentSpawnEndEvent;
-use codex_core::protocol::CollabAgentSpawnMode;
-use codex_core::protocol::CollabCloseEndEvent;
-use codex_core::protocol::CollabWaitingEndEvent;
-use codex_core::protocol::ErrorEvent;
-use codex_core::protocol::Event;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::FinalOutput;
-use codex_core::protocol::ListSkillsResponseEvent;
-use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol::SessionSource;
-use codex_core::protocol::SkillErrorInfo;
-use codex_core::protocol::TokenUsage;
-use codex_core::protocol::TurnAbortedEvent;
-use codex_core::protocol::TurnCompleteEvent;
-use codex_core::protocol::TurnStartedEvent;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_otel::OtelManager;
@@ -85,7 +64,28 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::AgentMessageDeltaEvent;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+use codex_protocol::protocol::CollabAgentSpawnMode;
+use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabWaitingEndEvent;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::FinalOutput;
+use codex_protocol::protocol::ListSkillsResponseEvent;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SkillErrorInfo;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -2440,6 +2440,10 @@ impl App {
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);
             }
+            AppEvent::OpenPlanReasoningScopePrompt { model, effort } => {
+                self.chat_widget
+                    .open_plan_reasoning_scope_prompt(model, effort);
+            }
             AppEvent::OpenAllModelsPopup { models } => {
                 self.chat_widget.open_all_models_popup(models);
             }
@@ -2991,6 +2995,11 @@ impl App {
             AppEvent::UpdateRateLimitSwitchPromptHidden(hidden) => {
                 self.chat_widget.set_rate_limit_switch_prompt_hidden(hidden);
             }
+            AppEvent::UpdatePlanModeReasoningEffort(effort) => {
+                self.config.plan_mode_reasoning_effort = effort;
+                self.chat_widget.set_plan_mode_reasoning_effort(effort);
+                self.refresh_status_line();
+            }
             AppEvent::PersistFullAccessWarningAcknowledged => {
                 if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
                     .set_hide_full_access_warning(true)
@@ -3034,6 +3043,45 @@ impl App {
                     self.chat_widget.add_error_message(format!(
                         "Failed to save rate limit reminder preference: {err}"
                     ));
+                }
+            }
+            AppEvent::PersistPlanModeReasoningEffort(effort) => {
+                let profile = self.active_profile.as_deref();
+                let segments = if let Some(profile) = profile {
+                    vec![
+                        "profiles".to_string(),
+                        profile.to_string(),
+                        "plan_mode_reasoning_effort".to_string(),
+                    ]
+                } else {
+                    vec!["plan_mode_reasoning_effort".to_string()]
+                };
+                let edit = if let Some(effort) = effort {
+                    ConfigEdit::SetPath {
+                        segments,
+                        value: effort.to_string().into(),
+                    }
+                } else {
+                    ConfigEdit::ClearPath { segments }
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits([edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist plan mode reasoning effort"
+                    );
+                    if let Some(profile) = profile {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save Plan mode reasoning effort for profile `{profile}`: {err}"
+                        ));
+                    } else {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save Plan mode reasoning effort: {err}"
+                        ));
+                    }
                 }
             }
             AppEvent::PersistModelMigrationPromptAcknowledged {
@@ -3382,7 +3430,7 @@ impl App {
         (!model.starts_with("codex-auto-")).then(|| Self::reasoning_label(reasoning_effort))
     }
 
-    pub(crate) fn token_usage(&self) -> codex_core::protocol::TokenUsage {
+    pub(crate) fn token_usage(&self) -> codex_protocol::protocol::TokenUsage {
         self.chat_widget.token_usage()
     }
 
@@ -3615,24 +3663,24 @@ mod tests {
     use codex_core::CodexAuth;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
-    use codex_core::protocol::AgentReasoningDeltaEvent;
-    use codex_core::protocol::AgentStatus;
-    use codex_core::protocol::AskForApproval;
-    use codex_core::protocol::CollabAgentSpawnEndEvent;
-    use codex_core::protocol::CollabCloseEndEvent;
-    use codex_core::protocol::CollabWaitingBeginEvent;
-    use codex_core::protocol::CollabWaitingEndEvent;
-    use codex_core::protocol::ErrorEvent;
-    use codex_core::protocol::Event;
-    use codex_core::protocol::EventMsg;
-    use codex_core::protocol::SandboxPolicy;
-    use codex_core::protocol::SessionConfiguredEvent;
-    use codex_core::protocol::SessionSource;
-    use codex_core::protocol::ThreadRolledBackEvent;
-    use codex_core::protocol::TurnCompleteEvent;
-    use codex_core::protocol::UserMessageEvent;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
+    use codex_protocol::protocol::AgentReasoningDeltaEvent;
+    use codex_protocol::protocol::AgentStatus;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+    use codex_protocol::protocol::CollabCloseEndEvent;
+    use codex_protocol::protocol::CollabWaitingBeginEvent;
+    use codex_protocol::protocol::CollabWaitingEndEvent;
+    use codex_protocol::protocol::ErrorEvent;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::SessionConfiguredEvent;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::ThreadRolledBackEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
     use crossterm::event::KeyModifiers;
