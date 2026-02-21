@@ -7,13 +7,13 @@ use crate::tools::spec::create_approval_parameters;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub(crate) fn register_python_tool(builder: &mut ToolRegistryBuilder, include_prefix_rule: bool) {
+pub(crate) fn register_python_tool(builder: &mut ToolRegistryBuilder, _include_prefix_rule: bool) {
     let python_handler = Arc::new(PythonHandler);
-    builder.push_spec_with_parallel_support(create_python_tool(include_prefix_rule), true);
+    builder.push_spec_with_parallel_support(create_python_tool(), true);
     builder.register_handler("python", python_handler);
 }
 
-fn create_python_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_python_tool() -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "code".to_string(),
@@ -57,7 +57,7 @@ fn create_python_tool(include_prefix_rule: bool) -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+    properties.extend(create_approval_parameters());
 
     ToolSpec::Function(ResponsesApiTool {
         name: "python".to_string(),

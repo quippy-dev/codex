@@ -140,6 +140,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
     pub(crate) auth_storage_home: PathBuf,
     pub(crate) config: Arc<Config>,
+    pub(crate) single_client_mode: bool,
     pub(crate) cli_overrides: Vec<(String, TomlValue)>,
     pub(crate) loader_overrides: LoaderOverrides,
     pub(crate) cloud_requirements: CloudRequirementsLoader,
@@ -156,6 +157,7 @@ impl MessageProcessor {
             codex_linux_sandbox_exe,
             auth_storage_home,
             config,
+            single_client_mode,
             cli_overrides,
             loader_overrides,
             cloud_requirements,
@@ -175,6 +177,7 @@ impl MessageProcessor {
             config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::VSCode,
+            config.model_catalog.clone(),
         ));
         let cloud_requirements = Arc::new(RwLock::new(cloud_requirements));
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
@@ -187,6 +190,7 @@ impl MessageProcessor {
             cli_overrides: cli_overrides.clone(),
             loader_overrides: loader_overrides.clone(),
             cloud_requirements: cloud_requirements.clone(),
+            single_client_mode,
             feedback,
         });
         let config_api = ConfigApi::new(
