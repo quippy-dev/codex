@@ -862,6 +862,17 @@ pub(crate) mod wait {
         call_id: String,
         arguments: String,
     ) -> Result<ToolOutput, FunctionCallError> {
+        if let Some(owner_thread_id) = session
+            .services
+            .agent_control
+            .watchdog_owner_for_active_helper(session.conversation_id)
+            .await
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "wait is not available to watchdog check-in agents. This thread is a one-shot watchdog check-in for owner {owner_thread_id}. Send the result to the parent/root agent with `send_input` (or finish with a final message for fallback delivery) and end your turn."
+            )));
+        }
+
         let args: WaitArgs = parse_arguments(&arguments)?;
         if args.ids.is_empty() {
             return Err(FunctionCallError::RespondToModel(
@@ -951,10 +962,9 @@ pub(crate) mod wait {
                 FunctionCallError::Fatal(format!("failed to serialize wait result: {err}"))
             })?;
 
-            return Ok(ToolOutput::Function {
-                body: FunctionCallOutputBody::Text(content),
-                success: None,
-            });
+            return Err(FunctionCallError::RespondToModel(format!(
+                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins only happen after the current turn ends and the owner thread is idle for at least interval_s. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
+            )));
         }
 
         let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
@@ -2662,7 +2672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_noops_for_watchdog_handles() {
+    async fn wait_rejects_watchdog_only_handles() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
@@ -2687,33 +2697,21 @@ mod tests {
             })),
         );
 
-        let output = timeout(
+        let wait_result = timeout(
             Duration::from_millis(250),
             MultiAgentHandler.handle(invocation),
         )
         .await
-        .expect("wait should return immediately for watchdog handles")
-        .expect("wait should succeed");
-
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
+        .expect("wait should return immediately for watchdog handles");
+        let Err(err) = wait_result else {
+            panic!("watchdog-only wait should return a correction");
         };
-        let result: WaitResult =
-            serde_json::from_str(&content).expect("wait result should be json");
-        let expected_watchdog_status = session.services.agent_control.get_status(watchdog_id).await;
-        assert_eq!(
-            result,
-            WaitResult {
-                status: HashMap::from([(watchdog_id, expected_watchdog_status)]),
-                timed_out: false
-            }
-        );
-        assert_eq!(success, None);
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected respond-to-model error");
+        };
+        assert!(message.contains("wait cannot be used to wait for watchdog check-ins"));
+        assert!(message.contains("Continue the task now or end the turn"));
+        assert!(message.contains(&watchdog_id.to_string()));
 
         let _ = session
             .services
@@ -2724,6 +2722,87 @@ mod tests {
             .services
             .agent_control
             .shutdown_agent(owner_thread.thread_id)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn wait_rejects_active_watchdog_helper_sessions() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let owner_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start owner thread");
+        session.conversation_id = owner_thread.thread_id;
+
+        let mut session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let watchdog_id = spawn_watchdog_for_test(session.clone(), turn.clone()).await;
+        let owner_thread_id = owner_thread.thread_id;
+
+        let mut helper_config = turn.config.as_ref().clone();
+        helper_config.ephemeral = true;
+        let helper_id = session
+            .services
+            .agent_control
+            .spawn_agent_handle(
+                helper_config.clone(),
+                Some(thread_spawn_source(owner_thread_id, 1)),
+            )
+            .await
+            .expect("spawn helper handle");
+        session
+            .services
+            .agent_control
+            .set_watchdog_active_helper_for_tests(watchdog_id, helper_id)
+            .await;
+
+        Arc::get_mut(&mut session)
+            .expect("no extra session refs")
+            .conversation_id = helper_id;
+        let (_, mut helper_turn) = make_session_and_context().await;
+        helper_turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: owner_thread_id,
+            depth: 1,
+            agent_nickname: None,
+            agent_role: None,
+        });
+        helper_turn.config = Arc::new(helper_config);
+        let helper_turn = Arc::new(helper_turn);
+        let invocation = invocation(
+            session.clone(),
+            helper_turn,
+            "wait",
+            function_payload(json!({
+                "ids": [watchdog_id.to_string()]
+            })),
+        );
+
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("watchdog helper wait should be rejected");
+        };
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected model-visible correction");
+        };
+        assert!(message.contains("wait is not available to watchdog check-in agents"));
+        assert!(message.contains("send_input"));
+
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(helper_id)
+            .await;
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(watchdog_id)
+            .await;
+        let _ = session
+            .services
+            .agent_control
+            .shutdown_agent(owner_thread_id)
             .await;
     }
 

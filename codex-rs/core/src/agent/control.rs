@@ -591,6 +591,15 @@ impl AgentControl {
             .await;
     }
 
+    pub(crate) async fn watchdog_owner_for_active_helper(
+        &self,
+        helper_thread_id: ThreadId,
+    ) -> Option<ThreadId> {
+        self.watchdogs
+            .owner_for_active_helper(helper_thread_id)
+            .await
+    }
+
     pub(crate) async fn list_agents(
         &self,
         owner_thread_id: ThreadId,
