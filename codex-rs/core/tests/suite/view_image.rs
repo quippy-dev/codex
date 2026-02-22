@@ -40,6 +40,8 @@ use serde_json::Value;
 use tokio::time::Duration;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::body_string_contains;
 
 fn find_image_message(body: &Value) -> Option<&Value> {
     body.get("input")
