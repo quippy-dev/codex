@@ -15,7 +15,6 @@ use crate::tools::handlers::multi_agents::DEFAULT_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
-use crate::tools::python::register_python_tool;
 use crate::tools::registry::ToolRegistryBuilder;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -40,7 +39,6 @@ pub(crate) struct ToolsConfig {
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
-    pub python_tool: bool,
     pub request_rule_enabled: bool,
     pub search_tool: bool,
     pub js_repl_enabled: bool,
@@ -67,13 +65,12 @@ impl ToolsConfig {
         let include_js_repl = features.enabled(Feature::JsRepl);
         let include_js_repl_tools_only =
             include_js_repl && features.enabled(Feature::JsReplToolsOnly);
-        let include_python_tool = features.enabled(Feature::PythonTool);
         let request_rule_enabled = features.enabled(Feature::RequestRule);
         let include_collab_tools = features.enabled(Feature::Collab);
         let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
         let include_search_tool = features.enabled(Feature::Apps);
 
-        let shell_type = if include_python_tool || !features.enabled(Feature::ShellTool) {
+        let shell_type = if !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
         } else if features.enabled(Feature::ShellZshFork) {
             ConfigShellToolType::ShellCommand
@@ -106,7 +103,6 @@ impl ToolsConfig {
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
             agent_roles: BTreeMap::new(),
-            python_tool: include_python_tool,
             request_rule_enabled,
             search_tool: include_search_tool,
             js_repl_enabled: include_js_repl,
@@ -1631,10 +1627,6 @@ pub(crate) fn build_specs(
     if config.collaboration_modes_tools {
         builder.push_spec(create_request_user_input_tool());
         builder.register_handler("request_user_input", request_user_input_handler);
-    }
-
-    if config.python_tool {
-        register_python_tool(&mut builder, config.request_rule_enabled);
     }
 
     if config.search_tool

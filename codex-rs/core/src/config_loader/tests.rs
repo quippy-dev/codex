@@ -744,6 +744,77 @@ allowed_approval_policies = ["on-request"]
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn ignore_system_requirements_skips_system_and_legacy_requirements() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    let managed_config_path = tmp.path().join("managed_config.toml");
+    tokio::fs::write(&managed_config_path, "approval_policy = \"never\"\n").await?;
+    let requirements_file = tmp.path().join("requirements.toml");
+    tokio::fs::write(
+        &requirements_file,
+        "allowed_approval_policies = [\"on-request\"]\n",
+    )
+    .await?;
+
+    let layers = super::load_config_layers_state_with_system_requirements_toml_file(
+        &codex_home,
+        Some(AbsolutePathBuf::from_absolute_path(tmp.path())?),
+        &[] as &[(String, TomlValue)],
+        LoaderOverrides {
+            managed_config_path: Some(managed_config_path),
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+            ..LoaderOverrides::default()
+        },
+        CloudRequirementsLoader::default(),
+        Some(AbsolutePathBuf::from_absolute_path(&requirements_file)?),
+    )
+    .await?;
+
+    assert_eq!(layers.requirements_toml().allowed_approval_policies, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn loads_system_requirements_when_ignore_flag_is_false() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    let managed_config_path = tmp.path().join("managed_config.toml");
+    tokio::fs::write(&managed_config_path, "approval_policy = \"never\"\n").await?;
+    let requirements_file = tmp.path().join("requirements.toml");
+    tokio::fs::write(
+        &requirements_file,
+        "allowed_approval_policies = [\"on-request\"]\n",
+    )
+    .await?;
+
+    let layers = super::load_config_layers_state_with_system_requirements_toml_file(
+        &codex_home,
+        Some(AbsolutePathBuf::from_absolute_path(tmp.path())?),
+        &[] as &[(String, TomlValue)],
+        LoaderOverrides {
+            managed_config_path: Some(managed_config_path),
+            ignore_system_config: true,
+            ignore_system_requirements: false,
+            ..LoaderOverrides::default()
+        },
+        CloudRequirementsLoader::default(),
+        Some(AbsolutePathBuf::from_absolute_path(&requirements_file)?),
+    )
+    .await?;
+
+    assert_eq!(
+        layers.requirements_toml().allowed_approval_policies,
+        Some(vec![AskForApproval::OnRequest])
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn load_config_layers_includes_cloud_requirements() -> anyhow::Result<()> {
     let tmp = tempdir()?;

@@ -100,11 +100,6 @@ impl ZshExecBridge {
         state.initialized_session_id = Some(session_id.to_string());
     }
 
-    pub(crate) async fn shutdown(&self) {
-        let mut state = self.state.lock().await;
-        state.initialized_session_id = None;
-    }
-
     pub(crate) fn next_wrapper_socket_path(&self) -> PathBuf {
         let socket_id = Uuid::new_v4().as_simple().to_string();
         let temp_dir = std::env::temp_dir();

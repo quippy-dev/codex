@@ -116,6 +116,25 @@ pub async fn load_config_layers_state(
     overrides: LoaderOverrides,
     cloud_requirements: CloudRequirementsLoader,
 ) -> io::Result<ConfigLayerStack> {
+    load_config_layers_state_with_system_requirements_toml_file(
+        codex_home,
+        cwd,
+        cli_overrides,
+        overrides,
+        cloud_requirements,
+        None,
+    )
+    .await
+}
+
+async fn load_config_layers_state_with_system_requirements_toml_file(
+    codex_home: &Path,
+    cwd: Option<AbsolutePathBuf>,
+    cli_overrides: &[(String, TomlValue)],
+    overrides: LoaderOverrides,
+    cloud_requirements: CloudRequirementsLoader,
+    system_requirements_toml_file_override: Option<AbsolutePathBuf>,
+) -> io::Result<ConfigLayerStack> {
     let ignore_system_requirements = overrides.ignore_system_requirements;
     let ignore_system_config = overrides.ignore_system_config;
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
@@ -134,16 +153,15 @@ pub async fn load_config_layers_state(
     )
     .await?;
 
-    if !ignore_system_requirements {
-        // Honor the system requirements.toml location.
-        let requirements_toml_file = system_requirements_toml_file()?;
-        load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
-    }
-
-    // Make a best-effort to support the legacy `managed_config.toml` as a
-    // requirements specification.
     let loaded_config_layers = layer_io::load_config_layers_internal(codex_home, overrides).await?;
     if !ignore_system_requirements {
+        // Honor the system requirements.toml location.
+        let requirements_toml_file =
+            system_requirements_toml_file_override.unwrap_or(system_requirements_toml_file()?);
+        load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
+
+        // Make a best-effort to support the legacy `managed_config.toml` as a
+        // requirements specification.
         load_requirements_from_legacy_scheme(
             &mut config_requirements_toml,
             loaded_config_layers.clone(),

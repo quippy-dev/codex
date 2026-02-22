@@ -115,8 +115,6 @@ pub enum Feature {
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
-    /// Enable the dedicated Python execution tool.
-    PythonTool,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
     /// Enforce UTF8 output in Powershell.
@@ -502,12 +500,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MemoryTool,
         key: "memory_tool",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::PythonTool,
-        key: "python_tool",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use codex_file_search::FileMatch;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -89,10 +91,11 @@ impl FileSearchPopup {
         self.state.ensure_visible(len, len.min(MAX_POPUP_ROWS));
     }
 
-    pub(crate) fn selected_match(&self) -> Option<&FileMatch> {
+    pub(crate) fn selected_match(&self) -> Option<&PathBuf> {
         self.state
             .selected_idx
             .and_then(|idx| self.matches.get(idx))
+            .map(|file_match| &file_match.path)
     }
 
     pub(crate) fn calculate_required_height(&self) -> u16 {
@@ -115,11 +118,7 @@ impl WidgetRef for &FileSearchPopup {
             self.matches
                 .iter()
                 .map(|m| GenericDisplayRow {
-                    name: if m.is_dir {
-                        format!("{}/", m.path.to_string_lossy())
-                    } else {
-                        m.path.to_string_lossy().to_string()
-                    },
+                    name: m.path.to_string_lossy().to_string(),
                     match_indices: m
                         .indices
                         .as_ref()
