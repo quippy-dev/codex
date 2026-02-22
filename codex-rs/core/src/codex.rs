@@ -2850,7 +2850,7 @@ impl Session {
         server_model: String,
     ) -> bool {
         let requested_model = turn_context.model_info.slug.clone();
-        if server_model == requested_model {
+        if server_model.eq_ignore_ascii_case(&requested_model) {
             info!("server reported model {server_model} (matches requested model)");
             return false;
         }

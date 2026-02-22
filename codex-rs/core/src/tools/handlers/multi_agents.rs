@@ -440,12 +440,21 @@ mod send_input {
                 .into(),
             )
             .await;
-        let result = session
-            .services
-            .agent_control
-            .send_input(receiver_thread_id, input_items)
-            .await
-            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err));
+        let result = if let Some(message) = single_text_input(&input_items) {
+            session
+                .services
+                .agent_control
+                .send_collab_message(receiver_thread_id, session.conversation_id, message)
+                .await
+                .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
+        } else {
+            session
+                .services
+                .agent_control
+                .send_input(receiver_thread_id, input_items)
+                .await
+                .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
+        };
         let status = session
             .services
             .agent_control
@@ -1446,6 +1455,14 @@ fn input_preview(items: &[UserInput]) -> String {
 
     parts.join("\n")
 }
+
+fn single_text_input(items: &[UserInput]) -> Option<String> {
+    match items {
+        [UserInput::Text { text, .. }] => Some(text.clone()),
+        _ => None,
+    }
+}
+
 fn build_agent_spawn_config(
     base_instructions: &BaseInstructions,
     turn: &TurnContext,
@@ -2162,6 +2179,67 @@ mod tests {
             .submit(Op::Shutdown {})
             .await
             .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn send_input_parent_alias_uses_collab_inbox_delivery_for_text() {
+        let (mut root_session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        root_session.services.agent_control = manager.agent_control();
+        let root_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start root thread");
+        let child_id = manager
+            .agent_control()
+            .spawn_agent_handle(
+                turn.config.as_ref().clone(),
+                Some(thread_spawn_source(root_thread.thread_id, 1)),
+            )
+            .await
+            .expect("spawn child handle");
+        let child_session = manager
+            .get_thread(child_id)
+            .await
+            .expect("child thread should exist")
+            .codex
+            .session
+            .clone();
+
+        let invocation = invocation(
+            child_session.clone(),
+            Arc::new(turn),
+            "send_input",
+            function_payload(json!({
+                "id": "parent",
+                "message": "watchdog check-in"
+            })),
+        );
+        MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("send_input should succeed");
+
+        let ops = manager.captured_ops();
+        let parent_received_collab_inbox = ops.iter().any(|(id, op)| {
+            *id == root_thread.thread_id && matches!(op, Op::InjectResponseItems { .. })
+        });
+        assert!(parent_received_collab_inbox);
+        let parent_received_user_input = ops
+            .iter()
+            .any(|(id, op)| *id == root_thread.thread_id && matches!(op, Op::UserInput { .. }));
+        assert!(!parent_received_user_input);
+
+        let _ = child_session
+            .services
+            .agent_control
+            .shutdown_agent(child_id)
+            .await;
+        let _ = child_session
+            .services
+            .agent_control
+            .shutdown_agent(root_thread.thread_id)
+            .await;
     }
 
     #[tokio::test]

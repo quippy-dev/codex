@@ -26,6 +26,7 @@
 //! back. This avoids duplicate handshakes but means a failed prewarm can consume one retry
 //! budget slot before any turn payload is sent.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -865,7 +866,16 @@ impl ModelClientSession {
                 effort,
                 summary,
             )?;
-            let ws_payload = ResponseCreateWsRequest::from(&request);
+            let mut ws_payload = ResponseCreateWsRequest::from(&request);
+            ws_payload.client_metadata =
+                parse_turn_metadata_header(turn_metadata_header).and_then(|header_value| {
+                    header_value.to_str().ok().map(|metadata| {
+                        HashMap::from([(
+                            X_CODEX_TURN_METADATA_HEADER.to_string(),
+                            metadata.to_string(),
+                        )])
+                    })
+                });
 
             match self
                 .websocket_connection(

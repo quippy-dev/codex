@@ -801,7 +801,7 @@ async fn responses_websocket_appends_on_prefix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_sends_turn_metadata_in_headers_only() {
+async fn responses_websocket_refreshes_turn_metadata_in_client_metadata() {
     skip_if_no_network!();
 
     let server = start_websocket_server(vec![vec![
@@ -851,15 +851,22 @@ async fn responses_websocket_sends_turn_metadata_in_headers_only() {
         handshake.header(X_CODEX_TURN_METADATA_HEADER),
         Some(first_turn_metadata.to_string())
     );
-    assert!(first.get("client_metadata").is_none());
+    assert_eq!(
+        first["client_metadata"],
+        serde_json::json!({
+            (X_CODEX_TURN_METADATA_HEADER): first_turn_metadata,
+        })
+    );
     assert_eq!(
         second,
         serde_json::json!({
             "type": "response.append",
             "input": serde_json::to_value(&prompt_two.input[2..]).expect("serialize append items"),
+            "client_metadata": {
+                (X_CODEX_TURN_METADATA_HEADER): enriched_turn_metadata,
+            },
         })
     );
-    assert!(second.get("client_metadata").is_none());
 
     server.shutdown().await;
 }
