@@ -3549,6 +3549,114 @@ async fn exec_end_without_begin_uses_event_command() {
 }
 
 #[tokio::test]
+async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+
+    begin_exec(&mut chat, "call-exploring", "cat /dev/null");
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(active_blob(&chat).contains("Read null"));
+
+    let orphan =
+        begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    end_exec(&mut chat, orphan, "repro-marker\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "only the orphan end should be inserted");
+    let orphan_blob = lines_to_single_string(&cells[0]);
+    assert!(
+        orphan_blob.contains("• Ran echo repro-marker"),
+        "expected orphan end to render a standalone entry: {orphan_blob:?}"
+    );
+    let active = active_blob(&chat);
+    assert!(
+        active.contains("• Exploring"),
+        "expected unrelated exploring call to remain active: {active:?}"
+    );
+    assert!(
+        active.contains("Read null"),
+        "expected active exploring command to remain visible: {active:?}"
+    );
+    assert!(
+        !active.contains("echo repro-marker"),
+        "orphaned end should not replace the active exploring cell: {active:?}"
+    );
+}
+
+#[tokio::test]
+async fn exec_end_without_begin_flushes_completed_unrelated_exploring_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+
+    let begin_ls = begin_exec(&mut chat, "call-ls", "ls -la");
+    end_exec(&mut chat, begin_ls, "", "", 0);
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(active_blob(&chat).contains("ls -la"));
+
+    let orphan = begin_unified_exec_startup(&mut chat, "call-after", "proc-1", "echo after");
+    end_exec(&mut chat, orphan, "after\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(
+        cells.len(),
+        2,
+        "completed exploring cell should flush before the orphan entry"
+    );
+    let first = lines_to_single_string(&cells[0]);
+    let second = lines_to_single_string(&cells[1]);
+    assert!(
+        first.contains("• Explored"),
+        "expected flushed exploring cell: {first:?}"
+    );
+    assert!(
+        first.contains("List ls -la"),
+        "expected flushed exploring cell: {first:?}"
+    );
+    assert!(
+        second.contains("• Ran echo after"),
+        "expected orphan end entry after flush: {second:?}"
+    );
+    assert!(
+        chat.active_cell.is_none(),
+        "both entries should be finalized"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_exploring_exec_end_is_not_misclassified_as_orphan() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let begin_ls = begin_exec(&mut chat, "call-ls", "ls -la");
+    let begin_cat = begin_exec(&mut chat, "call-cat", "cat foo.txt");
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    end_exec(&mut chat, begin_ls, "foo.txt\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "tracked end inside an exploring cell should not render as an orphan"
+    );
+    let active = active_blob(&chat);
+    assert!(
+        active.contains("List ls -la"),
+        "expected first command still grouped: {active:?}"
+    );
+    assert!(
+        active.contains("Read foo.txt"),
+        "expected second running command to stay in the same active cell: {active:?}"
+    );
+    assert!(
+        active.contains("• Exploring"),
+        "expected grouped exploring header to remain active: {active:?}"
+    );
+
+    end_exec(&mut chat, begin_cat, "hello\n", "", 0);
+}
+
+#[tokio::test]
 async fn exec_history_shows_unified_exec_startup_commands() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.on_task_started();
@@ -3590,6 +3698,29 @@ async fn exec_history_shows_unified_exec_tool_calls() {
 
     let blob = active_blob(&chat);
     assert_eq!(blob, "• Explored\n  └ List ls\n");
+}
+
+#[tokio::test]
+async fn unified_exec_unknown_end_with_active_exploring_cell_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+
+    begin_exec(&mut chat, "call-exploring", "cat /dev/null");
+    let orphan =
+        begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
+    end_exec(&mut chat, orphan, "repro-marker\n", "", 0);
+
+    let cells = drain_insert_history(&mut rx);
+    let history = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    let active = active_blob(&chat);
+    let snapshot = format!("History:\n{history}\nActive:\n{active}");
+    assert_snapshot!(
+        "unified_exec_unknown_end_with_active_exploring_cell",
+        snapshot
+    );
 }
 
 #[tokio::test]
@@ -7256,6 +7387,160 @@ async fn stream_error_updates_status_indicator() {
         .expect("status indicator should be visible");
     assert_eq!(status.header(), msg);
     assert_eq!(status.details(), Some(details));
+}
+
+#[tokio::test]
+async fn replayed_turn_started_does_not_mark_task_running() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.replay_initial_messages(vec![EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: "turn-1".to_string(),
+        model_context_window: None,
+        collaboration_mode_kind: ModeKind::Default,
+    })]);
+
+    assert!(!chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_widget().is_none());
+}
+
+#[tokio::test]
+async fn thread_snapshot_replayed_turn_started_marks_task_running() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event_replay(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    drain_insert_history(&mut rx);
+    assert!(chat.bottom_pane.is_task_running());
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), "Working");
+}
+
+#[tokio::test]
+async fn replayed_stream_error_does_not_set_retry_status_or_status_indicator() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_status_header("Idle".to_string());
+
+    chat.replay_initial_messages(vec![EventMsg::StreamError(StreamErrorEvent {
+        message: "Reconnecting... 2/5".to_string(),
+        codex_error_info: Some(CodexErrorInfo::Other),
+        additional_details: Some("Idle timeout waiting for SSE".to_string()),
+    })]);
+
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "expected no history cell for replayed StreamError event"
+    );
+    assert_eq!(chat.current_status_header, "Idle");
+    assert!(chat.retry_status_header.is_none());
+    assert!(chat.bottom_pane.status_widget().is_none());
+}
+
+#[tokio::test]
+async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_header() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event_replay(Event {
+        id: "task".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    drain_insert_history(&mut rx);
+
+    chat.handle_codex_event_replay(Event {
+        id: "retry".into(),
+        msg: EventMsg::StreamError(StreamErrorEvent {
+            message: "Reconnecting... 1/5".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            additional_details: None,
+        }),
+    });
+    drain_insert_history(&mut rx);
+
+    chat.handle_codex_event_replay(Event {
+        id: "delta".into(),
+        msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+            delta: "hello".to_string(),
+        }),
+    });
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), "Working");
+    assert_eq!(status.details(), None);
+    assert!(chat.retry_status_header.is_none());
+}
+
+#[tokio::test]
+async fn resume_replay_interrupted_reconnect_does_not_leave_stale_working_state() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_status_header("Idle".to_string());
+
+    chat.replay_initial_messages(vec![
+        EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+        EventMsg::StreamError(StreamErrorEvent {
+            message: "Reconnecting... 1/5".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            additional_details: None,
+        }),
+        EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+            delta: "hello".to_string(),
+        }),
+    ]);
+
+    let cells = drain_insert_history(&mut rx);
+    assert!(
+        cells.is_empty(),
+        "expected no history cells for replayed interrupted reconnect sequence"
+    );
+    assert!(!chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_widget().is_none());
+    assert_eq!(chat.current_status_header, "Idle");
+    assert!(chat.retry_status_header.is_none());
+}
+
+#[tokio::test]
+async fn replayed_interrupted_reconnect_footer_row_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.replay_initial_messages(vec![
+        EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+        EventMsg::StreamError(StreamErrorEvent {
+            message: "Reconnecting... 2/5".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+            additional_details: Some("Idle timeout waiting for SSE".to_string()),
+        }),
+    ]);
+
+    let header = render_bottom_first_row(&chat, 80);
+    assert!(
+        !header.contains("Reconnecting") && !header.contains("Working"),
+        "expected replayed interrupted reconnect to avoid active status row, got {header:?}"
+    );
+    assert_snapshot!("replayed_interrupted_reconnect_footer_row", header);
 }
 
 #[tokio::test]
