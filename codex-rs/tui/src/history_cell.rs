@@ -567,9 +567,6 @@ impl HistoryCell for SubagentStatusCell {
             let preview = truncate_text(agent.preview.trim(), preview_budget);
             let mut spans: Vec<Span<'static>> =
                 vec!["• ".dim(), format!("[#{}] ", agent.ordinal).dim()];
-            if agent.is_watchdog {
-                spans.push("[watchdog] ".magenta().dim());
-            }
             spans.push(Span::from(agent.name.clone()));
             spans.push(" ".into());
             spans.push(status_span_for_panel(&agent));
@@ -2662,7 +2659,7 @@ mod tests {
             running_count: 0,
             running_agents: vec![SubagentPanelAgent {
                 ordinal: 1,
-                name: "watchdog-agent".to_string(),
+                name: "watchdog-agent [watchdog]".to_string(),
                 status: AgentStatus::PendingInit,
                 is_watchdog: true,
                 preview: "monitor parent progress".to_string(),
@@ -2673,7 +2670,7 @@ mod tests {
         let lines = render_lines(&cell.display_lines(120));
 
         assert!(lines[0].contains("no subagents running"));
-        assert!(lines[1].contains("[watchdog] watchdog-agent idle"));
+        assert!(lines[1].contains("watchdog-agent [watchdog] idle"));
     }
 
     #[test]
@@ -2684,7 +2681,7 @@ mod tests {
             running_count: 0,
             running_agents: vec![SubagentPanelAgent {
                 ordinal: 1,
-                name: "watchdog-agent".to_string(),
+                name: "watchdog-agent [watchdog]".to_string(),
                 status: AgentStatus::PendingInit,
                 is_watchdog: true,
                 preview: "monitor parent progress".to_string(),

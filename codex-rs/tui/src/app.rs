@@ -375,7 +375,8 @@ const SUBAGENT_SHIMMER_WINDOW: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone)]
 struct SubagentInfo {
     ordinal: i32,
-    name: String,
+    nickname: Option<String>,
+    agent_role: Option<String>,
     prompt_preview: String,
     spawn_mode: CollabAgentSpawnMode,
     status: AgentStatus,
@@ -392,14 +393,16 @@ struct SubagentInfo {
 impl SubagentInfo {
     fn new(
         ordinal: i32,
-        name: String,
+        nickname: Option<String>,
+        agent_role: Option<String>,
         prompt_preview: String,
         spawn_mode: CollabAgentSpawnMode,
     ) -> Self {
         let now = Instant::now();
         Self {
             ordinal,
-            name,
+            nickname,
+            agent_role,
             prompt_preview: prompt_preview.clone(),
             spawn_mode,
             status: AgentStatus::PendingInit,
@@ -412,6 +415,30 @@ impl SubagentInfo {
             reasoning_buffer: String::new(),
             notified_terminal: false,
         }
+    }
+
+    fn merge_identity(&mut self, nickname: Option<&str>, agent_role: Option<&str>) {
+        if let Some(nickname) = nickname
+            .map(str::trim)
+            .filter(|nickname| !nickname.is_empty())
+        {
+            self.nickname = Some(nickname.to_string());
+        }
+        if let Some(agent_role) = agent_role
+            .map(str::trim)
+            .filter(|agent_role| !agent_role.is_empty())
+        {
+            self.agent_role = Some(agent_role.to_string());
+        }
+    }
+
+    fn label(&self) -> String {
+        format_subagent_label(
+            self.ordinal,
+            self.nickname.as_deref(),
+            self.agent_role.as_deref(),
+            self.spawn_mode,
+        )
     }
 
     fn is_running(&self) -> bool {
@@ -514,12 +541,17 @@ impl SubagentRegistry {
             .unwrap_or(i32::MAX - 1)
             .saturating_add(1);
         let prompt_preview = prompt_preview(&event.prompt);
-        let name = derive_subagent_name(&event.prompt, ordinal);
-
-        let mut info = SubagentInfo::new(ordinal, name.clone(), prompt_preview, event.spawn_mode);
+        let mut info = SubagentInfo::new(
+            ordinal,
+            event.new_agent_nickname.clone(),
+            event.new_agent_role.clone(),
+            prompt_preview,
+            event.spawn_mode,
+        );
         info.status = event.status.clone();
         info.latest_preview = info.prompt_preview.clone();
         info.latest_update_at = Instant::now();
+        let label = info.label();
 
         self.order.push(new_thread_id);
         self.agents.insert(new_thread_id, info);
@@ -537,7 +569,7 @@ impl SubagentRegistry {
         }
 
         let prompt_line = prompt_first_line(&event.prompt);
-        Some(Box::new(new_subagent_spawned_cell(&name, &prompt_line)))
+        Some(Box::new(new_subagent_spawned_cell(&label, &prompt_line)))
     }
 
     fn prune_superseded_watchdogs(&mut self, keep_thread_id: ThreadId) {
@@ -564,14 +596,19 @@ impl SubagentRegistry {
     fn on_close_end(&mut self, event: &CollabCloseEndEvent) -> Option<Box<dyn HistoryCell>> {
         let receiver_id = event.receiver_thread_id;
         let info = self.agents.get_mut(&receiver_id)?;
+        info.merge_identity(
+            event.receiver_agent_nickname.as_deref(),
+            event.receiver_agent_role.as_deref(),
+        );
         info.status = event.status.clone();
         info.latest_update_at = Instant::now();
 
         if is_terminal_status(&info.status) && !info.notified_terminal {
             info.notified_terminal = true;
             let summary = terminal_summary(&info.status);
+            let label = info.label();
             return Some(Box::new(new_subagent_update_cell(
-                &info.name,
+                &label,
                 &info.status,
                 summary.as_str(),
             )));
@@ -580,6 +617,13 @@ impl SubagentRegistry {
     }
 
     fn on_wait_end(&mut self, event: &CollabWaitingEndEvent) {
+        for entry in &event.agent_statuses {
+            let Some(info) = self.agents.get_mut(&entry.thread_id) else {
+                continue;
+            };
+            info.merge_identity(entry.agent_nickname.as_deref(), entry.agent_role.as_deref());
+        }
+
         for (thread_id, status) in &event.statuses {
             let Some(info) = self.agents.get_mut(thread_id) else {
                 continue;
@@ -644,8 +688,9 @@ impl SubagentRegistry {
                         .filter(|message| !message.is_empty())
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "completed".to_string());
+                    let label = info.label();
                     history.push(Box::new(new_subagent_update_cell(
-                        &info.name,
+                        &label,
                         &info.status,
                         summary.as_str(),
                     )) as Box<dyn HistoryCell>);
@@ -657,8 +702,9 @@ impl SubagentRegistry {
                 info.status = AgentStatus::Errored(reason_text.clone());
                 if !info.notified_terminal {
                     info.notified_terminal = true;
+                    let label = info.label();
                     history.push(Box::new(new_subagent_update_cell(
-                        &info.name,
+                        &label,
                         &info.status,
                         reason_text.as_str(),
                     )) as Box<dyn HistoryCell>);
@@ -675,8 +721,9 @@ impl SubagentRegistry {
                 info.status = AgentStatus::Errored(summary.clone());
                 if !info.notified_terminal {
                     info.notified_terminal = true;
+                    let label = info.label();
                     history.push(Box::new(new_subagent_update_cell(
-                        &info.name,
+                        &label,
                         &info.status,
                         summary.as_str(),
                     )) as Box<dyn HistoryCell>);
@@ -687,8 +734,9 @@ impl SubagentRegistry {
                 info.status = AgentStatus::Shutdown;
                 if !info.notified_terminal {
                     info.notified_terminal = true;
+                    let label = info.label();
                     history.push(Box::new(new_subagent_update_cell(
-                        &info.name,
+                        &label,
                         &info.status,
                         "shutdown",
                     )) as Box<dyn HistoryCell>);
@@ -760,7 +808,7 @@ impl SubagentRegistry {
             .into_iter()
             .map(|info| SubagentPanelAgent {
                 ordinal: info.ordinal,
-                name: info.name.clone(),
+                name: info.label(),
                 status: info.status.clone(),
                 is_watchdog: info.is_watchdog(),
                 preview: running_preview(info),
@@ -861,41 +909,28 @@ fn running_preview(info: &SubagentInfo) -> String {
     truncate_text(info.prompt_preview.trim(), SUBAGENT_PROMPT_PREVIEW_BUDGET)
 }
 
-fn derive_subagent_name(prompt: &str, ordinal: i32) -> String {
-    let first_line = prompt_first_line(prompt);
-    let stripped = first_line
-        .strip_prefix("Task:")
-        .or_else(|| first_line.strip_prefix("task:"))
-        .unwrap_or(&first_line)
-        .trim();
-
-    let stopwords = [
-        "the", "a", "an", "to", "and", "or", "of", "for", "from", "in", "on", "with", "read",
-        "file", "task",
-    ];
-
-    let tokens: Vec<String> = stripped
-        .split_whitespace()
-        .map(clean_token)
-        .filter(|token| !token.is_empty())
-        .filter(|token| !stopwords.contains(&token.as_str()))
-        .take(4)
-        .collect();
-
-    if tokens.is_empty() {
-        return format!("agent-{ordinal}");
+fn format_subagent_label(
+    ordinal: i32,
+    agent_nickname: Option<&str>,
+    agent_role: Option<&str>,
+    spawn_mode: CollabAgentSpawnMode,
+) -> String {
+    let base = agent_nickname
+        .map(str::trim)
+        .filter(|nickname| !nickname.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("Agent #{ordinal}"));
+    if spawn_mode == CollabAgentSpawnMode::Watchdog {
+        return format!("{base} [watchdog]");
     }
 
-    let joined = tokens.join("-");
-    truncate_text(&joined, 40)
-}
-
-fn clean_token(token: &str) -> String {
-    token
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect::<String>()
-        .to_lowercase()
+    let agent_role = agent_role
+        .map(str::trim)
+        .filter(|agent_role| !agent_role.is_empty());
+    match agent_role {
+        Some(agent_role) => format!("{base} [{agent_role}]"),
+        None => base,
+    }
 }
 
 fn should_show_model_migration_prompt(
@@ -3689,6 +3724,7 @@ mod tests {
     use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+    use codex_protocol::protocol::CollabAgentStatusEntry;
     use codex_protocol::protocol::CollabCloseEndEvent;
     use codex_protocol::protocol::CollabWaitingBeginEvent;
     use codex_protocol::protocol::CollabWaitingEndEvent;
@@ -4966,6 +5002,159 @@ mod tests {
             .map(|info| info.status.clone())
             .expect("status for first subagent");
         assert_eq!(status, AgentStatus::Completed(Some("done".to_string())));
+    }
+
+    #[test]
+    fn subagent_registry_uses_nickname_and_role_labels() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: Some("Apple".to_string()),
+            new_agent_role: Some("default".to_string()),
+            prompt: "Solve a problem".to_string(),
+            spawn_mode: CollabAgentSpawnMode::Spawn,
+            status: AgentStatus::PendingInit,
+        });
+        let spawned = spawned.expect("expected spawn cell");
+        let spawned_text = spawned
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(spawned_text.contains("Spawned subagent Apple [default]"));
+
+        let updates = registry.on_agent_event(
+            subagent_thread_id,
+            &EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".to_string(),
+                last_agent_message: Some("done".to_string()),
+            }),
+        );
+        assert_eq!(updates.len(), 1);
+        let update_text = updates[0]
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(update_text.contains("Subagent update: Apple [default] completed"));
+    }
+
+    #[test]
+    fn subagent_registry_uses_agent_ordinal_when_nickname_missing() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: None,
+            new_agent_role: Some("git_ops".to_string()),
+            prompt: "Solve a problem".to_string(),
+            spawn_mode: CollabAgentSpawnMode::Spawn,
+            status: AgentStatus::PendingInit,
+        });
+        let spawned = spawned.expect("expected spawn cell");
+        let spawned_text = spawned
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(spawned_text.contains("Spawned subagent Agent #1 [git_ops]"));
+
+        let updates = registry.on_agent_event(
+            subagent_thread_id,
+            &EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".to_string(),
+                last_agent_message: Some("done".to_string()),
+            }),
+        );
+        assert_eq!(updates.len(), 1);
+        let update_text = updates[0]
+            .display_lines(u16::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(update_text.contains("Subagent update: Agent #1 [git_ops] completed"));
+    }
+
+    #[test]
+    fn subagent_registry_watchdog_labels_use_watchdog_tag() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let _spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: Some("Assigned-Name-If-Any".to_string()),
+            new_agent_role: Some("default".to_string()),
+            prompt: "watchdog setup".to_string(),
+            spawn_mode: CollabAgentSpawnMode::Watchdog,
+            status: AgentStatus::PendingInit,
+        });
+
+        registry.rebuild_panel_state();
+        let panel = registry.panel_state.expect("panel state");
+        let guard = panel.lock().expect("panel lock");
+        assert_eq!(
+            guard.running_agents[0].name,
+            "Assigned-Name-If-Any [watchdog]"
+        );
+    }
+
+    #[test]
+    fn subagent_registry_wait_end_backfills_identity_metadata() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let _spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: None,
+            new_agent_role: None,
+            prompt: "Solve a problem".to_string(),
+            spawn_mode: CollabAgentSpawnMode::Spawn,
+            status: AgentStatus::PendingInit,
+        });
+
+        let mut statuses = HashMap::new();
+        statuses.insert(subagent_thread_id, AgentStatus::Running);
+        registry.on_wait_end(&CollabWaitingEndEvent {
+            sender_thread_id: root_thread_id,
+            call_id: "wait-1".to_string(),
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: subagent_thread_id,
+                agent_nickname: Some("Wisteria".to_string()),
+                agent_role: Some("git_ops".to_string()),
+                status: AgentStatus::Running,
+            }],
+            statuses,
+        });
+
+        let label = registry
+            .agents
+            .get(&subagent_thread_id)
+            .map(SubagentInfo::label)
+            .expect("subagent exists");
+        assert_eq!(label, "Wisteria [git_ops]");
     }
 
     #[test]
