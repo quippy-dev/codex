@@ -1970,7 +1970,12 @@ impl App {
                             app.handle_thread_created(thread_id).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            tracing::warn!("thread_created receiver lagged; skipping resync");
+                            tracing::warn!("thread_created receiver lagged; forcing thread resync");
+                            if let Err(err) = app.resync_thread_created_channels().await {
+                                tracing::warn!(
+                                    "failed to resync thread listeners after lag event: {err}"
+                                );
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             listen_for_threads = false;
@@ -3409,6 +3414,21 @@ impl App {
                 app_event_tx.send(AppEvent::CodexThreadEvent { thread_id, event });
             }
         });
+        Ok(())
+    }
+
+    async fn resync_thread_created_channels(&mut self) -> Result<()> {
+        let known_thread_ids = self
+            .thread_event_channels
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let thread_ids = self.server.list_thread_ids().await;
+        for thread_id in thread_ids {
+            if !known_thread_ids.contains(&thread_id) {
+                self.handle_thread_created(thread_id).await?;
+            }
+        }
         Ok(())
     }
 

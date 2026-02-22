@@ -3298,7 +3298,7 @@ impl CodexMessageProcessor {
             persist_extended_history,
         } = params;
 
-        let (rollout_path, source_thread_id) = if let Some(path) = path {
+        let (source_rollout_path, source_thread_id) = if let Some(path) = path {
             (path, None)
         } else {
             let existing_thread_id = match ThreadId::from_string(&thread_id) {
@@ -3340,9 +3340,12 @@ impl CodexMessageProcessor {
             }
         };
 
-        let history_cwd =
-            read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
-                .await;
+        let history_cwd = read_history_cwd_from_state_db(
+            &self.config,
+            source_thread_id,
+            source_rollout_path.as_path(),
+        )
+        .await;
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -3411,7 +3414,7 @@ impl CodexMessageProcessor {
             .fork_thread(
                 usize::MAX,
                 config,
-                rollout_path.clone(),
+                source_rollout_path.clone(),
                 persist_extended_history,
             )
             .await
@@ -3421,7 +3424,10 @@ impl CodexMessageProcessor {
                 let (code, message) = match err {
                     CodexErr::Io(_) | CodexErr::Json(_) => (
                         INVALID_REQUEST_ERROR_CODE,
-                        format!("failed to load rollout `{}`: {err}", rollout_path.display()),
+                        format!(
+                            "failed to load rollout `{}`: {err}",
+                            source_rollout_path.display()
+                        ),
                     ),
                     CodexErr::InvalidRequest(message) => (INVALID_REQUEST_ERROR_CODE, message),
                     _ => (INTERNAL_ERROR_CODE, format!("error forking thread: {err}")),
@@ -3436,8 +3442,11 @@ impl CodexMessageProcessor {
             }
         };
 
-        let SessionConfiguredEvent { rollout_path, .. } = session_configured;
-        let Some(rollout_path) = rollout_path else {
+        let SessionConfiguredEvent {
+            rollout_path: fork_rollout_path,
+            ..
+        } = session_configured;
+        let Some(fork_rollout_path) = fork_rollout_path else {
             self.send_internal_error(
                 request_id,
                 format!("rollout path missing for thread {thread_id}"),
@@ -3463,7 +3472,7 @@ impl CodexMessageProcessor {
         }
 
         let mut thread = match read_summary_from_rollout(
-            rollout_path.as_path(),
+            fork_rollout_path.as_path(),
             fallback_model_provider.as_str(),
         )
         .await
@@ -3474,7 +3483,7 @@ impl CodexMessageProcessor {
                     request_id,
                     format!(
                         "failed to load rollout `{}` for thread {thread_id}: {err}",
-                        rollout_path.display()
+                        fork_rollout_path.display()
                     ),
                 )
                 .await;
@@ -3482,7 +3491,7 @@ impl CodexMessageProcessor {
             }
         };
         // forked thread names do not inherit the source thread name
-        match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+        match read_rollout_items_from_rollout(fork_rollout_path.as_path()).await {
             Ok(items) => {
                 thread.turns = build_turns_from_rollout_items(&items);
             }
@@ -3491,11 +3500,37 @@ impl CodexMessageProcessor {
                     request_id,
                     format!(
                         "failed to load rollout `{}` for thread {thread_id}: {err}",
-                        rollout_path.display()
+                        fork_rollout_path.display()
                     ),
                 )
                 .await;
                 return;
+            }
+        }
+        if thread.turns.is_empty()
+            && !persist_extended_history
+            && let Ok(source_items) =
+                read_rollout_items_from_rollout(source_rollout_path.as_path()).await
+        {
+            let source_turns = build_turns_from_rollout_items(&source_items);
+            if !source_turns.is_empty() {
+                if thread.preview.is_empty()
+                    && let Some(first_user_text) = source_turns
+                        .iter()
+                        .flat_map(|turn| turn.items.iter())
+                        .find_map(|item| match item {
+                            ThreadItem::UserMessage { content, .. } => {
+                                content.iter().find_map(|input| match input {
+                                    V2UserInput::Text { text, .. } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                            }
+                            _ => None,
+                        })
+                {
+                    thread.preview = first_user_text.to_string();
+                }
+                thread.turns = source_turns;
             }
         }
 

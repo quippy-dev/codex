@@ -1,4 +1,7 @@
+use crate::protocol::v2::CollabAgentRef;
+use crate::protocol::v2::CollabAgentSpawnMode;
 use crate::protocol::v2::CollabAgentState;
+use crate::protocol::v2::CollabAgentStatusEntry;
 use crate::protocol::v2::CollabAgentTool;
 use crate::protocol::v2::CollabAgentToolCallStatus;
 use crate::protocol::v2::CommandAction;
@@ -455,11 +458,14 @@ impl ThreadHistoryBuilder {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SpawnAgent,
+            spawn_mode: None,
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: Vec::new(),
+            receiver_agents: Vec::new(),
             prompt: Some(payload.prompt.clone()),
             agents_states: HashMap::new(),
+            agent_statuses: Vec::new(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -474,25 +480,40 @@ impl ThreadHistoryBuilder {
             _ if has_receiver => CollabAgentToolCallStatus::Completed,
             _ => CollabAgentToolCallStatus::Failed,
         };
-        let (receiver_thread_ids, agents_states) = match &payload.new_thread_id {
-            Some(id) => {
-                let receiver_id = id.to_string();
-                let received_status = CollabAgentState::from(payload.status.clone());
-                (
-                    vec![receiver_id.clone()],
-                    [(receiver_id, received_status)].into_iter().collect(),
-                )
-            }
-            None => (Vec::new(), HashMap::new()),
-        };
+        let (receiver_thread_ids, receiver_agents, agents_states, agent_statuses) =
+            match &payload.new_thread_id {
+                Some(id) => {
+                    let receiver_id = id.to_string();
+                    let received_status = CollabAgentState::from(payload.status.clone());
+                    (
+                        vec![receiver_id.clone()],
+                        vec![CollabAgentRef {
+                            thread_id: receiver_id.clone(),
+                            agent_nickname: payload.new_agent_nickname.clone(),
+                            agent_role: payload.new_agent_role.clone(),
+                        }],
+                        [(receiver_id, received_status)].into_iter().collect(),
+                        vec![CollabAgentStatusEntry {
+                            thread_id: id.to_string(),
+                            agent_nickname: payload.new_agent_nickname.clone(),
+                            agent_role: payload.new_agent_role.clone(),
+                            status: CollabAgentState::from(payload.status.clone()),
+                        }],
+                    )
+                }
+                None => (Vec::new(), Vec::new(), HashMap::new(), Vec::new()),
+            };
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SpawnAgent,
+            spawn_mode: Some(CollabAgentSpawnMode::from(payload.spawn_mode)),
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids,
+            receiver_agents,
             prompt: Some(payload.prompt.clone()),
             agents_states,
+            agent_statuses,
         });
     }
 
@@ -503,11 +524,18 @@ impl ThreadHistoryBuilder {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SendInput,
+            spawn_mode: None,
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: None,
+                agent_role: None,
+            }],
             prompt: Some(payload.prompt.clone()),
             agents_states: HashMap::new(),
+            agent_statuses: Vec::new(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -525,11 +553,23 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SendInput,
+            spawn_mode: None,
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id.clone()],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: receiver_id.clone(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+            }],
             prompt: Some(payload.prompt.clone()),
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+                status: CollabAgentState::from(payload.status.clone()),
+            }],
         });
     }
 
@@ -540,6 +580,7 @@ impl ThreadHistoryBuilder {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::Wait,
+            spawn_mode: None,
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: payload
@@ -547,8 +588,10 @@ impl ThreadHistoryBuilder {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            receiver_agents: wait_receiver_agents(payload),
             prompt: None,
             agents_states: HashMap::new(),
+            agent_statuses: Vec::new(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -577,11 +620,23 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::Wait,
+            spawn_mode: None,
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids,
+            receiver_agents: wait_end_receiver_agents(payload),
             prompt: None,
             agents_states,
+            agent_statuses: payload
+                .agent_statuses
+                .iter()
+                .map(|entry| CollabAgentStatusEntry {
+                    thread_id: entry.thread_id.to_string(),
+                    agent_nickname: entry.agent_nickname.clone(),
+                    agent_role: entry.agent_role.clone(),
+                    status: CollabAgentState::from(entry.status.clone()),
+                })
+                .collect(),
         });
     }
 
@@ -592,11 +647,18 @@ impl ThreadHistoryBuilder {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::CloseAgent,
+            spawn_mode: None,
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: None,
+                agent_role: None,
+            }],
             prompt: None,
             agents_states: HashMap::new(),
+            agent_statuses: Vec::new(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -616,11 +678,23 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::CloseAgent,
+            spawn_mode: None,
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+            }],
             prompt: None,
             agents_states,
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+                status: CollabAgentState::from(payload.status.clone()),
+            }],
         });
     }
 
@@ -631,11 +705,18 @@ impl ThreadHistoryBuilder {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::ResumeAgent,
+            spawn_mode: None,
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+            }],
             prompt: None,
             agents_states: HashMap::new(),
+            agent_statuses: Vec::new(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -658,11 +739,23 @@ impl ThreadHistoryBuilder {
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::ResumeAgent,
+            spawn_mode: None,
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+            }],
             prompt: None,
             agents_states,
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: payload.receiver_thread_id.to_string(),
+                agent_nickname: payload.receiver_agent_nickname.clone(),
+                agent_role: payload.receiver_agent_role.clone(),
+                status: CollabAgentState::from(payload.status.clone()),
+            }],
         });
     }
 
@@ -886,6 +979,59 @@ impl ThreadHistoryBuilder {
         }
         content
     }
+}
+
+fn wait_receiver_agents(
+    payload: &codex_protocol::protocol::CollabWaitingBeginEvent,
+) -> Vec<CollabAgentRef> {
+    if payload.receiver_agents.is_empty() {
+        return payload
+            .receiver_thread_ids
+            .iter()
+            .map(|thread_id| CollabAgentRef {
+                thread_id: thread_id.to_string(),
+                agent_nickname: None,
+                agent_role: None,
+            })
+            .collect();
+    }
+    payload
+        .receiver_agents
+        .iter()
+        .map(|agent| CollabAgentRef {
+            thread_id: agent.thread_id.to_string(),
+            agent_nickname: agent.agent_nickname.clone(),
+            agent_role: agent.agent_role.clone(),
+        })
+        .collect()
+}
+
+fn wait_end_receiver_agents(
+    payload: &codex_protocol::protocol::CollabWaitingEndEvent,
+) -> Vec<CollabAgentRef> {
+    if payload.agent_statuses.is_empty() {
+        let mut receiver_thread_ids: Vec<String> =
+            payload.statuses.keys().map(ToString::to_string).collect();
+        receiver_thread_ids.sort();
+        return receiver_thread_ids
+            .into_iter()
+            .map(|thread_id| CollabAgentRef {
+                thread_id,
+                agent_nickname: None,
+                agent_role: None,
+            })
+            .collect();
+    }
+
+    payload
+        .agent_statuses
+        .iter()
+        .map(|entry| CollabAgentRef {
+            thread_id: entry.thread_id.to_string(),
+            agent_nickname: entry.agent_nickname.clone(),
+            agent_role: entry.agent_role.clone(),
+        })
+        .collect()
 }
 
 const REVIEW_FALLBACK_MESSAGE: &str = "Reviewer failed to output a response.";
@@ -2019,9 +2165,15 @@ mod tests {
             ThreadItem::CollabAgentToolCall {
                 id: "resume-1".into(),
                 tool: CollabAgentTool::ResumeAgent,
+                spawn_mode: None,
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: "00000000-0000-0000-0000-000000000001".into(),
                 receiver_thread_ids: vec!["00000000-0000-0000-0000-000000000002".into()],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: "00000000-0000-0000-0000-000000000002".into(),
+                    agent_nickname: None,
+                    agent_role: None,
+                }],
                 prompt: None,
                 agents_states: [(
                     "00000000-0000-0000-0000-000000000002".into(),
@@ -2032,6 +2184,15 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                agent_statuses: vec![CollabAgentStatusEntry {
+                    thread_id: "00000000-0000-0000-0000-000000000002".into(),
+                    agent_nickname: None,
+                    agent_role: None,
+                    status: CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Completed,
+                        message: None,
+                    },
+                }],
             }
         );
     }

@@ -31,6 +31,7 @@ use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
+use codex_protocol::protocol::CollabAgentSpawnMode as CoreCollabAgentSpawnMode;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
@@ -2747,6 +2748,8 @@ pub enum ThreadItem {
         id: String,
         /// Name of the collab tool that was invoked.
         tool: CollabAgentTool,
+        /// Spawn mode when `tool` is `SpawnAgent`.
+        spawn_mode: Option<CollabAgentSpawnMode>,
         /// Current status of the collab tool call.
         status: CollabAgentToolCallStatus,
         /// Thread ID of the agent issuing the collab request.
@@ -2754,10 +2757,14 @@ pub enum ThreadItem {
         /// Thread ID of the receiving agent, when applicable. In case of spawn operation,
         /// this corresponds to the newly spawned agent.
         receiver_thread_ids: Vec<String>,
+        /// Optional receiver metadata paired with receiver thread IDs.
+        receiver_agents: Vec<CollabAgentRef>,
         /// Prompt text sent as part of the collab tool call, when available.
         prompt: Option<String>,
         /// Last known status of the target agents, when available.
         agents_states: HashMap<String, CollabAgentState>,
+        /// Optional receiver metadata paired with final statuses.
+        agent_statuses: Vec<CollabAgentStatusEntry>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -2914,6 +2921,33 @@ pub enum CollabAgentTool {
     ResumeAgent,
     Wait,
     CloseAgent,
+}
+
+v2_enum_from_core! {
+    pub enum CollabAgentSpawnMode from CoreCollabAgentSpawnMode {
+        Spawn,
+        Fork,
+        Watchdog
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CollabAgentRef {
+    pub thread_id: String,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CollabAgentStatusEntry {
+    pub thread_id: String,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub status: CollabAgentState,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

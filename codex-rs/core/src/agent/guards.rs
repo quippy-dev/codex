@@ -3,6 +3,8 @@ use crate::error::Result;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use rand::prelude::IndexedRandom;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,9 +19,17 @@ use std::sync::atomic::Ordering;
 /// is).
 #[derive(Default)]
 pub(crate) struct Guards {
-    threads_set: Mutex<HashSet<ThreadId>>,
-    known_threads_set: Mutex<HashSet<ThreadId>>,
+    active_agents: Mutex<ActiveAgents>,
     total_count: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ActiveAgents {
+    threads_set: HashSet<ThreadId>,
+    known_threads_set: HashSet<ThreadId>,
+    thread_agent_nicknames: HashMap<ThreadId, String>,
+    used_agent_nicknames: HashSet<String>,
+    nickname_reset_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,19 +57,19 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
 
 impl Guards {
     pub(crate) fn tracked_thread_ids(&self) -> Vec<ThreadId> {
-        let threads = self
-            .threads_set
+        let active_agents = self
+            .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        threads.iter().copied().collect()
+        active_agents.threads_set.iter().copied().collect()
     }
 
     pub(crate) fn was_spawned_thread(&self, thread_id: ThreadId) -> bool {
-        let known_threads = self
-            .known_threads_set
+        let active_agents = self
+            .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        known_threads.contains(&thread_id)
+        active_agents.known_threads_set.contains(&thread_id)
     }
 
     pub(crate) fn reserve_spawn_slot(
@@ -76,6 +86,7 @@ impl Guards {
         Ok(SpawnReservation {
             state: Arc::clone(self),
             active: true,
+            reserved_agent_nickname: None,
         })
     }
 
@@ -94,28 +105,64 @@ impl Guards {
 
     pub(crate) fn release_spawned_thread(&self, thread_id: ThreadId) {
         let removed = {
-            let mut threads = self
-                .threads_set
+            let mut active_agents = self
+                .active_agents
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            threads.remove(&thread_id)
+            let removed = active_agents.threads_set.remove(&thread_id);
+            active_agents.thread_agent_nicknames.remove(&thread_id);
+            removed
         };
         if removed {
             self.total_count.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
-    fn register_spawned_thread(&self, thread_id: ThreadId) {
-        let mut threads = self
-            .threads_set
+    fn register_spawned_thread(&self, thread_id: ThreadId, agent_nickname: Option<String>) {
+        let mut active_agents = self
+            .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        threads.insert(thread_id);
-        let mut known_threads = self
-            .known_threads_set
+        active_agents.threads_set.insert(thread_id);
+        active_agents.known_threads_set.insert(thread_id);
+        if let Some(agent_nickname) = agent_nickname {
+            active_agents
+                .used_agent_nicknames
+                .insert(agent_nickname.clone());
+            active_agents
+                .thread_agent_nicknames
+                .insert(thread_id, agent_nickname);
+        }
+    }
+
+    fn reserve_agent_nickname(&self, names: &[&str], preferred: Option<&str>) -> Option<String> {
+        let mut active_agents = self
+            .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        known_threads.insert(thread_id);
+        let agent_nickname = if let Some(preferred) = preferred {
+            preferred.to_string()
+        } else {
+            if names.is_empty() {
+                return None;
+            }
+            let available_names: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|name| !active_agents.used_agent_nicknames.contains(*name))
+                .collect();
+            if let Some(name) = available_names.choose(&mut rand::rng()) {
+                (*name).to_string()
+            } else {
+                active_agents.used_agent_nicknames.clear();
+                active_agents.nickname_reset_count += 1;
+                names.choose(&mut rand::rng())?.to_string()
+            }
+        };
+        active_agents
+            .used_agent_nicknames
+            .insert(agent_nickname.clone());
+        Some(agent_nickname)
     }
 
     fn try_increment_spawned(&self, max_threads: usize) -> bool {
@@ -140,11 +187,37 @@ impl Guards {
 pub(crate) struct SpawnReservation {
     state: Arc<Guards>,
     active: bool,
+    reserved_agent_nickname: Option<String>,
 }
 
 impl SpawnReservation {
-    pub(crate) fn commit(mut self, thread_id: ThreadId) {
-        self.state.register_spawned_thread(thread_id);
+    pub(crate) fn reserve_agent_nickname_with_preference(
+        &mut self,
+        names: &[&str],
+        preferred: Option<&str>,
+    ) -> Result<String> {
+        let agent_nickname = self
+            .state
+            .reserve_agent_nickname(names, preferred)
+            .ok_or_else(|| {
+                CodexErr::UnsupportedOperation("no available agent nicknames".to_string())
+            })?;
+        self.reserved_agent_nickname = Some(agent_nickname.clone());
+        Ok(agent_nickname)
+    }
+
+    pub(crate) fn commit(self, thread_id: ThreadId) {
+        self.commit_with_agent_nickname(thread_id, None);
+    }
+
+    pub(crate) fn commit_with_agent_nickname(
+        mut self,
+        thread_id: ThreadId,
+        agent_nickname: Option<String>,
+    ) {
+        let agent_nickname = self.reserved_agent_nickname.take().or(agent_nickname);
+        self.state
+            .register_spawned_thread(thread_id, agent_nickname);
         self.active = false;
     }
 }

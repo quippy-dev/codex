@@ -20,9 +20,11 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
+use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabAgentSpawnMode;
+use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabResumeBeginEvent;
@@ -34,6 +36,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 
 pub struct MultiAgentHandler;
 
@@ -205,7 +208,7 @@ mod spawn {
             parent_thread_id: session.conversation_id,
             depth: child_depth,
             agent_nickname: None,
-            agent_role: None,
+            agent_role: role_name.map(str::to_string),
         });
         let agent_control = &session.services.agent_control;
         let result = match spawn_mode {
@@ -248,6 +251,15 @@ mod spawn {
             ),
             Err(_) => (None, AgentStatus::NotFound),
         };
+        let (new_agent_nickname, new_agent_role) = match new_thread_id {
+            Some(thread_id) => session
+                .services
+                .agent_control
+                .get_agent_nickname_and_role(thread_id)
+                .await
+                .unwrap_or((None, None)),
+            None => (None, None),
+        };
         session
             .send_event(
                 &turn,
@@ -255,8 +267,8 @@ mod spawn {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     new_thread_id,
-                    new_agent_nickname: None,
-                    new_agent_role: None,
+                    new_agent_nickname,
+                    new_agent_role,
                     prompt,
                     spawn_mode: spawn_mode.into(),
                     status,
@@ -396,6 +408,12 @@ mod send_input {
             )));
         }
         let prompt = input_preview(&input_items);
+        let (receiver_agent_nickname, receiver_agent_role) = session
+            .services
+            .agent_control
+            .get_agent_nickname_and_role(receiver_thread_id)
+            .await
+            .unwrap_or((None, None));
         if args.interrupt {
             session
                 .services
@@ -440,8 +458,8 @@ mod send_input {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
-                    receiver_agent_nickname: None,
-                    receiver_agent_role: None,
+                    receiver_agent_nickname,
+                    receiver_agent_role,
                     prompt,
                     status,
                 }
@@ -495,6 +513,12 @@ mod resume_agent {
             )));
         }
 
+        let (receiver_agent_nickname, receiver_agent_role) = session
+            .services
+            .agent_control
+            .get_agent_nickname_and_role(receiver_thread_id)
+            .await
+            .unwrap_or((None, None));
         session
             .send_event(
                 &turn,
@@ -502,8 +526,8 @@ mod resume_agent {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
-                    receiver_agent_nickname: None,
-                    receiver_agent_role: None,
+                    receiver_agent_nickname: receiver_agent_nickname.clone(),
+                    receiver_agent_role: receiver_agent_role.clone(),
                 }
                 .into(),
             )
@@ -540,6 +564,12 @@ mod resume_agent {
         } else {
             None
         };
+        let (receiver_agent_nickname, receiver_agent_role) = session
+            .services
+            .agent_control
+            .get_agent_nickname_and_role(receiver_thread_id)
+            .await
+            .unwrap_or((receiver_agent_nickname, receiver_agent_role));
 
         session
             .send_event(
@@ -548,8 +578,8 @@ mod resume_agent {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
-                    receiver_agent_nickname: None,
-                    receiver_agent_role: None,
+                    receiver_agent_nickname,
+                    receiver_agent_role,
                     status: status.clone(),
                 }
                 .into(),
@@ -594,13 +624,26 @@ mod resume_agent {
         })?;
 
         let config = build_agent_resume_config(turn.as_ref(), child_depth)?;
+        let (agent_nickname, agent_role) =
+            match crate::state_db::get_state_db(&turn.config, None).await {
+                Some(state_db_ctx) => match state_db_ctx.get_thread(receiver_thread_id).await {
+                    Ok(Some(metadata)) => (metadata.agent_nickname, metadata.agent_role),
+                    Ok(None) | Err(_) => (None, None),
+                },
+                None => (None, None),
+            };
         let resumed_thread_id = session
             .services
             .agent_control
             .resume_agent_from_rollout(
                 config,
                 rollout_path,
-                thread_spawn_source(session.conversation_id, child_depth),
+                thread_spawn_source_with_metadata(
+                    session.conversation_id,
+                    child_depth,
+                    agent_nickname,
+                    agent_role,
+                ),
             )
             .await
             .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))?;
@@ -731,10 +774,17 @@ mod list_agents {
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
         let owner_thread_id = match args.id.as_deref().map(str::trim) {
-            Some(id) if !id.is_empty() && matches!(id, "parent" | "root") => session
+            Some(id) if !id.is_empty() && id == "parent" => session
                 .parent_thread_id()
                 .await
                 .unwrap_or(session.conversation_id),
+            Some(id) if !id.is_empty() && id == "root" => {
+                session
+                    .services
+                    .agent_control
+                    .resolve_root_thread_id(session.conversation_id)
+                    .await
+            }
             Some(id) if !id.is_empty() && !matches!(id, "self") => agent_id(id)?,
             _ => session.conversation_id,
         };
@@ -824,6 +874,20 @@ pub(crate) mod wait {
             .map(|id| agent_id(id))
             .collect::<Result<Vec<_>, _>>()?;
         let event_receiver_thread_ids = requested_thread_ids.clone();
+        let mut receiver_agents = Vec::with_capacity(event_receiver_thread_ids.len());
+        for receiver_thread_id in &event_receiver_thread_ids {
+            let (agent_nickname, agent_role) = session
+                .services
+                .agent_control
+                .get_agent_nickname_and_role(*receiver_thread_id)
+                .await
+                .unwrap_or((None, None));
+            receiver_agents.push(CollabAgentRef {
+                thread_id: *receiver_thread_id,
+                agent_nickname,
+                agent_role,
+            });
+        }
         let watchdog_target_ids = session
             .services
             .agent_control
@@ -857,7 +921,7 @@ pub(crate) mod wait {
                 CollabWaitingBeginEvent {
                     sender_thread_id: session.conversation_id,
                     receiver_thread_ids: event_receiver_thread_ids,
-                    receiver_agents: Vec::new(),
+                    receiver_agents: receiver_agents.clone(),
                     call_id: call_id.clone(),
                 }
                 .into(),
@@ -872,7 +936,7 @@ pub(crate) mod wait {
                     CollabWaitingEndEvent {
                         sender_thread_id: session.conversation_id,
                         call_id,
-                        agent_statuses: Vec::new(),
+                        agent_statuses: build_wait_agent_statuses(&statuses_map, &receiver_agents),
                         statuses: statuses_map.clone(),
                     }
                     .into(),
@@ -917,7 +981,10 @@ pub(crate) mod wait {
                             CollabWaitingEndEvent {
                                 sender_thread_id: session.conversation_id,
                                 call_id: call_id.clone(),
-                                agent_statuses: Vec::new(),
+                                agent_statuses: build_wait_agent_statuses(
+                                    &statuses,
+                                    &receiver_agents,
+                                ),
                                 statuses,
                             }
                             .into(),
@@ -969,6 +1036,7 @@ pub(crate) mod wait {
         let statuses_map = statuses_with_watchdogs
             .into_iter()
             .collect::<HashMap<_, _>>();
+        let agent_statuses = build_wait_agent_statuses(&statuses_map, &receiver_agents);
         let result = WaitResult {
             status: statuses_map.clone(),
             timed_out: wait_timed_out,
@@ -981,7 +1049,7 @@ pub(crate) mod wait {
                 CollabWaitingEndEvent {
                     sender_thread_id: session.conversation_id,
                     call_id,
-                    agent_statuses: Vec::new(),
+                    agent_statuses,
                     statuses: statuses_map,
                 }
                 .into(),
@@ -1038,6 +1106,43 @@ pub(crate) mod wait {
     }
 }
 
+fn build_wait_agent_statuses(
+    statuses: &HashMap<ThreadId, AgentStatus>,
+    receiver_agents: &[CollabAgentRef],
+) -> Vec<CollabAgentStatusEntry> {
+    if statuses.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::with_capacity(statuses.len());
+    let mut seen = HashMap::with_capacity(receiver_agents.len());
+    for receiver_agent in receiver_agents {
+        seen.insert(receiver_agent.thread_id, ());
+        if let Some(status) = statuses.get(&receiver_agent.thread_id) {
+            entries.push(CollabAgentStatusEntry {
+                thread_id: receiver_agent.thread_id,
+                agent_nickname: receiver_agent.agent_nickname.clone(),
+                agent_role: receiver_agent.agent_role.clone(),
+                status: status.clone(),
+            });
+        }
+    }
+
+    let mut extras = statuses
+        .iter()
+        .filter(|(thread_id, _)| !seen.contains_key(thread_id))
+        .map(|(thread_id, status)| CollabAgentStatusEntry {
+            thread_id: *thread_id,
+            agent_nickname: None,
+            agent_role: None,
+            status: status.clone(),
+        })
+        .collect::<Vec<_>>();
+    extras.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
+    entries.extend(extras);
+    entries
+}
+
 pub mod close_agent {
     use super::*;
     use crate::rollout::find_thread_path_by_id_str;
@@ -1074,6 +1179,12 @@ pub mod close_agent {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
         let agent_id = agent_id(&args.id)?;
         let status_before = session.services.agent_control.get_status(agent_id).await;
+        let (receiver_agent_nickname, receiver_agent_role) = session
+            .services
+            .agent_control
+            .get_agent_nickname_and_role(agent_id)
+            .await
+            .unwrap_or((None, None));
         let mut was_known = if matches!(status_before, AgentStatus::NotFound) {
             let listed = session
                 .services
@@ -1136,8 +1247,8 @@ pub mod close_agent {
                         call_id: call_id.clone(),
                         sender_thread_id: session.conversation_id,
                         receiver_thread_id: agent_id,
-                        receiver_agent_nickname: None,
-                        receiver_agent_role: None,
+                        receiver_agent_nickname: receiver_agent_nickname.clone(),
+                        receiver_agent_role: receiver_agent_role.clone(),
                         status: status.clone(),
                     }
                     .into(),
@@ -1197,8 +1308,8 @@ pub mod close_agent {
                     call_id,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id: agent_id,
-                    receiver_agent_nickname: None,
-                    receiver_agent_role: None,
+                    receiver_agent_nickname,
+                    receiver_agent_role,
                     status: status.clone(),
                 }
                 .into(),
@@ -1256,12 +1367,22 @@ fn multi_agent_tool_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallErro
     }
 }
 
+#[cfg(test)]
 fn thread_spawn_source(parent_thread_id: ThreadId, depth: i32) -> SessionSource {
+    thread_spawn_source_with_metadata(parent_thread_id, depth, None, None)
+}
+
+fn thread_spawn_source_with_metadata(
+    parent_thread_id: ThreadId,
+    depth: i32,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+) -> SessionSource {
     SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id,
         depth,
-        agent_nickname: None,
-        agent_role: None,
+        agent_nickname,
+        agent_role,
     })
 }
 
@@ -1837,23 +1958,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_agents_accepts_root_alias_for_subagents() {
+    async fn list_agents_root_alias_resolves_true_root_from_nested_subagents() {
         let (mut root_session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         root_session.services.agent_control = manager.agent_control();
-        let parent_thread_id = root_session.conversation_id;
+        let root_thread_id = root_session.conversation_id;
         let child_id = manager
             .agent_control()
             .spawn_agent_handle(
                 turn.config.as_ref().clone(),
-                Some(thread_spawn_source(parent_thread_id, 1)),
+                Some(thread_spawn_source(root_thread_id, 1)),
             )
             .await
             .expect("spawn child handle");
-        let child_session = manager
-            .get_thread(child_id)
+        let grandchild_id = manager
+            .agent_control()
+            .spawn_agent_handle(
+                turn.config.as_ref().clone(),
+                Some(thread_spawn_source(child_id, 2)),
+            )
             .await
-            .expect("child thread should exist")
+            .expect("spawn grandchild handle");
+        let grandchild_session = manager
+            .get_thread(grandchild_id)
+            .await
+            .expect("grandchild thread should exist")
+            .codex
+            .session
+            .clone();
+        let invocation = invocation(
+            grandchild_session.clone(),
+            Arc::new(turn),
+            "list_agents",
+            function_payload(json!({
+                "id": "root",
+                "recursive": true
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("list_agents should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: ListAgentsResultForTest =
+            serde_json::from_str(&content).expect("list_agents result should be json");
+        let expected_child_status = manager.agent_control().get_status(child_id).await;
+        let expected_grandchild_status = manager.agent_control().get_status(grandchild_id).await;
+        assert_eq!(
+            result,
+            ListAgentsResultForTest {
+                agents: vec![
+                    ListAgentEntryForTest {
+                        id: child_id.to_string(),
+                        parent_id: root_thread_id.to_string(),
+                        status: expected_child_status,
+                        depth: 1,
+                    },
+                    ListAgentEntryForTest {
+                        id: grandchild_id.to_string(),
+                        parent_id: child_id.to_string(),
+                        status: expected_grandchild_status,
+                        depth: 2,
+                    },
+                ],
+            }
+        );
+        assert_eq!(success, Some(true));
+
+        let _ = grandchild_session
+            .services
+            .agent_control
+            .shutdown_agent(child_id)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_agents_parent_alias_targets_immediate_parent() {
+        let (mut root_session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        root_session.services.agent_control = manager.agent_control();
+        let root_thread_id = root_session.conversation_id;
+        let child_id = manager
+            .agent_control()
+            .spawn_agent_handle(
+                turn.config.as_ref().clone(),
+                Some(thread_spawn_source(root_thread_id, 1)),
+            )
+            .await
+            .expect("spawn child handle");
+        let grandchild_id = manager
+            .agent_control()
+            .spawn_agent_handle(
+                turn.config.as_ref().clone(),
+                Some(thread_spawn_source(child_id, 2)),
+            )
+            .await
+            .expect("spawn grandchild handle");
+        let child_session = manager
+            .get_thread(grandchild_id)
+            .await
+            .expect("grandchild thread should exist")
             .codex
             .session
             .clone();
@@ -1863,7 +2074,7 @@ mod tests {
             Arc::new(turn),
             "list_agents",
             function_payload(json!({
-                "id": "root",
+                "id": "parent",
                 "recursive": false
             })),
         );
@@ -1881,13 +2092,13 @@ mod tests {
         };
         let result: ListAgentsResultForTest =
             serde_json::from_str(&content).expect("list_agents result should be json");
-        let expected_status = manager.agent_control().get_status(child_id).await;
+        let expected_status = manager.agent_control().get_status(grandchild_id).await;
         assert_eq!(
             result,
             ListAgentsResultForTest {
                 agents: vec![ListAgentEntryForTest {
-                    id: child_id.to_string(),
-                    parent_id: parent_thread_id.to_string(),
+                    id: grandchild_id.to_string(),
+                    parent_id: child_id.to_string(),
                     status: expected_status,
                     depth: 1,
                 }],

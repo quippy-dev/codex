@@ -3,6 +3,7 @@ use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
 use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
+use crate::agent::guards::SpawnReservation;
 use crate::agent::status::is_final;
 use crate::config::Config;
 use crate::config::types::CollabInboxDeliveryRole;
@@ -33,6 +34,16 @@ use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
+
+const AGENT_NAMES: &str = include_str!("agent_names.txt");
+
+fn agent_nickname_list() -> Vec<&'static str> {
+    AGENT_NAMES
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
 
 /// Control-plane handle for multi-agent operations.
 /// `AgentControl` is held by each session (via `SessionServices`). It provides capability to
@@ -113,10 +124,12 @@ impl AgentControl {
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
-        let notification_source = session_source.clone();
-        let reservation = self
+        let mut reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
+        let session_source =
+            self.maybe_reserve_thread_spawn_identity(&mut reservation, session_source)?;
+        let notification_source = session_source.clone();
 
         // The same `AgentControl` is sent to spawn the thread.
         let new_thread = match session_source {
@@ -151,9 +164,11 @@ impl AgentControl {
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
-        let reservation = self
+        let mut reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
+        let session_source =
+            self.maybe_reserve_thread_spawn_identity(&mut reservation, session_source)?;
 
         let new_thread = match session_source {
             Some(session_source) => {
@@ -182,10 +197,12 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
-        let notification_source = session_source.clone();
-        let reservation = self
+        let mut reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
+        let session_source =
+            self.reserve_thread_spawn_identity(&mut reservation, session_source)?;
+        let notification_source = Some(session_source.clone());
 
         let parent_thread = state.get_thread(parent_thread_id).await?;
         parent_thread.flush_rollout().await;
@@ -209,7 +226,7 @@ impl AgentControl {
         state.notify_thread_created(new_thread.thread_id);
         self.submit_initial_input_or_cleanup(&state, new_thread.thread_id, items)
             .await?;
-        self.maybe_start_completion_watcher(new_thread.thread_id, Some(notification_source));
+        self.maybe_start_completion_watcher(new_thread.thread_id, notification_source);
 
         Ok(new_thread.thread_id)
     }
@@ -222,10 +239,12 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
         let state = self.upgrade()?;
-        let notification_source = session_source.clone();
-        let reservation = self
+        let mut reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
+        let session_source =
+            self.reserve_thread_spawn_identity(&mut reservation, session_source)?;
+        let notification_source = Some(session_source.clone());
 
         let resumed_thread = state
             .resume_thread_from_rollout_with_source(
@@ -239,7 +258,7 @@ impl AgentControl {
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state.notify_thread_created(resumed_thread.thread_id);
-        self.maybe_start_completion_watcher(resumed_thread.thread_id, Some(notification_source));
+        self.maybe_start_completion_watcher(resumed_thread.thread_id, notification_source);
 
         Ok(resumed_thread.thread_id)
     }
@@ -366,6 +385,48 @@ impl AgentControl {
             return AgentStatus::NotFound;
         };
         thread.agent_status().await
+    }
+
+    pub(crate) async fn get_agent_nickname_and_role(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let Ok(state) = self.upgrade() else {
+            return None;
+        };
+        let Ok(thread) = state.get_thread(agent_id).await else {
+            return None;
+        };
+        let session_source = thread.config_snapshot().await.session_source;
+        Some((
+            session_source.get_nickname(),
+            session_source.get_agent_role(),
+        ))
+    }
+
+    pub(crate) async fn resolve_root_thread_id(&self, thread_id: ThreadId) -> ThreadId {
+        let Ok(state) = self.upgrade() else {
+            return thread_id;
+        };
+        let mut root_thread_id = thread_id;
+        let mut visited = HashSet::new();
+        while visited.insert(root_thread_id) {
+            let Ok(thread) = state.get_thread(root_thread_id).await else {
+                break;
+            };
+            let snapshot = thread.config_snapshot().await;
+            let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = snapshot.session_source
+            else {
+                break;
+            };
+            if parent_thread_id == root_thread_id {
+                break;
+            }
+            root_thread_id = parent_thread_id;
+        }
+        root_thread_id
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.
@@ -748,6 +809,43 @@ impl AgentControl {
         }
 
         descendants
+    }
+
+    fn reserve_thread_spawn_identity(
+        &self,
+        reservation: &mut SpawnReservation,
+        session_source: SessionSource,
+    ) -> CodexResult<SessionSource> {
+        match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_nickname,
+                agent_role,
+            }) => {
+                let agent_nickname = reservation.reserve_agent_nickname_with_preference(
+                    &agent_nickname_list(),
+                    agent_nickname.as_deref(),
+                )?;
+                Ok(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth,
+                    agent_nickname: Some(agent_nickname),
+                    agent_role,
+                }))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn maybe_reserve_thread_spawn_identity(
+        &self,
+        reservation: &mut SpawnReservation,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<Option<SessionSource>> {
+        session_source
+            .map(|source| self.reserve_thread_spawn_identity(reservation, source))
+            .transpose()
     }
 }
 

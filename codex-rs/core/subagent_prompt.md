@@ -18,11 +18,13 @@ Term definitions in this file:
 
 ## Multi-Agent Guidance (Upstream Surface)
 
-The only multi-agent tools available in this environment are `spawn_agent`, `send_input`, `wait`, and `close_agent`.
+The multi-agent tools available in this environment are `spawn_agent`, `send_input`, `resume_agent`, `list_agents`, `wait`, and `close_agent`. `compact_parent_context` is available only to active watchdog check-in helper threads.
 
 Important: to coordinate with parent/root, use `send_input`. A plain assistant message in your own thread does not notify the parent.
 
 You can call `send_input` without an `id` (or with `id = "parent"` / `id = "root"`); these forms target the immediate parent thread in this runtime.
+
+When using `list_agents`, `id = "self"` targets the current thread, `id = "parent"` targets the immediate parent thread, and `id = "root"` targets the true root thread.
 
 ## Reporting Expectations
 

@@ -703,7 +703,7 @@ fn create_list_agents_tool() -> ToolSpec {
         "id".to_string(),
         JsonSchema::String {
             description: Some(
-                "Identifier of the parent agent whose spawned agents to list. Defaults to the current agent; pass \"root\" to target the root agent."
+                "Identifier of the agent whose spawned agents to list. Defaults to the current agent; pass \"self\" for the current agent, \"parent\" for the immediate parent, or \"root\" for the true root agent."
                     .to_string(),
             ),
         },

@@ -105,13 +105,39 @@ Guidance:
 - While any child agents are active, run `list_agents` on a regular cadence (every 30-60 seconds) and after each `wait` call to refresh ground-truth status.
 - Keep an explicit set of outstanding agent ids. A non-final agent is one not yet `completed`, `failed`, or `canceled`; continue `wait`/`list_agents` reconciliation until no non-final agents remain.
 
-### 4) `close_agent`
+### 4) `resume_agent`
+
+Resume a previously closed agent by id.
+
+Guidance:
+- Use this when you need to continue work on a known closed agent instead of spawning a brand-new thread.
+- After resume, treat the returned id like any other active agent id (`send_input`, `wait`, `close_agent`).
+
+### 5) `list_agents`
+
+List child-agent status for a chosen owner thread.
+
+Guidance:
+- Use it to reconcile `wait` snapshots with ground truth when multiple agents are active.
+- `id = "self"` targets the current thread.
+- `id = "parent"` targets the immediate parent thread.
+- `id = "root"` targets the true root thread.
+
+### 6) `close_agent`
 
 Close an agent that is complete, stuck, or no longer relevant.
 
 Guidance:
 - Keep the set of active agents small and purposeful.
 - Close agents that have finished their job or are no longer on the critical path.
+
+### 7) `compact_parent_context`
+
+Request parent-context compaction from a watchdog check-in helper.
+
+Guidance:
+- This is only valid for an active watchdog check-in helper thread.
+- Do not call this from normal root/subagent flows.
 
 ## Operating Principles
 

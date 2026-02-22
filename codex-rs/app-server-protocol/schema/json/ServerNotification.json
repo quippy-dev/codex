@@ -497,6 +497,37 @@
         }
       ]
     },
+    "CollabAgentRef": {
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "CollabAgentSpawnMode": {
+      "enum": [
+        "spawn",
+        "fork",
+        "watchdog"
+      ],
+      "type": "string"
+    },
     "CollabAgentState": {
       "properties": {
         "message": {
@@ -524,6 +555,33 @@
         "notFound"
       ],
       "type": "string"
+    },
+    "CollabAgentStatusEntry": {
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/CollabAgentState"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "threadId"
+      ],
+      "type": "object"
     },
     "CollabAgentTool": {
       "enum": [
@@ -1967,6 +2025,13 @@
         },
         {
           "properties": {
+            "agentStatuses": {
+              "description": "Optional receiver metadata paired with final statuses.",
+              "items": {
+                "$ref": "#/definitions/CollabAgentStatusEntry"
+              },
+              "type": "array"
+            },
             "agentsStates": {
               "additionalProperties": {
                 "$ref": "#/definitions/CollabAgentState"
@@ -1985,6 +2050,13 @@
                 "null"
               ]
             },
+            "receiverAgents": {
+              "description": "Optional receiver metadata paired with receiver thread IDs.",
+              "items": {
+                "$ref": "#/definitions/CollabAgentRef"
+              },
+              "type": "array"
+            },
             "receiverThreadIds": {
               "description": "Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
               "items": {
@@ -1995,6 +2067,17 @@
             "senderThreadId": {
               "description": "Thread ID of the agent issuing the collab request.",
               "type": "string"
+            },
+            "spawnMode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CollabAgentSpawnMode"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Spawn mode when `tool` is `SpawnAgent`."
             },
             "status": {
               "allOf": [
@@ -2021,8 +2104,10 @@
             }
           },
           "required": [
+            "agentStatuses",
             "agentsStates",
             "id",
+            "receiverAgents",
             "receiverThreadIds",
             "senderThreadId",
             "status",
