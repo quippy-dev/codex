@@ -300,10 +300,29 @@ impl ToolRegistryBuilder {
 }
 
 fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &str) -> String {
-    match payload {
+    let message = match payload {
         ToolPayload::Custom { .. } => format!("unsupported custom tool call: {tool_name}"),
         _ => format!("unsupported call: {tool_name}"),
+    };
+
+    if is_collab_tool_name(tool_name) {
+        format!("{message}. collab tools may be disabled by feature/depth gating.")
+    } else {
+        message
     }
+}
+
+fn is_collab_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "spawn_agent"
+            | "send_input"
+            | "resume_agent"
+            | "compact_parent_context"
+            | "list_agents"
+            | "wait"
+            | "close_agent"
+    )
 }
 
 fn sandbox_policy_tag(policy: &SandboxPolicy) -> &'static str {
@@ -345,6 +364,61 @@ impl From<&ToolPayload> for HookToolInput {
                 tool: tool.clone(),
                 arguments: raw_arguments.clone(),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn unsupported_message_stays_generic_for_non_collab_function_tools() {
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+
+        let message = unsupported_tool_call_message(&payload, "shell");
+
+        assert_eq!(message, "unsupported call: shell");
+    }
+
+    #[test]
+    fn unsupported_message_stays_generic_for_non_collab_custom_tools() {
+        let payload = ToolPayload::Custom {
+            input: "input".to_string(),
+        };
+
+        let message = unsupported_tool_call_message(&payload, "non_collab_custom_tool");
+
+        assert_eq!(
+            message,
+            "unsupported custom tool call: non_collab_custom_tool"
+        );
+    }
+
+    #[test]
+    fn unsupported_message_calls_out_collab_feature_or_depth_gating() {
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+        for tool_name in [
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "compact_parent_context",
+            "list_agents",
+            "wait",
+            "close_agent",
+        ] {
+            let message = unsupported_tool_call_message(&payload, tool_name);
+            assert_eq!(
+                message,
+                format!(
+                    "unsupported call: {tool_name}. collab tools may be disabled by feature/depth gating."
+                )
+            );
         }
     }
 }

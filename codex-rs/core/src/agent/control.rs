@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
+use crate::rollout::find_thread_path_by_id_str;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
@@ -204,13 +205,27 @@ impl AgentControl {
             self.reserve_thread_spawn_identity(&mut reservation, session_source)?;
         let notification_source = Some(session_source.clone());
 
-        let parent_thread = state.get_thread(parent_thread_id).await?;
-        parent_thread.flush_rollout().await;
-        let rollout_path = parent_thread.rollout_path().ok_or_else(|| {
-            CodexErr::UnsupportedOperation(format!(
-                "rollout history unavailable for thread {parent_thread_id}"
-            ))
-        })?;
+        let live_rollout_path = match state.get_thread(parent_thread_id).await {
+            Ok(parent_thread) => {
+                parent_thread.flush_rollout().await;
+                parent_thread.rollout_path()
+            }
+            Err(CodexErr::ThreadNotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        let rollout_path = match live_rollout_path {
+            Some(path) => path,
+            None => find_thread_path_by_id_str(
+                config.codex_home.as_path(),
+                &parent_thread_id.to_string(),
+            )
+            .await?
+            .ok_or_else(|| {
+                CodexErr::UnsupportedOperation(format!(
+                    "rollout history unavailable for thread {parent_thread_id}"
+                ))
+            })?,
+        };
 
         let new_thread = state
             .fork_thread_with_source(
@@ -928,6 +943,7 @@ mod tests {
     use crate::config::ConfigBuilder;
     use assert_matches::assert_matches;
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::TurnAbortReason;
@@ -960,6 +976,20 @@ mod tests {
             text: text.to_string(),
             text_elements: Vec::new(),
         }]
+    }
+
+    fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
+        history_items.iter().any(|item| {
+            let ResponseItem::Message { content, .. } = item else {
+                return false;
+            };
+            content.iter().any(|content_item| match content_item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    text.contains(needle)
+                }
+                ContentItem::InputImage { .. } => false,
+            })
+        })
     }
 
     struct AgentControlHarness {
@@ -1330,6 +1360,83 @@ mod tests {
             .into_iter()
             .find(|entry| *entry == expected);
         assert_eq!(captured, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn fork_agent_falls_back_to_rollout_on_disk_when_parent_missing_in_memory() {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        parent_thread
+            .inject_user_message_without_turn("parent seed context".to_string())
+            .await;
+        parent_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.codex.session.flush_rollout().await;
+        let _ = harness.manager.remove_thread(&parent_thread_id).await;
+
+        let thread_id = harness
+            .control
+            .fork_agent(
+                harness.config.clone(),
+                text_input("forked"),
+                parent_thread_id,
+                usize::MAX,
+                SessionSource::Exec,
+            )
+            .await
+            .expect("fork_agent should fall back to rollout on disk");
+        let thread = harness
+            .manager
+            .get_thread(thread_id)
+            .await
+            .expect("thread should be registered");
+        let history = thread.codex.session.clone_history().await;
+        assert!(history_contains_text(
+            history.raw_items(),
+            "parent seed context"
+        ));
+        let expected = (
+            thread_id,
+            Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "forked".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+            },
+        );
+        let captured = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .find(|entry| *entry == expected);
+        assert_eq!(captured, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn fork_agent_errors_when_parent_missing_from_memory_and_rollout() {
+        let harness = AgentControlHarness::new().await;
+        let parent_thread_id = ThreadId::new();
+
+        let err = harness
+            .control
+            .fork_agent(
+                harness.config.clone(),
+                text_input("forked"),
+                parent_thread_id,
+                0,
+                SessionSource::Exec,
+            )
+            .await
+            .expect_err("fork_agent should fail when parent rollout is unavailable");
+        assert_matches!(
+            err,
+            CodexErr::UnsupportedOperation(message)
+                if message == format!("rollout history unavailable for thread {parent_thread_id}")
+        );
     }
 
     #[tokio::test]
