@@ -3,4 +3,3 @@ source: tui/src/history_cell.rs
 expression: rendered
 ---
 • Subagent update: users-dev-codex-worker completed
-  └ Top candidate: `abc123` this change collapsed mode handling next steps: - restore execute mode - add snapshot coverage

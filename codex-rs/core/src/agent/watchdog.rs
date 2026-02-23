@@ -1,6 +1,7 @@
 use super::control::AgentControl;
 use super::guards::Guards;
 use super::guards::exceeds_thread_spawn_depth_limit;
+use super::status::completed_message_for_collab_fallback;
 use super::status::is_final;
 use crate::codex::load_watchdog_prompt;
 use crate::config::Config;
@@ -214,7 +215,14 @@ impl WatchdogManager {
         let force_due = self
             .take_force_due_if_generation(target_thread_id, generation)
             .await;
-        let owner_has_active_turn = match owner_thread {
+        let owner_is_root_thread = match owner_thread.as_ref() {
+            Ok(thread) => !matches!(
+                thread.config_snapshot().await.session_source,
+                SessionSource::SubAgent(_)
+            ),
+            Err(_) => false,
+        };
+        let owner_has_active_turn = match owner_thread.as_ref() {
             Ok(thread) => thread.has_active_turn().await,
             Err(_) => false,
         };
@@ -256,12 +264,13 @@ impl WatchdogManager {
                 .await
                 .map(|thread| thread.last_completed_turn_used_collab_send_input())
                 .unwrap_or(false);
-            if let AgentStatus::Completed(Some(message)) = &helper_status
-                && !message.trim().is_empty()
-                && !helper_sent_input
+            // Root-owned helper fallbacks are forwarded by the control completion watcher.
+            if !owner_is_root_thread
+                && let Some(message) =
+                    completed_message_for_collab_fallback(&helper_status, helper_sent_input)
             {
                 if let Err(err) = control_for_spawn
-                    .send_collab_message(snapshot.owner_thread_id, helper_id, message.clone())
+                    .send_collab_message(snapshot.owner_thread_id, helper_id, message.to_string())
                     .await
                 {
                     warn!(

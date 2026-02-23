@@ -617,10 +617,17 @@ pub(crate) fn new_subagent_spawned_cell(name: &str, prompt_preview: &str) -> Pla
     PlainHistoryCell::new(lines)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubagentUpdateLevel {
+    Root,
+    Nested,
+}
+
 pub(crate) fn new_subagent_update_cell(
     name: &str,
     status: &AgentStatus,
     summary: &str,
+    update_level: SubagentUpdateLevel,
 ) -> PlainHistoryCell {
     let mut lines = vec![Line::from(vec![
         "• ".dim(),
@@ -634,7 +641,11 @@ pub(crate) fn new_subagent_update_cell(
         &summary.split_whitespace().collect::<Vec<_>>().join(" "),
         240,
     );
-    if !summary.is_empty() {
+    let should_suppress_summary = matches!(
+        (status, update_level),
+        (AgentStatus::Completed(_), SubagentUpdateLevel::Root)
+    );
+    if !summary.is_empty() && !should_suppress_summary {
         lines.push(Line::from(vec!["  └ ".dim(), summary.into()]));
     }
 
@@ -2731,19 +2742,36 @@ mod tests {
             "users-dev-codex-worker",
             &AgentStatus::Completed(Some("done".to_string())),
             "Top candidate: `abc123`\nthis change collapsed mode handling\n\nnext steps:\n- restore execute mode\n- add snapshot coverage",
+            SubagentUpdateLevel::Root,
         );
         let rendered = render_transcript(&cell).join("\n");
 
+        assert_eq!(rendered.lines().count(), 1);
         insta::assert_snapshot!(rendered);
     }
 
     #[test]
-    fn subagent_update_cell_truncates_long_summary() {
-        let long_summary = "a".repeat(420);
+    fn subagent_update_cell_nested_completed_keeps_summary_snapshot() {
         let cell = new_subagent_update_cell(
             "users-dev-codex-worker",
             &AgentStatus::Completed(Some("done".to_string())),
+            "Top candidate: `abc123`\nthis change collapsed mode handling\n\nnext steps:\n- restore execute mode\n- add snapshot coverage",
+            SubagentUpdateLevel::Nested,
+        );
+        let rendered = render_transcript(&cell).join("\n");
+
+        assert_eq!(rendered.lines().count(), 2);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn subagent_update_cell_errored_truncates_long_summary() {
+        let long_summary = "a".repeat(420);
+        let cell = new_subagent_update_cell(
+            "users-dev-codex-worker",
+            &AgentStatus::Errored("tool timeout".to_string()),
             long_summary.as_str(),
+            SubagentUpdateLevel::Root,
         );
         let rendered = render_transcript(&cell).join("\n");
         let expected = truncate_text(long_summary.as_str(), 240);

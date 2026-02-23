@@ -353,7 +353,11 @@ fn wait_complete_lines(
                 role: agent_role.as_deref(),
             });
             spans.push(Span::from(": ").dim());
-            spans.extend(status_summary_spans(&status));
+            let status_spans = match status {
+                AgentStatus::Completed(_) => vec![Span::from("Completed").green()],
+                _ => status_summary_spans(&status),
+            };
+            spans.extend(status_spans);
             spans.into()
         })
         .collect()

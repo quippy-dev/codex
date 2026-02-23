@@ -4,6 +4,7 @@ use super::watchdog::WatchdogRegistration;
 use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
 use crate::agent::guards::SpawnReservation;
+use crate::agent::status::completed_message_for_collab_fallback;
 use crate::agent::status::is_final;
 use crate::codex::DeferredCollabEnqueueError;
 use crate::config::Config;
@@ -571,6 +572,30 @@ impl AgentControl {
             let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
                 return;
             };
+            let parent_is_root_thread = !matches!(
+                parent_thread.config_snapshot().await.session_source,
+                SessionSource::SubAgent(_)
+            );
+
+            if parent_is_root_thread {
+                let child_used_collab_send_input = state
+                    .get_thread(child_thread_id)
+                    .await
+                    .map(|thread| thread.last_completed_turn_used_collab_send_input())
+                    .unwrap_or(false);
+                if let Some(message) =
+                    completed_message_for_collab_fallback(&status, child_used_collab_send_input)
+                    && let Err(err) = control
+                        .send_collab_message(parent_thread_id, child_thread_id, message.to_string())
+                        .await
+                {
+                    warn!(
+                        child_thread_id = %child_thread_id,
+                        parent_thread_id = %parent_thread_id,
+                        "subagent completion fallback forward failed: {err}"
+                    );
+                }
+            }
             parent_thread
                 .inject_user_message_without_turn(format_subagent_notification_message(
                     &child_thread_id.to_string(),

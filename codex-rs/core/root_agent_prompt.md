@@ -39,6 +39,7 @@ A check-in is eligible after at least `interval_s` seconds of owner-thread idlen
 The watchdog registration persists across check-ins, but each watchdog check-in agent is a fresh one-shot fork from owner state at check-in start.
 Primary delivery path: the watchdog check-in agent calls `send_input` to the owner thread (its direct parent thread for this run).
 Fallback delivery path: if a watchdog check-in agent exits without any `send_input`, runtime may forward one final multi-agent inbox message (`collab_inbox` tool output or `[collab_inbox:…]` developer message). This fallback is best-effort and not guaranteed.
+Completion-only fallback path: when a subagent with a root parent exits without `send_input`, runtime may forward one final multi-agent inbox message for completion visibility. This is best-effort and not a coordination channel.
 
 After spawning a watchdog, continue progressing the user’s task. Use `wait` for normal subagents only.
 
@@ -91,6 +92,7 @@ Guidance:
 - Use `interrupt = true` only when you must preempt the target; omit it for normal queued follow-ups.
 - Subagents can call `send_input` without an `id` (or with `id = "parent"` / `id = "root"`). In this runtime those forms resolve to the immediate parent thread.
 - Treat explicit `send_input` deliveries as the primary path and multi-agent inbox messages (`collab_inbox` tool calls or `[collab_inbox:…]` messages) as fallback inbound agent messages.
+- Use fallback inbox messages for completion visibility only; do not treat them as a replacement for deliberate `send_input` coordination.
 
 ### 3) `wait`
 

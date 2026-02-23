@@ -21,6 +21,7 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::SubagentPanelAgent;
 use crate::history_cell::SubagentPanelState;
 use crate::history_cell::SubagentStatusCell;
+use crate::history_cell::SubagentUpdateLevel;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::history_cell::new_subagent_spawned_cell;
@@ -381,6 +382,7 @@ struct SubagentInfo {
     prompt_preview: String,
     spawn_mode: CollabAgentSpawnMode,
     status: AgentStatus,
+    is_root_level: bool,
     spawned_at: Instant,
     started_at: Option<Instant>,
     latest_summary: String,
@@ -398,6 +400,7 @@ impl SubagentInfo {
         agent_role: Option<String>,
         prompt_preview: String,
         spawn_mode: CollabAgentSpawnMode,
+        is_root_level: bool,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -407,6 +410,7 @@ impl SubagentInfo {
             prompt_preview: prompt_preview.clone(),
             spawn_mode,
             status: AgentStatus::PendingInit,
+            is_root_level,
             spawned_at: now,
             started_at: None,
             latest_summary: String::new(),
@@ -466,6 +470,14 @@ impl SubagentInfo {
 
     fn running_started_at(&self) -> Instant {
         self.started_at.unwrap_or(self.spawned_at)
+    }
+
+    fn update_level(&self) -> SubagentUpdateLevel {
+        if self.is_root_level {
+            SubagentUpdateLevel::Root
+        } else {
+            SubagentUpdateLevel::Nested
+        }
     }
 
     fn update_preview(&mut self, preview: String) {
@@ -542,12 +554,14 @@ impl SubagentRegistry {
             .unwrap_or(i32::MAX - 1)
             .saturating_add(1);
         let prompt_preview = prompt_preview(&event.prompt);
+        let is_root_level = self.is_root_thread(event.sender_thread_id);
         let mut info = SubagentInfo::new(
             ordinal,
             event.new_agent_nickname.clone(),
             event.new_agent_role.clone(),
             prompt_preview,
             event.spawn_mode,
+            is_root_level,
         );
         info.status = event.status.clone();
         info.latest_preview = info.prompt_preview.clone();
@@ -612,6 +626,7 @@ impl SubagentRegistry {
                 &label,
                 &info.status,
                 summary.as_str(),
+                info.update_level(),
             )));
         }
         None
@@ -694,6 +709,7 @@ impl SubagentRegistry {
                         &label,
                         &info.status,
                         summary.as_str(),
+                        info.update_level(),
                     )) as Box<dyn HistoryCell>);
                 }
             }
@@ -708,6 +724,7 @@ impl SubagentRegistry {
                         &label,
                         &info.status,
                         reason_text.as_str(),
+                        info.update_level(),
                     )) as Box<dyn HistoryCell>);
                 }
             }
@@ -727,6 +744,7 @@ impl SubagentRegistry {
                         &label,
                         &info.status,
                         summary.as_str(),
+                        info.update_level(),
                     )) as Box<dyn HistoryCell>);
                 }
             }
@@ -740,6 +758,7 @@ impl SubagentRegistry {
                         &label,
                         &info.status,
                         "shutdown",
+                        info.update_level(),
                     )) as Box<dyn HistoryCell>);
                 }
             }
@@ -1456,26 +1475,34 @@ impl App {
             self.subagents.set_root_thread(thread_id);
         }
 
-        if self.subagents.is_root_thread(thread_id) {
-            match &event.msg {
-                EventMsg::CollabAgentSpawnEnd(ev) => {
-                    // Keep registry/panel state in sync, but let chatwidget own
-                    // lifecycle transcript cells for root-thread collab events.
-                    let _ = self.subagents.on_spawn_end(ev);
-                }
-                EventMsg::CollabWaitingEnd(ev) => {
-                    self.subagents.on_wait_end(ev);
-                }
-                EventMsg::CollabCloseEnd(ev) => {
-                    let _ = self.subagents.on_close_end(ev);
-                }
-                _ => {}
+        match &event.msg {
+            EventMsg::CollabAgentSpawnEnd(ev) if self.subagents.is_root_thread(thread_id) => {
+                // Keep registry/panel state in sync, but let chatwidget own
+                // lifecycle transcript cells for root-thread collab events.
+                let _ = self.subagents.on_spawn_end(ev);
             }
-        } else {
-            let updates = self.subagents.on_agent_event(thread_id, &event.msg);
-            for cell in updates {
-                self.emit_or_queue_subagent_history(cell);
+            EventMsg::CollabWaitingEnd(ev) => {
+                self.subagents.on_wait_end(ev);
             }
+            EventMsg::CollabCloseEnd(ev) => {
+                let is_nested_receiver = self
+                    .subagents
+                    .agents
+                    .get(&ev.receiver_thread_id)
+                    .is_some_and(|info| info.update_level() == SubagentUpdateLevel::Nested);
+                if let Some(cell) = self.subagents.on_close_end(ev)
+                    && is_nested_receiver
+                {
+                    self.emit_or_queue_subagent_history(cell);
+                }
+            }
+            _ if !self.subagents.is_root_thread(thread_id) => {
+                let updates = self.subagents.on_agent_event(thread_id, &event.msg);
+                for cell in updates {
+                    self.emit_or_queue_subagent_history(cell);
+                }
+            }
+            _ => {}
         }
 
         self.sync_subagent_panel_state();
@@ -5424,10 +5451,6 @@ mod tests {
         );
 
         assert_eq!(updates.len(), 1);
-        let expected = truncate_text(
-            &message.split_whitespace().collect::<Vec<_>>().join(" "),
-            240,
-        );
         let status = registry
             .agents
             .get(&subagent_thread_id)
@@ -5442,9 +5465,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Subagent update:"));
-        assert!(rendered.contains(expected.as_str()));
         assert!(!rendered.contains(message.as_str()));
-        assert_eq!(rendered.lines().count(), 2);
+        assert_eq!(rendered.lines().count(), 1);
     }
 
     #[test]
@@ -5642,6 +5664,93 @@ mod tests {
             close_cells.is_empty(),
             "app should not emit duplicate close lifecycle cells"
         );
+    }
+
+    #[tokio::test]
+    async fn root_subagent_side_effects_emit_nested_close_end_summary_once() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let parent_thread_id = ThreadId::new();
+        let nested_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn-root".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-root".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(parent_thread_id),
+                    new_agent_nickname: Some("RootChild".to_string()),
+                    new_agent_role: Some("default".to_string()),
+                    prompt: "root child prompt".to_string(),
+                    spawn_mode: CollabAgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        let root_spawn_cells = drain_insert_history_text(&mut app_event_rx);
+        assert!(root_spawn_cells.is_empty());
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn-nested".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-nested".to_string(),
+                    sender_thread_id: parent_thread_id,
+                    new_thread_id: Some(nested_thread_id),
+                    new_agent_nickname: Some("NestedWorker".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "nested worker prompt".to_string(),
+                    spawn_mode: CollabAgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        let nested_spawn_cells = drain_insert_history_text(&mut app_event_rx);
+        assert!(nested_spawn_cells.is_empty());
+
+        let nested_summary = "nested completed summary";
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "close-nested-1".to_string(),
+                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                    call_id: "call-close".to_string(),
+                    sender_thread_id: parent_thread_id,
+                    receiver_thread_id: nested_thread_id,
+                    receiver_agent_nickname: Some("NestedWorker".to_string()),
+                    receiver_agent_role: Some("worker".to_string()),
+                    status: AgentStatus::Completed(Some(nested_summary.to_string())),
+                }),
+            },
+        );
+
+        let close_cells = drain_insert_history_text(&mut app_event_rx);
+        assert_eq!(close_cells.len(), 1);
+        assert!(close_cells[0].contains("Subagent update: NestedWorker [worker] completed"));
+        assert!(close_cells[0].contains(nested_summary));
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "close-nested-2".to_string(),
+                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                    call_id: "call-close".to_string(),
+                    sender_thread_id: parent_thread_id,
+                    receiver_thread_id: nested_thread_id,
+                    receiver_agent_nickname: Some("NestedWorker".to_string()),
+                    receiver_agent_role: Some("worker".to_string()),
+                    status: AgentStatus::Completed(Some(nested_summary.to_string())),
+                }),
+            },
+        );
+        let duplicate_close_cells = drain_insert_history_text(&mut app_event_rx);
+        assert!(duplicate_close_cells.is_empty());
     }
 
     #[test]

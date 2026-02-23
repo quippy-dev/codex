@@ -11,7 +11,7 @@ expression: snapshot
 • Waiting for Robie [explorer]
 
 • Finished waiting
-  └ Robie [explorer]: Completed - 39916800
+  └ Robie [explorer]: Completed
     Bob [worker]: Error - tool timeout
 
 • Closed Robie [explorer]

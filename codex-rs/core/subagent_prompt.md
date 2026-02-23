@@ -6,6 +6,7 @@ Term definitions in this file:
 - **parent thread**: the thread that spawned this subagent.
 - **root thread**: the top-level user-facing thread.
 - **`send_input`**: send a message to an existing agent thread; it does not spawn agents. Delivery is asynchronous.
+- **completion-only fallback inbox message**: a best-effort runtime-forwarded message that can appear when a subagent with a root parent exits without `send_input`; this is for root visibility, not coordination.
 - **durable state**: thread-level task state needed across later turns/check-ins (not disk/database persistence).
 - In this runtime, when a subagent calls `send_input`, `id = "parent"` and `id = "root"` both route to the immediate parent thread.
 
