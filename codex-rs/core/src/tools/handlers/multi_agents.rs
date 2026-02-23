@@ -982,8 +982,10 @@ pub(crate) mod wait {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
                     let status = rx.borrow().clone();
-                    if is_final(&status) {
-                        initial_final_statuses.push((*id, status));
+                    if let Some(final_status) =
+                        observed_wait_final_status(&session, *id, status).await
+                    {
+                        initial_final_statuses.push((*id, final_status));
                     }
                     status_rxs.push((*id, rx));
                 }
@@ -1090,21 +1092,63 @@ pub(crate) mod wait {
         thread_id: ThreadId,
         mut status_rx: Receiver<AgentStatus>,
     ) -> Option<(ThreadId, AgentStatus)> {
-        let mut status = status_rx.borrow().clone();
-        if is_final(&status) {
-            return Some((thread_id, status));
+        let status = status_rx.borrow().clone();
+        if let Some(final_status) = observed_wait_final_status(&session, thread_id, status).await {
+            return Some((thread_id, final_status));
         }
 
         loop {
             if status_rx.changed().await.is_err() {
                 let latest = session.services.agent_control.get_status(thread_id).await;
-                return is_final(&latest).then_some((thread_id, latest));
+                return observed_wait_final_status(&session, thread_id, latest)
+                    .await
+                    .map(|final_status| (thread_id, final_status));
             }
-            status = status_rx.borrow().clone();
-            if is_final(&status) {
-                return Some((thread_id, status));
+            let status = status_rx.borrow().clone();
+            if let Some(final_status) =
+                observed_wait_final_status(&session, thread_id, status).await
+            {
+                return Some((thread_id, final_status));
             }
         }
+    }
+
+    async fn observed_wait_final_status(
+        session: &Arc<Session>,
+        thread_id: ThreadId,
+        observed_status: AgentStatus,
+    ) -> Option<AgentStatus> {
+        let follow_up_status = if matches!(&observed_status, AgentStatus::Errored(reason) if reason == "Interrupted")
+        {
+            Some(session.services.agent_control.get_status(thread_id).await)
+        } else {
+            None
+        };
+        finalized_wait_status(observed_status, follow_up_status)
+    }
+
+    fn finalized_wait_status(
+        observed_status: AgentStatus,
+        follow_up_status: Option<AgentStatus>,
+    ) -> Option<AgentStatus> {
+        if !is_final(&observed_status) {
+            return None;
+        }
+        if !matches!(&observed_status, AgentStatus::Errored(reason) if reason == "Interrupted") {
+            return Some(observed_status);
+        }
+
+        let Some(follow_up_status) = follow_up_status else {
+            return Some(observed_status);
+        };
+        if matches!(
+            &follow_up_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        ) {
+            return None;
+        }
+
+        Some(follow_up_status)
     }
 
     async fn split_wait_ids(
@@ -1121,6 +1165,57 @@ pub(crate) mod wait {
             } else {
                 receiver_thread_ids.push(thread_id);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::finalized_wait_status;
+        use codex_protocol::protocol::AgentStatus;
+        use pretty_assertions::assert_eq;
+
+        #[test]
+        fn interrupted_follow_up_running_is_treated_as_non_final() {
+            assert_eq!(
+                finalized_wait_status(
+                    AgentStatus::Errored("Interrupted".to_string()),
+                    Some(AgentStatus::Running),
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn interrupted_follow_up_pending_init_is_treated_as_non_final() {
+            assert_eq!(
+                finalized_wait_status(
+                    AgentStatus::Errored("Interrupted".to_string()),
+                    Some(AgentStatus::PendingInit),
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn interrupted_follow_up_final_status_wins() {
+            assert_eq!(
+                finalized_wait_status(
+                    AgentStatus::Errored("Interrupted".to_string()),
+                    Some(AgentStatus::Shutdown),
+                ),
+                Some(AgentStatus::Shutdown)
+            );
+        }
+
+        #[test]
+        fn non_interrupted_error_is_unchanged() {
+            assert_eq!(
+                finalized_wait_status(
+                    AgentStatus::Errored("boom".to_string()),
+                    Some(AgentStatus::Running),
+                ),
+                Some(AgentStatus::Errored("boom".to_string()))
+            );
         }
     }
 }
@@ -1557,6 +1652,9 @@ mod tests {
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
+    use crate::protocol::ErrorEvent;
+    use crate::protocol::Event;
+    use crate::protocol::EventMsg;
     use crate::protocol::Op;
     use crate::protocol::SandboxPolicy;
     use crate::protocol::SessionSource;
@@ -3067,6 +3165,67 @@ mod tests {
             }
         );
         assert_eq!(success, None);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_non_interrupted_errors_immediately() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+
+        thread
+            .thread
+            .codex
+            .session
+            .send_event_raw(Event {
+                id: "err-1".to_string(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "boom".to_string(),
+                    codex_error_info: None,
+                }),
+            })
+            .await;
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": 1000
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert_eq!(
+            result,
+            WaitResult {
+                status: HashMap::from([(agent_id, AgentStatus::Errored("boom".to_string()))]),
+                timed_out: false
+            }
+        );
+        assert_eq!(success, None);
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
     }
 
     #[tokio::test]
