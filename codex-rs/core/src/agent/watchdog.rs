@@ -187,6 +187,20 @@ impl WatchdogManager {
             Err(_) => AgentStatus::NotFound,
         };
         if is_watchdog_terminated(&owner_status) {
+            if let Some(helper_id) = snapshot.active_helper_id {
+                let control_for_cleanup = AgentControl::from_parts(
+                    self.manager.clone(),
+                    Arc::clone(&self.guards),
+                    Arc::clone(self),
+                );
+                if let Err(err) = control_for_cleanup.shutdown_agent(helper_id).await {
+                    warn!(
+                        helper_id = %helper_id,
+                        owner_thread_id = %snapshot.owner_thread_id,
+                        "watchdog helper cleanup failed while owner is final: {err}"
+                    );
+                }
+            }
             info!(
                 target_thread_id = %target_thread_id,
                 owner_thread_id = %snapshot.owner_thread_id,

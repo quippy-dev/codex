@@ -664,12 +664,7 @@ impl AgentControl {
 
         let mut listings = Vec::new();
         if all {
-            let mut thread_ids = threads
-                .iter()
-                .map(|(thread_id, _)| *thread_id)
-                .collect::<HashSet<_>>();
-            thread_ids.extend(self.guards.tracked_thread_ids());
-            let mut thread_ids = thread_ids.into_iter().collect::<Vec<_>>();
+            let mut thread_ids = self.guards.tracked_thread_ids();
             thread_ids.sort_by_key(ToString::to_string);
             for thread_id in thread_ids {
                 listings.push(AgentListing {
@@ -1808,6 +1803,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_run_once_cleans_up_active_helper_when_owner_missing() {
+        let max_threads = 2usize;
+        let (_home, config) = test_config_with_cli_overrides(vec![(
+            "agents.max_threads".to_string(),
+            TomlValue::Integer(max_threads as i64),
+        )])
+        .await;
+        let manager = ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.clone(),
+        );
+        let control = manager.agent_control();
+
+        let owner_thread = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start owner thread");
+        let owner_thread_id = owner_thread.thread_id;
+        let watchdog_handle_id = control
+            .spawn_agent_handle(
+                config.clone(),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: owner_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            )
+            .await
+            .expect("spawn watchdog handle");
+        control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 30,
+                prompt: "watchdog".to_string(),
+                config: config.clone(),
+            })
+            .await
+            .expect("register watchdog");
+
+        let helper_id = control
+            .spawn_agent(
+                config.clone(),
+                text_input("helper"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: owner_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            )
+            .await
+            .expect("spawn helper");
+        control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_id)
+            .await;
+
+        let _ = manager.remove_thread(&owner_thread_id).await;
+
+        control.run_watchdogs_once_for_tests().await;
+
+        let helper_after = manager.get_thread(helper_id).await;
+        assert!(matches!(helper_after, Err(CodexErr::ThreadNotFound(id)) if id == helper_id));
+
+        let replacement = control
+            .spawn_agent(config, text_input("replacement"), None)
+            .await
+            .expect("replacement spawn should succeed after helper cleanup");
+        let _ = control.shutdown_agent(replacement).await;
+        let _ = control.shutdown_agent(watchdog_handle_id).await;
+    }
+
+    #[tokio::test]
     async fn list_agents_all_includes_tracked_not_found_threads() {
         let max_threads = 1usize;
         let (_home, config) = test_config_with_cli_overrides(vec![(
@@ -1849,7 +1920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_agents_all_includes_live_manager_threads_even_if_untracked() {
+    async fn list_agents_all_excludes_live_manager_threads_when_untracked() {
         let (_home, config) = test_config().await;
         let manager = ThreadManager::with_models_provider_and_home_for_tests(
             CodexAuth::from_api_key("dummy"),
@@ -1870,9 +1941,8 @@ mod tests {
             .expect("list all agents");
         let listing = listings
             .into_iter()
-            .find(|entry| entry.thread_id == agent_id)
-            .expect("live manager thread should be listed");
-        assert_ne!(listing.status, AgentStatus::NotFound);
+            .find(|entry| entry.thread_id == agent_id);
+        assert!(listing.is_none());
 
         let _ = control.shutdown_agent(agent_id).await;
     }
