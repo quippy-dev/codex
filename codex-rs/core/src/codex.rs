@@ -1625,6 +1625,7 @@ impl Session {
                 let rollout_items = resumed_history.history;
                 let restored_tool_selection =
                     Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
+                let latest_proposed_plan = Self::last_proposed_plan_from_rollout(&rollout_items);
                 let (previous_regular_turn_context_item, crossed_compaction_after_turn) =
                     Self::last_rollout_regular_turn_context_lookup(&rollout_items);
                 let previous_model =
@@ -1642,6 +1643,8 @@ impl Session {
                     state.set_reference_context_item(reference_context_item);
                 }
                 self.set_previous_model(previous_model.clone()).await;
+                self.set_latest_proposed_plan_text(latest_proposed_plan)
+                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 if let Some(prev) = previous_model.as_deref().filter(|p| *p != curr) {
@@ -1684,11 +1687,14 @@ impl Session {
             InitialHistory::Forked(rollout_items) => {
                 let restored_tool_selection =
                     Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
+                let latest_proposed_plan = Self::last_proposed_plan_from_rollout(&rollout_items);
                 let (previous_regular_turn_context_item, _) =
                     Self::last_rollout_regular_turn_context_lookup(&rollout_items);
                 let previous_model =
                     previous_regular_turn_context_item.map(|ctx| ctx.model.clone());
                 self.set_previous_model(previous_model).await;
+                self.set_latest_proposed_plan_text(latest_proposed_plan)
+                    .await;
 
                 // Always add response items to conversation history
                 let reconstructed_history = self
@@ -1883,6 +1889,91 @@ impl Session {
         })
     }
 
+    fn last_proposed_plan_from_rollout(rollout_items: &[RolloutItem]) -> Option<String> {
+        // Reverse scan over rollout items, applying `ThreadRolledBack` in the same way as
+        // resume/fork history reconstruction: skips consume only user turns.
+        let mut turns_to_skip_due_to_rollback = 0usize;
+        let mut saw_turn_lifecycle_event = false;
+        let mut saw_thread_rollback = false;
+        let mut active_turn_id: Option<&str> = None;
+        let mut active_turn_saw_user_message = false;
+        let mut active_turn_latest_plan_text: Option<String> = None;
+
+        for item in rollout_items.iter().rev() {
+            match item {
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    saw_thread_rollback = true;
+                    let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
+                    turns_to_skip_due_to_rollback =
+                        turns_to_skip_due_to_rollback.saturating_add(num_turns);
+                }
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
+                    saw_turn_lifecycle_event = true;
+                    active_turn_id = Some(event.turn_id.as_str());
+                    active_turn_saw_user_message = false;
+                    active_turn_latest_plan_text = None;
+                }
+                RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => {
+                    saw_turn_lifecycle_event = true;
+                    active_turn_id = event.turn_id.as_deref();
+                    active_turn_saw_user_message = false;
+                    active_turn_latest_plan_text = None;
+                }
+                RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
+                    if active_turn_id.is_some() {
+                        active_turn_saw_user_message = true;
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                    if let Some(active_id) = active_turn_id
+                        && event.turn_id == active_id
+                        && let TurnItem::Plan(plan) = &event.item
+                    {
+                        // Reverse scan sees the latest completed plan in this turn first.
+                        active_turn_latest_plan_text.get_or_insert_with(|| plan.text.clone());
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                    saw_turn_lifecycle_event = true;
+                    if active_turn_id == Some(event.turn_id.as_str()) {
+                        let active_turn_is_rolled_back =
+                            active_turn_saw_user_message && turns_to_skip_due_to_rollback > 0;
+                        if active_turn_is_rolled_back {
+                            turns_to_skip_due_to_rollback -= 1;
+                        }
+                        if !active_turn_is_rolled_back
+                            && let Some(plan_text) = active_turn_latest_plan_text
+                        {
+                            return Some(plan_text);
+                        }
+                        active_turn_id = None;
+                        active_turn_saw_user_message = false;
+                        active_turn_latest_plan_text = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Legacy/minimal rollouts may include plan items without turn lifecycle events.
+        // If rollback markers are present without lifecycle data, we cannot safely attribute
+        // plans to surviving turns, so fail closed and leave the cache unset.
+        if !saw_turn_lifecycle_event {
+            if saw_thread_rollback {
+                return None;
+            }
+            return rollout_items.iter().rev().find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match &event.item {
+                    TurnItem::Plan(plan) => Some(plan.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        }
+
+        None
+    }
+
     fn extract_mcp_tool_selection_from_rollout(
         rollout_items: &[RolloutItem],
     ) -> Option<Vec<String>> {
@@ -1939,6 +2030,16 @@ impl Session {
     pub(crate) async fn set_previous_model(&self, previous_model: Option<String>) {
         let mut state = self.state.lock().await;
         state.set_previous_model(previous_model);
+    }
+
+    pub(crate) async fn latest_proposed_plan_text(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state.latest_proposed_plan_text()
+    }
+
+    pub(crate) async fn set_latest_proposed_plan_text(&self, plan_text: Option<String>) {
+        let mut state = self.state.lock().await;
+        state.set_latest_proposed_plan_text(plan_text);
     }
 
     fn maybe_refresh_shell_snapshot_for_cwd(
@@ -2295,6 +2396,10 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
+        if let TurnItem::Plan(plan_item) = &item {
+            self.set_latest_proposed_plan_text(Some(plan_item.text.clone()))
+                .await;
+        }
         self.send_event(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -4152,6 +4257,33 @@ mod handlers {
             msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns }),
         })
         .await;
+
+        let latest_proposed_plan_text = {
+            let rollout_path = {
+                let rollout = sess.services.rollout.lock().await;
+                rollout
+                    .as_ref()
+                    .map(|recorder| recorder.rollout_path().to_path_buf())
+            };
+
+            if let Some(rollout_path) = rollout_path {
+                match crate::rollout::RolloutRecorder::load_rollout_items(&rollout_path).await {
+                    Ok((rollout_items, _, _)) => {
+                        Session::last_proposed_plan_from_rollout(&rollout_items)
+                    }
+                    Err(err) => {
+                        warn!(
+                            "failed to reload rollout after rollback for plan cache refresh: {err}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        sess.set_latest_proposed_plan_text(latest_proposed_plan_text)
+            .await;
     }
 
     /// Persists the thread name in the session index, updates in-memory state, and emits
@@ -6659,6 +6791,113 @@ mod tests {
         assert_eq!(selected, None);
     }
 
+    #[test]
+    fn last_proposed_plan_from_rollout_returns_latest_completed_plan_item() {
+        let rollout_items = vec![
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::Plan(PlanItem {
+                    id: "turn-1-plan".to_string(),
+                    text: "- Step 1".to_string(),
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-2".to_string(),
+                item: TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
+                    id: "agent-item".to_string(),
+                    content: vec![codex_protocol::items::AgentMessageContent::Text {
+                        text: "not a plan".to_string(),
+                    }],
+                    phase: None,
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn-3".to_string(),
+                item: TurnItem::Plan(PlanItem {
+                    id: "turn-3-plan".to_string(),
+                    text: "- Step 3".to_string(),
+                }),
+            })),
+        ];
+
+        let latest = Session::last_proposed_plan_from_rollout(&rollout_items);
+        assert_eq!(latest, Some("- Step 3".to_string()));
+    }
+
+    #[test]
+    fn last_proposed_plan_from_rollout_ignores_rolled_back_turns() {
+        let thread_id = ThreadId::new();
+        let rollout_items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Plan,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "draft a plan".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: thread_id.clone(),
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::Plan(PlanItem {
+                    id: "turn-1-plan".to_string(),
+                    text: "- Keep this plan".to_string(),
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: None,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-2".to_string(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Plan,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "replace that plan".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn-2".to_string(),
+                item: TurnItem::Plan(PlanItem {
+                    id: "turn-2-plan".to_string(),
+                    text: "- Rolled-back plan".to_string(),
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: "turn-2".to_string(),
+                    last_agent_message: None,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            )),
+        ];
+
+        let latest = Session::last_proposed_plan_from_rollout(&rollout_items);
+        assert_eq!(latest, Some("- Keep this plan".to_string()));
+    }
+
     #[tokio::test]
     async fn reconstruct_history_matches_live_compactions() {
         let (session, turn_context) = make_session_and_context().await;
@@ -6888,6 +7127,88 @@ mod tests {
 
         assert_eq!(session.previous_model().await, None);
         assert!(session.reference_context_item().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_resumed_hydrates_latest_surviving_proposed_plan() {
+        let (session, _) = make_session_and_context().await;
+        let thread_id = ThreadId::new();
+        let rollout_items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Plan,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "draft plan".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: thread_id.clone(),
+                turn_id: "turn-1".to_string(),
+                item: TurnItem::Plan(PlanItem {
+                    id: "turn-1-plan".to_string(),
+                    text: "- Keep this plan".to_string(),
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: None,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-2".to_string(),
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Plan,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "new plan".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn-2".to_string(),
+                item: TurnItem::Plan(PlanItem {
+                    id: "turn-2-plan".to_string(),
+                    text: "- Rolled-back plan".to_string(),
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: "turn-2".to_string(),
+                    last_agent_message: None,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            )),
+        ];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        assert_eq!(
+            session.latest_proposed_plan_text().await,
+            Some("- Keep this plan".to_string())
+        );
     }
 
     #[tokio::test]
@@ -7209,6 +7530,8 @@ mod tests {
         sess.record_into_history(&turn_2, tc.as_ref()).await;
         sess.set_previous_model(Some("previous-regular-model".to_string()))
             .await;
+        sess.set_latest_proposed_plan_text(Some("- stale plan".to_string()))
+            .await;
 
         handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
 
@@ -7225,6 +7548,7 @@ mod tests {
             sess.previous_model().await,
             Some("previous-regular-model".to_string())
         );
+        assert_eq!(sess.latest_proposed_plan_text().await, None);
     }
 
     #[tokio::test]
