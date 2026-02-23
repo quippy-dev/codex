@@ -1991,6 +1991,9 @@ impl SessionSource {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_nickname, .. }) => {
                 agent_nickname.clone()
             }
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
+                Some("morpheus".to_string())
+            }
             _ => None,
         }
     }
@@ -1999,6 +2002,9 @@ impl SessionSource {
         match self {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
                 agent_role.clone()
+            }
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
+                Some("memory builder".to_string())
             }
             _ => None,
         }

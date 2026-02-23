@@ -49,6 +49,7 @@ use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
 use codex_core::config::Config;
+use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
 use codex_core::config::types::WindowsSandboxModeToml;
@@ -1117,6 +1118,27 @@ impl ChatWidget {
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
+        self.config.cwd = event.cwd.clone();
+        if let Err(err) = self
+            .config
+            .permissions
+            .approval_policy
+            .set(event.approval_policy)
+        {
+            tracing::warn!(%err, "failed to sync approval_policy from SessionConfigured");
+            self.config.permissions.approval_policy =
+                Constrained::allow_only(event.approval_policy);
+        }
+        if let Err(err) = self
+            .config
+            .permissions
+            .sandbox_policy
+            .set(event.sandbox_policy.clone())
+        {
+            tracing::warn!(%err, "failed to sync sandbox_policy from SessionConfigured");
+            self.config.permissions.sandbox_policy =
+                Constrained::allow_only(event.sandbox_policy.clone());
+        }
         let initial_messages = event.initial_messages.clone();
         let forked_from_id = event.forked_from_id;
         let model_for_header = event.model.clone();
@@ -2975,9 +2997,7 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
-        widget.bottom_pane.set_collaboration_modes_enabled(
-            widget.config.features.enabled(Feature::CollaborationModes),
-        );
+        widget.bottom_pane.set_collaboration_modes_enabled(true);
         widget.sync_personality_command_enabled();
         widget
             .bottom_pane
@@ -3146,9 +3166,7 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
-        widget.bottom_pane.set_collaboration_modes_enabled(
-            widget.config.features.enabled(Feature::CollaborationModes),
-        );
+        widget.bottom_pane.set_collaboration_modes_enabled(true);
         widget.sync_personality_command_enabled();
         widget
             .bottom_pane
@@ -3306,9 +3324,7 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
-        widget.bottom_pane.set_collaboration_modes_enabled(
-            widget.config.features.enabled(Feature::CollaborationModes),
-        );
+        widget.bottom_pane.set_collaboration_modes_enabled(true);
         widget.sync_personality_command_enabled();
         widget
             .bottom_pane
@@ -3426,7 +3442,14 @@ impl ChatWidget {
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
                     };
-                    if self.is_session_configured() && !self.is_plan_streaming_in_tui() {
+                    // Steer submissions during active final-answer streaming can race with turn
+                    // completion and strand the UI in a running state. Queue those inputs instead
+                    // of injecting immediately; `on_task_complete()` drains this FIFO via
+                    // `maybe_send_next_queued_input()`, so no typed prompt is dropped.
+                    let should_submit_now = self.is_session_configured()
+                        && !self.is_plan_streaming_in_tui()
+                        && self.stream_controller.is_none();
+                    if should_submit_now {
                         // Submitted is only emitted when steer is enabled.
                         // Reset any reasoning header only when we are actually submitting a turn.
                         self.reasoning_buffer.clear();
@@ -6498,22 +6521,6 @@ impl ChatWidget {
         if feature == Feature::Steer {
             self.bottom_pane.set_steer_enabled(enabled);
         }
-        if feature == Feature::CollaborationModes {
-            self.bottom_pane.set_collaboration_modes_enabled(enabled);
-            let settings = self.current_collaboration_mode.settings.clone();
-            self.current_collaboration_mode = CollaborationMode {
-                mode: ModeKind::Default,
-                settings,
-            };
-            self.active_collaboration_mask = if enabled {
-                collaboration_modes::default_mask(self.models_manager.as_ref())
-            } else {
-                None
-            };
-            self.update_collaboration_mode_indicator();
-            self.refresh_model_display();
-            self.request_redraw();
-        }
         if feature == Feature::Personality {
             self.sync_personality_command_enabled();
         }
@@ -6692,17 +6699,14 @@ impl ChatWidget {
     }
 
     fn collaboration_modes_enabled(&self) -> bool {
-        self.config.features.enabled(Feature::CollaborationModes)
+        true
     }
 
     fn initial_collaboration_mask(
-        config: &Config,
+        _config: &Config,
         models_manager: &ModelsManager,
         model_override: Option<&str>,
     ) -> Option<CollaborationModeMask> {
-        if !config.features.enabled(Feature::CollaborationModes) {
-            return None;
-        }
         let mut mask = collaboration_modes::default_mask(models_manager)?;
         if let Some(model_override) = model_override {
             mask.model = Some(model_override.to_string());
