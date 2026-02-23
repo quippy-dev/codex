@@ -2030,8 +2030,12 @@ fn collab_send_input_status(
     status: &codex_protocol::protocol::AgentStatus,
 ) -> V2CollabToolCallStatus {
     match status {
-        codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Failed,
-        _ => V2CollabToolCallStatus::Completed,
+        codex_protocol::protocol::AgentStatus::PendingInit
+        | codex_protocol::protocol::AgentStatus::Running
+        | codex_protocol::protocol::AgentStatus::Completed(_)
+        | codex_protocol::protocol::AgentStatus::Shutdown => V2CollabToolCallStatus::Completed,
+        codex_protocol::protocol::AgentStatus::Errored(_)
+        | codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Failed,
     }
 }
 
@@ -2353,11 +2357,11 @@ mod tests {
     }
 
     #[test]
-    fn collab_send_input_status_maps_errored_to_completed() {
+    fn collab_send_input_status_maps_errored_to_failed() {
         let status = collab_send_input_status(&codex_protocol::protocol::AgentStatus::Errored(
             "Interrupted".to_string(),
         ));
-        assert_eq!(status, V2CollabToolCallStatus::Completed);
+        assert_eq!(status, V2CollabToolCallStatus::Failed);
     }
 
     #[test]
