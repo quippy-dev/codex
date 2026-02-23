@@ -5,6 +5,7 @@ use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
 use crate::agent::guards::SpawnReservation;
 use crate::agent::status::is_final;
+use crate::codex::DeferredCollabEnqueueError;
 use crate::config::Config;
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::CodexErr;
@@ -342,12 +343,79 @@ impl AgentControl {
             return self.send_prompt(agent_id, message).await;
         }
 
-        let prepend_turn_start_user_message = !thread.has_active_turn().await;
+        let receiver_has_active_turn = thread.has_active_turn().await;
+        if !receiver_has_active_turn
+            && thread
+                .codex
+                .session
+                .post_interrupt_collab_hold_armed()
+                .await
+        {
+            let sender_is_watchdog_helper_for_receiver = self
+                .watchdog_owner_for_active_helper(sender_thread_id)
+                .await
+                == Some(agent_id);
+            if !sender_is_watchdog_helper_for_receiver {
+                let deferred_items = build_collab_inbox_items(
+                    snapshot.collab_inbox_delivery_role,
+                    sender_thread_id,
+                    message.clone(),
+                    false,
+                )?;
+                match thread
+                    .codex
+                    .session
+                    .enqueue_deferred_collab_items(deferred_items)
+                    .await
+                {
+                    Ok(()) => {
+                        return Ok(Uuid::now_v7().to_string());
+                    }
+                    Err(DeferredCollabEnqueueError::TooManyItems {
+                        existing_items,
+                        incoming_items,
+                        max_items,
+                    }) => {
+                        warn!(
+                            receiver_thread_id = %agent_id,
+                            sender_thread_id = %sender_thread_id,
+                            existing_items,
+                            incoming_items,
+                            max_items,
+                            "deferred collab queue item limit exceeded; injecting immediately and relaxing ordering guarantee"
+                        );
+                    }
+                    Err(DeferredCollabEnqueueError::TooManyBytes {
+                        existing_bytes,
+                        incoming_bytes,
+                        max_bytes,
+                    }) => {
+                        warn!(
+                            receiver_thread_id = %agent_id,
+                            sender_thread_id = %sender_thread_id,
+                            existing_bytes,
+                            incoming_bytes,
+                            max_bytes,
+                            "deferred collab queue byte limit exceeded; injecting immediately and relaxing ordering guarantee"
+                        );
+                    }
+                    Err(DeferredCollabEnqueueError::Serialization { message }) => {
+                        warn!(
+                            receiver_thread_id = %agent_id,
+                            sender_thread_id = %sender_thread_id,
+                            error = message,
+                            "failed to serialize deferred collab payload; injecting immediately and relaxing ordering guarantee"
+                        );
+                    }
+                }
+            }
+        }
+
         let items = build_collab_inbox_items(
             snapshot.collab_inbox_delivery_role,
             sender_thread_id,
             message,
-            prepend_turn_start_user_message,
+            !receiver_has_active_turn,
         )?;
         state
             .send_op(agent_id, Op::InjectResponseItems { items })
@@ -1019,6 +1087,14 @@ mod tests {
                 .expect("start thread");
             (new_thread.thread_id, new_thread.thread)
         }
+
+        async fn arm_post_interrupt_hold(&self, thread: &Arc<CodexThread>) {
+            {
+                let mut active = thread.codex.session.active_turn.lock().await;
+                *active = Some(crate::state::ActiveTurn::default());
+            }
+            thread.codex.session.interrupt_task().await;
+        }
     }
 
     #[tokio::test]
@@ -1324,6 +1400,181 @@ mod tests {
             }
             other => panic!("expected collab function call output, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_collab_message_defers_when_post_interrupt_hold_is_armed() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        harness.arm_post_interrupt_hold(&receiver_thread).await;
+
+        let submission_id = harness
+            .control
+            .send_collab_message(
+                receiver_thread_id,
+                ThreadId::new(),
+                "deferred update".to_string(),
+            )
+            .await
+            .expect("send_collab_message should defer while hold is armed");
+        assert!(!submission_id.is_empty());
+
+        let (deferred_items, deferred_bytes) =
+            receiver_thread.codex.session.deferred_collab_stats().await;
+        assert_eq!(deferred_items, 2);
+        assert!(deferred_bytes > 0);
+
+        let injected = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            });
+        assert_eq!(injected, false);
+
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_collab_message_watchdog_helper_bypasses_deferral() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        harness.arm_post_interrupt_hold(&receiver_thread).await;
+
+        let watchdog_handle_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: receiver_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            )
+            .await
+            .expect("spawn watchdog handle");
+        harness
+            .control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id: receiver_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 30,
+                prompt: "watchdog".to_string(),
+                config: harness.config.clone(),
+            })
+            .await
+            .expect("register watchdog");
+
+        let helper_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: receiver_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+            )
+            .await
+            .expect("spawn helper");
+        harness
+            .control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_id)
+            .await;
+
+        let submission_id = harness
+            .control
+            .send_collab_message(receiver_thread_id, helper_id, "watchdog bypass".to_string())
+            .await
+            .expect("watchdog helper should bypass deferred collab queue");
+        assert!(!submission_id.is_empty());
+
+        let (deferred_items, _deferred_bytes) =
+            receiver_thread.codex.session.deferred_collab_stats().await;
+        assert_eq!(deferred_items, 0);
+
+        let injected = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            });
+        assert_eq!(injected, true);
+
+        let _ = harness.control.shutdown_agent(watchdog_handle_id).await;
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_collab_message_overflow_fails_open_with_immediate_inject() {
+        const DEFERRED_COLLAB_ITEMS_MAX: usize = 8192;
+
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        harness.arm_post_interrupt_hold(&receiver_thread).await;
+        let sender_thread_id = ThreadId::new();
+
+        let seeded_items = (0..DEFERRED_COLLAB_ITEMS_MAX)
+            .map(|idx| ResponseInputItem::Message {
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("seed-{idx}"),
+                }],
+            })
+            .collect::<Vec<_>>();
+        receiver_thread
+            .codex
+            .session
+            .enqueue_deferred_collab_items(seeded_items)
+            .await
+            .expect("seed deferred collab items");
+        let (queued_before, _queued_before_bytes) =
+            receiver_thread.codex.session.deferred_collab_stats().await;
+        assert_eq!(queued_before, DEFERRED_COLLAB_ITEMS_MAX);
+
+        let overflow_submission_id = harness
+            .control
+            .send_collab_message(receiver_thread_id, sender_thread_id, "overflow".to_string())
+            .await
+            .expect("overflow should fail open and inject");
+        assert!(!overflow_submission_id.is_empty());
+
+        let (queued_after, _queued_after_bytes) =
+            receiver_thread.codex.session.deferred_collab_stats().await;
+        assert_eq!(queued_after, DEFERRED_COLLAB_ITEMS_MAX);
+
+        let injected_ops = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .filter(|(thread_id, op)| {
+                *thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(injected_ops.len(), 1);
+
+        let Op::InjectResponseItems { items } = &injected_ops[0].1 else {
+            unreachable!("filtered to inject ops");
+        };
+        match &items[0] {
+            ResponseInputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert_eq!(
+                    content,
+                    &vec![ContentItem::InputText {
+                        text: String::new()
+                    }]
+                );
+            }
+            other => panic!("expected prepended user message on fail-open inject, got {other:?}"),
+        }
+
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
     }
 
     #[tokio::test]

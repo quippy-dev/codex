@@ -147,6 +147,23 @@ pub enum SteerInputError {
     ExpectedTurnMismatch { expected: String, actual: String },
     EmptyInput,
 }
+
+#[derive(Debug)]
+pub(crate) enum DeferredCollabEnqueueError {
+    TooManyItems {
+        existing_items: usize,
+        incoming_items: usize,
+        max_items: usize,
+    },
+    TooManyBytes {
+        existing_bytes: usize,
+        incoming_bytes: usize,
+        max_bytes: usize,
+    },
+    Serialization {
+        message: String,
+    },
+}
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::feedback_tags;
 use crate::file_watcher::FileWatcher;
@@ -3466,6 +3483,39 @@ impl Session {
         }
     }
 
+    pub(crate) async fn post_interrupt_collab_hold_armed(&self) -> bool {
+        let state = self.state.lock().await;
+        state.post_interrupt_collab_hold_armed()
+    }
+
+    pub(crate) async fn enqueue_deferred_collab_items(
+        &self,
+        items: Vec<ResponseInputItem>,
+    ) -> Result<(), DeferredCollabEnqueueError> {
+        let mut state = self.state.lock().await;
+        state.enqueue_deferred_collab_items(items)
+    }
+
+    pub(crate) async fn take_deferred_collab_items(&self) -> Vec<ResponseInputItem> {
+        let mut state = self.state.lock().await;
+        state.take_deferred_collab_items()
+    }
+
+    pub(crate) async fn restore_deferred_collab_items(&self, items: Vec<ResponseInputItem>) {
+        let mut state = self.state.lock().await;
+        state.restore_deferred_collab_items(items);
+    }
+
+    pub(crate) async fn deferred_collab_stats(&self) -> (usize, usize) {
+        let state = self.state.lock().await;
+        state.deferred_collab_stats()
+    }
+
+    pub(crate) async fn clear_post_interrupt_collab_hold_if_no_deferred_items(&self) -> bool {
+        let mut state = self.state.lock().await;
+        state.clear_post_interrupt_collab_hold_if_no_deferred_items()
+    }
+
     pub async fn list_resources(
         &self,
         server: &str,
@@ -3532,6 +3582,14 @@ impl Session {
         info!("interrupt received: abort current task, if any");
         let has_active_turn = { self.active_turn.lock().await.is_some() };
         if has_active_turn {
+            let mut state = self.state.lock().await;
+            if !matches!(
+                state.session_configuration.session_source,
+                SessionSource::SubAgent(_)
+            ) {
+                let _ = state.arm_post_interrupt_collab_hold();
+            }
+            drop(state);
             self.abort_all_tasks(TurnAbortReason::Interrupted).await;
         } else {
             self.cancel_mcp_startup().await;
@@ -3835,6 +3893,43 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     debug!("Agent loop exited");
 }
 
+async fn flush_post_interrupt_deferred_collab_items(sess: &Arc<Session>, flush_source: &str) {
+    if !sess.post_interrupt_collab_hold_armed().await {
+        return;
+    }
+
+    let deferred_items = sess.take_deferred_collab_items().await;
+    if deferred_items.is_empty() {
+        let _ = sess
+            .clear_post_interrupt_collab_hold_if_no_deferred_items()
+            .await;
+        return;
+    }
+
+    match sess.inject_response_items(deferred_items).await {
+        Ok(()) => {
+            let _ = sess
+                .clear_post_interrupt_collab_hold_if_no_deferred_items()
+                .await;
+        }
+        Err(items_without_active_turn) => {
+            warn!(
+                flush_source = flush_source,
+                "unable to flush deferred collab items after user input; no active turn"
+            );
+            sess.restore_deferred_collab_items(items_without_active_turn)
+                .await;
+            let (restored_items, restored_bytes) = sess.deferred_collab_stats().await;
+            warn!(
+                flush_source = flush_source,
+                restored_items,
+                restored_bytes,
+                "restored deferred collab items; post-interrupt hold remains armed"
+            );
+        }
+    }
+}
+
 /// Operation handlers
 mod handlers {
     use crate::codex::Session;
@@ -3980,13 +4075,21 @@ mod handlers {
         current_context.otel_manager.user_prompt(&items);
 
         // Attempt to inject input into current task.
+        let mut spawned_replacement_turn = false;
         if let Err(SteerInputError::NoActiveTurn(items)) = sess.steer_input(items, None).await {
             sess.refresh_mcp_servers_if_requested(&current_context)
                 .await;
             let regular_task = sess.take_startup_regular_task().await.unwrap_or_default();
             sess.spawn_task(Arc::clone(&current_context), items, regular_task)
                 .await;
+            spawned_replacement_turn = true;
         }
+
+        if spawned_replacement_turn {
+            return;
+        }
+
+        super::flush_post_interrupt_deferred_collab_items(sess, "user_input_or_turn").await;
     }
 
     pub async fn inject_response_items(
@@ -5052,6 +5155,7 @@ pub(crate) async fn run_turn(
     let response_item: ResponseItem = initial_input_for_turn.clone().into();
     sess.record_user_prompt_and_emit_turn_item(turn_context.as_ref(), &input, response_item)
         .await;
+    flush_post_interrupt_deferred_collab_items(&sess, "run_turn_start").await;
     // Track the previous-model baseline from the regular user-turn path only so
     // standalone tasks (compact/shell/review/undo) cannot suppress future
     // `<model_switch>` injections.
@@ -6540,6 +6644,7 @@ mod tests {
     use crate::protocol::TokenCountEvent;
     use crate::protocol::TokenUsage;
     use crate::protocol::TokenUsageInfo;
+    use crate::state::ActiveTurn;
     use crate::state::TaskKind;
     use crate::tasks::SessionTask;
     use crate::tasks::SessionTaskContext;
@@ -9075,6 +9180,49 @@ mod tests {
         }
     }
 
+    fn user_text_input(text: &str) -> UserInput {
+        UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }
+    }
+
+    fn user_input_op(text: &str) -> Op {
+        Op::UserInput {
+            items: vec![user_text_input(text)],
+            final_output_json_schema: None,
+        }
+    }
+
+    fn user_input_response_item(text: &str) -> ResponseInputItem {
+        ResponseInputItem::from(vec![user_text_input(text)])
+    }
+
+    fn deferred_collab_item(text: &str) -> ResponseInputItem {
+        ResponseInputItem::Message {
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    async fn spawn_never_ending_regular_task(
+        sess: &Arc<Session>,
+        turn_context: &Arc<TurnContext>,
+        input_text: &str,
+    ) {
+        sess.spawn_task(
+            Arc::clone(turn_context),
+            vec![user_text_input(input_text)],
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[test_log::test]
     async fn abort_regular_task_emits_turn_aborted_only() {
@@ -9286,6 +9434,170 @@ mod tests {
             .await
             .expect("submission loop task should exit cleanly");
 
+        sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupt_task_arms_post_interrupt_collab_hold_for_root_sessions_only() {
+        let (root_sess, _root_tc, _rx) = make_session_and_context_with_rx().await;
+        assert_eq!(root_sess.post_interrupt_collab_hold_armed().await, false);
+
+        root_sess.interrupt_task().await;
+        assert_eq!(root_sess.post_interrupt_collab_hold_armed().await, false);
+
+        {
+            let mut active = root_sess.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+        root_sess.interrupt_task().await;
+        assert_eq!(root_sess.post_interrupt_collab_hold_armed().await, true);
+
+        let (subagent_sess, _subagent_tc, _rx) = make_session_and_context_with_rx().await;
+        {
+            let mut state = subagent_sess.state.lock().await;
+            state.session_configuration.session_source =
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: ThreadId::default(),
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                });
+        }
+        {
+            let mut active = subagent_sess.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+        subagent_sess.interrupt_task().await;
+        assert_eq!(
+            subagent_sess.post_interrupt_collab_hold_armed().await,
+            false
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_input_or_turn_flushes_deferred_collab_items_after_processing_input_and_clears_hold()
+     {
+        let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+        let deferred = deferred_collab_item("first deferred collab");
+        {
+            let mut active = sess.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+        sess.interrupt_task().await;
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, true);
+        sess.enqueue_deferred_collab_items(vec![deferred.clone()])
+            .await
+            .expect("enqueue deferred collab item");
+
+        spawn_never_ending_regular_task(&sess, &tc, "flush-turn").await;
+        handlers::user_input_or_turn(
+            &sess,
+            "flush-user-input".to_string(),
+            user_input_op("flush-user-input"),
+        )
+        .await;
+        assert_eq!(
+            sess.get_pending_input().await,
+            vec![user_input_response_item("flush-user-input"), deferred]
+        );
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, false);
+        sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_input_or_turn_replacement_turn_spawn_path_flushes_deferred_collab_for_first_request_path()
+     {
+        let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+        let deferred = deferred_collab_item("spawn-path deferred collab");
+        let deferred_response_item: ResponseItem = deferred.clone().into();
+
+        {
+            let mut active = sess.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+        sess.interrupt_task().await;
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, true);
+        sess.enqueue_deferred_collab_items(vec![deferred.clone()])
+            .await
+            .expect("enqueue deferred collab item");
+        assert!(!sess.has_active_turn().await);
+
+        handlers::user_input_or_turn(
+            &sess,
+            "spawn-path-user-input".to_string(),
+            user_input_op("spawn-path-user-input"),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let deferred_queue_empty = sess.deferred_collab_stats().await.0 == 0;
+                let hold_cleared = !sess.post_interrupt_collab_hold_armed().await;
+                let pending_has_items = sess.has_pending_input().await;
+                let history_has_deferred = sess
+                    .clone_history()
+                    .await
+                    .raw_items()
+                    .iter()
+                    .any(|item| item == &deferred_response_item);
+                if deferred_queue_empty
+                    && hold_cleared
+                    && (pending_has_items || history_has_deferred)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred collab should be flushed onto replacement turn input path");
+
+        assert_eq!(sess.deferred_collab_stats().await.0, 0);
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, false);
+
+        sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_input_or_turn_restores_deferred_collab_items_when_flush_cannot_inject() {
+        let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+        let deferred = deferred_collab_item("restored deferred collab");
+
+        {
+            let mut active = sess.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+        sess.interrupt_task().await;
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, true);
+        sess.enqueue_deferred_collab_items(vec![deferred.clone()])
+            .await
+            .expect("enqueue deferred collab item");
+
+        handlers::user_input_or_turn(
+            &sess,
+            "empty-user-input".to_string(),
+            Op::UserInput {
+                items: Vec::new(),
+                final_output_json_schema: None,
+            },
+        )
+        .await;
+        assert!(!sess.has_active_turn().await);
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, true);
+        assert_eq!(sess.deferred_collab_stats().await.0, 1);
+
+        spawn_never_ending_regular_task(&sess, &tc, "restore-turn").await;
+        handlers::user_input_or_turn(
+            &sess,
+            "restore-user-input".to_string(),
+            user_input_op("restore-user-input"),
+        )
+        .await;
+        assert_eq!(
+            sess.get_pending_input().await,
+            vec![user_input_response_item("restore-user-input"), deferred]
+        );
+        assert_eq!(sess.post_interrupt_collab_hold_armed().await, false);
         sess.abort_all_tasks(TurnAbortReason::Replaced).await;
     }
 

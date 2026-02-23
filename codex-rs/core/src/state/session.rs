@@ -4,6 +4,7 @@ use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::codex::DeferredCollabEnqueueError;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
 use crate::protocol::RateLimitSnapshot;
@@ -11,7 +12,12 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::tasks::RegularTask;
 use crate::truncate::TruncationPolicy;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::TurnContextItem;
+use tracing::warn;
+
+const DEFERRED_COLLAB_ITEMS_MAX: usize = 8192;
+const DEFERRED_COLLAB_BYTES_MAX: usize = 64 * 1024 * 1024;
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
@@ -31,6 +37,9 @@ pub(crate) struct SessionState {
     pub(crate) startup_regular_task: Option<RegularTask>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
+    post_interrupt_collab_hold_armed: bool,
+    deferred_collab_items: Vec<ResponseInputItem>,
+    deferred_collab_items_bytes: usize,
 }
 
 impl SessionState {
@@ -49,6 +58,9 @@ impl SessionState {
             startup_regular_task: None,
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
+            post_interrupt_collab_hold_armed: false,
+            deferred_collab_items: Vec::new(),
+            deferred_collab_items_bytes: 0,
         }
     }
 
@@ -239,6 +251,148 @@ impl SessionState {
     pub(crate) fn clear_connector_selection(&mut self) {
         self.active_connector_selection.clear();
     }
+
+    pub(crate) fn arm_post_interrupt_collab_hold(&mut self) -> bool {
+        let was_armed = self.post_interrupt_collab_hold_armed;
+        self.post_interrupt_collab_hold_armed = true;
+        !was_armed
+    }
+
+    pub(crate) fn post_interrupt_collab_hold_armed(&self) -> bool {
+        self.post_interrupt_collab_hold_armed
+    }
+
+    pub(crate) fn clear_post_interrupt_collab_hold_if_no_deferred_items(&mut self) -> bool {
+        if self.deferred_collab_items.is_empty() {
+            self.post_interrupt_collab_hold_armed = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn enqueue_deferred_collab_items(
+        &mut self,
+        items: Vec<ResponseInputItem>,
+    ) -> Result<(), DeferredCollabEnqueueError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let existing_items = self.deferred_collab_items.len();
+        let incoming_items = items.len();
+        if existing_items.saturating_add(incoming_items) > DEFERRED_COLLAB_ITEMS_MAX {
+            return Err(DeferredCollabEnqueueError::TooManyItems {
+                existing_items,
+                incoming_items,
+                max_items: DEFERRED_COLLAB_ITEMS_MAX,
+            });
+        }
+
+        let incoming_bytes = match serialized_response_input_items_bytes(&items) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err(DeferredCollabEnqueueError::Serialization {
+                    message: err.to_string(),
+                });
+            }
+        };
+        if self
+            .deferred_collab_items_bytes
+            .saturating_add(incoming_bytes)
+            > DEFERRED_COLLAB_BYTES_MAX
+        {
+            return Err(DeferredCollabEnqueueError::TooManyBytes {
+                existing_bytes: self.deferred_collab_items_bytes,
+                incoming_bytes,
+                max_bytes: DEFERRED_COLLAB_BYTES_MAX,
+            });
+        }
+
+        self.deferred_collab_items.extend(items);
+        self.deferred_collab_items_bytes += incoming_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn take_deferred_collab_items(&mut self) -> Vec<ResponseInputItem> {
+        if self.deferred_collab_items.is_empty() {
+            return Vec::with_capacity(0);
+        }
+
+        self.deferred_collab_items_bytes = 0;
+        std::mem::take(&mut self.deferred_collab_items)
+    }
+
+    pub(crate) fn restore_deferred_collab_items(&mut self, items: Vec<ResponseInputItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let mut restored_items = items;
+        restored_items.append(&mut self.deferred_collab_items);
+
+        let initial_count = restored_items.len();
+        if initial_count > DEFERRED_COLLAB_ITEMS_MAX {
+            let dropped_items = initial_count - DEFERRED_COLLAB_ITEMS_MAX;
+            restored_items.truncate(DEFERRED_COLLAB_ITEMS_MAX);
+            warn!(
+                dropped_items,
+                kept_items = restored_items.len(),
+                max_items = DEFERRED_COLLAB_ITEMS_MAX,
+                "trimmed deferred collab items during restore to enforce item cap"
+            );
+        }
+
+        let mut total_bytes = 0usize;
+        let mut keep_prefix_len = restored_items.len();
+        for (idx, item) in restored_items.iter().enumerate() {
+            let item_bytes = match serde_json::to_vec(item).map(|serialized| serialized.len()) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    keep_prefix_len = idx;
+                    warn!(
+                        dropped_items = restored_items.len().saturating_sub(idx),
+                        error = %err,
+                        "dropping deferred collab items during restore due to serialization failure"
+                    );
+                    break;
+                }
+            };
+
+            if total_bytes.saturating_add(item_bytes) > DEFERRED_COLLAB_BYTES_MAX {
+                keep_prefix_len = idx;
+                warn!(
+                    dropped_items = restored_items.len().saturating_sub(idx),
+                    kept_items = idx,
+                    kept_bytes = total_bytes,
+                    max_bytes = DEFERRED_COLLAB_BYTES_MAX,
+                    "trimmed deferred collab items during restore to enforce byte cap"
+                );
+                break;
+            }
+
+            total_bytes += item_bytes;
+        }
+
+        restored_items.truncate(keep_prefix_len);
+        self.deferred_collab_items = restored_items;
+        self.deferred_collab_items_bytes = total_bytes;
+    }
+
+    pub(crate) fn deferred_collab_stats(&self) -> (usize, usize) {
+        (
+            self.deferred_collab_items.len(),
+            self.deferred_collab_items_bytes,
+        )
+    }
+}
+
+fn serialized_response_input_items_bytes(
+    items: &[ResponseInputItem],
+) -> Result<usize, serde_json::Error> {
+    items.iter().try_fold(0usize, |acc, item| {
+        serde_json::to_vec(item).map(|serialized| acc.saturating_add(serialized.len()))
+    })
 }
 
 // Sometimes new snapshots don't include credits or plan information.
@@ -265,7 +419,15 @@ mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
     use crate::protocol::RateLimitWindow;
+    use codex_protocol::models::ContentItem;
     use pretty_assertions::assert_eq;
+
+    fn deferred_collab_message(text: String) -> ResponseInputItem {
+        ResponseInputItem::Message {
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText { text }],
+        }
+    }
 
     #[tokio::test]
     async fn merge_mcp_tool_selection_deduplicates_and_preserves_order() {
@@ -397,6 +559,66 @@ mod tests {
         state.clear_connector_selection();
 
         assert_eq!(state.get_connector_selection(), HashSet::new());
+    }
+
+    #[tokio::test]
+    async fn restore_deferred_collab_items_enforces_item_cap_after_interleaving_enqueue() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        let restored_item = deferred_collab_message("restored-priority-item".to_string());
+
+        state
+            .enqueue_deferred_collab_items(vec![restored_item.clone()])
+            .expect("enqueue initial deferred item");
+        let taken_for_restore = state.take_deferred_collab_items();
+        assert_eq!(taken_for_restore, vec![restored_item.clone()]);
+
+        let interleaved_items = (0..DEFERRED_COLLAB_ITEMS_MAX)
+            .map(|idx| deferred_collab_message(format!("interleaved-item-{idx}")))
+            .collect::<Vec<_>>();
+        state
+            .enqueue_deferred_collab_items(interleaved_items)
+            .expect("enqueue interleaved deferred items");
+
+        state.restore_deferred_collab_items(taken_for_restore);
+
+        let (item_count, total_bytes) = state.deferred_collab_stats();
+        assert_eq!(item_count, DEFERRED_COLLAB_ITEMS_MAX);
+        assert!(total_bytes <= DEFERRED_COLLAB_BYTES_MAX);
+
+        let restored_queue = state.take_deferred_collab_items();
+        assert_eq!(restored_queue.first(), Some(&restored_item));
+        assert_eq!(restored_queue.len(), DEFERRED_COLLAB_ITEMS_MAX);
+    }
+
+    #[tokio::test]
+    async fn restore_deferred_collab_items_enforces_byte_cap_after_interleaving_enqueue() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        let payload = "x".repeat(DEFERRED_COLLAB_BYTES_MAX / 2);
+        let restored_item = deferred_collab_message(payload.clone());
+        let interleaved_item = deferred_collab_message(payload);
+
+        state
+            .enqueue_deferred_collab_items(vec![restored_item.clone()])
+            .expect("enqueue deferred item to later restore");
+        let taken_for_restore = state.take_deferred_collab_items();
+
+        state
+            .enqueue_deferred_collab_items(vec![interleaved_item])
+            .expect("enqueue interleaved deferred item");
+
+        state.restore_deferred_collab_items(taken_for_restore);
+
+        let (item_count, total_bytes) = state.deferred_collab_stats();
+        assert_eq!(item_count, 1);
+        assert!(total_bytes <= DEFERRED_COLLAB_BYTES_MAX);
+
+        let expected_bytes =
+            serialized_response_input_items_bytes(std::slice::from_ref(&restored_item))
+                .expect("serialize restored deferred item");
+        assert_eq!(total_bytes, expected_bytes);
+        assert_eq!(state.take_deferred_collab_items(), vec![restored_item]);
     }
 
     #[tokio::test]
