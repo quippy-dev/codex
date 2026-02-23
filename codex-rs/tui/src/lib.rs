@@ -1196,7 +1196,7 @@ trust_level = "untrusted"
         );
         assert_eq!(
             trusted_config.permissions.approval_policy.value(),
-            AskForApproval::OnFailure
+            AskForApproval::OnRequest
         );
 
         let untrusted_overrides = ConfigOverrides {
@@ -1220,7 +1220,7 @@ trust_level = "untrusted"
         );
         assert_eq!(
             untrusted_config.permissions.approval_policy.value(),
-            AskForApproval::OnFailure
+            AskForApproval::UnlessTrusted
         );
         Ok(())
     }

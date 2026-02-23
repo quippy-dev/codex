@@ -1278,9 +1278,14 @@ impl ChatWidget {
         if let Some((sender, message)) = collab_inbox_message_from_item(&event.item) {
             let hint = sender.map(|sender| format!("from {sender}"));
             self.add_to_history(history_cell::new_info_event(
-                format!("Agent message: {message}"),
+                "Agent message:".to_string(),
                 hint,
             ));
+            let mut rendered: Vec<Line<'static>> = Vec::new();
+            append_markdown(&message, None, &mut rendered);
+            if !rendered.is_empty() {
+                self.add_boxed_history(Box::new(AgentMessageCell::new(rendered, false)));
+            }
             self.request_redraw();
         }
     }

@@ -630,13 +630,12 @@ pub(crate) fn new_subagent_update_cell(
         status_label_span(status),
     ])];
 
-    let summary = summary.trim();
+    let summary = truncate_text(
+        &summary.split_whitespace().collect::<Vec<_>>().join(" "),
+        240,
+    );
     if !summary.is_empty() {
-        let summary_lines = summary
-            .lines()
-            .map(|line| Line::from(line.to_string()))
-            .collect::<Vec<_>>();
-        lines.extend(prefix_lines(summary_lines, "  └ ".dim(), "    ".into()));
+        lines.push(Line::from(vec!["  └ ".dim(), summary.into()]));
     }
 
     PlainHistoryCell::new(lines)
@@ -2727,7 +2726,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_update_cell_preserves_multiline_summary_snapshot() {
+    fn subagent_update_cell_collapses_multiline_summary_snapshot() {
         let cell = new_subagent_update_cell(
             "users-dev-codex-worker",
             &AgentStatus::Completed(Some("done".to_string())),
@@ -2739,7 +2738,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_update_cell_does_not_truncate_long_summary() {
+    fn subagent_update_cell_truncates_long_summary() {
         let long_summary = "a".repeat(420);
         let cell = new_subagent_update_cell(
             "users-dev-codex-worker",
@@ -2747,9 +2746,11 @@ mod tests {
             long_summary.as_str(),
         );
         let rendered = render_transcript(&cell).join("\n");
+        let expected = truncate_text(long_summary.as_str(), 240);
 
-        assert!(rendered.contains(long_summary.as_str()));
-        assert!(!rendered.contains("..."));
+        assert!(rendered.contains(expected.as_str()));
+        assert!(!rendered.contains(long_summary.as_str()));
+        assert_eq!(rendered.lines().count(), 2);
     }
 
     fn image_block(data: &str) -> serde_json::Value {

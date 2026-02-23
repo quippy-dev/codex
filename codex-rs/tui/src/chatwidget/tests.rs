@@ -42,7 +42,9 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::default_input_modalities;
@@ -77,6 +79,7 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::RateLimitWindow;
+use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SessionSource;
@@ -8039,6 +8042,44 @@ async fn deltas_then_same_final_message_are_rendered_snapshot() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_snapshot!(combined);
+}
+
+#[tokio::test]
+async fn raw_collab_inbox_agent_message_renders_header_and_markdown_body_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let tail_marker = "TAIL_END_0123456789";
+    let padding = "x".repeat(220);
+    let markdown_body = format!(
+        "**Bold line**\n\n```rust\nfn main() {{ println!(\"hi\"); }}\n```\n{padding}\n{tail_marker}",
+    );
+
+    chat.handle_codex_event(Event {
+        id: "raw-1".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: format!("[collab_inbox:agent-7] {markdown_body}"),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 2, "expected header and body history cells");
+
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(combined.contains("Agent message:"));
+    assert!(combined.contains("from agent-7"));
+    assert!(combined.contains("Bold line"));
+    assert!(!combined.contains("**Bold line**"));
+    assert!(combined.contains(tail_marker));
 }
 
 // Combined visual snapshot using vt100 for history + direct buffer overlay for UI.

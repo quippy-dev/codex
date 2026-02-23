@@ -5395,7 +5395,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_registry_turn_complete_history_keeps_full_message() {
+    fn subagent_registry_turn_complete_history_collapses_and_truncates_summary() {
         let mut registry = SubagentRegistry::new(false);
         let root_thread_id = ThreadId::new();
         let subagent_thread_id = ThreadId::new();
@@ -5424,12 +5424,16 @@ mod tests {
         );
 
         assert_eq!(updates.len(), 1);
+        let expected = truncate_text(
+            &message.split_whitespace().collect::<Vec<_>>().join(" "),
+            240,
+        );
         let status = registry
             .agents
             .get(&subagent_thread_id)
             .map(|info| info.status.clone())
             .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Completed(Some(message)));
+        assert_eq!(status, AgentStatus::Completed(Some(message.clone())));
 
         let rendered = updates[0]
             .display_lines(u16::MAX)
@@ -5438,13 +5442,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Subagent update:"));
-        assert!(rendered.contains("top candidate"));
-        assert!(rendered.contains("details line"));
-        assert!(rendered.contains(tail.as_str()));
+        assert!(rendered.contains(expected.as_str()));
+        assert!(!rendered.contains(message.as_str()));
+        assert_eq!(rendered.lines().count(), 2);
     }
 
     #[test]
-    fn subagent_registry_error_history_keeps_full_message() {
+    fn subagent_registry_error_history_collapses_and_truncates_summary() {
         let mut registry = SubagentRegistry::new(false);
         let root_thread_id = ThreadId::new();
         let subagent_thread_id = ThreadId::new();
@@ -5473,12 +5477,16 @@ mod tests {
         );
 
         assert_eq!(updates.len(), 1);
+        let expected = truncate_text(
+            &message.split_whitespace().collect::<Vec<_>>().join(" "),
+            240,
+        );
         let status = registry
             .agents
             .get(&subagent_thread_id)
             .map(|info| info.status.clone())
             .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Errored(message));
+        assert_eq!(status, AgentStatus::Errored(message.clone()));
 
         let rendered = updates[0]
             .display_lines(u16::MAX)
@@ -5487,8 +5495,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Subagent update:"));
-        assert!(rendered.contains("fatal mismatch"));
-        assert!(rendered.contains(tail.as_str()));
+        assert!(rendered.contains(expected.as_str()));
+        assert!(!rendered.contains(message.as_str()));
+        assert_eq!(rendered.lines().count(), 2);
     }
 
     #[test]
