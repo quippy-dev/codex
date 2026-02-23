@@ -1642,7 +1642,7 @@ async fn make_chatwidget_manual(
         skills: None,
     });
     bottom.set_steer_enabled(true);
-    bottom.set_collaboration_modes_enabled(cfg.features.enabled(Feature::CollaborationModes));
+    bottom.set_collaboration_modes_enabled(true);
     let auth_manager =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
     let codex_home = cfg.codex_home.clone();
@@ -1657,6 +1657,7 @@ async fn make_chatwidget_manual(
         },
     };
     let current_collaboration_mode = base_mode;
+    let active_collaboration_mask = collaboration_modes::default_mask(models_manager.as_ref());
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_tx: op_tx,
@@ -1665,7 +1666,7 @@ async fn make_chatwidget_manual(
         active_cell_revision: 0,
         config: cfg,
         current_collaboration_mode,
-        active_collaboration_mask: None,
+        active_collaboration_mask,
         auth_manager,
         models_manager,
         otel_manager,
@@ -3436,6 +3437,105 @@ async fn steer_enter_queues_while_plan_stream_is_active() {
 }
 
 #[tokio::test]
+async fn steer_enter_queues_while_final_answer_stream_is_active() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    // Keep the assistant stream open (no commit tick/finalize) to model the repro window:
+    // user presses Enter while the final answer is still streaming.
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "queued while streaming"
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    // Once final output ends, the queued input must be submitted automatically.
+    chat.on_task_complete(None, false);
+
+    assert!(chat.queued_user_messages.is_empty());
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { .. } => {}
+        other => panic!("expected Op::UserTurn after stream completion, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn steer_enter_during_final_stream_preserves_follow_up_prompts_in_order() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    // Simulate "dead mode" repro timing by keeping a final-answer stream active while the
+    // user submits multiple follow-up prompts.
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane
+        .set_composer_text("first follow-up".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.bottom_pane
+        .set_composer_text("second follow-up".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.queued_user_messages.len(), 2);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "first follow-up"
+    );
+    assert_eq!(
+        chat.queued_user_messages.back().unwrap().text,
+        "second follow-up"
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    // Completion must recover by submitting the oldest queued prompt first.
+    chat.on_task_complete(None, false);
+
+    let first_items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(
+        first_items,
+        vec![UserInput::Text {
+            text: "first follow-up".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "second follow-up"
+    );
+
+    // A subsequent turn lifecycle should continue draining remaining queued prompts, proving
+    // the widget did not enter a permanently stuck state.
+    chat.on_task_started();
+    chat.on_task_complete(None, false);
+
+    let second_items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    };
+    assert_eq!(
+        second_items,
+        vec![UserInput::Text {
+            text: "second follow-up".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
 async fn steer_enter_submits_when_plan_stream_is_not_active() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -4089,20 +4189,15 @@ async fn slash_init_skips_when_project_doc_exists() {
 }
 
 #[tokio::test]
-async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
+async fn collab_mode_shift_tab_cycles_only_when_idle() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_feature_enabled(Feature::CollaborationModes, false);
 
     let initial = chat.current_collaboration_mode().clone();
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
-    assert_eq!(chat.current_collaboration_mode(), &initial);
-    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
-
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
-
-    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Execute);
     assert_eq!(chat.current_collaboration_mode(), &initial);
+
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
 
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
@@ -4110,6 +4205,10 @@ async fn collab_mode_shift_tab_cycles_only_when_enabled_and_idle() {
 
     chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
+    assert_eq!(chat.current_collaboration_mode(), &initial);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Execute);
     assert_eq!(chat.current_collaboration_mode(), &initial);
 
     chat.on_task_started();
@@ -4531,26 +4630,12 @@ async fn collab_mode_is_sent_after_enabling() {
 }
 
 #[tokio::test]
-async fn collab_mode_toggle_on_applies_default_preset() {
+async fn collab_mode_applies_default_preset() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
 
     chat.bottom_pane
-        .set_composer_text("before toggle".to_string(), Vec::new(), Vec::new());
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn {
-            collaboration_mode: None,
-            personality: Some(Personality::Pragmatic),
-            ..
-        } => {}
-        other => panic!("expected Op::UserTurn without collaboration_mode, got {other:?}"),
-    }
-
-    chat.set_feature_enabled(Feature::CollaborationModes, true);
-
-    chat.bottom_pane
-        .set_composer_text("after toggle".to_string(), Vec::new(), Vec::new());
+        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     match next_submit_op(&mut op_rx) {
         Op::UserTurn {
