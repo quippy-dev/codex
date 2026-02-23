@@ -15,7 +15,9 @@ use crate::history_cell::UserHistoryCell;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
@@ -4490,6 +4492,49 @@ async fn slash_exit_requests_exit() {
     chat.dispatch_command(SlashCommand::Exit);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
+}
+
+#[tokio::test]
+async fn slash_logout_uses_auth_manager_storage_path() -> std::io::Result<()> {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let codex_home = tempdir()?;
+    let override_home = tempdir()?;
+    let override_auth_file = override_home.path().join("auth.json");
+
+    codex_core::auth::login_with_api_key(
+        codex_home.path(),
+        "default-home-key",
+        AuthCredentialsStoreMode::File,
+    )?;
+    codex_core::auth::login_with_api_key(
+        override_home.path(),
+        "override-key",
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    chat.config.codex_home = codex_home.path().to_path_buf();
+    chat.config.cli_auth_credentials_store_mode = AuthCredentialsStoreMode::File;
+    chat.auth_manager = AuthManager::shared_with_auth_file(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+        Some(override_auth_file.clone()),
+    )?;
+
+    chat.dispatch_command(SlashCommand::Logout);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
+    assert!(
+        codex_home.path().join("auth.json").exists(),
+        "logout should not delete default codex_home auth.json when --auth-file is set"
+    );
+    assert!(
+        !override_auth_file.exists(),
+        "logout should delete auth data from the overridden --auth-file location"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
