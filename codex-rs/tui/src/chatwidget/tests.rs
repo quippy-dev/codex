@@ -4128,6 +4128,59 @@ async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_sam
 }
 
 #[tokio::test]
+async fn mode_switch_execute_reuses_default_reasoning_effort() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+
+    let plan_mask = collaboration_modes::plan_mask(chat.models_manager.as_ref())
+        .expect("expected plan collaboration mode");
+    chat.set_collaboration_mask(plan_mask);
+    let _ = drain_insert_history(&mut rx);
+
+    let default_mask = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.set_collaboration_mask(default_mask);
+    let default_messages = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        default_messages.contains("Model changed to gpt-5.3-codex medium for Default mode."),
+        "expected Default-mode reasoning fallback notice, got: {default_messages:?}"
+    );
+
+    let plan_mask = collaboration_modes::plan_mask(chat.models_manager.as_ref())
+        .expect("expected plan collaboration mode");
+    chat.set_collaboration_mask(plan_mask);
+    let plan_messages = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_messages.contains("Model changed to gpt-5.3-codex xhigh for Plan mode."),
+        "expected Plan-mode override notice, got: {plan_messages:?}"
+    );
+
+    let execute_mask =
+        collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Execute)
+            .expect("expected execute collaboration mode");
+    chat.set_collaboration_mask(execute_mask);
+    let execute_messages = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        execute_messages.contains("Model changed to gpt-5.3-codex medium for Execute mode."),
+        "expected Execute-mode global reasoning notice, got: {execute_messages:?}"
+    );
+}
+
+#[tokio::test]
 async fn collab_slash_command_opens_picker_and_updates_mode() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());

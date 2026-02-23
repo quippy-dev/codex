@@ -70,8 +70,13 @@ fn call_output_content_and_success(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()> {
+async fn request_user_input_round_trip_resolves_pending_in_plan_mode() -> anyhow::Result<()> {
     request_user_input_round_trip_for_mode(ModeKind::Plan).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_user_input_round_trip_resolves_pending_in_default_mode() -> anyhow::Result<()> {
+    request_user_input_round_trip_for_mode(ModeKind::Default).await
 }
 
 async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Result<()> {
@@ -280,19 +285,6 @@ where
 async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
     assert_request_user_input_rejected("Execute", |model| CollaborationMode {
         mode: ModeKind::Execute,
-        settings: Settings {
-            model,
-            reasoning_effort: None,
-            developer_instructions: None,
-        },
-    })
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_rejected_in_default_mode() -> anyhow::Result<()> {
-    assert_request_user_input_rejected("Default", |model| CollaborationMode {
-        mode: ModeKind::Default,
         settings: Settings {
             model,
             reasoning_effort: None,
