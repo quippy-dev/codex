@@ -5,7 +5,10 @@ use codex_core::built_in_model_providers;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -401,6 +404,101 @@ async fn summarize_context_three_requests_and_instructions() {
     assert!(
         saw_compacted_summary,
         "expected a Compacted entry containing the summarizer output"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let plan_text = "- Step 1\n- Step 2\n";
+    let plan_block = format!("<proposed_plan>\n{plan_text}</proposed_plan>\n");
+    let first_turn = sse(vec![
+        ev_assistant_message("m0", &format!("Intro\n{plan_block}Outro")),
+        ev_completed("r0"),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m1", SUMMARY_TEXT),
+        ev_completed("r1"),
+    ]);
+    let follow_up_turn = sse(vec![ev_completed("r2")]);
+    let request_log =
+        mount_sse_sequence(&server, vec![first_turn, compact_turn, follow_up_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200_000);
+    });
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex;
+    let session_configured = test.session_configured;
+
+    let plan_mode = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: session_configured.model.clone(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        },
+    };
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "please plan".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: std::env::current_dir().expect("cwd"),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model,
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            final_output_json_schema: None,
+            collaboration_mode: Some(plan_mode),
+            personality: None,
+        })
+        .await
+        .expect("submit plan turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Implement the plan.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit follow-up turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected plan, compact, and follow-up requests"
+    );
+    let body3 = requests[2].body_json();
+    let input3 = body3
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("third request input array");
+    let serialized = serde_json::to_string(input3).expect("serialize third request input");
+    assert!(
+        serialized.contains("Implement the plan."),
+        "expected follow-up request to include implementation prompt"
+    );
+    assert!(
+        serialized.contains("<proposed_plan>\\n- Step 1\\n- Step 2\\n</proposed_plan>"),
+        "expected follow-up request to retain the latest proposed plan verbatim after compact"
     );
 }
 

@@ -25,6 +25,8 @@ pub(crate) struct SessionState {
     /// on subsequent regular turns (including full-context reinjection after
     /// resume or `/compact`).
     previous_model: Option<String>,
+    /// Latest completed proposed plan text emitted as `TurnItem::Plan`.
+    latest_proposed_plan_text: Option<String>,
     /// Startup regular task pre-created during session initialization.
     pub(crate) startup_regular_task: Option<RegularTask>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
@@ -43,6 +45,7 @@ impl SessionState {
             dependency_env: HashMap::new(),
             mcp_dependency_prompted: HashSet::new(),
             previous_model: None,
+            latest_proposed_plan_text: None,
             startup_regular_task: None,
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
@@ -63,6 +66,14 @@ impl SessionState {
     }
     pub(crate) fn set_previous_model(&mut self, previous_model: Option<String>) {
         self.previous_model = previous_model;
+    }
+
+    pub(crate) fn latest_proposed_plan_text(&self) -> Option<String> {
+        self.latest_proposed_plan_text.clone()
+    }
+
+    pub(crate) fn set_latest_proposed_plan_text(&mut self, plan_text: Option<String>) {
+        self.latest_proposed_plan_text = plan_text;
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {

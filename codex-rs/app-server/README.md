@@ -334,6 +334,8 @@ Use `thread/unarchive` to move an archived rollout back into the sessions direct
 
 Use `thread/compact/start` to trigger manual history compaction for a thread. The request returns immediately with `{}`.
 
+When the thread is currently in Plan mode and has a previously completed proposed plan, manual compaction retains that plan text in compacted context so a follow-up like “Implement the plan.” can still resolve after compaction.
+
 Progress is emitted as standard `turn/*` and `item/*` notifications on the same `threadId`. Clients should expect a single compaction item:
 
 - `item/started` with `item: { "type": "contextCompaction", ... }`
