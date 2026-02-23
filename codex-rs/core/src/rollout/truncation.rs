@@ -1,10 +1,9 @@
 //! Helpers for truncating rollouts based on "user turn" boundaries.
 //!
 //! In core, "user turns" are detected by scanning `ResponseItem::Message` items and
-//! interpreting them via `event_mapping::parse_turn_item(...)`.
+//! evaluating them with `context_manager::is_user_turn_boundary(...)`.
 
-use crate::event_mapping;
-use codex_protocol::items::TurnItem;
+use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
@@ -22,10 +21,7 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
     for (idx, item) in items.iter().enumerate() {
         match item {
             RolloutItem::ResponseItem(item @ ResponseItem::Message { .. })
-                if matches!(
-                    event_mapping::parse_turn_item(item),
-                    Some(TurnItem::UserMessage(_))
-                ) =>
+                if is_user_turn_boundary(item) =>
             {
                 user_positions.push(idx);
             }
@@ -96,6 +92,20 @@ mod tests {
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn retained_plan_marker_msg(plan: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "[[codex_retained_proposed_plan]]\n<proposed_plan>\n{plan}\n</proposed_plan>"
+                ),
             }],
             end_turn: None,
             phase: None,
@@ -184,6 +194,26 @@ mod tests {
         // So n_from_start=2 should cut before u4 (not u3).
         let truncated = truncate_rollout_before_nth_user_message_from_start(&rollout_items, 2);
         let expected = rollout_items[..7].to_vec();
+        assert_eq!(
+            serde_json::to_value(&truncated).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn truncates_rollout_from_start_ignores_retained_plan_marker_messages() {
+        let rollout_items = vec![
+            RolloutItem::ResponseItem(retained_plan_marker_msg("- Step 1")),
+            RolloutItem::ResponseItem(user_msg("u1")),
+            RolloutItem::ResponseItem(assistant_msg("a1")),
+            RolloutItem::ResponseItem(user_msg("u2")),
+            RolloutItem::ResponseItem(assistant_msg("a2")),
+        ];
+
+        // Effective user-turn boundaries are u1 and u2; retained plan marker
+        // should not count.
+        let truncated = truncate_rollout_before_nth_user_message_from_start(&rollout_items, 1);
+        let expected = rollout_items[..3].to_vec();
         assert_eq!(
             serde_json::to_value(&truncated).unwrap(),
             serde_json::to_value(&expected).unwrap()
