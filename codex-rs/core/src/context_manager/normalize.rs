@@ -223,7 +223,7 @@ pub(crate) fn drop_subagent_notifications_covered_by_wait(items: &mut Vec<Respon
     let mut notification_indexes_to_drop = HashSet::new();
     // Index of the most recent item that is not a user session-prefix message.
     // We only dedupe when the `wait` output and notification are separated solely by
-    // session-prefix user messages.
+    // session-prefix user messages, in either order.
     let mut last_non_prefix_index: Option<usize> = None;
 
     for (index, item) in items.iter().enumerate() {
@@ -254,6 +254,9 @@ pub(crate) fn drop_subagent_notifications_covered_by_wait(items: &mut Vec<Respon
                             latest_notification_by_agent.get(&agent_id)
                             && notification_status == &status
                             && *notification_index < index
+                            && last_non_prefix_index.is_none_or(|last_non_prefix| {
+                                last_non_prefix <= *notification_index
+                            })
                         {
                             notification_indexes_to_drop.insert(*notification_index);
                         }
@@ -278,10 +281,8 @@ pub(crate) fn drop_subagent_notifications_covered_by_wait(items: &mut Vec<Respon
                     if let Some((wait_status, wait_output_index)) =
                         latest_wait_status_by_agent.get(&notification.agent_id)
                     {
-                        let no_non_prefix_between = match last_non_prefix_index {
-                            Some(last_non_prefix) => last_non_prefix <= *wait_output_index,
-                            None => true,
-                        };
+                        let no_non_prefix_between = last_non_prefix_index
+                            .is_none_or(|last_non_prefix| last_non_prefix <= *wait_output_index);
                         if no_non_prefix_between && wait_status == &notification.status {
                             notification_indexes_to_drop.insert(index);
                         }

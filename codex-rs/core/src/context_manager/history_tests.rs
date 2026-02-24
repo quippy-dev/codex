@@ -1016,7 +1016,8 @@ fn normalize_dedupes_subagent_notification_with_matching_wait_result() {
 }
 
 #[test]
-fn normalize_dedupes_subagent_notification_when_matching_wait_output_comes_later() {
+fn normalize_keeps_subagent_notification_when_matching_wait_output_comes_later_with_non_prefix_intervening()
+ {
     let agent_id = ThreadId::new().to_string();
     let items = vec![
         user_input_text_msg(&format!(
@@ -1036,6 +1037,36 @@ fn normalize_dedupes_subagent_notification_when_matching_wait_output_comes_later
             )),
         },
     ];
+    let mut h = create_history_with_items(items.clone());
+
+    h.normalize_history(&default_input_modalities());
+
+    assert_eq!(h.raw_items(), items);
+}
+
+#[test]
+fn normalize_dedupes_subagent_notification_when_matching_wait_output_comes_later_with_only_prefix_messages_between()
+ {
+    let agent_id = ThreadId::new().to_string();
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "wait".to_string(),
+            arguments: format!(r#"{{"ids":["{agent_id}"],"timeout_ms":1000}}"#),
+            call_id: "wait-call-1".to_string(),
+        },
+        user_input_text_msg(&format!(
+            "<subagent_notification>{{\"agent_id\":\"{agent_id}\",\"status\":\"shutdown\"}}</subagent_notification>"
+        )),
+        user_input_text_msg("<environment_context>\nfoo\n</environment_context>"),
+        user_input_text_msg("<turn_aborted>{\"reason\":\"interrupt\"}</turn_aborted>"),
+        ResponseItem::FunctionCallOutput {
+            call_id: "wait-call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text(format!(
+                r#"{{"status":{{"{agent_id}":"shutdown"}},"timed_out":false}}"#
+            )),
+        },
+    ];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
@@ -1043,13 +1074,14 @@ fn normalize_dedupes_subagent_notification_when_matching_wait_output_comes_later
     assert_eq!(
         h.raw_items(),
         vec![
-            user_input_text_msg("wait for child completion"),
             ResponseItem::FunctionCall {
                 id: None,
                 name: "wait".to_string(),
                 arguments: format!(r#"{{"ids":["{agent_id}"],"timeout_ms":1000}}"#),
                 call_id: "wait-call-1".to_string(),
             },
+            user_input_text_msg("<environment_context>\nfoo\n</environment_context>"),
+            user_input_text_msg("<turn_aborted>{\"reason\":\"interrupt\"}</turn_aborted>"),
             ResponseItem::FunctionCallOutput {
                 call_id: "wait-call-1".to_string(),
                 output: FunctionCallOutputPayload::from_text(format!(
