@@ -2595,11 +2595,12 @@ impl ChatWidget {
         self.notify(Notification::ExecApprovalRequested { command });
 
         let request = ApprovalRequest::Exec {
-            id: ev.call_id,
+            id: ev.effective_approval_id(),
             command: ev.command,
             reason: ev.reason,
             network_approval_context: ev.network_approval_context,
             proposed_execpolicy_amendment: ev.proposed_execpolicy_amendment,
+            proposed_network_policy_amendments: ev.proposed_network_policy_amendments,
             additional_permissions: ev.additional_permissions,
         };
         self.bottom_pane
@@ -4668,6 +4669,10 @@ impl ChatWidget {
             .map(|m| m.text.clone())
             .collect();
         self.bottom_pane.set_queued_user_messages(messages);
+    }
+
+    pub(crate) fn set_pending_thread_approvals(&mut self, threads: Vec<String>) {
+        self.bottom_pane.set_pending_thread_approvals(threads);
     }
 
     pub(crate) fn add_diff_in_progress(&mut self) {
@@ -7353,6 +7358,11 @@ impl ChatWidget {
     #[cfg(test)]
     pub(crate) fn remote_image_urls(&self) -> Vec<String> {
         self.bottom_pane.remote_image_urls()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_thread_approvals(&self) -> &[String] {
+        self.bottom_pane.pending_thread_approvals()
     }
 
     pub(crate) fn show_esc_backtrack_hint(&mut self) {
