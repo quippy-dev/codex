@@ -2004,6 +2004,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_rejects_watchdog_from_subagent() {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: session.conversation_id,
+            depth: 0,
+            agent_nickname: None,
+            agent_role: None,
+        });
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "watchdog check-in",
+                "spawn_mode": "watchdog"
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("watchdog spawn should be rejected for subagents");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "watchdogs can only be spawned by root agents".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn send_input_rejects_empty_message() {
         let (session, turn) = make_session_and_context().await;
         let invocation = invocation(
