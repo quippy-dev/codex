@@ -1,6 +1,6 @@
 use super::LoaderOverrides;
 use super::load_config_layers_state;
-use super::override_system_requirements_toml_file_for_test;
+use super::load_config_layers_state_with_system_requirements_toml_file;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::ConfigToml;
@@ -285,14 +285,17 @@ async fn returns_empty_when_all_layers_missing() {
         "expected empty config for user layer when config.toml does not exist"
     );
 
-    let binding = layers.effective_config();
-    let base_table = binding.as_table().expect("base table expected");
-    assert!(
-        base_table.is_empty(),
-        "expected empty base layer when configs missing"
+    let layers_high_to_low = layers.layers_high_to_low();
+    let system_layer = layers_high_to_low
+        .iter()
+        .find(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
+        .expect("system layer should always be present");
+    let effective = layers.effective_config();
+    assert_eq!(
+        effective, system_layer.config,
+        "expected no non-system config when all local layers are missing"
     );
-    let num_system_layers = layers
-        .layers_high_to_low()
+    let num_system_layers = layers_high_to_low
         .iter()
         .filter(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
         .count();
@@ -300,16 +303,6 @@ async fn returns_empty_when_all_layers_missing() {
         num_system_layers, 1,
         "system layer should always be present"
     );
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let effective = layers.effective_config();
-        let table = effective.as_table().expect("top-level table expected");
-        assert!(
-            table.is_empty(),
-            "expected empty table when configs missing"
-        );
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -579,10 +572,7 @@ allowed_approval_policies = ["never"]
     )
     .await?;
 
-    let _requirements_toml_override =
-        override_system_requirements_toml_file_for_test(&requirements_file)?;
-
-    let layers = load_config_layers_state(
+    let layers = load_config_layers_state_with_system_requirements_toml_file(
         tmp.path(),
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
@@ -595,6 +585,7 @@ allowed_approval_policies = ["never"]
             ignore_system_requirements: false,
         },
         CloudRequirementsLoader::default(),
+        Some(AbsolutePathBuf::try_from(requirements_file.as_path())?),
     )
     .await?;
 
@@ -618,10 +609,7 @@ allowed_approval_policies = ["never"]
     )
     .await?;
 
-    let _requirements_toml_override =
-        override_system_requirements_toml_file_for_test(&requirements_file)?;
-
-    let layers = load_config_layers_state(
+    let layers = load_config_layers_state_with_system_requirements_toml_file(
         tmp.path(),
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
@@ -634,6 +622,7 @@ allowed_approval_policies = ["never"]
             ignore_system_requirements: true,
         },
         CloudRequirementsLoader::default(),
+        Some(AbsolutePathBuf::try_from(requirements_file.as_path())?),
     )
     .await?;
 

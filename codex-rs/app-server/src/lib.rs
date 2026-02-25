@@ -64,6 +64,7 @@ mod fuzzy_file_search;
 mod message_processor;
 mod models;
 mod outgoing_message;
+mod runtime_bootstrap;
 mod thread_state;
 mod thread_status;
 mod transport;
@@ -356,86 +357,19 @@ pub async fn run_main_with_transport(
     let shutdown_when_no_connections = single_client_mode;
     let graceful_ctrl_c_restart_enabled = !single_client_mode;
 
-    // Parse CLI overrides once and derive the base Config eagerly so later
-    // components do not need to work with raw TOML values.
-    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("error parsing -c overrides: {e}"),
-        )
-    })?;
-    let cloud_requirements = match ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides.clone())
-        .loader_overrides(loader_overrides.clone())
-        .build()
-        .await
-    {
-        Ok(config) => {
-            let effective_toml = config.config_layer_stack.effective_config();
-            match effective_toml.try_into() {
-                Ok(config_toml) => {
-                    if let Err(err) = codex_core::personality_migration::maybe_migrate_personality(
-                        &config.codex_home,
-                        &config_toml,
-                    )
-                    .await
-                    {
-                        warn!(error = %err, "Failed to run personality migration");
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to deserialize config for personality migration");
-                }
-            }
-
-            let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
-                config.codex_home.clone(),
-                auth_file.as_deref(),
-                config.cli_auth_credentials_store_mode,
-            )?;
-            let auth_manager = AuthManager::shared(
-                auth_storage_home,
-                false,
-                config.cli_auth_credentials_store_mode,
-            );
-            cloud_requirements_loader(
-                auth_manager,
-                config.chatgpt_base_url,
-                config.codex_home.clone(),
-            )
-        }
-        Err(err) => {
-            warn!(error = %err, "Failed to preload config for cloud requirements");
-            // TODO(gt): Make cloud requirements preload failures blocking once we can fail-closed.
-            CloudRequirementsLoader::default()
-        }
-    };
-    let loader_overrides_for_config_api = loader_overrides.clone();
-    let mut config_warnings = Vec::new();
-    let config = match ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides.clone())
-        .loader_overrides(loader_overrides)
-        .cloud_requirements(cloud_requirements.clone())
-        .build()
-        .await
-    {
-        Ok(config) => config,
-        Err(err) => {
-            let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
-            config_warnings.push(message);
-            Config::load_default_with_cli_overrides(cli_kv_overrides.clone()).map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("error loading default config after config error: {e}"),
-                )
-            })?
-        }
-    };
-    let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
-        config.codex_home.clone(),
-        auth_file.as_deref(),
-        config.cli_auth_credentials_store_mode,
-    )?;
+    let runtime_bootstrap::RuntimeBootstrap {
+        cli_kv_overrides,
+        cloud_requirements,
+        config,
+        mut config_warnings,
+        auth_storage_home,
+        loader_overrides_for_config_api,
+    } = runtime_bootstrap::prepare_runtime_bootstrap(
+        &cli_config_overrides,
+        loader_overrides,
+        auth_file.clone(),
+    )
+    .await?;
 
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         let (path, range) = exec_policy_warning_location(&err);

@@ -1,6 +1,7 @@
 mod layer_io;
 #[cfg(target_os = "macos")]
 mod macos;
+mod requirements_pipeline;
 
 #[cfg(test)]
 mod tests;
@@ -19,8 +20,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
-#[cfg(test)]
-use std::cell::RefCell;
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
@@ -135,35 +134,18 @@ async fn load_config_layers_state_with_system_requirements_toml_file(
     cloud_requirements: CloudRequirementsLoader,
     system_requirements_toml_file_override: Option<AbsolutePathBuf>,
 ) -> io::Result<ConfigLayerStack> {
+    let mut config_requirements_toml =
+        requirements_pipeline::load_config_requirements_with_sources(
+            &overrides,
+            cloud_requirements,
+        )
+        .await?;
     let ignore_system_requirements = overrides.ignore_system_requirements;
-    let ignore_system_config = overrides.ignore_system_config;
-    let mut config_requirements_toml = ConfigRequirementsWithSources::default();
-
-    if let Some(requirements) = cloud_requirements.get().await {
-        config_requirements_toml
-            .merge_unset_fields(RequirementSource::CloudRequirements, requirements);
-    }
-
-    #[cfg(target_os = "macos")]
-    macos::load_managed_admin_requirements_toml(
-        &mut config_requirements_toml,
-        overrides
-            .macos_managed_config_requirements_base64
-            .as_deref(),
-    )
-    .await?;
-
     let loaded_config_layers = layer_io::load_config_layers_internal(codex_home, overrides).await?;
     if !ignore_system_requirements {
-        // Honor the system requirements.toml location.
-        let requirements_toml_file =
-            system_requirements_toml_file_override.unwrap_or(system_requirements_toml_file()?);
-        load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
-
-        // Make a best-effort to support the legacy `managed_config.toml` as a
-        // requirements specification.
-        load_requirements_from_legacy_scheme(
+        requirements_pipeline::merge_system_and_legacy_requirements(
             &mut config_requirements_toml,
+            system_requirements_toml_file_override,
             loaded_config_layers.clone(),
         )
         .await?;
@@ -186,16 +168,9 @@ async fn load_config_layers_state_with_system_requirements_toml_file(
     };
 
     // Include an entry for the "system" config folder, loading its config.toml,
-    // if it exists (unless explicitly disabled by overrides).
+    // if it exists.
     let system_config_toml_file = system_config_toml_file()?;
-    let system_layer = if ignore_system_config {
-        ConfigLayerEntry::new(
-            ConfigLayerSource::System {
-                file: system_config_toml_file.clone(),
-            },
-            TomlValue::Table(toml::map::Map::new()),
-        )
-    } else {
+    let system_layer =
         load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
             ConfigLayerEntry::new(
                 ConfigLayerSource::System {
@@ -204,8 +179,7 @@ async fn load_config_layers_state_with_system_requirements_toml_file(
                 config_toml,
             )
         })
-        .await?
-    };
+        .await?;
     layers.push(system_layer);
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file
@@ -417,57 +391,13 @@ async fn load_requirements_toml(
     Ok(())
 }
 
-#[cfg(test)]
-thread_local! {
-    static SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE: RefCell<Option<AbsolutePathBuf>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct SystemRequirementsTomlFileOverrideGuard;
-
-#[cfg(test)]
-pub(crate) fn override_system_requirements_toml_file_for_test(
-    requirements_toml_file: impl AsRef<Path>,
-) -> io::Result<SystemRequirementsTomlFileOverrideGuard> {
-    let requirements_toml_file =
-        AbsolutePathBuf::from_absolute_path(requirements_toml_file.as_ref())?;
-    SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE.with(|override_file| {
-        *override_file.borrow_mut() = Some(requirements_toml_file);
-    });
-    Ok(SystemRequirementsTomlFileOverrideGuard)
-}
-
-#[cfg(test)]
-impl Drop for SystemRequirementsTomlFileOverrideGuard {
-    fn drop(&mut self) {
-        SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE.with(|override_file| {
-            *override_file.borrow_mut() = None;
-        });
-    }
-}
-
-#[cfg(test)]
-fn system_requirements_toml_file_override() -> Option<AbsolutePathBuf> {
-    SYSTEM_REQUIREMENTS_TOML_FILE_OVERRIDE.with(|override_file| override_file.borrow().clone())
-}
-
 #[cfg(unix)]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
-    #[cfg(test)]
-    if let Some(requirements_toml_file) = system_requirements_toml_file_override() {
-        return Ok(requirements_toml_file);
-    }
-
     AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
 }
 
 #[cfg(windows)]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
-    #[cfg(test)]
-    if let Some(requirements_toml_file) = system_requirements_toml_file_override() {
-        return Ok(requirements_toml_file);
-    }
-
     windows_system_requirements_toml_file()
 }
 
