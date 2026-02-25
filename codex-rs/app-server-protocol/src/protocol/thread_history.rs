@@ -1164,6 +1164,7 @@ mod tests {
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
+    use codex_protocol::protocol::RetainedProposedPlan;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -2112,6 +2113,7 @@ mod tests {
             })),
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
+                retained_proposed_plan: RetainedProposedPlan::None,
                 replacement_history: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {

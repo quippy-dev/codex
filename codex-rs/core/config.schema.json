@@ -37,6 +37,12 @@
           ],
           "description": "How inbound collaboration messages are delivered to non-subagent threads."
         },
+        "job_max_runtime_seconds": {
+          "description": "Default maximum runtime in seconds for agent job workers.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
         "max_depth": {
           "description": "Maximum nesting depth allowed for spawned agent threads. Root sessions start at depth 0.",
           "format": "int32",
@@ -383,10 +389,19 @@
             "prevent_idle_sleep": {
               "type": "boolean"
             },
+            "realtime_conversation": {
+              "type": "boolean"
+            },
             "remote_models": {
               "type": "boolean"
             },
+            "request_permissions": {
+              "type": "boolean"
+            },
             "request_rule": {
+              "type": "boolean"
+            },
+            "request_user_input_outside_plan_mode": {
               "type": "boolean"
             },
             "responses_websockets": {
@@ -410,6 +425,9 @@
             "shell_zsh_fork": {
               "type": "boolean"
             },
+            "skill_approval": {
+              "type": "boolean"
+            },
             "skill_env_var_dependency_prompt": {
               "type": "boolean"
             },
@@ -429,6 +447,9 @@
               "type": "boolean"
             },
             "use_linux_sandbox_bwrap": {
+              "type": "boolean"
+            },
+            "voice_transcription": {
               "type": "boolean"
             },
             "web_search": {
@@ -1664,10 +1685,19 @@
         "prevent_idle_sleep": {
           "type": "boolean"
         },
+        "realtime_conversation": {
+          "type": "boolean"
+        },
         "remote_models": {
           "type": "boolean"
         },
+        "request_permissions": {
+          "type": "boolean"
+        },
         "request_rule": {
+          "type": "boolean"
+        },
+        "request_user_input_outside_plan_mode": {
           "type": "boolean"
         },
         "responses_websockets": {
@@ -1691,6 +1721,9 @@
         "shell_zsh_fork": {
           "type": "boolean"
         },
+        "skill_approval": {
+          "type": "boolean"
+        },
         "skill_env_var_dependency_prompt": {
           "type": "boolean"
         },
@@ -1710,6 +1743,9 @@
           "type": "boolean"
         },
         "use_linux_sandbox_bwrap": {
+          "type": "boolean"
+        },
+        "voice_transcription": {
           "type": "boolean"
         },
         "web_search": {
@@ -2031,6 +2067,14 @@
         }
       ],
       "description": "User-level skill config entries keyed by SKILL.md path."
+    },
+    "sqlite_home": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
     },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",

@@ -1567,7 +1567,7 @@ fn single_text_input(items: &[UserInput]) -> Option<String> {
     }
 }
 
-fn build_agent_spawn_config(
+pub(crate) fn build_agent_spawn_config(
     base_instructions: &BaseInstructions,
     turn: &TurnContext,
     child_depth: i32,
@@ -1643,7 +1643,7 @@ fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpawnConfigStrategy {
+pub(crate) enum SpawnConfigStrategy {
     ContextFreeSpawn,
     ForkLike,
 }

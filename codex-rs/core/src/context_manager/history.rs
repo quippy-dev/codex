@@ -21,8 +21,6 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
 
-const RETAINED_PROPOSED_PLAN_PREFIX: &str = "[[codex_retained_proposed_plan]]\n";
-
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
@@ -427,9 +425,9 @@ fn estimate_item_token_count(item: &ResponseItem) -> i64 {
 
 /// Approximate model-visible byte cost for one image input.
 ///
-/// The estimator later converts bytes to tokens using a 4-bytes/token heuristic,
-/// so 340 bytes is approximately 85 tokens.
-const IMAGE_BYTES_ESTIMATE: i64 = 340;
+/// The estimator later converts bytes to tokens using a 4-bytes/token heuristic
+/// with ceiling division, so 7,373 bytes maps to approximately 1,844 tokens.
+const IMAGE_BYTES_ESTIMATE: i64 = 7373;
 
 pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
@@ -566,7 +564,6 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
 
     if UserInstructions::is_user_instructions(content)
         || SkillInstructions::is_skill_instructions(content)
-        || is_synthetic_retained_plan_marker(content)
     {
         return false;
     }
@@ -589,16 +586,6 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
 
     true
 }
-
-fn is_synthetic_retained_plan_marker(content: &[ContentItem]) -> bool {
-    content.iter().any(|content_item| match content_item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-            text.starts_with(RETAINED_PROPOSED_PLAN_PREFIX)
-        }
-        ContentItem::InputImage { .. } => false,
-    })
-}
-
 fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {
     let mut positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {

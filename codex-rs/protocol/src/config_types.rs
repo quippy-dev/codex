@@ -202,7 +202,7 @@ impl ModeKind {
     }
 
     pub const fn allows_request_user_input(self) -> bool {
-        matches!(self, Self::Plan | Self::Default)
+        matches!(self, Self::Plan)
     }
 }
 

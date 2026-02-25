@@ -70,16 +70,14 @@ fn call_output_content_and_success(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_resolves_pending_in_plan_mode() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Plan).await
+async fn request_user_input_round_trip_resolves_pending() -> anyhow::Result<()> {
+    request_user_input_round_trip_for_mode(ModeKind::Plan, false).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_user_input_round_trip_resolves_pending_in_default_mode() -> anyhow::Result<()> {
-    request_user_input_round_trip_for_mode(ModeKind::Default).await
-}
-
-async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Result<()> {
+async fn request_user_input_round_trip_for_mode(
+    mode: ModeKind,
+    request_user_input_outside_plan_mode: bool,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -91,8 +89,13 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
         session_configured,
         ..
     } = builder
-        .with_config(|config| {
+        .with_config(move |config| {
             config.features.enable(Feature::CollaborationModes);
+            if request_user_input_outside_plan_mode {
+                config
+                    .features
+                    .enable(Feature::RequestUserInputOutsidePlanMode);
+            }
         })
         .build(&server)
         .await?;
@@ -195,6 +198,24 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_user_input_round_trip_resolves_pending_in_default_mode_with_flag()
+-> anyhow::Result<()> {
+    request_user_input_round_trip_for_mode(ModeKind::Default, true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_user_input_round_trip_resolves_pending_in_execute_mode_with_flag()
+-> anyhow::Result<()> {
+    request_user_input_round_trip_for_mode(ModeKind::Execute, true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_user_input_round_trip_resolves_pending_in_pair_mode_with_flag()
+-> anyhow::Result<()> {
+    request_user_input_round_trip_for_mode(ModeKind::PairProgramming, true).await
+}
+
 async fn assert_request_user_input_rejected<F>(mode_name: &str, build_mode: F) -> anyhow::Result<()>
 where
     F: FnOnce(String) -> CollaborationMode,
@@ -285,6 +306,19 @@ where
 async fn request_user_input_rejected_in_execute_mode_alias() -> anyhow::Result<()> {
     assert_request_user_input_rejected("Execute", |model| CollaborationMode {
         mode: ModeKind::Execute,
+        settings: Settings {
+            model,
+            reasoning_effort: None,
+            developer_instructions: None,
+        },
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_user_input_rejected_in_default_mode() -> anyhow::Result<()> {
+    assert_request_user_input_rejected("Default", |model| CollaborationMode {
+        mode: ModeKind::Default,
         settings: Settings {
             model,
             reasoning_effort: None,

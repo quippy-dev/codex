@@ -124,6 +124,10 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
 
+mod pending_interactive_replay;
+
+use self::pending_interactive_replay::PendingInteractiveReplayState;
+
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
 /// Baseline cadence for periodic stream commit animation ticks.
@@ -272,6 +276,7 @@ struct ThreadEventStore {
     session_configured: Option<Event>,
     buffer: VecDeque<Event>,
     user_message_ids: HashSet<String>,
+    pending_interactive_replay: PendingInteractiveReplayState,
     capacity: usize,
     active: bool,
 }
@@ -282,6 +287,7 @@ impl ThreadEventStore {
             session_configured: None,
             buffer: VecDeque::new(),
             user_message_ids: HashSet::new(),
+            pending_interactive_replay: PendingInteractiveReplayState::default(),
             capacity,
             active: false,
         }
@@ -294,6 +300,7 @@ impl ThreadEventStore {
     }
 
     fn push_event(&mut self, event: Event) {
+        self.pending_interactive_replay.note_event(&event);
         match &event.msg {
             EventMsg::SessionConfigured(_) => {
                 self.session_configured = Some(event);
@@ -326,20 +333,46 @@ impl ThreadEventStore {
             return;
         }
         self.buffer.push_back(event);
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-            && matches!(removed.msg, EventMsg::UserMessage(_))
-            && !removed.id.is_empty()
-        {
-            self.user_message_ids.remove(&removed.id);
+        if self.buffer.len() > self.capacity {
+            if let Some(removed) = self.buffer.pop_front() {
+                self.pending_interactive_replay.note_evicted_event(&removed);
+                if matches!(removed.msg, EventMsg::UserMessage(_)) && !removed.id.is_empty() {
+                    self.user_message_ids.remove(&removed.id);
+                }
+            }
         }
     }
 
     fn snapshot(&self) -> ThreadEventSnapshot {
         ThreadEventSnapshot {
             session_configured: self.session_configured.clone(),
-            events: self.buffer.iter().cloned().collect(),
+            events: self
+                .buffer
+                .iter()
+                .filter(|event| {
+                    self.pending_interactive_replay
+                        .should_replay_snapshot_event(event)
+                })
+                .cloned()
+                .collect(),
         }
+    }
+
+    fn note_outbound_op(&mut self, op: &Op) {
+        self.pending_interactive_replay.note_outbound_op(op);
+    }
+
+    fn op_can_change_pending_replay_state(op: &Op) -> bool {
+        PendingInteractiveReplayState::op_can_change_state(op)
+    }
+
+    fn event_can_change_pending_thread_approvals(event: &Event) -> bool {
+        PendingInteractiveReplayState::event_can_change_pending_thread_approvals(event)
+    }
+
+    fn has_pending_thread_approvals(&self) -> bool {
+        self.pending_interactive_replay
+            .has_pending_thread_approvals()
     }
 }
 
@@ -1312,6 +1345,24 @@ impl App {
         self.clear_ui_header_lines_with_version(width, CODEX_CLI_VERSION)
     }
 
+    fn queue_clear_ui_header(&mut self, tui: &mut tui::Tui) {
+        let width = tui.terminal.last_known_screen_size.width;
+        let header_lines = self.clear_ui_header_lines(width);
+        if !header_lines.is_empty() {
+            tui.insert_history_lines(header_lines);
+            self.has_emitted_history_lines = true;
+        }
+    }
+
+    fn reset_app_ui_state_after_clear(&mut self) {
+        self.overlay = None;
+        self.transcript_cells.clear();
+        self.deferred_history_lines.clear();
+        self.has_emitted_history_lines = false;
+        self.backtrack = BacktrackState::default();
+        self.backtrack_render_pending = false;
+    }
+
     fn clear_terminal_ui(&mut self, tui: &mut tui::Tui, redraw_header: bool) -> Result<()> {
         let is_alt_screen_active = tui.is_alt_screen_active();
 
@@ -1382,6 +1433,7 @@ impl App {
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = receiver;
         self.sync_subagent_panel_state();
+        self.refresh_pending_thread_approvals().await;
     }
 
     async fn store_active_thread_receiver(&mut self) {
@@ -1416,6 +1468,75 @@ impl App {
         }
         self.active_thread_rx = None;
         self.sync_subagent_panel_state();
+        self.refresh_pending_thread_approvals().await;
+    }
+
+    async fn note_active_thread_outbound_op(&mut self, op: &Op) {
+        if !ThreadEventStore::op_can_change_pending_replay_state(op) {
+            return;
+        }
+        let Some(thread_id) = self.active_thread_id else {
+            return;
+        };
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let mut store = channel.store.lock().await;
+        store.note_outbound_op(op);
+    }
+
+    async fn refresh_pending_thread_approvals(&mut self) {
+        let channels: Vec<(ThreadId, Arc<Mutex<ThreadEventStore>>)> = self
+            .thread_event_channels
+            .iter()
+            .map(|(thread_id, channel)| (*thread_id, Arc::clone(&channel.store)))
+            .collect();
+
+        let mut pending_thread_ids = Vec::new();
+        for (thread_id, store) in channels {
+            if Some(thread_id) == self.active_thread_id {
+                continue;
+            }
+
+            let store = store.lock().await;
+            if store.has_pending_thread_approvals() {
+                pending_thread_ids.push(thread_id);
+            }
+        }
+
+        pending_thread_ids.sort_by_key(ThreadId::to_string);
+
+        let threads = pending_thread_ids
+            .into_iter()
+            .map(|thread_id| {
+                let is_primary = self.primary_thread_id == Some(thread_id);
+                let fallback_label = if is_primary {
+                    "Main [default]".to_string()
+                } else {
+                    let thread_id = thread_id.to_string();
+                    let short_id: String = thread_id.chars().take(8).collect();
+                    format!("Agent ({short_id})")
+                };
+                if let Some(entry) = self.agent_picker_threads.get(&thread_id) {
+                    let label = format_agent_picker_item_name(
+                        entry.agent_nickname.as_deref(),
+                        entry.agent_role.as_deref(),
+                        is_primary,
+                    );
+                    if label == "Agent" {
+                        let thread_id = thread_id.to_string();
+                        let short_id: String = thread_id.chars().take(8).collect();
+                        format!("{label} ({short_id})")
+                    } else {
+                        label
+                    }
+                } else {
+                    fallback_label
+                }
+            })
+            .collect();
+
+        self.chat_widget.set_pending_thread_approvals(threads);
     }
 
     fn subagents_root_active(&self) -> bool {
@@ -1508,6 +1629,8 @@ impl App {
 
     async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
         self.process_subagent_side_effects(thread_id, &event);
+        let refresh_pending_thread_approvals =
+            ThreadEventStore::event_can_change_pending_thread_approvals(&event);
 
         let (sender, store) = {
             let channel = self.ensure_thread_channel(thread_id);
@@ -1537,6 +1660,10 @@ impl App {
                     tracing::warn!("thread {thread_id} event channel closed");
                 }
             }
+        }
+        if refresh_pending_thread_approvals {
+            self.app_event_tx
+                .send(AppEvent::RefreshPendingThreadApprovals);
         }
         Ok(())
     }
@@ -1894,6 +2021,9 @@ impl App {
             auth_manager.clone(),
             SessionSource::Cli,
             config.model_catalog.clone(),
+            config
+                .features
+                .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
         ));
         let mut model = thread_manager
             .get_models_manager()
@@ -2255,6 +2385,8 @@ impl App {
                     {
                         return Ok(AppRunControl::Continue);
                     }
+                    // Allow widgets to process any pending timers before rendering.
+                    self.chat_widget.pre_draw_tick();
                     tui.draw(
                         self.chat_widget.desired_height(tui.terminal.size()?.width),
                         |frame| {
@@ -2557,6 +2689,7 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
+                self.note_active_thread_outbound_op(&op).await;
                 self.chat_widget.submit_op(op);
             }
             AppEvent::DiffResult(text) => {
@@ -3299,6 +3432,9 @@ impl App {
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker().await;
             }
+            AppEvent::RefreshPendingThreadApprovals => {
+                self.refresh_pending_thread_approvals().await;
+            }
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread(tui, thread_id).await?;
             }
@@ -3442,6 +3578,21 @@ impl App {
                     ));
                 }
             },
+            #[cfg(not(target_os = "linux"))]
+            AppEvent::TranscriptionComplete { id, text } => {
+                self.chat_widget.replace_transcription(&id, &text);
+            }
+            #[cfg(not(target_os = "linux"))]
+            AppEvent::TranscriptionFailed { id, error: _ } => {
+                self.chat_widget.remove_transcription_placeholder(&id);
+            }
+            #[cfg(not(target_os = "linux"))]
+            AppEvent::UpdateRecordingMeter { id, text } => {
+                let updated = self.chat_widget.update_transcription_in_place(&id, &text);
+                if updated {
+                    tui.frame_requester().schedule_frame();
+                }
+            }
             AppEvent::StatusLineSetup { items } => {
                 let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
                 let edit = codex_core::config::edit::status_line_items_edit(&ids);
@@ -3792,6 +3943,25 @@ impl App {
                 let _ = tui.enter_alt_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
                 tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if !self.chat_widget.can_run_ctrl_l_clear_now() {
+                    return;
+                }
+                if let Err(err) = self.clear_terminal_ui(tui, false) {
+                    tracing::warn!(error = %err, "failed to clear terminal UI");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to clear terminal UI: {err}"));
+                } else {
+                    self.reset_app_ui_state_after_clear();
+                    self.queue_clear_ui_header(tui);
+                    tui.frame_requester().schedule_frame();
+                }
             }
             KeyEvent {
                 code: KeyCode::Char('g'),

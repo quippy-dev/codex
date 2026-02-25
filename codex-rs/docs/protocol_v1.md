@@ -68,7 +68,7 @@ For complete documentation of the `Op` and `EventMsg` variants, refer to [protoc
   - `Op::UserTurn` – Any input from the user to kick off a `Turn`
   - `Op::UserInput` – Legacy form of user input
   - `Op::Interrupt` – Interrupts a running turn
-  - `Op::Compact` – Manually compacts conversation history; in Plan mode it retains the latest completed proposed plan for post-compact execution follow-ups
+  - `Op::Compact` – Manually compacts conversation history; in Plan mode it retains the latest completed proposed plan for post-compact execution follow-ups. Persisted `RolloutItem::Compacted` entries now always include required typed `retained_proposed_plan` data: `{"type":"none"}` or `{"type":"proposed_plan","text":"..."}`.
   - `Op::ExecApproval` – Approve or deny code execution
   - `Op::UserInputAnswer` – Provide answers for a `request_user_input` tool call
   - `Op::ListSkills` – Request skills for one or more cwd values (optionally `force_reload`)
