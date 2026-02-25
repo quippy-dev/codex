@@ -497,8 +497,11 @@ mod tests {
     fn assert_seatbelt_denied(stderr: &[u8], path: &Path) {
         let stderr = String::from_utf8_lossy(stderr);
         let expected = format!("bash: {}: Operation not permitted\n", path.display());
+        let expected_with_line_suffix = format!(": {}: Operation not permitted\n", path.display());
         assert!(
             stderr == expected
+                || (stderr.starts_with("bash: line ")
+                    && stderr.ends_with(&expected_with_line_suffix))
                 || stderr.contains("sandbox-exec: sandbox_apply: Operation not permitted"),
             "unexpected stderr: {stderr}"
         );

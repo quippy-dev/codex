@@ -3664,10 +3664,7 @@ impl ChatWidget {
                 self.request_quit_without_confirmation();
             }
             SlashCommand::Logout => {
-                if let Err(e) = codex_core::auth::logout(
-                    &self.config.codex_home,
-                    self.config.cli_auth_credentials_store_mode,
-                ) {
+                if let Err(e) = self.auth_manager.logout() {
                     tracing::error!("failed to logout: {e}");
                 }
                 self.request_quit_without_confirmation();

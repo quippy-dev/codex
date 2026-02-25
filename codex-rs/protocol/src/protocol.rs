@@ -2096,9 +2096,16 @@ pub struct SessionMetaLine {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
+pub struct ForkReferenceItem {
+    pub rollout_path: PathBuf,
+    pub nth_user_message: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    ForkReference(ForkReferenceItem),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),

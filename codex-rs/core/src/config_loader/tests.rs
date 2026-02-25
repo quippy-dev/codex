@@ -1,5 +1,6 @@
 use super::LoaderOverrides;
 use super::load_config_layers_state;
+use super::load_config_layers_state_with_system_requirements_toml_file;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::ConfigToml;
@@ -556,6 +557,77 @@ enforce_residency = "us"
         config_requirements.enforce_residency.value(),
         Some(crate::config_loader::ResidencyRequirement::Us)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn load_config_layers_loads_system_requirements_when_not_ignored() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let requirements_file = tmp.path().join("requirements.toml");
+    tokio::fs::write(
+        &requirements_file,
+        r#"
+allowed_approval_policies = ["never"]
+"#,
+    )
+    .await?;
+
+    let layers = load_config_layers_state_with_system_requirements_toml_file(
+        tmp.path(),
+        Some(AbsolutePathBuf::try_from(tmp.path())?),
+        &[] as &[(String, TomlValue)],
+        LoaderOverrides {
+            managed_config_path: Some(tmp.path().join("managed_config.toml")),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: Some(String::new()),
+            macos_managed_config_requirements_base64: Some(String::new()),
+            ignore_system_config: true,
+            ignore_system_requirements: false,
+        },
+        CloudRequirementsLoader::default(),
+        Some(AbsolutePathBuf::try_from(requirements_file.as_path())?),
+    )
+    .await?;
+
+    assert_eq!(
+        layers.requirements_toml().allowed_approval_policies,
+        Some(vec![AskForApproval::Never])
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn load_config_layers_skips_system_requirements_when_ignored() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let requirements_file = tmp.path().join("requirements.toml");
+    tokio::fs::write(
+        &requirements_file,
+        r#"
+allowed_approval_policies = ["never"]
+"#,
+    )
+    .await?;
+
+    let layers = load_config_layers_state_with_system_requirements_toml_file(
+        tmp.path(),
+        Some(AbsolutePathBuf::try_from(tmp.path())?),
+        &[] as &[(String, TomlValue)],
+        LoaderOverrides {
+            managed_config_path: Some(tmp.path().join("managed_config.toml")),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: Some(String::new()),
+            macos_managed_config_requirements_base64: Some(String::new()),
+            ignore_system_config: true,
+            ignore_system_requirements: true,
+        },
+        CloudRequirementsLoader::default(),
+        Some(AbsolutePathBuf::try_from(requirements_file.as_path())?),
+    )
+    .await?;
+
+    assert_eq!(layers.requirements_toml().allowed_approval_policies, None);
+
     Ok(())
 }
 

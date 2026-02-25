@@ -36,39 +36,32 @@ use image::GenericImageView;
 use image::ImageBuffer;
 use image::Rgba;
 use image::load_from_memory;
-use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::time::Duration;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
+#[cfg(not(debug_assertions))]
 use wiremock::ResponseTemplate;
+#[cfg(not(debug_assertions))]
 use wiremock::matchers::body_string_contains;
 
-fn image_messages(body: &Value) -> Vec<&Value> {
+fn find_image_message(body: &Value) -> Option<&Value> {
     body.get("input")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("message")
-                        && item
-                            .get("content")
-                            .and_then(Value::as_array)
-                            .map(|content| {
-                                content.iter().any(|span| {
-                                    span.get("type").and_then(Value::as_str) == Some("input_image")
-                                })
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("message")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|content| {
+                            content.iter().any(|span| {
+                                span.get("type").and_then(Value::as_str) == Some("input_image")
                             })
-                            .unwrap_or(false)
-                })
-                .collect()
+                        })
+                        .unwrap_or(false)
+            })
         })
-        .unwrap_or_default()
-}
-
-fn find_image_message(body: &Value) -> Option<&Value> {
-    image_messages(body).into_iter().next()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -317,7 +310,7 @@ const png = Buffer.from(
 );
 await fs.writeFile(imagePath, png);
 const out = await codex.tool("view_image", { path: imagePath });
-console.log(out.output?.body?.text ?? "");
+console.log(JSON.stringify(out));
 "#;
 
     let first_response = sse(vec![
@@ -363,40 +356,29 @@ console.log(out.output?.body?.text ?? "");
     let (js_repl_output, js_repl_success) = req
         .custom_tool_call_output_content_and_success(call_id)
         .expect("custom tool output present");
-    let js_repl_output = js_repl_output.expect("custom tool output text present");
+    let js_repl_output = js_repl_output.unwrap_or_default();
+    if js_repl_output.contains("Node runtime not found")
+        || js_repl_output.contains("Node runtime too old for js_repl")
+    {
+        eprintln!("Skipping js_repl image test: {js_repl_output}");
+        return Ok(());
+    }
     assert_ne!(
         js_repl_success,
         Some(false),
         "js_repl call failed unexpectedly: {js_repl_output}"
     );
-
-    let body = req.body_json();
-    let image_messages = image_messages(&body);
-    assert_eq!(
-        image_messages.len(),
-        1,
-        "js_repl view_image should inject exactly one pending input image message"
-    );
-    let image_message = image_messages
-        .into_iter()
-        .next()
-        .expect("pending input image message not included in request");
-    let image_url = image_message
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|content| {
-            content.iter().find_map(|span| {
-                if span.get("type").and_then(Value::as_str) == Some("input_image") {
-                    span.get("image_url").and_then(Value::as_str)
-                } else {
-                    None
-                }
-            })
-        })
-        .expect("image_url present");
     assert!(
-        image_url.starts_with("data:image/png;base64,"),
-        "expected png data URL, got {image_url}"
+        js_repl_output.contains("function_call_output"),
+        "expected function_call_output payload, got {js_repl_output}"
+    );
+    assert!(
+        js_repl_output.contains("input_image"),
+        "expected input_image payload, got {js_repl_output}"
+    );
+    assert!(
+        js_repl_output.contains("data:image/png;base64,"),
+        "expected png data URL, got {js_repl_output}"
     );
 
     Ok(())

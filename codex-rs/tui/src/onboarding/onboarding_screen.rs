@@ -27,6 +27,7 @@ use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use color_eyre::eyre::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -65,6 +66,7 @@ pub(crate) struct OnboardingScreenArgs {
     pub show_login_screen: bool,
     pub login_status: LoginStatus,
     pub auth_manager: Arc<AuthManager>,
+    pub auth_storage_home: PathBuf,
     pub config: Config,
 }
 
@@ -80,6 +82,7 @@ impl OnboardingScreen {
             show_login_screen,
             login_status,
             auth_manager,
+            auth_storage_home,
             config,
         } = args;
         let cwd = config.cwd.clone();
@@ -103,7 +106,7 @@ impl OnboardingScreen {
                 highlighted_mode,
                 error: None,
                 sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
-                codex_home: codex_home.clone(),
+                codex_home: auth_storage_home.clone(),
                 cli_auth_credentials_store_mode,
                 login_status,
                 auth_manager,

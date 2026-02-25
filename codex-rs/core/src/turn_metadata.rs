@@ -240,8 +240,29 @@ mod tests {
     use super::*;
 
     use serde_json::Value;
+    use std::path::Path;
     use tempfile::TempDir;
     use tokio::process::Command;
+
+    async fn run_git_command(repo_path: &Path, args: &[&str]) {
+        let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let output = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", null_path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .await
+            .expect("run git command");
+
+        assert!(
+            output.status.success(),
+            "git command failed: git {}\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[tokio::test]
     async fn build_turn_metadata_header_includes_has_changes_for_clean_repo() {
@@ -249,38 +270,13 @@ mod tests {
         let repo_path = temp_dir.path().join("repo");
         std::fs::create_dir_all(&repo_path).expect("create repo");
 
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_path)
-            .output()
-            .await
-            .expect("git init");
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(&repo_path)
-            .output()
-            .await
-            .expect("git config user.name");
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&repo_path)
-            .output()
-            .await
-            .expect("git config user.email");
+        run_git_command(&repo_path, &["init"]).await;
+        run_git_command(&repo_path, &["config", "user.name", "Test User"]).await;
+        run_git_command(&repo_path, &["config", "user.email", "test@example.com"]).await;
 
         std::fs::write(repo_path.join("README.md"), "hello").expect("write file");
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&repo_path)
-            .output()
-            .await
-            .expect("git add");
-        Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&repo_path)
-            .output()
-            .await
-            .expect("git commit");
+        run_git_command(&repo_path, &["add", "."]).await;
+        run_git_command(&repo_path, &["commit", "-m", "initial"]).await;
 
         let header = build_turn_metadata_header(&repo_path, Some("none"))
             .await

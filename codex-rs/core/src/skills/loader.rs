@@ -17,7 +17,6 @@ use crate::skills::system::system_cache_root_dir;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::SkillScope;
-use dirs::home_dir;
 use dunce::canonicalize as canonicalize_path;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -146,7 +145,8 @@ impl fmt::Display for SkillParseError {
 impl Error for SkillParseError {}
 
 pub fn load_skills(config: &Config) -> SkillLoadOutcome {
-    load_skills_with_home_dir(config, home_dir().as_deref())
+    let home_dir = user_home_dir_from_layer_stack(&config.config_layer_stack);
+    load_skills_with_home_dir(config, home_dir.as_deref())
 }
 
 fn load_skills_with_home_dir(config: &Config, home_dir: Option<&Path>) -> SkillLoadOutcome {
@@ -157,6 +157,21 @@ fn load_skills_with_home_dir(config: &Config, home_dir: Option<&Path>) -> SkillL
     ));
     dedupe_skill_roots_by_path(&mut roots);
     load_skills_from_roots(roots)
+}
+
+fn user_home_dir_from_layer_stack(config_layer_stack: &ConfigLayerStack) -> Option<PathBuf> {
+    for layer in
+        config_layer_stack.get_layers(ConfigLayerStackOrdering::HighestPrecedenceFirst, true)
+    {
+        if matches!(layer.name, ConfigLayerSource::User { .. })
+            && let Some(config_folder) = layer.config_folder()
+            && let Some(parent) = config_folder.as_path().parent()
+        {
+            return Some(parent.to_path_buf());
+        }
+    }
+
+    None
 }
 
 pub(crate) struct SkillRoot {
@@ -276,7 +291,8 @@ pub(crate) fn skill_roots_from_layer_stack_with_agents(
     config_layer_stack: &ConfigLayerStack,
     cwd: &Path,
 ) -> Vec<SkillRoot> {
-    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir().as_deref());
+    let home_dir = user_home_dir_from_layer_stack(config_layer_stack);
+    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir.as_deref());
     roots.extend(repo_agents_skill_roots(config_layer_stack, cwd));
     dedupe_skill_roots_by_path(&mut roots);
     roots
@@ -2654,7 +2670,7 @@ permissions:
             .map(|root| root.scope)
             .collect();
         let mut expected = vec![SkillScope::User, SkillScope::System];
-        if home_dir().is_some() {
+        if user_home_dir_from_layer_stack(&cfg.config_layer_stack).is_some() {
             expected.insert(1, SkillScope::User);
         }
         expected.push(SkillScope::Admin);
