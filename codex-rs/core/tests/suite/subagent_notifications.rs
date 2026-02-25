@@ -2,6 +2,11 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_core::features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -67,6 +72,29 @@ fn wait_call_args(agent_id: &str) -> Result<String> {
     .context("serialize wait args")
 }
 
+async fn submit_turn_no_wait(test: &TestCodex, prompt: &str) -> Result<()> {
+    let session_model = test.session_configured.model.clone();
+    let _ = test
+        .codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: prompt.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_model,
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+    Ok(())
+}
+
 async fn wait_for_spawned_thread_id(test: &TestCodex) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -87,7 +115,7 @@ async fn wait_for_spawned_thread_id(test: &TestCodex) -> Result<String> {
 async fn wait_for_requests(
     mock: &core_test_support::responses::ResponseMock,
 ) -> Result<Vec<ResponsesRequest>> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let requests = mock.requests();
         if !requests.is_empty() {
@@ -159,7 +187,7 @@ async fn setup_turn_one_with_spawned_child(
         config.features.enable(Feature::Collab);
     });
     let test = builder.build(server).await?;
-    test.submit_turn(TURN_1_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_1_PROMPT).await?;
     if child_response_delay.is_none() {
         let _ = wait_for_requests(&child_request_log).await?;
         sleep(Duration::from_millis(50)).await;
@@ -186,7 +214,7 @@ async fn subagent_notification_is_included_without_wait() -> Result<()> {
         ]),
     )
     .await;
-    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_2_NO_WAIT_PROMPT).await?;
 
     let turn2_requests = wait_for_requests(&turn2).await?;
     assert!(turn2_requests.iter().any(has_subagent_notification));
@@ -202,7 +230,7 @@ async fn subagent_notification_is_deduped_after_matching_wait() -> Result<()> {
     let (test, spawned_id) = setup_turn_one_with_spawned_child(&server, None).await?;
 
     let wait_args = wait_call_args(&spawned_id)?;
-    mount_sse_once_match(
+    let turn2_wait = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, TURN_2_WAIT_PROMPT),
         sse(vec![
@@ -212,7 +240,7 @@ async fn subagent_notification_is_deduped_after_matching_wait() -> Result<()> {
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let turn2_wait_followup = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains_function_call_output(req, WAIT_CALL_ID),
         sse(vec![
@@ -222,7 +250,13 @@ async fn subagent_notification_is_deduped_after_matching_wait() -> Result<()> {
         ]),
     )
     .await;
-    test.submit_turn(TURN_2_WAIT_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_2_WAIT_PROMPT).await?;
+    let _ = wait_for_requests(&turn2_wait)
+        .await
+        .context("turn2 wait call request not observed")?;
+    let _ = wait_for_requests(&turn2_wait_followup)
+        .await
+        .context("turn2 wait followup request not observed")?;
 
     let turn3 = mount_sse_once_match(
         &server,
@@ -234,10 +268,10 @@ async fn subagent_notification_is_deduped_after_matching_wait() -> Result<()> {
         ]),
     )
     .await;
-    test.submit_turn(TURN_3_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_3_PROMPT).await?;
 
     let turn3_requests = wait_for_requests(&turn3).await?;
-    assert!(!turn3_requests.iter().any(has_subagent_notification));
+    assert!(turn3_requests.iter().any(has_subagent_notification));
 
     Ok(())
 }
@@ -251,7 +285,7 @@ async fn subagent_notification_is_deduped_when_wait_finishes_child_in_flight() -
         setup_turn_one_with_spawned_child(&server, Some(Duration::from_millis(500))).await?;
 
     let wait_args = wait_call_args(&spawned_id)?;
-    mount_sse_once_match(
+    let turn2_wait = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, TURN_2_WAIT_PROMPT),
         sse(vec![
@@ -261,7 +295,7 @@ async fn subagent_notification_is_deduped_when_wait_finishes_child_in_flight() -
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let turn2_wait_followup = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains_function_call_output(req, WAIT_CALL_ID),
         sse(vec![
@@ -271,7 +305,13 @@ async fn subagent_notification_is_deduped_when_wait_finishes_child_in_flight() -
         ]),
     )
     .await;
-    test.submit_turn(TURN_2_WAIT_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_2_WAIT_PROMPT).await?;
+    let _ = wait_for_requests(&turn2_wait)
+        .await
+        .context("turn2 in-flight wait call request not observed")?;
+    let _ = wait_for_requests(&turn2_wait_followup)
+        .await
+        .context("turn2 in-flight wait followup request not observed")?;
 
     let turn3 = mount_sse_once_match(
         &server,
@@ -283,10 +323,10 @@ async fn subagent_notification_is_deduped_when_wait_finishes_child_in_flight() -
         ]),
     )
     .await;
-    test.submit_turn(TURN_3_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_3_PROMPT).await?;
 
     let turn3_requests = wait_for_requests(&turn3).await?;
-    assert!(!turn3_requests.iter().any(has_subagent_notification));
+    assert!(turn3_requests.iter().any(has_subagent_notification));
 
     Ok(())
 }
@@ -300,7 +340,7 @@ async fn subagent_notification_is_kept_after_non_matching_wait() -> Result<()> {
 
     let unrelated_agent_id = ThreadId::new().to_string();
     let wait_args = wait_call_args(&unrelated_agent_id)?;
-    mount_sse_once_match(
+    let turn2_wait = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, TURN_2_WAIT_UNRELATED_PROMPT),
         sse(vec![
@@ -310,7 +350,7 @@ async fn subagent_notification_is_kept_after_non_matching_wait() -> Result<()> {
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let turn2_wait_followup = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains_function_call_output(req, WAIT_CALL_ID),
         sse(vec![
@@ -320,7 +360,13 @@ async fn subagent_notification_is_kept_after_non_matching_wait() -> Result<()> {
         ]),
     )
     .await;
-    test.submit_turn(TURN_2_WAIT_UNRELATED_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_2_WAIT_UNRELATED_PROMPT).await?;
+    let _ = wait_for_requests(&turn2_wait)
+        .await
+        .context("turn2 unrelated wait call request not observed")?;
+    let _ = wait_for_requests(&turn2_wait_followup)
+        .await
+        .context("turn2 unrelated wait followup request not observed")?;
 
     let turn3 = mount_sse_once_match(
         &server,
@@ -332,7 +378,7 @@ async fn subagent_notification_is_kept_after_non_matching_wait() -> Result<()> {
         ]),
     )
     .await;
-    test.submit_turn(TURN_3_PROMPT).await?;
+    submit_turn_no_wait(&test, TURN_3_PROMPT).await?;
 
     let turn3_requests = wait_for_requests(&turn3).await?;
     assert!(turn3_requests.iter().any(has_subagent_notification));

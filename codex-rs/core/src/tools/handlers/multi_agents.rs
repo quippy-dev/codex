@@ -1656,7 +1656,6 @@ mod tests {
     use crate::ThreadManager;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
-    use crate::config::DEFAULT_AGENT_MAX_DEPTH;
     use crate::config::types::ShellEnvironmentPolicy;
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
@@ -1927,10 +1926,11 @@ mod tests {
         let (mut session, mut turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
+        let max_depth = turn.config.agent_max_depth;
 
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
-            depth: DEFAULT_AGENT_MAX_DEPTH,
+            depth: max_depth,
             agent_nickname: None,
             agent_role: None,
         });
@@ -1961,13 +1961,14 @@ mod tests {
         let (mut session, mut turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
+        let current_max_depth = turn.config.agent_max_depth;
 
         let mut config = (*turn.config).clone();
-        config.agent_max_depth = DEFAULT_AGENT_MAX_DEPTH + 1;
+        config.agent_max_depth = current_max_depth + 1;
         turn.config = Arc::new(config);
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
-            depth: DEFAULT_AGENT_MAX_DEPTH,
+            depth: current_max_depth,
             agent_nickname: None,
             agent_role: None,
         });
@@ -2694,10 +2695,11 @@ mod tests {
         let (mut session, mut turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
+        let max_depth = turn.config.agent_max_depth;
 
         turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: session.conversation_id,
-            depth: DEFAULT_AGENT_MAX_DEPTH,
+            depth: max_depth,
             agent_nickname: None,
             agent_role: None,
         });
@@ -3591,7 +3593,7 @@ mod tests {
         let config = build_agent_spawn_config(
             &base_instructions,
             &turn,
-            DEFAULT_AGENT_MAX_DEPTH,
+            turn.config.agent_max_depth,
             SpawnConfigStrategy::ContextFreeSpawn,
         )
         .expect("context-free spawn config");

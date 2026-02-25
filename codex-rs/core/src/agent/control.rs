@@ -1936,7 +1936,11 @@ mod tests {
             config.codex_home.clone(),
         );
         let control = manager.agent_control();
-        let owner_thread_id = ThreadId::new();
+        let owner_thread = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start owner thread");
+        let owner_thread_id = owner_thread.thread_id;
 
         let watchdog_handle_id = control
             .spawn_agent_handle(
@@ -1983,6 +1987,16 @@ mod tests {
             .shutdown_agent(watchdog_handle_id)
             .await
             .expect("shutdown watchdog handle");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(control.get_status(helper_id).await, AgentStatus::NotFound) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watchdog helper should be cleaned up before replacement spawns");
 
         let replacement_a = control
             .spawn_agent(config.clone(), text_input("replacement-a"), None)
@@ -2001,6 +2015,7 @@ mod tests {
             .shutdown_agent(replacement_b)
             .await
             .expect("shutdown replacement_b");
+        let _ = control.shutdown_agent(owner_thread_id).await;
     }
 
     #[tokio::test]

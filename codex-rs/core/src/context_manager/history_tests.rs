@@ -1484,7 +1484,6 @@ fn normalize_uses_latest_wait_status_for_dedupe() {
     );
 }
 
-#[cfg(not(debug_assertions))]
 #[test]
 fn normalize_adds_missing_output_for_custom_tool_call() {
     let items = vec![ResponseItem::CustomToolCall {
@@ -1516,7 +1515,6 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
     );
 }
 
-#[cfg(not(debug_assertions))]
 #[test]
 fn normalize_adds_missing_output_for_local_shell_call_with_id() {
     let items = vec![ResponseItem::LocalShellCall {
@@ -1558,7 +1556,6 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
     );
 }
 
-#[cfg(not(debug_assertions))]
 #[test]
 fn normalize_removes_orphan_function_call_output() {
     let items = vec![ResponseItem::FunctionCallOutput {
@@ -1572,7 +1569,6 @@ fn normalize_removes_orphan_function_call_output() {
     assert_eq!(h.raw_items(), vec![]);
 }
 
-#[cfg(not(debug_assertions))]
 #[test]
 fn normalize_removes_orphan_custom_tool_call_output() {
     let items = vec![ResponseItem::CustomToolCallOutput {
@@ -1586,7 +1582,6 @@ fn normalize_removes_orphan_custom_tool_call_output() {
     assert_eq!(h.raw_items(), vec![]);
 }
 
-#[cfg(not(debug_assertions))]
 #[test]
 fn normalize_mixed_inserts_and_removals() {
     let items = vec![
@@ -1697,104 +1692,6 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
             },
         ]
     );
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
-fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
-    let items = vec![ResponseItem::CustomToolCall {
-        id: None,
-        status: None,
-        call_id: "tool-x".to_string(),
-        name: "custom".to_string(),
-        input: "{}".to_string(),
-    }];
-    let mut h = create_history_with_items(items);
-    h.normalize_history(&default_input_modalities());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
-fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() {
-    let items = vec![ResponseItem::LocalShellCall {
-        id: None,
-        call_id: Some("shell-1".to_string()),
-        status: LocalShellStatus::Completed,
-        action: LocalShellAction::Exec(LocalShellExecAction {
-            command: vec!["echo".to_string(), "hi".to_string()],
-            timeout_ms: None,
-            working_directory: None,
-            env: None,
-            user: None,
-        }),
-    }];
-    let mut h = create_history_with_items(items);
-    h.normalize_history(&default_input_modalities());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
-fn normalize_removes_orphan_function_call_output_panics_in_debug() {
-    let items = vec![ResponseItem::FunctionCallOutput {
-        call_id: "orphan-1".to_string(),
-        output: FunctionCallOutputPayload::from_text("ok".to_string()),
-    }];
-    let mut h = create_history_with_items(items);
-    h.normalize_history(&default_input_modalities());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
-fn normalize_removes_orphan_custom_tool_call_output_panics_in_debug() {
-    let items = vec![ResponseItem::CustomToolCallOutput {
-        call_id: "orphan-2".to_string(),
-        output: "ok".to_string(),
-    }];
-    let mut h = create_history_with_items(items);
-    h.normalize_history(&default_input_modalities());
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic]
-fn normalize_mixed_inserts_and_removals_panics_in_debug() {
-    let items = vec![
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "f1".to_string(),
-            arguments: "{}".to_string(),
-            call_id: "c1".to_string(),
-        },
-        ResponseItem::FunctionCallOutput {
-            call_id: "c2".to_string(),
-            output: FunctionCallOutputPayload::from_text("ok".to_string()),
-        },
-        ResponseItem::CustomToolCall {
-            id: None,
-            status: None,
-            call_id: "t1".to_string(),
-            name: "tool".to_string(),
-            input: "{}".to_string(),
-        },
-        ResponseItem::LocalShellCall {
-            id: None,
-            call_id: Some("s1".to_string()),
-            status: LocalShellStatus::Completed,
-            action: LocalShellAction::Exec(LocalShellExecAction {
-                command: vec!["echo".to_string()],
-                timeout_ms: None,
-                working_directory: None,
-                env: None,
-                user: None,
-            }),
-        },
-    ];
-    let mut h = create_history_with_items(items);
-    h.normalize_history(&default_input_modalities());
 }
 
 #[test]

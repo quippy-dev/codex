@@ -757,53 +757,93 @@ mod tests {
 
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let repo_path = create_test_git_repo(&temp_dir).await;
+        let envs = vec![
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ];
 
         // Make three distinct commits with small delays to ensure ordering by timestamp.
         fs::write(repo_path.join("file.txt"), "one").unwrap();
-        Command::new("git")
+        let add_1 = Command::new("git")
+            .envs(envs.clone())
             .args(["add", "file.txt"])
             .current_dir(&repo_path)
             .output()
             .await
             .expect("git add");
-        Command::new("git")
+        assert!(
+            add_1.status.success(),
+            "git add 1 failed: {}",
+            String::from_utf8_lossy(&add_1.stderr)
+        );
+        let commit_1 = Command::new("git")
+            .envs(envs.clone())
             .args(["commit", "-m", "first change"])
             .current_dir(&repo_path)
             .output()
             .await
             .expect("git commit 1");
+        assert!(
+            commit_1.status.success(),
+            "git commit 1 failed: {}",
+            String::from_utf8_lossy(&commit_1.stderr)
+        );
 
         sleep(Duration::from_millis(1100)).await;
 
         fs::write(repo_path.join("file.txt"), "two").unwrap();
-        Command::new("git")
+        let add_2 = Command::new("git")
+            .envs(envs.clone())
             .args(["add", "file.txt"])
             .current_dir(&repo_path)
             .output()
             .await
             .expect("git add 2");
-        Command::new("git")
+        assert!(
+            add_2.status.success(),
+            "git add 2 failed: {}",
+            String::from_utf8_lossy(&add_2.stderr)
+        );
+        let commit_2 = Command::new("git")
+            .envs(envs.clone())
             .args(["commit", "-m", "second change"])
             .current_dir(&repo_path)
             .output()
             .await
             .expect("git commit 2");
+        assert!(
+            commit_2.status.success(),
+            "git commit 2 failed: {}",
+            String::from_utf8_lossy(&commit_2.stderr)
+        );
 
         sleep(Duration::from_millis(1100)).await;
 
         fs::write(repo_path.join("file.txt"), "three").unwrap();
-        Command::new("git")
+        let add_3 = Command::new("git")
+            .envs(envs.clone())
             .args(["add", "file.txt"])
             .current_dir(&repo_path)
             .output()
             .await
             .expect("git add 3");
-        Command::new("git")
+        assert!(
+            add_3.status.success(),
+            "git add 3 failed: {}",
+            String::from_utf8_lossy(&add_3.stderr)
+        );
+        let commit_3 = Command::new("git")
+            .envs(envs)
             .args(["commit", "-m", "third change"])
             .current_dir(&repo_path)
             .output()
             .await
             .expect("git commit 3");
+        assert!(
+            commit_3.status.success(),
+            "git commit 3 failed: {}",
+            String::from_utf8_lossy(&commit_3.stderr)
+        );
 
         // Request the latest 3 commits; should be our three changes in reverse time order.
         let entries = recent_commits(&repo_path, 3).await;
