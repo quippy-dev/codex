@@ -1,17 +1,13 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use codex_core::SandboxState;
-use codex_execpolicy::Policy;
 use path_absolutize::Absolutize as _;
 use tokio::process::Command;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::unix::escalate_protocol::ESCALATE_SOCKET_ENV_VAR;
@@ -25,11 +21,27 @@ use crate::unix::escalate_protocol::SuperExecResult;
 use crate::unix::escalation_policy::EscalationPolicy;
 use crate::unix::socket::AsyncDatagramSocket;
 use crate::unix::socket::AsyncSocket;
-use crate::unix::stopwatch::Stopwatch;
+
+/// Adapter for running the shell command after the escalation server has been set up.
+///
+/// This lets `shell-escalation` own the Unix escalation protocol while the caller
+/// keeps control over process spawning, output capture, and sandbox integration.
+/// Implementations can capture any sandbox state they need.
+#[async_trait::async_trait]
+pub trait ShellCommandExecutor: Send + Sync {
+    /// Runs the requested shell command and returns the captured result.
+    async fn run(
+        &self,
+        command: Vec<String>,
+        cwd: PathBuf,
+        env: HashMap<String, String>,
+        cancel_rx: CancellationToken,
+    ) -> anyhow::Result<ExecResult>;
+}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ExecParams {
-    /// The bash string to execute.
+    /// The the string of Zsh/shell to execute.
     pub command: String,
     /// The working directory to execute the command in. Must be an absolute path.
     pub workdir: String,
@@ -42,12 +54,14 @@ pub struct ExecParams {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExecResult {
     pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    /// Aggregated stdout+stderr output for compatibility with existing callers.
     pub output: String,
     pub duration: Duration,
     pub timed_out: bool,
 }
 
-#[allow(clippy::module_name_repetitions)]
 pub struct EscalateServer {
     bash_path: PathBuf,
     execve_wrapper: PathBuf,
@@ -70,12 +84,12 @@ impl EscalateServer {
         &self,
         params: ExecParams,
         cancel_rx: CancellationToken,
-        sandbox_state: &SandboxState,
+        command_executor: &dyn ShellCommandExecutor,
     ) -> anyhow::Result<ExecResult> {
         let (escalate_server, escalate_client) = AsyncDatagramSocket::pair()?;
         let client_socket = escalate_client.into_inner();
+        // Only the client endpoint should cross exec into the wrapper process.
         client_socket.set_cloexec(false)?;
-
         let escalate_task = tokio::spawn(escalate_task(escalate_server, self.policy.clone()));
         let mut env = std::env::vars().collect::<HashMap<String, String>>();
         env.insert(
@@ -91,77 +105,21 @@ impl EscalateServer {
             self.execve_wrapper.to_string_lossy().to_string(),
         );
 
-        let ExecParams {
-            command,
-            workdir,
-            timeout_ms: _,
-            login,
-        } = params;
-        let result = codex_core::exec::process_exec_tool_call(
-            codex_core::exec::ExecParams {
-                command: vec![
-                    self.bash_path.to_string_lossy().to_string(),
-                    if login == Some(false) {
-                        "-c".to_string()
-                    } else {
-                        "-lc".to_string()
-                    },
-                    command,
-                ],
-                cwd: PathBuf::from(&workdir),
-                expiration: codex_core::exec::ExecExpiration::Cancellation(cancel_rx),
-                env,
-                network: None,
-                sandbox_permissions: codex_core::sandboxing::SandboxPermissions::UseDefault,
-                windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-                justification: None,
-                arg0: None,
+        let command = vec![
+            self.bash_path.to_string_lossy().to_string(),
+            if params.login == Some(false) {
+                "-c".to_string()
+            } else {
+                "-lc".to_string()
             },
-            &sandbox_state.sandbox_policy,
-            &sandbox_state.sandbox_cwd,
-            &sandbox_state.codex_linux_sandbox_exe,
-            sandbox_state.use_linux_sandbox_bwrap,
-            None,
-        )
-        .await?;
+            params.command,
+        ];
+        let result = command_executor
+            .run(command, PathBuf::from(&params.workdir), env, cancel_rx)
+            .await?;
         escalate_task.abort();
-
-        Ok(ExecResult {
-            exit_code: result.exit_code,
-            output: result.aggregated_output.text,
-            duration: result.duration,
-            timed_out: result.timed_out,
-        })
+        Ok(result)
     }
-}
-
-/// Factory for creating escalation policy instances for a single shell run.
-pub trait EscalationPolicyFactory {
-    type Policy: EscalationPolicy + Send + Sync + 'static;
-
-    fn create_policy(&self, policy: Arc<RwLock<Policy>>, stopwatch: Stopwatch) -> Self::Policy;
-}
-
-pub async fn run_escalate_server(
-    exec_params: ExecParams,
-    sandbox_state: &SandboxState,
-    shell_program: impl AsRef<Path>,
-    execve_wrapper: impl AsRef<Path>,
-    policy: Arc<RwLock<Policy>>,
-    escalation_policy_factory: impl EscalationPolicyFactory,
-    effective_timeout: Duration,
-) -> anyhow::Result<ExecResult> {
-    let stopwatch = Stopwatch::new(effective_timeout);
-    let cancel_token = stopwatch.cancellation_token();
-    let escalate_server = EscalateServer::new(
-        shell_program.as_ref().to_path_buf(),
-        execve_wrapper.as_ref().to_path_buf(),
-        escalation_policy_factory.create_policy(policy, stopwatch),
-    );
-
-    escalate_server
-        .exec(exec_params, cancel_token, sandbox_state)
-        .await
 }
 
 async fn escalate_task(

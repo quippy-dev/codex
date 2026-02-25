@@ -23,7 +23,6 @@ members = [
     "hooks",
     "secrets",
     "exec",
-    "exec-server",
     "execpolicy",
     "execpolicy-legacy",
     "keyring-store",
@@ -138,7 +137,6 @@ codex-utils-sleep-inhibitor = { path = "utils/sleep-inhibitor" }
 codex-utils-string = { path = "utils/string" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
 core_test_support = { path = "core/tests/common" }
-exec_server_test_support = { path = "exec-server/tests/common" }
 mcp_test_support = { path = "mcp-server/tests/common" }
 
 # External
@@ -162,6 +160,7 @@ clap = "4"
 clap_complete = "4"
 color-eyre = "0.6.3"
 crossbeam-channel = "0.5.15"
+csv = "1.3.1"
 crossterm = "0.28.1"
 ctor = "0.6.3"
 derive_more = "2"
@@ -183,7 +182,6 @@ ignore = "0.4.23"
 image = { version = "^0.25.9", default-features = false }
 include_dir = "0.7.4"
 indexmap = "2.12.0"
-indoc = "2.0"
 insta = "1.46.3"
 inventory = "0.3.19"
 itertools = "0.14.0"

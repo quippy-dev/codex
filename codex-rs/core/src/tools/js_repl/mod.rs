@@ -9,6 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ResponseInputItem;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -269,7 +272,7 @@ pub struct JsReplManager {
     node_path: Option<PathBuf>,
     node_module_dirs: Vec<PathBuf>,
     tmp_dir: tempfile::TempDir,
-    kernel: Mutex<Option<KernelState>>,
+    kernel: Arc<Mutex<Option<KernelState>>>,
     exec_lock: Arc<tokio::sync::Semaphore>,
     exec_tool_calls: Arc<Mutex<HashMap<String, ExecToolCalls>>>,
 }
@@ -287,7 +290,7 @@ impl JsReplManager {
             node_path,
             node_module_dirs,
             tmp_dir,
-            kernel: Mutex::new(None),
+            kernel: Arc::new(Mutex::new(None)),
             exec_lock: Arc::new(tokio::sync::Semaphore::new(1)),
             exec_tool_calls: Arc::new(Mutex::new(HashMap::new())),
         });
@@ -588,6 +591,7 @@ impl JsReplManager {
             env,
             expiration: ExecExpiration::DefaultTimeout,
             sandbox_permissions: SandboxPermissions::UseDefault,
+            additional_permissions: None,
             justification: None,
         };
 
@@ -668,6 +672,7 @@ impl JsReplManager {
         tokio::spawn(Self::read_stdout(
             stdout,
             Arc::clone(&child),
+            Arc::clone(&self.kernel),
             Arc::clone(&recent_stderr),
             Arc::clone(&pending_execs),
             Arc::clone(&exec_contexts),
@@ -810,6 +815,7 @@ impl JsReplManager {
     async fn read_stdout(
         stdout: tokio::process::ChildStdout,
         child: Arc<Mutex<Child>>,
+        manager_kernel: Arc<Mutex<Option<KernelState>>>,
         recent_stderr: Arc<Mutex<VecDeque<String>>>,
         pending_execs: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecResultMessage>>>>,
         exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>>,
@@ -963,6 +969,16 @@ impl JsReplManager {
             .clone()
             .unwrap_or_else(|| "js_repl kernel exited unexpectedly".to_string());
 
+        {
+            let mut kernel = manager_kernel.lock().await;
+            let should_clear = kernel
+                .as_ref()
+                .is_some_and(|state| Arc::ptr_eq(&state.child, &child));
+            if should_clear {
+                kernel.take();
+            }
+        }
+
         let mut pending = pending_execs.lock().await;
         let pending_exec_ids = pending.keys().cloned().collect::<Vec<_>>();
         for (_id, tx) in pending.drain() {
@@ -1037,36 +1053,78 @@ impl JsReplManager {
                 }
             };
 
+        let tool_name = req.tool_name.clone();
         let call = crate::tools::router::ToolCall {
-            tool_name: req.tool_name,
+            tool_name: tool_name.clone(),
             call_id: req.id.clone(),
             payload,
         };
 
+        let session = Arc::clone(&exec.session);
+        let turn = Arc::clone(&exec.turn);
+        let tracker = Arc::clone(&exec.tracker);
+
         match router
             .dispatch_tool_call(
-                exec.session,
-                exec.turn,
-                exec.tracker,
+                session.clone(),
+                turn,
+                tracker,
                 call,
                 crate::tools::router::ToolCallSource::JsRepl,
             )
             .await
         {
-            Ok(response) => match serde_json::to_value(response) {
-                Ok(value) => RunToolResult {
-                    id: req.id,
-                    ok: true,
-                    response: Some(value),
-                    error: None,
-                },
-                Err(err) => RunToolResult {
-                    id: req.id,
-                    ok: false,
-                    response: None,
-                    error: Some(format!("failed to serialize tool output: {err}")),
-                },
-            },
+            Ok(response) => {
+                if let ResponseInputItem::FunctionCallOutput { output, .. } = &response
+                    && let Some(items) = output.content_items()
+                {
+                    let mut has_image = false;
+                    let mut content = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item {
+                            FunctionCallOutputContentItem::InputText { text } => {
+                                content.push(ContentItem::InputText { text: text.clone() });
+                            }
+                            FunctionCallOutputContentItem::InputImage { image_url } => {
+                                has_image = true;
+                                content.push(ContentItem::InputImage {
+                                    image_url: image_url.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    if has_image
+                        && session
+                            .inject_response_items(vec![ResponseInputItem::Message {
+                                role: "user".to_string(),
+                                content,
+                            }])
+                            .await
+                            .is_err()
+                    {
+                        warn!(
+                            tool_name = %tool_name,
+                            "js_repl tool call returned image content but there was no active turn to attach it to"
+                        );
+                    }
+                }
+
+                match serde_json::to_value(response) {
+                    Ok(value) => RunToolResult {
+                        id: req.id,
+                        ok: true,
+                        response: Some(value),
+                        error: None,
+                    },
+                    Err(err) => RunToolResult {
+                        id: req.id,
+                        ok: false,
+                        response: None,
+                        error: Some(format!("failed to serialize tool output: {err}")),
+                    },
+                }
+            }
             Err(err) => RunToolResult {
                 id: req.id,
                 ok: false,
@@ -1288,9 +1346,14 @@ pub(crate) fn resolve_node(config_path: Option<&Path>) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::codex::make_session_and_context;
+    use crate::codex::make_session_and_context_with_dynamic_tools_and_rx;
     use crate::protocol::AskForApproval;
+    use crate::protocol::EventMsg;
     use crate::protocol::SandboxPolicy;
     use crate::turn_diff_tracker::TurnDiffTracker;
+    use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+    use codex_protocol::dynamic_tools::DynamicToolResponse;
+    use codex_protocol::dynamic_tools::DynamicToolSpec;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseInputItem;
     use codex_protocol::openai_models::InputModality;
@@ -1742,7 +1805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn js_repl_kernel_failure_includes_model_diagnostics() -> anyhow::Result<()> {
+    async fn js_repl_forced_kernel_exit_recovers_on_next_exec() -> anyhow::Result<()> {
         if !can_run_js_repl_runtime_tests().await {
             return Ok(());
         }
@@ -1771,9 +1834,24 @@ mod tests {
             Arc::clone(&state.child)
         };
         JsReplManager::kill_kernel_child(&child, "test_crash").await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let cleared = {
+                    let guard = manager.kernel.lock().await;
+                    guard
+                        .as_ref()
+                        .is_none_or(|state| !Arc::ptr_eq(&state.child, &child))
+                };
+                if cleared {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host should clear dead kernel state promptly");
 
-        let err = manager
+        let result = manager
             .execute(
                 session,
                 turn,
@@ -1783,13 +1861,107 @@ mod tests {
                     timeout_ms: Some(10_000),
                 },
             )
-            .await
-            .expect_err("expected kernel failure after forced kill");
+            .await?;
+        assert!(result.output.contains("after-kill"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn js_repl_uncaught_exception_returns_exec_error_and_recovers() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+
+        manager
+            .execute(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                Arc::clone(&tracker),
+                JsReplArgs {
+                    code: "console.log('warmup');".to_string(),
+                    timeout_ms: Some(10_000),
+                },
+            )
+            .await?;
+
+        let child = {
+            let guard = manager.kernel.lock().await;
+            let state = guard.as_ref().expect("kernel should exist after warmup");
+            Arc::clone(&state.child)
+        };
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.execute(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                Arc::clone(&tracker),
+                JsReplArgs {
+                    code: "setTimeout(() => { throw new Error('boom'); }, 0);\nawait new Promise(() => {});".to_string(),
+                    timeout_ms: Some(10_000),
+                },
+            ),
+        )
+        .await
+        .expect("uncaught exception should fail promptly")
+        .expect_err("expected uncaught exception to fail the exec");
 
         let message = err.to_string();
-        assert!(message.contains("js_repl diagnostics:"));
-        assert!(message.contains("\"reason\":\"write_failed\""));
-        assert!(message.contains("\"kernel_status\":\"exited("));
+        assert!(message.contains("js_repl kernel uncaught exception: boom"));
+        assert!(message.contains("kernel reset."));
+        assert!(message.contains("Catch or handle async errors"));
+        assert!(!message.contains("js_repl kernel exited unexpectedly"));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let exited = {
+                    let mut child = child.lock().await;
+                    child.try_wait()?.is_some()
+                };
+                if exited {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("uncaught exception should terminate the previous kernel process")?;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let cleared = {
+                    let guard = manager.kernel.lock().await;
+                    guard
+                        .as_ref()
+                        .is_none_or(|state| !Arc::ptr_eq(&state.child, &child))
+                };
+                if cleared {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host should clear dead kernel state promptly");
+
+        let next = manager
+            .execute(
+                session,
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: "console.log('after reset');".to_string(),
+                    timeout_ms: Some(10_000),
+                },
+            )
+            .await?;
+        assert!(next.output.contains("after reset"));
         Ok(())
     }
 
@@ -1994,19 +2166,114 @@ console.log(out.output?.body?.text ?? "");
         assert!(result.output.contains("function_call_output"));
 
         let pending_input = session.get_pending_input().await;
-        let image_url = pending_input
-            .iter()
-            .find_map(|item| match item {
-                ResponseInputItem::Message { content, .. } => {
-                    content.iter().find_map(|content_item| match content_item {
-                        ContentItem::InputImage { image_url } => Some(image_url.as_str()),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            })
-            .expect("view_image should inject an input_image message for the active turn");
+        let [ResponseInputItem::Message { role, content }] = pending_input.as_slice() else {
+            panic!(
+                "view_image should inject exactly one pending input message, got {pending_input:?}"
+            );
+        };
+        assert_eq!(role, "user");
+        let [ContentItem::InputImage { image_url }] = content.as_slice() else {
+            panic!(
+                "view_image should inject exactly one input_image content item, got {content:?}"
+            );
+        };
         assert!(image_url.starts_with("data:image/png;base64,"));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_can_attach_image_via_dynamic_tool_with_mixed_content() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(vec![DynamicToolSpec {
+                name: "inline_image".to_string(),
+                description: "Returns inline text and image content.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            }])
+            .await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+const out = await codex.tool("inline_image", {});
+console.log(out.type);
+"#;
+        let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+        let session_for_response = Arc::clone(&session);
+        let response_watcher = async move {
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(2), rx_event.recv()).await??;
+                if let EventMsg::DynamicToolCallRequest(request) = event.msg {
+                    session_for_response
+                        .notify_dynamic_tool_response(
+                            &request.call_id,
+                            DynamicToolResponse {
+                                content_items: vec![
+                                    DynamicToolCallOutputContentItem::InputText {
+                                        text: "inline image note".to_string(),
+                                    },
+                                    DynamicToolCallOutputContentItem::InputImage {
+                                        image_url: image_url.to_string(),
+                                    },
+                                ],
+                                success: true,
+                            },
+                        )
+                        .await;
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+        };
+
+        let (result, response_watcher_result) = tokio::join!(
+            manager.execute(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            ),
+            response_watcher,
+        );
+        response_watcher_result?;
+        let result = result?;
+        assert!(result.output.contains("function_call_output"));
+
+        let pending_input = session.get_pending_input().await;
+        assert_eq!(
+            pending_input,
+            vec![ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputText {
+                        text: "inline image note".to_string(),
+                    },
+                    ContentItem::InputImage {
+                        image_url: image_url.to_string(),
+                    },
+                ],
+            }]
+        );
 
         Ok(())
     }

@@ -105,6 +105,7 @@ impl McpProcess {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.current_dir(codex_home);
         cmd.env("CODEX_HOME", codex_home);
         cmd.env("CODEX_APP_SERVER_IGNORE_SYSTEM_CONFIG", "1");
         cmd.env("CODEX_APP_SERVER_IGNORE_SYSTEM_REQUIREMENTS", "1");
