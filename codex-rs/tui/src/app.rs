@@ -828,12 +828,22 @@ impl App {
         let Some(active_id) = self.active_thread_id else {
             return;
         };
-        let Some(receiver) = self.active_thread_rx.take() else {
+        let Some(mut receiver) = self.active_thread_rx.take() else {
             return;
         };
         if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
             let mut store = channel.store.lock().await;
             store.active = false;
+            drop(store);
+            // Every queued thread event is written to `ThreadEventStore` before it is sent to this
+            // channel receiver. Drop parked backlog so thread-switch replay comes only from the
+            // filtered store snapshot and does not resurrect stale interactive prompts.
+            loop {
+                match receiver.try_recv() {
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
+            }
             channel.receiver = Some(receiver);
         }
     }
@@ -3534,6 +3544,120 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_active_thread_receiver_drains_queued_backlog() {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(8));
+        app.activate_thread_channel(thread_id).await;
+
+        let event = Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::RequestUserInput(
+                codex_protocol::request_user_input::RequestUserInputEvent {
+                    call_id: "call-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    questions: Vec::new(),
+                },
+            ),
+        };
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("missing thread channel");
+            let mut store = channel.store.lock().await;
+            store.push_event(event.clone());
+            channel
+                .sender
+                .try_send(event)
+                .expect("failed to enqueue stale event");
+        }
+
+        app.store_active_thread_receiver().await;
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("missing thread channel");
+            let store = channel.store.lock().await;
+            assert!(
+                !store.active,
+                "thread should be inactive after parking receiver"
+            );
+        }
+
+        let channel = app
+            .thread_event_channels
+            .get_mut(&thread_id)
+            .expect("missing thread channel");
+        let receiver = channel
+            .receiver
+            .as_mut()
+            .expect("parked receiver should be restored to channel");
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "parked receiver backlog should be drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_thread_for_replay_keeps_resolved_request_user_input_filtered() {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(8));
+        app.activate_thread_channel(thread_id).await;
+
+        let request_event = Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::RequestUserInput(
+                codex_protocol::request_user_input::RequestUserInputEvent {
+                    call_id: "call-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    questions: Vec::new(),
+                },
+            ),
+        };
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("missing thread channel");
+            let mut store = channel.store.lock().await;
+            store.push_event(request_event.clone());
+            store.note_outbound_op(&Op::UserInputAnswer {
+                id: "turn-1".to_string(),
+                response: codex_protocol::request_user_input::RequestUserInputResponse {
+                    answers: std::collections::HashMap::new(),
+                },
+            });
+            channel
+                .sender
+                .try_send(request_event)
+                .expect("failed to enqueue stale event");
+        }
+
+        app.store_active_thread_receiver().await;
+        let (mut receiver, snapshot) = app
+            .activate_thread_for_replay(thread_id)
+            .await
+            .expect("failed to activate thread for replay");
+
+        assert!(
+            snapshot.events.is_empty(),
+            "resolved request_user_input prompt should be filtered from replay snapshot"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "stale queued prompt should not remain in receiver backlog after parking"
+        );
     }
 
     #[tokio::test]
