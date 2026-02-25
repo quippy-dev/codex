@@ -55,6 +55,7 @@ pub(crate) struct ToolsConfig {
     pub js_repl_tools_only: bool,
     pub collab_tools: bool,
     pub collaboration_modes_tools: bool,
+    pub request_user_input_outside_plan_mode: bool,
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
@@ -80,7 +81,9 @@ impl ToolsConfig {
         let include_js_repl_tools_only =
             include_js_repl && features.enabled(Feature::JsReplToolsOnly);
         let include_collab_tools = features.enabled(Feature::Collab);
-        let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
+        let include_collaboration_modes_tools = true;
+        let request_user_input_outside_plan_mode =
+            features.enabled(Feature::RequestUserInputOutsidePlanMode);
         let include_search_tool = features.enabled(Feature::Apps);
         let include_agent_jobs = include_collab_tools && features.enabled(Feature::Sqlite);
         let request_permission_enabled = features.enabled(Feature::RequestPermissions);
@@ -138,6 +141,7 @@ impl ToolsConfig {
             js_repl_tools_only: include_js_repl_tools_only,
             collab_tools: include_collab_tools,
             collaboration_modes_tools: include_collaboration_modes_tools,
+            request_user_input_outside_plan_mode,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
@@ -872,7 +876,7 @@ fn create_wait_tool() -> ToolSpec {
     })
 }
 
-fn create_request_user_input_tool() -> ToolSpec {
+fn create_request_user_input_tool(request_user_input_outside_plan_mode: bool) -> ToolSpec {
     let mut option_props = BTreeMap::new();
     option_props.insert(
         "label".to_string(),
@@ -943,7 +947,7 @@ fn create_request_user_input_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "request_user_input".to_string(),
-        description: request_user_input_tool_description(),
+        description: request_user_input_tool_description(request_user_input_outside_plan_mode),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -1728,7 +1732,9 @@ pub(crate) fn build_specs(
     }
 
     if config.collaboration_modes_tools {
-        builder.push_spec(create_request_user_input_tool());
+        builder.push_spec(create_request_user_input_tool(
+            config.request_user_input_outside_plan_mode,
+        ));
         builder.register_handler("request_user_input", request_user_input_handler);
     }
 
@@ -2055,7 +2061,7 @@ mod tests {
             create_exec_command_tool(true, false),
             create_write_stdin_tool(),
             PLAN_TOOL.clone(),
-            create_request_user_input_tool(),
+            create_request_user_input_tool(false),
             create_apply_patch_freeform_tool(),
             ToolSpec::WebSearch {
                 external_web_access: Some(true),
@@ -2141,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn request_user_input_requires_collaboration_modes_feature() {
+    fn request_user_input_is_available_without_collaboration_modes_feature() {
         let config = test_config();
         let model_info =
             ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
@@ -2155,8 +2161,8 @@ mod tests {
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert!(
-            !tools.iter().any(|t| t.spec.name() == "request_user_input"),
-            "request_user_input should be disabled when collaboration_modes feature is off"
+            tools.iter().any(|t| t.spec.name() == "request_user_input"),
+            "request_user_input should be available even when collaboration_modes feature is off"
         );
 
         features.enable(Feature::CollaborationModes);

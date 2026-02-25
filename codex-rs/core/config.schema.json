@@ -391,6 +391,9 @@
             "request_rule": {
               "type": "boolean"
             },
+            "request_user_input_outside_plan_mode": {
+              "type": "boolean"
+            },
             "responses_websockets": {
               "type": "boolean"
             },
@@ -1682,6 +1685,9 @@
           "type": "boolean"
         },
         "request_rule": {
+          "type": "boolean"
+        },
+        "request_user_input_outside_plan_mode": {
           "type": "boolean"
         },
         "responses_websockets": {
