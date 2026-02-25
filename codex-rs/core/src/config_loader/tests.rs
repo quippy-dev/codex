@@ -284,14 +284,17 @@ async fn returns_empty_when_all_layers_missing() {
         "expected empty config for user layer when config.toml does not exist"
     );
 
-    let binding = layers.effective_config();
-    let base_table = binding.as_table().expect("base table expected");
-    assert!(
-        base_table.is_empty(),
-        "expected empty base layer when configs missing"
+    let layers_high_to_low = layers.layers_high_to_low();
+    let system_layer = layers_high_to_low
+        .iter()
+        .find(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
+        .expect("system layer should always be present");
+    let effective = layers.effective_config();
+    assert_eq!(
+        effective, system_layer.config,
+        "expected no non-system config when all local layers are missing"
     );
-    let num_system_layers = layers
-        .layers_high_to_low()
+    let num_system_layers = layers_high_to_low
         .iter()
         .filter(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
         .count();
@@ -299,16 +302,6 @@ async fn returns_empty_when_all_layers_missing() {
         num_system_layers, 1,
         "system layer should always be present"
     );
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let effective = layers.effective_config();
-        let table = effective.as_table().expect("top-level table expected");
-        assert!(
-            table.is_empty(),
-            "expected empty table when configs missing"
-        );
-    }
 }
 
 #[cfg(target_os = "macos")]

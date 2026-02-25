@@ -1,6 +1,7 @@
 mod layer_io;
 #[cfg(target_os = "macos")]
 mod macos;
+mod requirements_pipeline;
 
 #[cfg(test)]
 mod tests;
@@ -133,34 +134,18 @@ async fn load_config_layers_state_with_system_requirements_toml_file(
     cloud_requirements: CloudRequirementsLoader,
     system_requirements_toml_file_override: Option<AbsolutePathBuf>,
 ) -> io::Result<ConfigLayerStack> {
+    let mut config_requirements_toml =
+        requirements_pipeline::load_config_requirements_with_sources(
+            &overrides,
+            cloud_requirements,
+        )
+        .await?;
     let ignore_system_requirements = overrides.ignore_system_requirements;
-    let mut config_requirements_toml = ConfigRequirementsWithSources::default();
-
-    if let Some(requirements) = cloud_requirements.get().await {
-        config_requirements_toml
-            .merge_unset_fields(RequirementSource::CloudRequirements, requirements);
-    }
-
-    #[cfg(target_os = "macos")]
-    macos::load_managed_admin_requirements_toml(
-        &mut config_requirements_toml,
-        overrides
-            .macos_managed_config_requirements_base64
-            .as_deref(),
-    )
-    .await?;
-
     let loaded_config_layers = layer_io::load_config_layers_internal(codex_home, overrides).await?;
     if !ignore_system_requirements {
-        // Honor the system requirements.toml location.
-        let requirements_toml_file =
-            system_requirements_toml_file_override.unwrap_or(system_requirements_toml_file()?);
-        load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
-
-        // Make a best-effort to support the legacy `managed_config.toml` as a
-        // requirements specification.
-        load_requirements_from_legacy_scheme(
+        requirements_pipeline::merge_system_and_legacy_requirements(
             &mut config_requirements_toml,
+            system_requirements_toml_file_override,
             loaded_config_layers.clone(),
         )
         .await?;

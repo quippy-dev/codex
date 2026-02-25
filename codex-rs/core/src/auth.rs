@@ -1,3 +1,5 @@
+mod auth_file_contract;
+mod auth_file_ops;
 mod storage;
 
 use async_trait::async_trait;
@@ -32,6 +34,11 @@ use crate::token_data::PlanType as InternalPlanType;
 use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::util::try_parse_error_message;
+pub use auth_file_contract::resolve_auth_storage_home;
+pub use auth_file_contract::validate_auth_file_override;
+pub use auth_file_ops::load_auth_dot_json_with_auth_file;
+pub use auth_file_ops::logout_with_auth_file;
+pub use auth_file_ops::save_auth_with_auth_file;
 use codex_client::CodexHttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
 use serde_json::Value;
@@ -387,58 +394,6 @@ pub fn read_codex_api_key_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn validate_auth_file_override(
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    auth_file: Option<&Path>,
-) -> std::io::Result<()> {
-    if auth_file.is_some()
-        && matches!(
-            auth_credentials_store_mode,
-            AuthCredentialsStoreMode::Auto | AuthCredentialsStoreMode::Keyring
-        )
-    {
-        let mode = match auth_credentials_store_mode {
-            AuthCredentialsStoreMode::Auto => "auto",
-            AuthCredentialsStoreMode::Keyring => "keyring",
-            _ => unreachable!(),
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "--auth-file cannot be used when `cli_auth_credentials_store` is `{mode}`. Set `-c cli_auth_credentials_store=file` (or `ephemeral`) and retry."
-            ),
-        ));
-    }
-    Ok(())
-}
-
-pub fn resolve_auth_storage_home(
-    codex_home: PathBuf,
-    auth_file: Option<&Path>,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-) -> std::io::Result<PathBuf> {
-    validate_auth_file_override(auth_credentials_store_mode, auth_file)?;
-
-    let Some(auth_file) = auth_file else {
-        return Ok(codex_home);
-    };
-
-    if auth_file.file_name().and_then(|name| name.to_str()) != Some("auth.json") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "--auth-file must point to a file named `auth.json` so it can map to core auth storage. Got: {}",
-                auth_file.display()
-            ),
-        ));
-    }
-
-    Ok(auth_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".")))
-}
-
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
 pub fn logout(
@@ -446,20 +401,6 @@ pub fn logout(
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<bool> {
     logout_with_auth_file(codex_home, auth_credentials_store_mode, None)
-}
-
-pub fn logout_with_auth_file(
-    codex_home: &Path,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    auth_file: Option<PathBuf>,
-) -> std::io::Result<bool> {
-    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
-    let storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
-        auth_credentials_store_mode,
-        auth_file,
-    );
-    storage.delete()
 }
 
 /// Writes an `auth.json` that contains only the API key.
@@ -505,21 +446,6 @@ pub fn save_auth(
     save_auth_with_auth_file(codex_home, auth, auth_credentials_store_mode, None)
 }
 
-pub fn save_auth_with_auth_file(
-    codex_home: &Path,
-    auth: &AuthDotJson,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    auth_file: Option<PathBuf>,
-) -> std::io::Result<()> {
-    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
-    let storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
-        auth_credentials_store_mode,
-        auth_file,
-    );
-    storage.save(auth)
-}
-
 /// Load CLI auth data using the configured credential store backend.
 /// Returns `None` when no credentials are stored. This function is
 /// provided only for tests. Production code should not directly load
@@ -530,20 +456,6 @@ pub fn load_auth_dot_json(
     auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> std::io::Result<Option<AuthDotJson>> {
     load_auth_dot_json_with_auth_file(codex_home, auth_credentials_store_mode, None)
-}
-
-pub fn load_auth_dot_json_with_auth_file(
-    codex_home: &Path,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    auth_file: Option<PathBuf>,
-) -> std::io::Result<Option<AuthDotJson>> {
-    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
-    let storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
-        auth_credentials_store_mode,
-        auth_file,
-    );
-    storage.load()
 }
 
 pub fn enforce_login_restrictions(config: &Config) -> std::io::Result<()> {
