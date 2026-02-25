@@ -482,6 +482,7 @@ mod tests {
     use chrono::Utc;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::RetainedProposedPlan;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
     use codex_protocol::protocol::SessionMeta;
@@ -555,6 +556,7 @@ mod tests {
             .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
         let items = vec![RolloutItem::Compacted(CompactedItem {
             message: "noop".to_string(),
+            retained_proposed_plan: RetainedProposedPlan::None,
             replacement_history: None,
         })];
 

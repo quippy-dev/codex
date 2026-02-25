@@ -7,8 +7,8 @@ use crate::compact::CompactTrigger;
 use crate::compact::InitialContextInjection;
 use crate::compact::extract_trailing_model_switch_update_for_compaction_request;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
-use crate::compact::plan_text_for_manual_plan_compaction;
-use crate::compact::upsert_retained_plan_message;
+use crate::compact::insert_retained_plan_context_message;
+use crate::compact::retained_proposed_plan_for_manual_plan_compaction;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
@@ -177,10 +177,13 @@ async fn run_remote_compact_task_inner_impl(
         initial_context_injection,
     )
     .await;
-    let retained_plan_text =
-        plan_text_for_manual_plan_compaction(sess.as_ref(), turn_context.as_ref(), compact_trigger)
-            .await;
-    new_history = upsert_retained_plan_message(new_history, retained_plan_text.as_deref());
+    let retained_proposed_plan = retained_proposed_plan_for_manual_plan_compaction(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        compact_trigger,
+    )
+    .await;
+    new_history = insert_retained_plan_context_message(new_history, &retained_proposed_plan);
     // Reattach the stripped model-switch update only after successful compaction so the model
     // still sees the switch instructions on the next real sampling request.
     if let Some(model_switch_item) = stripped_model_switch_item {
@@ -200,6 +203,7 @@ async fn run_remote_compact_task_inner_impl(
 
     let compacted_item = CompactedItem {
         message: String::new(),
+        retained_proposed_plan,
         replacement_history: Some(new_history),
     };
     sess.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])

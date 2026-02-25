@@ -336,6 +336,8 @@ Use `thread/compact/start` to trigger manual history compaction for a thread. Th
 
 When the thread is currently in Plan mode and has a previously completed proposed plan, manual compaction retains that plan text in compacted context so a follow-up like “Implement the plan.” can still resolve after compaction.
 
+In the persisted rollout JSONL, compacted markers are written as `RolloutItem::Compacted` with required typed `retained_proposed_plan` payload (`{"type":"none"}` or `{"type":"proposed_plan","text":"..."}`).
+
 Progress is emitted as standard `turn/*` and `item/*` notifications on the same `threadId`. Clients should expect a single compaction item:
 
 - `item/started` with `item: { "type": "contextCompaction", ... }`

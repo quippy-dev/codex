@@ -2084,8 +2084,16 @@ pub enum RolloutItem {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct CompactedItem {
     pub message: String,
+    pub retained_proposed_plan: RetainedProposedPlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_history: Option<Vec<ResponseItem>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RetainedProposedPlan {
+    None,
+    ProposedPlan { text: String },
 }
 
 impl From<CompactedItem> for ResponseItem {

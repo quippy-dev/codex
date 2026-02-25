@@ -12,6 +12,7 @@ use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
+use crate::protocol::RetainedProposedPlan;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::WarningEvent;
 use crate::truncate::TruncationPolicy;
@@ -32,7 +33,6 @@ use tracing::error;
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
-const RETAINED_PROPOSED_PLAN_PREFIX: &str = "[[codex_retained_proposed_plan]]\n";
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -250,11 +250,12 @@ async fn run_compact_task_inner(
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_user_messages(history_items);
-    let retained_plan_text =
-        plan_text_for_manual_plan_compaction(&sess, &turn_context, compact_trigger).await;
+    let retained_proposed_plan =
+        retained_proposed_plan_for_manual_plan_compaction(&sess, &turn_context, compact_trigger)
+            .await;
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
-    new_history = upsert_retained_plan_message(new_history, retained_plan_text.as_deref());
+    new_history = insert_retained_plan_context_message(new_history, &retained_proposed_plan);
 
     if matches!(
         initial_context_injection,
@@ -285,6 +286,7 @@ async fn run_compact_task_inner(
 
     let rollout_item = RolloutItem::Compacted(CompactedItem {
         message: summary_text.clone(),
+        retained_proposed_plan,
         replacement_history: Some(new_history),
     });
     sess.persist_rollout_items(&[rollout_item]).await;
@@ -322,9 +324,7 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
         .iter()
         .filter_map(|item| match crate::event_mapping::parse_turn_item(item) {
             Some(TurnItem::UserMessage(user)) => {
-                if is_summary_message(&user.message())
-                    || is_retained_proposed_plan_message(&user.message())
-                {
+                if is_summary_message(&user.message()) {
                     None
                 } else {
                     Some(user.message())
@@ -339,52 +339,45 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
-fn is_retained_proposed_plan_message(message: &str) -> bool {
-    message.starts_with(RETAINED_PROPOSED_PLAN_PREFIX)
-}
-
-fn retained_proposed_plan_message(plan_text: &str) -> ResponseItem {
-    let text =
-        format!("{RETAINED_PROPOSED_PLAN_PREFIX}<proposed_plan>\n{plan_text}</proposed_plan>");
+fn retained_proposed_plan_context_message(plan_text: &str) -> ResponseItem {
+    let text = format!("<proposed_plan>\n{plan_text}</proposed_plan>");
     ResponseItem::Message {
         id: None,
-        role: "user".to_string(),
+        role: "developer".to_string(),
         content: vec![ContentItem::InputText { text }],
         end_turn: None,
         phase: None,
     }
 }
 
-pub(crate) async fn plan_text_for_manual_plan_compaction(
+pub(crate) async fn retained_proposed_plan_for_manual_plan_compaction(
     sess: &Session,
     turn_context: &TurnContext,
     compact_trigger: CompactTrigger,
-) -> Option<String> {
+) -> RetainedProposedPlan {
     if compact_trigger != CompactTrigger::Manual {
-        return None;
+        return RetainedProposedPlan::None;
     }
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
-        return None;
+        return RetainedProposedPlan::None;
     }
-    sess.latest_proposed_plan_text().await
+    let Some(plan_text) = sess.latest_proposed_plan_text().await else {
+        return RetainedProposedPlan::None;
+    };
+    if plan_text.trim().is_empty() {
+        return RetainedProposedPlan::None;
+    }
+    RetainedProposedPlan::ProposedPlan { text: plan_text }
 }
 
-pub(crate) fn upsert_retained_plan_message(
+pub(crate) fn insert_retained_plan_context_message(
     mut history: Vec<ResponseItem>,
-    retained_plan_text: Option<&str>,
+    retained_proposed_plan: &RetainedProposedPlan,
 ) -> Vec<ResponseItem> {
-    history.retain(|item| {
-        !matches!(
-            crate::event_mapping::parse_turn_item(item),
-            Some(TurnItem::UserMessage(user))
-                if is_retained_proposed_plan_message(&user.message())
-        )
-    });
-
-    let Some(retained_plan_text) = retained_plan_text else {
+    let RetainedProposedPlan::ProposedPlan { text } = retained_proposed_plan else {
         return history;
     };
-    if retained_plan_text.trim().is_empty() {
+    if text.trim().is_empty() {
         return history;
     }
 
@@ -397,7 +390,7 @@ pub(crate) fn upsert_retained_plan_message(
         matches!(item, ResponseItem::Compaction { .. }).then_some(idx)
     });
 
-    let retained = retained_proposed_plan_message(retained_plan_text);
+    let retained = retained_proposed_plan_context_message(text);
     if let Some(idx) = insertion_index {
         history.insert(idx, retained);
     } else {
@@ -796,15 +789,13 @@ do things
     }
 
     #[test]
-    fn collect_user_messages_filters_retained_plan_markers() {
-        let retained_marker =
-            format!("{RETAINED_PROPOSED_PLAN_PREFIX}<proposed_plan>\n- Step 1\n</proposed_plan>");
+    fn collect_user_messages_ignores_developer_retained_plan_context() {
         let items = vec![
             ResponseItem::Message {
                 id: None,
-                role: "user".to_string(),
+                role: "developer".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: retained_marker,
+                    text: "<proposed_plan>\n- Step 1\n</proposed_plan>".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
@@ -1225,7 +1216,7 @@ keep me updated
     }
 
     #[test]
-    fn upsert_retained_plan_message_inserts_before_summary() {
+    fn insert_retained_plan_context_message_inserts_before_summary() {
         let history = vec![ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -1236,19 +1227,20 @@ keep me updated
             phase: None,
         }];
 
-        let refreshed = upsert_retained_plan_message(history, Some("- Step 1\n- Step 2\n"));
+        let refreshed = insert_retained_plan_context_message(
+            history,
+            &RetainedProposedPlan::ProposedPlan {
+                text: "- Step 1\n- Step 2\n".to_string(),
+            },
+        );
 
         assert_eq!(refreshed.len(), 2);
         let retained_text = match &refreshed[0] {
-            ResponseItem::Message { content, .. } => {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
                 content_items_to_text(content).unwrap_or_default()
             }
             other => panic!("expected retained plan message, found {other:?}"),
         };
-        assert!(
-            retained_text.starts_with(RETAINED_PROPOSED_PLAN_PREFIX),
-            "expected retained plan marker, got `{retained_text}`"
-        );
         assert!(
             retained_text.contains("<proposed_plan>\n- Step 1\n- Step 2\n</proposed_plan>"),
             "expected verbatim proposed plan block, got `{retained_text}`"
@@ -1256,68 +1248,69 @@ keep me updated
     }
 
     #[test]
-    fn upsert_retained_plan_message_replaces_existing_marker() {
-        let existing = retained_proposed_plan_message("Old plan");
+    fn insert_retained_plan_context_message_inserts_before_compaction_without_summary() {
         let history = vec![
             ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText {
-                    text: "normal user message".to_string(),
+                    text: "latest user message".to_string(),
                 }],
                 end_turn: None,
                 phase: None,
             },
-            existing,
+            ResponseItem::Compaction {
+                encrypted_content: "encrypted-summary".to_string(),
+            },
         ];
 
-        let refreshed = upsert_retained_plan_message(history, Some("New plan"));
+        let refreshed = insert_retained_plan_context_message(
+            history,
+            &RetainedProposedPlan::ProposedPlan {
+                text: "New plan".to_string(),
+            },
+        );
 
-        let retained_count = refreshed
-            .iter()
-            .filter(|item| {
-                matches!(
-                    crate::event_mapping::parse_turn_item(item),
-                    Some(TurnItem::UserMessage(user))
-                        if is_retained_proposed_plan_message(&user.message())
-                )
-            })
-            .count();
-        assert_eq!(retained_count, 1);
-        let retained_text = match refreshed.last() {
-            Some(ResponseItem::Message { content, .. }) => {
-                content_items_to_text(content).unwrap_or_default()
-            }
-            other => panic!("expected trailing retained plan message, found {other:?}"),
-        };
-        assert!(retained_text.contains("New plan"));
-        assert!(!retained_text.contains("Old plan"));
+        let expected = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "latest user message".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            retained_proposed_plan_context_message("New plan"),
+            ResponseItem::Compaction {
+                encrypted_content: "encrypted-summary".to_string(),
+            },
+        ];
+        assert_eq!(refreshed, expected);
     }
 
     #[test]
-    fn upsert_retained_plan_message_removes_marker_when_plan_missing() {
-        let history = vec![
-            retained_proposed_plan_message("Old plan"),
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "normal user message".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
+    fn insert_retained_plan_context_message_noops_for_none_or_empty_plan() {
+        let history = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "normal user message".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }];
+
+        let none_refreshed =
+            insert_retained_plan_context_message(history.clone(), &RetainedProposedPlan::None);
+        assert_eq!(none_refreshed, history);
+
+        let empty_refreshed = insert_retained_plan_context_message(
+            history.clone(),
+            &RetainedProposedPlan::ProposedPlan {
+                text: "   ".to_string(),
             },
-        ];
-
-        let refreshed = upsert_retained_plan_message(history, None);
-
-        assert_eq!(refreshed.len(), 1);
-        let remaining_text = match &refreshed[0] {
-            ResponseItem::Message { content, .. } => {
-                content_items_to_text(content).unwrap_or_default()
-            }
-            other => panic!("expected remaining user message, found {other:?}"),
-        };
-        assert_eq!(remaining_text, "normal user message");
+        );
+        assert_eq!(empty_refreshed, history);
     }
 }

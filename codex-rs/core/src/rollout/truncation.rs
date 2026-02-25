@@ -98,14 +98,12 @@ mod tests {
         }
     }
 
-    fn retained_plan_marker_msg(plan: &str) -> ResponseItem {
+    fn retained_plan_context_msg(plan: &str) -> ResponseItem {
         ResponseItem::Message {
             id: None,
-            role: "user".to_string(),
+            role: "developer".to_string(),
             content: vec![ContentItem::InputText {
-                text: format!(
-                    "[[codex_retained_proposed_plan]]\n<proposed_plan>\n{plan}\n</proposed_plan>"
-                ),
+                text: format!("<proposed_plan>\n{plan}\n</proposed_plan>"),
             }],
             end_turn: None,
             phase: None,
@@ -201,16 +199,16 @@ mod tests {
     }
 
     #[test]
-    fn truncates_rollout_from_start_ignores_retained_plan_marker_messages() {
+    fn truncates_rollout_from_start_ignores_developer_retained_plan_context_messages() {
         let rollout_items = vec![
-            RolloutItem::ResponseItem(retained_plan_marker_msg("- Step 1")),
+            RolloutItem::ResponseItem(retained_plan_context_msg("- Step 1")),
             RolloutItem::ResponseItem(user_msg("u1")),
             RolloutItem::ResponseItem(assistant_msg("a1")),
             RolloutItem::ResponseItem(user_msg("u2")),
             RolloutItem::ResponseItem(assistant_msg("a2")),
         ];
 
-        // Effective user-turn boundaries are u1 and u2; retained plan marker
+        // Effective user-turn boundaries are u1 and u2; developer retained plan context
         // should not count.
         let truncated = truncate_rollout_before_nth_user_message_from_start(&rollout_items, 1);
         let expected = rollout_items[..3].to_vec();

@@ -64,12 +64,6 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
     }
 }
 
-fn retained_plan_marker_msg(plan: &str) -> ResponseItem {
-    user_input_text_msg(&format!(
-        "[[codex_retained_proposed_plan]]\n<proposed_plan>\n{plan}\n</proposed_plan>"
-    ))
-}
-
 fn custom_tool_call_output(call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::CustomToolCallOutput {
         call_id: call_id.to_string(),
@@ -671,9 +665,18 @@ fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
 }
 
 #[test]
-fn drop_last_n_user_turns_ignores_retained_plan_marker_messages() {
+fn drop_last_n_user_turns_preserves_developer_plan_context_messages() {
+    let developer_plan_context = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "<proposed_plan>\n- Step 1\n</proposed_plan>".to_string(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
     let items = vec![
-        retained_plan_marker_msg("- Step 1"),
+        developer_plan_context.clone(),
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
         user_input_text_msg("turn 2 user"),
@@ -686,14 +689,14 @@ fn drop_last_n_user_turns_ignores_retained_plan_marker_messages() {
     assert_eq!(
         history.for_prompt(&modalities),
         vec![
-            retained_plan_marker_msg("- Step 1"),
+            developer_plan_context.clone(),
             user_input_text_msg("turn 1 user"),
             assistant_msg("turn 1 assistant"),
         ]
     );
 
     let mut history = create_history_with_items(vec![
-        retained_plan_marker_msg("- Step 1"),
+        developer_plan_context.clone(),
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
         user_input_text_msg("turn 2 user"),
@@ -702,7 +705,7 @@ fn drop_last_n_user_turns_ignores_retained_plan_marker_messages() {
     history.drop_last_n_user_turns(2);
     assert_eq!(
         history.for_prompt(&modalities),
-        vec![retained_plan_marker_msg("- Step 1")]
+        vec![developer_plan_context]
     );
 }
 

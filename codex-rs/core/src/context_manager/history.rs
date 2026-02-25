@@ -21,8 +21,6 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use std::ops::Deref;
 
-const RETAINED_PROPOSED_PLAN_PREFIX: &str = "[[codex_retained_proposed_plan]]\n";
-
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
@@ -562,7 +560,6 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
 
     if UserInstructions::is_user_instructions(content)
         || SkillInstructions::is_skill_instructions(content)
-        || is_synthetic_retained_plan_marker(content)
     {
         return false;
     }
@@ -585,16 +582,6 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
 
     true
 }
-
-fn is_synthetic_retained_plan_marker(content: &[ContentItem]) -> bool {
-    content.iter().any(|content_item| match content_item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-            text.starts_with(RETAINED_PROPOSED_PLAN_PREFIX)
-        }
-        ContentItem::InputImage { .. } => false,
-    })
-}
-
 fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {
     let mut positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {
