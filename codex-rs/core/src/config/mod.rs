@@ -2479,6 +2479,7 @@ persistence = "none"
         let memories = r#"
 [memories]
 max_raw_memories_for_global = 512
+max_unused_days = 21
 max_rollout_age_days = 42
 max_rollouts_per_startup = 9
 min_rollout_idle_hours = 24
@@ -2490,6 +2491,7 @@ phase_2_model = "gpt-5"
         assert_eq!(
             Some(MemoriesToml {
                 max_raw_memories_for_global: Some(512),
+                max_unused_days: Some(21),
                 max_rollout_age_days: Some(42),
                 max_rollouts_per_startup: Some(9),
                 min_rollout_idle_hours: Some(24),
@@ -2509,6 +2511,7 @@ phase_2_model = "gpt-5"
             config.memories,
             MemoriesConfig {
                 max_raw_memories_for_global: 512,
+                max_unused_days: 21,
                 max_rollout_age_days: 42,
                 max_rollouts_per_startup: 9,
                 min_rollout_idle_hours: 24,
