@@ -368,61 +368,6 @@ impl From<&ToolPayload> for HookToolInput {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn unsupported_message_stays_generic_for_non_collab_function_tools() {
-        let payload = ToolPayload::Function {
-            arguments: "{}".to_string(),
-        };
-
-        let message = unsupported_tool_call_message(&payload, "shell");
-
-        assert_eq!(message, "unsupported call: shell");
-    }
-
-    #[test]
-    fn unsupported_message_stays_generic_for_non_collab_custom_tools() {
-        let payload = ToolPayload::Custom {
-            input: "input".to_string(),
-        };
-
-        let message = unsupported_tool_call_message(&payload, "non_collab_custom_tool");
-
-        assert_eq!(
-            message,
-            "unsupported custom tool call: non_collab_custom_tool"
-        );
-    }
-
-    #[test]
-    fn unsupported_message_calls_out_collab_feature_or_depth_gating() {
-        let payload = ToolPayload::Function {
-            arguments: "{}".to_string(),
-        };
-        for tool_name in [
-            "spawn_agent",
-            "send_input",
-            "resume_agent",
-            "compact_parent_context",
-            "list_agents",
-            "wait",
-            "close_agent",
-        ] {
-            let message = unsupported_tool_call_message(&payload, tool_name);
-            assert_eq!(
-                message,
-                format!(
-                    "unsupported call: {tool_name}. collab tools may be disabled by feature/depth gating."
-                )
-            );
-        }
-    }
-}
-
 fn hook_tool_kind(tool_input: &HookToolInput) -> HookToolKind {
     match tool_input {
         HookToolInput::Function { .. } => HookToolKind::Function,
@@ -507,4 +452,59 @@ async fn dispatch_after_tool_use_hook(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn unsupported_message_stays_generic_for_non_collab_function_tools() {
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+
+        let message = unsupported_tool_call_message(&payload, "shell");
+
+        assert_eq!(message, "unsupported call: shell");
+    }
+
+    #[test]
+    fn unsupported_message_stays_generic_for_non_collab_custom_tools() {
+        let payload = ToolPayload::Custom {
+            input: "input".to_string(),
+        };
+
+        let message = unsupported_tool_call_message(&payload, "non_collab_custom_tool");
+
+        assert_eq!(
+            message,
+            "unsupported custom tool call: non_collab_custom_tool"
+        );
+    }
+
+    #[test]
+    fn unsupported_message_calls_out_collab_feature_or_depth_gating() {
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+        for tool_name in [
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "compact_parent_context",
+            "list_agents",
+            "wait",
+            "close_agent",
+        ] {
+            let message = unsupported_tool_call_message(&payload, tool_name);
+            assert_eq!(
+                message,
+                format!(
+                    "unsupported call: {tool_name}. collab tools may be disabled by feature/depth gating."
+                )
+            );
+        }
+    }
 }

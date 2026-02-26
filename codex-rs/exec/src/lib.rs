@@ -35,6 +35,7 @@ use codex_core::git_info::get_git_repo_root;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_protocol::approvals::ElicitationAction;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
@@ -380,7 +381,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let default_approval_policy = config.permissions.approval_policy.value();
     let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
-    let default_summary = config.model_reasoning_summary;
+    let default_summary = config
+        .model_reasoning_summary
+        .unwrap_or(ReasoningSummary::Auto);
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.

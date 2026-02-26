@@ -523,6 +523,27 @@ impl ThreadManagerState {
         )
         .await
     }
+
+    pub(crate) async fn spawn_thread_from_history_with_source(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        agent_control: AgentControl,
+        session_source: SessionSource,
+        persist_extended_history: bool,
+    ) -> CodexResult<NewThread> {
+        self.spawn_thread_with_source(
+            config,
+            initial_history,
+            Arc::clone(&self.auth_manager),
+            agent_control,
+            session_source,
+            Vec::new(),
+            persist_extended_history,
+            None,
+        )
+        .await
+    }
     /// Spawn a new thread with optional history and register it with the manager.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_thread(
@@ -751,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_session_prefix_messages_when_truncating() {
         let (session, turn_context) = make_session_and_context().await;
-        let mut items = session.build_initial_context(&turn_context).await;
+        let mut items = session.build_initial_context(&turn_context, None).await;
         items.push(user_msg("feature request"));
         items.push(assistant_msg("ack"));
         items.push(user_msg("second question"));

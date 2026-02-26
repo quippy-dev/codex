@@ -1,4 +1,9 @@
+use crate::contextual_user_message::SUBAGENT_NOTIFICATION_CLOSE_TAG;
+use crate::contextual_user_message::SUBAGENT_NOTIFICATION_FRAGMENT;
+use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
+use crate::contextual_user_message::TURN_ABORTED_OPEN_TAG;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use serde::Deserialize;
 
 /// Helpers for identifying model-visible "session prefix" messages.
@@ -7,11 +12,6 @@ use serde::Deserialize;
 /// follow-up turns (e.g. `<environment_context>`, `<turn_aborted>`). These items are persisted in
 /// history so the model can see them, but they are not user intent and must not create user-turn
 /// boundaries.
-pub(crate) const ENVIRONMENT_CONTEXT_OPEN_TAG: &str = "<environment_context>";
-pub(crate) const TURN_ABORTED_OPEN_TAG: &str = "<turn_aborted>";
-pub(crate) const SUBAGENT_NOTIFICATION_OPEN_TAG: &str = "<subagent_notification>";
-pub(crate) const SUBAGENT_NOTIFICATION_CLOSE_TAG: &str = "</subagent_notification>";
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct SubagentNotification {
     pub(crate) agent_id: String,
@@ -37,7 +37,7 @@ pub(crate) fn format_subagent_notification_message(agent_id: &str, status: &Agen
         "status": status,
     })
     .to_string();
-    format!("{SUBAGENT_NOTIFICATION_OPEN_TAG}\n{payload_json}\n{SUBAGENT_NOTIFICATION_CLOSE_TAG}")
+    SUBAGENT_NOTIFICATION_FRAGMENT.wrap(payload_json)
 }
 
 pub(crate) fn parse_subagent_notification(text: &str) -> Option<SubagentNotification> {

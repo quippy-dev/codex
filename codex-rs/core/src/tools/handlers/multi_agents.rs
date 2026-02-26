@@ -101,13 +101,13 @@ mod spawn {
     use crate::agent::AgentControl;
     use crate::agent::DEFAULT_WATCHDOG_INTERVAL_S;
     use crate::agent::WatchdogRegistration;
+    use crate::agent::control::SpawnAgentOptions;
     use crate::agent::exceeds_thread_spawn_depth_limit;
     use crate::agent::next_thread_spawn_depth;
     use crate::agent::role::DEFAULT_ROLE_NAME;
     use crate::agent::role::apply_role_to_config;
     use crate::config::Config;
     use codex_protocol::protocol::SessionSource;
-    use codex_protocol::protocol::SubAgentSource;
     use std::collections::HashSet;
     use std::sync::Arc;
     use tracing::info;
@@ -129,6 +129,8 @@ mod spawn {
         #[serde(default, alias = "mode")]
         spawn_mode: SpawnMode,
         interval_s: Option<i64>,
+        #[serde(default)]
+        fork_context: bool,
     }
 
     #[derive(Debug, Serialize)]
@@ -175,6 +177,11 @@ mod spawn {
                 "watchdogs can only be spawned by root agents".to_string(),
             ));
         }
+        if matches!(spawn_mode, SpawnMode::Watchdog) && args.fork_context {
+            return Err(FunctionCallError::RespondToModel(
+                "fork_context is not supported when spawn_mode=watchdog".to_string(),
+            ));
+        }
         let max_depth = turn.config.agent_max_depth;
         if exceeds_thread_spawn_depth_limit(child_depth, max_depth) {
             return Err(FunctionCallError::RespondToModel(format!(
@@ -206,28 +213,23 @@ mod spawn {
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         apply_spawn_agent_overrides(&mut config, child_depth);
-        let spawn_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: session.conversation_id,
-            depth: child_depth,
-            agent_nickname: None,
-            agent_role: role_name.map(str::to_string),
-        });
+        let spawn_source = thread_spawn_source_with_metadata(
+            session.conversation_id,
+            child_depth,
+            None,
+            role_name.map(str::to_string),
+        );
         let agent_control = &session.services.agent_control;
         let result = match spawn_mode {
-            SpawnMode::Spawn => {
+            SpawnMode::Spawn | SpawnMode::Fork => {
                 agent_control
-                    .spawn_agent(config, input_items.clone(), Some(spawn_source))
-                    .await
-            }
-            SpawnMode::Fork => {
-                agent_control
-                    .fork_agent(
+                    .spawn_agent_with_options(
                         config,
                         input_items,
-                        session.conversation_id,
-                        // Preserve full history for forked agents so model-side caching remains effective.
-                        usize::MAX,
-                        spawn_source,
+                        Some(spawn_source),
+                        SpawnAgentOptions {
+                            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+                        },
                     )
                     .await
             }
@@ -1619,7 +1621,7 @@ fn build_agent_shared_config(
     config.model = Some(turn.model_info.slug.clone());
     config.model_provider = turn.provider.clone();
     config.model_reasoning_effort = turn.reasoning_effort;
-    config.model_reasoning_summary = turn.reasoning_summary;
+    config.model_reasoning_summary = Some(turn.reasoning_summary);
     config.compact_prompt = turn.compact_prompt.clone();
     config.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
     config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
@@ -3514,7 +3516,7 @@ mod tests {
         expected.model = Some(turn.model_info.slug.clone());
         expected.model_provider = turn.provider.clone();
         expected.model_reasoning_effort = turn.reasoning_effort;
-        expected.model_reasoning_summary = turn.reasoning_summary;
+        expected.model_reasoning_summary = Some(turn.reasoning_summary);
         // build_agent_spawn_config intentionally clears turn-local developer instructions.
         expected.developer_instructions = None;
         expected.compact_prompt = turn.compact_prompt.clone();
@@ -3572,7 +3574,7 @@ mod tests {
         expected.model = Some(turn.model_info.slug.clone());
         expected.model_provider = turn.provider.clone();
         expected.model_reasoning_effort = turn.reasoning_effort;
-        expected.model_reasoning_summary = turn.reasoning_summary;
+        expected.model_reasoning_summary = Some(turn.reasoning_summary);
         expected.compact_prompt = turn.compact_prompt.clone();
         expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
         expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();

@@ -273,9 +273,7 @@ async fn assistant_memory_citations_update_usage_and_reorder_phase2_selection() 
     seed_stage1_output(&test, cited_thread, owner, "workspace-cited", 100).await?;
     seed_stage1_output(&test, uncited_thread, owner, "workspace-uncited", 200).await?;
 
-    let initial_selection = db
-        .select_stage1_outputs_for_phase2(1, test.config.memories.max_unused_days)
-        .await?;
+    let initial_selection = db.get_phase2_input_selection(1, 36_500).await?;
     assert_eq!(
         initial_selection
             .selected
@@ -311,14 +309,12 @@ async fn assistant_memory_citations_update_usage_and_reorder_phase2_selection() 
         other => panic!("expected usage-only phase2 claim, got {other:?}"),
     };
     assert!(
-        db.mark_global_phase2_job_succeeded(ownership_token.as_str(), input_watermark)
+        db.mark_global_phase2_job_succeeded(ownership_token.as_str(), input_watermark, &[])
             .await?,
         "usage-only citation should re-dirty phase 2"
     );
 
-    let updated_selection = db
-        .select_stage1_outputs_for_phase2(1, test.config.memories.max_unused_days)
-        .await?;
+    let updated_selection = db.get_phase2_input_selection(1, 36_500).await?;
     assert_eq!(
         updated_selection
             .selected
@@ -492,7 +488,7 @@ async fn mark_phase2_clean(db: &codex_state::StateRuntime, owner: ThreadId) -> R
         other => panic!("expected phase2 claim, got {other:?}"),
     };
     assert!(
-        db.mark_global_phase2_job_succeeded(ownership_token.as_str(), input_watermark)
+        db.mark_global_phase2_job_succeeded(ownership_token.as_str(), input_watermark, &[])
             .await?,
         "phase2 success should clear dirty state"
     );

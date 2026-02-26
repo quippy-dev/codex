@@ -139,7 +139,7 @@ async fn build_test_codex(server: &wiremock::MockServer) -> Result<TestCodex> {
     let mut builder = test_codex()
         .with_model(MODEL_WITH_TOOL)
         .with_config(move |config| {
-            config.model_catalog = Some(model_catalog.clone());
+            config.model_catalog = Some(model_catalog);
         });
     builder.build(server).await
 }
