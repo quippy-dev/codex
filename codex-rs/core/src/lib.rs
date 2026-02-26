@@ -28,6 +28,7 @@ pub mod config;
 pub mod config_loader;
 pub mod connectors;
 mod context_manager;
+mod contextual_user_message;
 pub mod custom_prompts;
 pub(crate) mod encrypted_content_fallback;
 pub mod env;

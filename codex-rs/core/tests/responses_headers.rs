@@ -63,7 +63,9 @@ async fn responses_stream_includes_subagent_header_on_review() {
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
     let effort = config.model_reasoning_effort;
-    let summary = config.model_reasoning_summary;
+    let summary = config
+        .model_reasoning_summary
+        .unwrap_or(ReasoningSummary::Auto);
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
     let config = Arc::new(config);
@@ -167,7 +169,9 @@ async fn responses_stream_includes_subagent_header_on_other() {
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
     let effort = config.model_reasoning_effort;
-    let summary = config.model_reasoning_summary;
+    let summary = config
+        .model_reasoning_summary
+        .unwrap_or(ReasoningSummary::Auto);
     let model = codex_core::test_support::get_model_offline(config.model.as_deref());
     config.model = Some(model.clone());
     let config = Arc::new(config);
@@ -267,9 +271,11 @@ async fn responses_respects_model_info_overrides_from_config() {
     config.model_provider_id = provider.name.clone();
     config.model_provider = provider.clone();
     config.model_supports_reasoning_summaries = Some(true);
-    config.model_reasoning_summary = ReasoningSummary::Detailed;
+    config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
     let effort = config.model_reasoning_effort;
-    let summary = config.model_reasoning_summary;
+    let summary = config
+        .model_reasoning_summary
+        .unwrap_or(ReasoningSummary::Auto);
     let model = config.model.clone().expect("model configured");
     let config = Arc::new(config);
 
