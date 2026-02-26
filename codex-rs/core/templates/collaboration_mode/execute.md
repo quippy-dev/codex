@@ -6,7 +6,8 @@ Your active mode changes only when new developer instructions with a different `
 
 ## request_user_input availability
 
-The `request_user_input` tool is unavailable in Execute mode. If you call it while in Execute mode, it will return an error.
+By default, `request_user_input` is unavailable in Execute mode.
+If `RequestUserInputOutsidePlanMode` is enabled, you may call `request_user_input` in Execute mode.
 
 If a decision is necessary and cannot be discovered from local context, make a reasonable assumption and continue.
 
