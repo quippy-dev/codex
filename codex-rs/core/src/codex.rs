@@ -29,6 +29,8 @@ use crate::features::FEATURES;
 use crate::features::Feature;
 use crate::features::Features;
 use crate::features::maybe_push_unstable_features_warning;
+#[cfg(test)]
+use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
@@ -92,7 +94,6 @@ use codex_protocol::protocol::TurnContextNetworkItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
-use codex_protocol::skill_approval::SkillApprovalResponse;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_stream_parser::AssistantTextChunk;
@@ -153,8 +154,6 @@ use crate::error::Result as CodexResult;
 use crate::exec::StreamOutput;
 use codex_config::CONFIG_TOML_FILE;
 
-mod rollout_reconstruction;
-
 #[derive(Debug, PartialEq)]
 pub enum SteerInputError {
     NoActiveTurn(Vec<UserInput>),
@@ -199,7 +198,6 @@ use crate::protocol::ModelRerouteEvent;
 use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
-use crate::protocol::PatchApplyStatus;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReasoningContentDeltaEvent;
@@ -253,6 +251,7 @@ use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
+use crate::tools::js_repl::resolve_compatible_node;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
 use crate::tools::network_approval::build_network_policy_decider;
@@ -341,6 +340,18 @@ impl Codex {
             && depth >= config.agent_max_depth
         {
             config.features.disable(Feature::Collab);
+        }
+
+        if config.features.enabled(Feature::JsRepl)
+            && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
+        {
+            let message = format!(
+                "Disabled `js_repl` for this session because the configured Node runtime is unavailable or incompatible. {err}"
+            );
+            warn!("{message}");
+            config.features.disable(Feature::JsRepl);
+            config.features.disable(Feature::JsReplToolsOnly);
+            config.startup_warnings.push(message);
         }
 
         let allowed_skills_for_implicit_invocation =
@@ -1381,7 +1392,7 @@ impl Session {
             otel_manager,
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
-            execve_session_approvals: RwLock::new(HashSet::new()),
+            execve_session_approvals: RwLock::new(HashMap::new()),
             skills_manager,
             file_watcher,
             agent_control,
@@ -1652,6 +1663,16 @@ impl Session {
         state.clear_connector_selection();
     }
 
+    pub(crate) async fn latest_proposed_plan_text(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state.latest_proposed_plan_text()
+    }
+
+    pub(crate) async fn set_latest_proposed_plan_text(&self, plan_text: Option<String>) {
+        let mut state = self.state.lock().await;
+        state.set_latest_proposed_plan_text(plan_text);
+    }
+
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
         self.clear_mcp_tool_selection().await;
@@ -1672,19 +1693,23 @@ impl Session {
                 let rollout_items = resumed_history.history;
                 let restored_tool_selection =
                     Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
-                let reconstructed_rollout = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-                    .await;
-                let previous_model = reconstructed_rollout.previous_model.clone();
-                let latest_proposed_plan = reconstructed_rollout.latest_proposed_plan_text.clone();
+                let (previous_regular_turn_context_item, crossed_compaction_after_turn) =
+                    Self::last_rollout_regular_turn_context_lookup(&rollout_items);
+                let previous_model =
+                    previous_regular_turn_context_item.map(|ctx| ctx.model.clone());
                 let curr = turn_context.model_info.slug.as_str();
+                let reference_context_item = if !crossed_compaction_after_turn {
+                    previous_regular_turn_context_item.cloned()
+                } else {
+                    // Keep the baseline empty when compaction may have stripped the referenced
+                    // context diffs so the first resumed regular turn fully reinjects context.
+                    None
+                };
                 {
                     let mut state = self.state.lock().await;
-                    state.set_reference_context_item(reconstructed_rollout.reference_context_item);
+                    state.set_reference_context_item(reference_context_item);
                 }
                 self.set_previous_model(previous_model.clone()).await;
-                self.set_latest_proposed_plan_text(latest_proposed_plan)
-                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 if let Some(prev) = previous_model.as_deref().filter(|p| *p != curr) {
@@ -1702,7 +1727,9 @@ impl Session {
                 }
 
                 // Always add response items to conversation history
-                let reconstructed_history = reconstructed_rollout.history;
+                let reconstructed_history = self
+                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+                    .await;
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history, &turn_context)
                         .await;
@@ -1725,17 +1752,16 @@ impl Session {
             InitialHistory::Forked(rollout_items) => {
                 let restored_tool_selection =
                     Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
-                let reconstructed_rollout = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-                    .await;
-                let previous_model = reconstructed_rollout.previous_model.clone();
-                let latest_proposed_plan = reconstructed_rollout.latest_proposed_plan_text.clone();
+                let (previous_regular_turn_context_item, _) =
+                    Self::last_rollout_regular_turn_context_lookup(&rollout_items);
+                let previous_model =
+                    previous_regular_turn_context_item.map(|ctx| ctx.model.clone());
                 self.set_previous_model(previous_model).await;
-                self.set_latest_proposed_plan_text(latest_proposed_plan)
-                    .await;
 
                 // Always add response items to conversation history
-                let reconstructed_history = reconstructed_rollout.history;
+                let reconstructed_history = self
+                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+                    .await;
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history, &turn_context)
                         .await;
@@ -1772,6 +1798,150 @@ impl Session {
                 self.flush_rollout().await;
             }
         }
+    }
+
+    /// Returns `(last_turn_context_item, crossed_compaction_after_turn)` from the
+    /// rollback-adjusted rollout view.
+    ///
+    /// This relies on the invariant that only regular turns persist `TurnContextItem`.
+    /// `ThreadRolledBack` markers are applied so resume/fork uses the post-rollback history view.
+    ///
+    /// Returns `(None, false)` when no persisted `TurnContextItem` can be found.
+    ///
+    /// Older/minimal rollouts may only contain `RolloutItem::TurnContext` entries without turn
+    /// lifecycle events. In that case we fall back to the last `TurnContextItem` (plus whether a
+    /// later `Compacted` item appears in rollout order).
+    // TODO(ccunningham): Simplify this lookup by sharing rollout traversal/rollback application
+    // with `reconstruct_history_from_rollout` so resume/fork baseline hydration does not need a
+    // second bespoke rollout scan.
+    fn last_rollout_regular_turn_context_lookup(
+        rollout_items: &[RolloutItem],
+    ) -> (Option<&TurnContextItem>, bool) {
+        // Reverse scan over rollout items. `ThreadRolledBack(num_turns)` is naturally handled by
+        // skipping the next `num_turns` completed turn spans we encounter while walking backward.
+        //
+        // "Active turn" here means: we have seen `TurnComplete`/`TurnAborted` and are currently
+        // scanning backward through that completed turn until its matching `TurnStarted`.
+        let mut turns_to_skip_due_to_rollback = 0usize;
+        let mut saw_surviving_compaction_after_candidate = false;
+        let mut saw_turn_lifecycle_event = false;
+        let mut active_turn_id: Option<&str> = None;
+        let mut active_turn_saw_user_message = false;
+        let mut active_turn_context: Option<&TurnContextItem> = None;
+        let mut active_turn_contains_compaction = false;
+
+        for item in rollout_items.iter().rev() {
+            match item {
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    // Rollbacks count completed turns, not `TurnContextItem`s. We must continue
+                    // ignoring all items inside each skipped turn until we reach its
+                    // corresponding `TurnStarted`.
+                    let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
+                    turns_to_skip_due_to_rollback =
+                        turns_to_skip_due_to_rollback.saturating_add(num_turns);
+                }
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
+                    saw_turn_lifecycle_event = true;
+                    // Enter the reverse "turn span" for this completed turn.
+                    active_turn_id = Some(event.turn_id.as_str());
+                    active_turn_saw_user_message = false;
+                    active_turn_context = None;
+                    active_turn_contains_compaction = false;
+                }
+                RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => {
+                    saw_turn_lifecycle_event = true;
+                    // Same reverse-turn handling as `TurnComplete`. Some aborted turns may not
+                    // have a turn id; in that case we cannot match `TurnContextItem`s to them.
+                    active_turn_id = event.turn_id.as_deref();
+                    active_turn_saw_user_message = false;
+                    active_turn_context = None;
+                    active_turn_contains_compaction = false;
+                }
+                RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
+                    if active_turn_id.is_some() {
+                        active_turn_saw_user_message = true;
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                    saw_turn_lifecycle_event = true;
+                    if active_turn_id == Some(event.turn_id.as_str()) {
+                        let active_turn_is_rolled_back =
+                            active_turn_saw_user_message && turns_to_skip_due_to_rollback > 0;
+                        if active_turn_is_rolled_back {
+                            // `ThreadRolledBack(num_turns)` counts user turns, so only consume a
+                            // skip once we've confirmed this reverse-scanned turn span contains a
+                            // user message. Standalone task turns must not consume rollback skips.
+                            turns_to_skip_due_to_rollback -= 1;
+                        }
+                        if !active_turn_is_rolled_back {
+                            if let Some(context_item) = active_turn_context {
+                                return (
+                                    Some(context_item),
+                                    saw_surviving_compaction_after_candidate,
+                                );
+                            }
+                            // No `TurnContextItem` in this surviving turn; keep scanning older
+                            // turns, but remember if this turn compacted so the eventual
+                            // candidate reports "compaction happened after it".
+                            if active_turn_contains_compaction {
+                                saw_surviving_compaction_after_candidate = true;
+                            }
+                        }
+                        active_turn_id = None;
+                        active_turn_saw_user_message = false;
+                        active_turn_context = None;
+                        active_turn_contains_compaction = false;
+                    }
+                }
+                RolloutItem::TurnContext(ctx) => {
+                    // Capture the latest turn context seen in this reverse-scanned turn span. If
+                    // the turn later proves to be rolled back, we discard it when we hit the
+                    // matching `TurnStarted`. Older rollouts may have lifecycle events but omit
+                    // `TurnContextItem.turn_id`; accept those as belonging to the active turn
+                    // span for resume/fork hydration.
+                    if let Some(active_id) = active_turn_id
+                        && ctx
+                            .turn_id
+                            .as_deref()
+                            .is_none_or(|turn_id| turn_id == active_id)
+                    {
+                        // Reverse scan sees the latest `TurnContextItem` for the turn first.
+                        active_turn_context.get_or_insert(ctx);
+                    }
+                }
+                RolloutItem::Compacted(_) => {
+                    if active_turn_id.is_some() {
+                        // Compaction inside the currently scanned turn is only "after" the
+                        // eventual candidate if this turn has no `TurnContextItem` and we keep
+                        // scanning into older turns.
+                        active_turn_contains_compaction = true;
+                    } else {
+                        saw_surviving_compaction_after_candidate = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Legacy/minimal rollouts may only persist `TurnContextItem`/`Compacted` without turn
+        // lifecycle events. Fall back to the last `TurnContextItem` in rollout order so
+        // resume/fork can still hydrate `previous_model` and detect compaction-after-baseline.
+        if !saw_turn_lifecycle_event {
+            let mut saw_compaction_after_last_turn_context = false;
+            for item in rollout_items.iter().rev() {
+                match item {
+                    RolloutItem::Compacted(_) => {
+                        saw_compaction_after_last_turn_context = true;
+                    }
+                    RolloutItem::TurnContext(ctx) => {
+                        return (Some(ctx), saw_compaction_after_last_turn_context);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        (None, false)
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
@@ -1837,16 +2007,6 @@ impl Session {
     pub(crate) async fn set_previous_model(&self, previous_model: Option<String>) {
         let mut state = self.state.lock().await;
         state.set_previous_model(previous_model);
-    }
-
-    pub(crate) async fn latest_proposed_plan_text(&self) -> Option<String> {
-        let state = self.state.lock().await;
-        state.latest_proposed_plan_text()
-    }
-
-    pub(crate) async fn set_latest_proposed_plan_text(&self, plan_text: Option<String>) {
-        let mut state = self.state.lock().await;
-        state.set_latest_proposed_plan_text(plan_text);
     }
 
     fn maybe_refresh_shell_snapshot_for_cwd(
@@ -2271,10 +2431,6 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
-        if let TurnItem::Plan(plan_item) = &item {
-            self.set_latest_proposed_plan_text(Some(plan_item.text.clone()))
-                .await;
-        }
         self.send_event(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -2456,9 +2612,13 @@ impl Session {
 
     /// Emit an exec approval request event and await the user's decision.
     ///
-    /// The request is keyed by `call_id` + `approval_id` so matching responses are delivered
-    /// to the correct in-flight turn. If the task is aborted, this returns the
-    /// default `ReviewDecision` (`Denied`).
+    /// The request is keyed by `call_id` + `approval_id` so matching responses
+    /// are delivered to the correct in-flight turn. If the task is aborted,
+    /// this returns the default `ReviewDecision` (`Denied`).
+    ///
+    /// Note that if `available_decisions` is `None`, then the other fields will
+    /// be used to derive the available decisions via
+    /// [ExecApprovalRequestEvent::default_available_decisions].
     #[allow(clippy::too_many_arguments)]
     pub async fn request_command_approval(
         &self,
@@ -2471,6 +2631,7 @@ impl Session {
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
         additional_permissions: Option<PermissionProfile>,
+        available_decisions: Option<Vec<ReviewDecision>>,
     ) -> ReviewDecision {
         //  command-level approvals use `call_id`.
         // `approval_id` is only present for subcommand callbacks (execve intercept)
@@ -2504,6 +2665,14 @@ impl Session {
                 },
             ]
         });
+        let available_decisions = available_decisions.unwrap_or_else(|| {
+            ExecApprovalRequestEvent::default_available_decisions(
+                network_approval_context.as_ref(),
+                proposed_execpolicy_amendment.as_ref(),
+                proposed_network_policy_amendments.as_deref(),
+                additional_permissions.as_ref(),
+            )
+        });
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
             approval_id,
@@ -2515,6 +2684,7 @@ impl Session {
             proposed_execpolicy_amendment,
             proposed_network_policy_amendments,
             additional_permissions,
+            available_decisions: Some(available_decisions),
             parsed_cmd,
         });
         self.send_event(turn_context, event).await;
@@ -2589,40 +2759,6 @@ impl Session {
         rx_response.await.ok()
     }
 
-    pub async fn request_skill_approval(
-        &self,
-        turn_context: &TurnContext,
-        item_id: String,
-        skill_name: String,
-    ) -> Option<SkillApprovalResponse> {
-        let (tx_response, rx_response) = oneshot::channel();
-        let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_skill_approval(item_id.clone(), tx_response)
-                }
-                None => None,
-            }
-        };
-        if prev_entry.is_some() {
-            warn!("Overwriting existing pending skill approval for item_id: {item_id}");
-        }
-
-        self.send_event(
-            turn_context,
-            EventMsg::SkillRequestApproval(
-                codex_protocol::skill_approval::SkillRequestApprovalEvent {
-                    item_id,
-                    skill_name,
-                },
-            ),
-        )
-        .await;
-        rx_response.await.ok()
-    }
-
     pub async fn notify_user_input_response(
         &self,
         sub_id: &str,
@@ -2665,31 +2801,6 @@ impl Session {
             }
             None => {
                 warn!("No pending dynamic tool call found for call_id: {call_id}");
-            }
-        }
-    }
-
-    pub async fn notify_skill_approval_response(
-        &self,
-        item_id: &str,
-        response: SkillApprovalResponse,
-    ) {
-        let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.remove_pending_skill_approval(item_id)
-                }
-                None => None,
-            }
-        };
-        match entry {
-            Some(tx_response) => {
-                tx_response.send(response).ok();
-            }
-            None => {
-                warn!("No pending skill approval found for item_id: {item_id}");
             }
         }
     }
@@ -2739,6 +2850,42 @@ impl Session {
         self.record_into_history(items, turn_context).await;
         self.persist_rollout_response_items(items).await;
         self.send_raw_response_items(turn_context, items).await;
+    }
+
+    async fn reconstruct_history_from_rollout(
+        &self,
+        turn_context: &TurnContext,
+        rollout_items: &[RolloutItem],
+    ) -> Vec<ResponseItem> {
+        let mut history = ContextManager::new();
+        for item in rollout_items {
+            match item {
+                RolloutItem::ResponseItem(response_item) => {
+                    history.record_items(
+                        std::iter::once(response_item),
+                        turn_context.truncation_policy,
+                    );
+                }
+                RolloutItem::Compacted(compacted) => {
+                    if let Some(replacement) = &compacted.replacement_history {
+                        history.replace(replacement.clone());
+                    } else {
+                        let user_messages = collect_user_messages(history.raw_items());
+                        let rebuilt = compact::build_compacted_history(
+                            self.build_initial_context(turn_context).await,
+                            &user_messages,
+                            &compacted.message,
+                        );
+                        history.replace(rebuilt);
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    history.drop_last_n_user_turns(rollback.num_turns);
+                }
+                _ => {}
+            }
+        }
+        history.raw_items().to_vec()
     }
 
     /// Append ResponseItems to the in-memory conversation history only.
@@ -3561,9 +3708,6 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::DynamicToolResponse { id, response } => {
                 handlers::dynamic_tool_response(&sess, id, response).await;
             }
-            Op::SkillApproval { id, response } => {
-                handlers::skill_approval_response(&sess, id, response).await;
-            }
             Op::AddToHistory { text } => {
                 handlers::add_to_history(&sess, &config, text).await;
             }
@@ -3687,7 +3831,6 @@ mod handlers {
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::WarningEvent;
     use codex_protocol::request_user_input::RequestUserInputResponse;
-    use codex_protocol::skill_approval::SkillApprovalResponse;
 
     use crate::context_manager::is_user_turn_boundary;
     use codex_protocol::config_types::CollaborationMode;
@@ -3926,14 +4069,6 @@ mod handlers {
         response: DynamicToolResponse,
     ) {
         sess.notify_dynamic_tool_response(&id, response).await;
-    }
-
-    pub async fn skill_approval_response(
-        sess: &Arc<Session>,
-        id: String,
-        response: SkillApprovalResponse,
-    ) {
-        sess.notify_skill_approval_response(&id, response).await;
     }
 
     pub async fn add_to_history(sess: &Arc<Session>, config: &Arc<Config>, text: String) {
@@ -4280,35 +4415,6 @@ mod handlers {
             msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns }),
         })
         .await;
-
-        let latest_proposed_plan_text = {
-            let rollout_path = {
-                let rollout = sess.services.rollout.lock().await;
-                rollout
-                    .as_ref()
-                    .map(|recorder| recorder.rollout_path().to_path_buf())
-            };
-
-            if let Some(rollout_path) = rollout_path {
-                match crate::rollout::RolloutRecorder::load_rollout_items(&rollout_path).await {
-                    Ok((rollout_items, _, _)) => {
-                        sess.reconstruct_history_from_rollout(turn_context.as_ref(), &rollout_items)
-                            .await
-                            .latest_proposed_plan_text
-                    }
-                    Err(err) => {
-                        warn!(
-                            "failed to reload rollout after rollback for plan cache refresh: {err}"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
-        sess.set_latest_proposed_plan_text(latest_proposed_plan_text)
-            .await;
     }
 
     /// Persists the thread name in the session index, updates in-memory state, and emits
@@ -5669,46 +5775,79 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
             TurnItem::AgentMessage(item) => Some(agent_message_text(item)),
             _ => None,
         },
-        EventMsg::ExecCommandBegin(event) => {
-            let command = event.command.join(" ");
-            Some(format!(
-                "Exec command started: {command}\nWorking directory: {}",
-                event.cwd.display()
-            ))
-        }
-        EventMsg::PatchApplyBegin(event) => {
-            let mut files: Vec<String> = event
-                .changes
-                .keys()
-                .map(|path| path.display().to_string())
-                .collect();
-            files.sort();
-            let file_list = if files.is_empty() {
-                "none".to_string()
-            } else {
-                files.join(", ")
-            };
-            Some(format!(
-                "apply_patch started ({count} file change(s))\nFiles: {file_list}",
-                count = files.len()
-            ))
-        }
-        EventMsg::PatchApplyEnd(event) => {
-            let status = match event.status {
-                PatchApplyStatus::Completed => "completed",
-                PatchApplyStatus::Failed => "failed",
-                PatchApplyStatus::Declined => "declined",
-            };
-            let mut text = format!("apply_patch {status}");
-            if !event.stdout.is_empty() {
-                text.push_str(&format!("\nstdout:\n{}", event.stdout));
-            }
-            if !event.stderr.is_empty() {
-                text.push_str(&format!("\nstderr:\n{}", event.stderr));
-            }
-            Some(text)
-        }
-        _ => None,
+        EventMsg::Error(_)
+        | EventMsg::Warning(_)
+        | EventMsg::RealtimeConversationStarted(_)
+        | EventMsg::RealtimeConversationRealtime(_)
+        | EventMsg::RealtimeConversationClosed(_)
+        | EventMsg::ModelReroute(_)
+        | EventMsg::ContextCompacted(_)
+        | EventMsg::ThreadRolledBack(_)
+        | EventMsg::TurnStarted(_)
+        | EventMsg::TurnComplete(_)
+        | EventMsg::TokenCount(_)
+        | EventMsg::UserMessage(_)
+        | EventMsg::AgentMessageDelta(_)
+        | EventMsg::AgentReasoning(_)
+        | EventMsg::AgentReasoningDelta(_)
+        | EventMsg::AgentReasoningRawContent(_)
+        | EventMsg::AgentReasoningRawContentDelta(_)
+        | EventMsg::AgentReasoningSectionBreak(_)
+        | EventMsg::SessionConfigured(_)
+        | EventMsg::ThreadNameUpdated(_)
+        | EventMsg::McpStartupUpdate(_)
+        | EventMsg::McpStartupComplete(_)
+        | EventMsg::McpToolCallBegin(_)
+        | EventMsg::McpToolCallEnd(_)
+        | EventMsg::WebSearchBegin(_)
+        | EventMsg::WebSearchEnd(_)
+        | EventMsg::ExecCommandBegin(_)
+        | EventMsg::ExecCommandOutputDelta(_)
+        | EventMsg::TerminalInteraction(_)
+        | EventMsg::ExecCommandEnd(_)
+        | EventMsg::PatchApplyBegin(_)
+        | EventMsg::PatchApplyEnd(_)
+        | EventMsg::ViewImageToolCall(_)
+        | EventMsg::ExecApprovalRequest(_)
+        | EventMsg::RequestUserInput(_)
+        | EventMsg::DynamicToolCallRequest(_)
+        | EventMsg::DynamicToolCallResponse(_)
+        | EventMsg::ElicitationRequest(_)
+        | EventMsg::ApplyPatchApprovalRequest(_)
+        | EventMsg::DeprecationNotice(_)
+        | EventMsg::BackgroundEvent(_)
+        | EventMsg::UndoStarted(_)
+        | EventMsg::UndoCompleted(_)
+        | EventMsg::StreamError(_)
+        | EventMsg::TurnDiff(_)
+        | EventMsg::GetHistoryEntryResponse(_)
+        | EventMsg::McpListToolsResponse(_)
+        | EventMsg::ListCustomPromptsResponse(_)
+        | EventMsg::ListSkillsResponse(_)
+        | EventMsg::ListRemoteSkillsResponse(_)
+        | EventMsg::RemoteSkillDownloaded(_)
+        | EventMsg::SkillsUpdateAvailable
+        | EventMsg::PlanUpdate(_)
+        | EventMsg::TurnAborted(_)
+        | EventMsg::ShutdownComplete
+        | EventMsg::EnteredReviewMode(_)
+        | EventMsg::ExitedReviewMode(_)
+        | EventMsg::RawResponseItem(_)
+        | EventMsg::ItemStarted(_)
+        | EventMsg::AgentMessageContentDelta(_)
+        | EventMsg::PlanDelta(_)
+        | EventMsg::ReasoningContentDelta(_)
+        | EventMsg::ReasoningRawContentDelta(_)
+        | EventMsg::CollabAgentSpawnBegin(_)
+        | EventMsg::CollabAgentSpawnEnd(_)
+        | EventMsg::CollabAgentInteractionBegin(_)
+        | EventMsg::CollabAgentInteractionEnd(_)
+        | EventMsg::CollabWaitingBegin(_)
+        | EventMsg::CollabWaitingEnd(_)
+        | EventMsg::CollabCloseBegin(_)
+        | EventMsg::CollabCloseEnd(_)
+        | EventMsg::CollabResumeBegin(_)
+        | EventMsg::CollabResumeEnd(_) => None,
     }
 }
 
@@ -7024,7 +7163,7 @@ mod tests {
             .reconstruct_history_from_rollout(reconstruction_turn.as_ref(), &rollout_items)
             .await;
 
-        assert_eq!(expected, reconstructed.history);
+        assert_eq!(expected, reconstructed);
     }
 
     #[tokio::test]
@@ -7061,7 +7200,7 @@ mod tests {
             .reconstruct_history_from_rollout(&turn_context, &rollout_items)
             .await;
 
-        assert_eq!(reconstructed.history, replacement_history);
+        assert_eq!(reconstructed, replacement_history);
     }
 
     #[tokio::test]
@@ -7244,88 +7383,6 @@ mod tests {
 
         assert_eq!(session.previous_model().await, None);
         assert!(session.reference_context_item().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn record_initial_history_resumed_hydrates_latest_surviving_proposed_plan() {
-        let (session, _) = make_session_and_context().await;
-        let thread_id = ThreadId::new();
-        let rollout_items = vec![
-            RolloutItem::EventMsg(EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
-                    turn_id: "turn-1".to_string(),
-                    model_context_window: Some(128_000),
-                    collaboration_mode_kind: ModeKind::Plan,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
-                    message: "draft plan".to_string(),
-                    images: None,
-                    local_images: Vec::new(),
-                    text_elements: Vec::new(),
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id: thread_id.clone(),
-                turn_id: "turn-1".to_string(),
-                item: TurnItem::Plan(PlanItem {
-                    id: "turn-1-plan".to_string(),
-                    text: "- Keep this plan".to_string(),
-                }),
-            })),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(
-                codex_protocol::protocol::TurnCompleteEvent {
-                    turn_id: "turn-1".to_string(),
-                    last_agent_message: None,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
-                    turn_id: "turn-2".to_string(),
-                    model_context_window: Some(128_000),
-                    collaboration_mode_kind: ModeKind::Plan,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
-                    message: "new plan".to_string(),
-                    images: None,
-                    local_images: Vec::new(),
-                    text_elements: Vec::new(),
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id,
-                turn_id: "turn-2".to_string(),
-                item: TurnItem::Plan(PlanItem {
-                    id: "turn-2-plan".to_string(),
-                    text: "- Rolled-back plan".to_string(),
-                }),
-            })),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(
-                codex_protocol::protocol::TurnCompleteEvent {
-                    turn_id: "turn-2".to_string(),
-                    last_agent_message: None,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-            )),
-        ];
-
-        session
-            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
-                conversation_id: ThreadId::default(),
-                history: rollout_items,
-                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
-            }))
-            .await;
-
-        assert_eq!(
-            session.latest_proposed_plan_text().await,
-            Some("- Keep this plan".to_string())
-        );
     }
 
     #[tokio::test]
@@ -7648,8 +7705,6 @@ mod tests {
         sess.record_into_history(&turn_2, tc.as_ref()).await;
         sess.set_previous_model(Some("previous-regular-model".to_string()))
             .await;
-        sess.set_latest_proposed_plan_text(Some("- stale plan".to_string()))
-            .await;
 
         handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
 
@@ -7666,7 +7721,6 @@ mod tests {
             sess.previous_model().await,
             Some("previous-regular-model".to_string())
         );
-        assert_eq!(sess.latest_proposed_plan_text().await, None);
     }
 
     #[tokio::test]
@@ -8199,9 +8253,7 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig::default(),
         ));
         let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
         let model_info =
@@ -8278,9 +8330,7 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig::default(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -8366,7 +8416,7 @@ mod tests {
             otel_manager: otel_manager.clone(),
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
-            execve_session_approvals: RwLock::new(HashSet::new()),
+            execve_session_approvals: RwLock::new(HashMap::new()),
             skills_manager,
             file_watcher,
             agent_control,
@@ -8439,9 +8489,7 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig::default(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -8527,7 +8575,7 @@ mod tests {
             otel_manager: otel_manager.clone(),
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
-            execve_session_approvals: RwLock::new(HashSet::new()),
+            execve_session_approvals: RwLock::new(HashMap::new()),
             skills_manager,
             file_watcher,
             agent_control,
@@ -9375,23 +9423,20 @@ mod tests {
 
         let timeout_ms = 1000;
         let sandbox_permissions = SandboxPermissions::RequireEscalated;
-        let command = if cfg!(windows) {
-            vec![
-                "cmd.exe".to_string(),
-                "/C".to_string(),
-                "echo hi".to_string(),
-            ]
-        } else {
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo hi".to_string(),
-            ]
-        };
         let params = ExecParams {
-            command: command.clone(),
-            original_command: shlex::try_join(command.iter().map(String::as_str))
-                .unwrap_or_else(|_| command.join(" ")),
+            command: if cfg!(windows) {
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    "echo hi".to_string(),
+                ]
+            } else {
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo hi".to_string(),
+                ]
+            },
             cwd: turn_context.cwd.clone(),
             expiration: timeout_ms.into(),
             env: HashMap::new(),
@@ -9405,7 +9450,6 @@ mod tests {
         let params2 = ExecParams {
             sandbox_permissions: SandboxPermissions::UseDefault,
             command: params.command.clone(),
-            original_command: params.original_command.clone(),
             cwd: params.cwd.clone(),
             expiration: timeout_ms.into(),
             env: HashMap::new(),

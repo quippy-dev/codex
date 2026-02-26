@@ -41,7 +41,6 @@ use crate::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use crate::parse_command::ParsedCommand;
 use crate::plan_tool::UpdatePlanArgs;
 use crate::request_user_input::RequestUserInputResponse;
-use crate::skill_approval::SkillApprovalResponse;
 use crate::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
@@ -62,7 +61,6 @@ pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
 pub use crate::approvals::NetworkPolicyRuleAction;
 pub use crate::request_user_input::RequestUserInputEvent;
-pub use crate::skill_approval::SkillRequestApprovalEvent;
 
 /// Open/close tags for special user-input blocks. Used across crates to avoid
 /// duplicated hardcoded strings.
@@ -294,14 +292,6 @@ pub enum Op {
         id: String,
         /// Tool output payload.
         response: DynamicToolResponse,
-    },
-
-    /// Resolve a skill approval request.
-    SkillApproval {
-        /// Item id for the in-flight request.
-        id: String,
-        /// User decision.
-        response: SkillApprovalResponse,
     },
 
     /// Append an entry to the persistent cross-session message history.
@@ -1055,8 +1045,6 @@ pub enum EventMsg {
     DynamicToolCallRequest(DynamicToolCallRequest),
 
     DynamicToolCallResponse(DynamicToolCallResponseEvent),
-
-    SkillRequestApproval(SkillRequestApprovalEvent),
 
     ElicitationRequest(ElicitationRequestEvent),
 
@@ -2804,8 +2792,8 @@ pub enum ReviewDecision {
         proposed_execpolicy_amendment: ExecPolicyAmendment,
     },
 
-    /// User has approved this command and wants to automatically approve any
-    /// future identical instances (`command` and `cwd` match exactly) for the
+    /// User has approved this request and wants future prompts in the same
+    /// session-scoped approval cache to be automatically approved for the
     /// remainder of the session.
     ApprovedForSession,
 

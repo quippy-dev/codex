@@ -11,6 +11,7 @@ use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherEvent;
+use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -22,7 +23,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelsResponse;
-use codex_protocol::protocol::ForkReferenceItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
@@ -144,7 +144,7 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         session_source: SessionSource,
         model_catalog: Option<ModelsResponse>,
-        request_user_input_outside_plan_mode: bool,
+        collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
@@ -157,7 +157,7 @@ impl ThreadManager {
                     codex_home,
                     auth_manager.clone(),
                     model_catalog,
-                    request_user_input_outside_plan_mode,
+                    collaboration_modes_config,
                 )),
                 skills_manager,
                 file_watcher,
@@ -383,16 +383,7 @@ impl ThreadManager {
         persist_extended_history: bool,
     ) -> CodexResult<NewThread> {
         let history = RolloutRecorder::get_rollout_history(&path).await?;
-        let mut history = truncate_before_nth_user_message(history, nth_user_message);
-        if let InitialHistory::Forked(items) = &mut history {
-            items.insert(
-                0,
-                RolloutItem::ForkReference(ForkReferenceItem {
-                    rollout_path: path.clone(),
-                    nth_user_message,
-                }),
-            );
-        }
+        let history = truncate_before_nth_user_message(history, nth_user_message);
         self.state
             .spawn_thread(
                 config,

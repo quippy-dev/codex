@@ -328,6 +328,9 @@
             "connectors": {
               "type": "boolean"
             },
+            "default_mode_request_user_input": {
+              "type": "boolean"
+            },
             "elevated_windows_sandbox": {
               "type": "boolean"
             },
@@ -407,9 +410,6 @@
               "type": "boolean"
             },
             "shell_zsh_fork": {
-              "type": "boolean"
-            },
-            "skill_approval": {
               "type": "boolean"
             },
             "skill_env_var_dependency_prompt": {
@@ -1629,6 +1629,9 @@
         "connectors": {
           "type": "boolean"
         },
+        "default_mode_request_user_input": {
+          "type": "boolean"
+        },
         "elevated_windows_sandbox": {
           "type": "boolean"
         },
@@ -1708,9 +1711,6 @@
           "type": "boolean"
         },
         "shell_zsh_fork": {
-          "type": "boolean"
-        },
-        "skill_approval": {
           "type": "boolean"
         },
         "skill_env_var_dependency_prompt": {

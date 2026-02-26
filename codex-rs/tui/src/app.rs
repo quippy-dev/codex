@@ -47,6 +47,7 @@ use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::Feature;
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
@@ -828,22 +829,12 @@ impl App {
         let Some(active_id) = self.active_thread_id else {
             return;
         };
-        let Some(mut receiver) = self.active_thread_rx.take() else {
+        let Some(receiver) = self.active_thread_rx.take() else {
             return;
         };
         if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
             let mut store = channel.store.lock().await;
             store.active = false;
-            drop(store);
-            // Every queued thread event is written to `ThreadEventStore` before it is sent to this
-            // channel receiver. Drop parked backlog so thread-switch replay comes only from the
-            // filtered store snapshot and does not resurrect stale interactive prompts.
-            loop {
-                match receiver.try_recv() {
-                    Ok(_) => {}
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                }
-            }
             channel.receiver = Some(receiver);
         }
     }
@@ -1329,9 +1320,11 @@ impl App {
             auth_manager.clone(),
             SessionSource::Cli,
             config.model_catalog.clone(),
-            config
-                .features
-                .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
+            },
         ));
         let mut model = thread_manager
             .get_models_manager()
@@ -3547,120 +3540,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_active_thread_receiver_drains_queued_backlog() {
-        let mut app = make_test_app().await;
-        let thread_id = ThreadId::new();
-        app.thread_event_channels
-            .insert(thread_id, ThreadEventChannel::new(8));
-        app.activate_thread_channel(thread_id).await;
-
-        let event = Event {
-            id: "ev-1".to_string(),
-            msg: EventMsg::RequestUserInput(
-                codex_protocol::request_user_input::RequestUserInputEvent {
-                    call_id: "call-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    questions: Vec::new(),
-                },
-            ),
-        };
-
-        {
-            let channel = app
-                .thread_event_channels
-                .get(&thread_id)
-                .expect("missing thread channel");
-            let mut store = channel.store.lock().await;
-            store.push_event(event.clone());
-            channel
-                .sender
-                .try_send(event)
-                .expect("failed to enqueue stale event");
-        }
-
-        app.store_active_thread_receiver().await;
-
-        {
-            let channel = app
-                .thread_event_channels
-                .get(&thread_id)
-                .expect("missing thread channel");
-            let store = channel.store.lock().await;
-            assert!(
-                !store.active,
-                "thread should be inactive after parking receiver"
-            );
-        }
-
-        let channel = app
-            .thread_event_channels
-            .get_mut(&thread_id)
-            .expect("missing thread channel");
-        let receiver = channel
-            .receiver
-            .as_mut()
-            .expect("parked receiver should be restored to channel");
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
-            "parked receiver backlog should be drained"
-        );
-    }
-
-    #[tokio::test]
-    async fn activate_thread_for_replay_keeps_resolved_request_user_input_filtered() {
-        let mut app = make_test_app().await;
-        let thread_id = ThreadId::new();
-        app.thread_event_channels
-            .insert(thread_id, ThreadEventChannel::new(8));
-        app.activate_thread_channel(thread_id).await;
-
-        let request_event = Event {
-            id: "ev-1".to_string(),
-            msg: EventMsg::RequestUserInput(
-                codex_protocol::request_user_input::RequestUserInputEvent {
-                    call_id: "call-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    questions: Vec::new(),
-                },
-            ),
-        };
-
-        {
-            let channel = app
-                .thread_event_channels
-                .get(&thread_id)
-                .expect("missing thread channel");
-            let mut store = channel.store.lock().await;
-            store.push_event(request_event.clone());
-            store.note_outbound_op(&Op::UserInputAnswer {
-                id: "turn-1".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
-                    answers: std::collections::HashMap::new(),
-                },
-            });
-            channel
-                .sender
-                .try_send(request_event)
-                .expect("failed to enqueue stale event");
-        }
-
-        app.store_active_thread_receiver().await;
-        let (mut receiver, snapshot) = app
-            .activate_thread_for_replay(thread_id)
-            .await
-            .expect("failed to activate thread for replay");
-
-        assert!(
-            snapshot.events.is_empty(),
-            "resolved request_user_input prompt should be filtered from replay snapshot"
-        );
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
-            "stale queued prompt should not remain in receiver backlog after parking"
-        );
-    }
-
-    #[tokio::test]
     async fn refresh_pending_thread_approvals_only_lists_inactive_threads() {
         let mut app = make_test_app().await;
         let main_thread_id =
@@ -3690,6 +3569,7 @@ mod tests {
                         proposed_execpolicy_amendment: None,
                         proposed_network_policy_amendments: None,
                         additional_permissions: None,
+                        available_decisions: None,
                         parsed_cmd: Vec::new(),
                     },
                 ),
