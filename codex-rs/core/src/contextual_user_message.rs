@@ -30,14 +30,9 @@ impl ContextualUserFragmentDefinition {
 
     pub(crate) fn matches_text(&self, text: &str) -> bool {
         let trimmed = text.trim_start();
-        let starts_with_marker = trimmed
+        trimmed
             .get(..self.start_marker.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(self.start_marker));
-        let trimmed = trimmed.trim_end();
-        let ends_with_marker = trimmed
-            .get(trimmed.len().saturating_sub(self.end_marker.len())..)
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(self.end_marker));
-        starts_with_marker && ends_with_marker
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(self.start_marker))
     }
 
     pub(crate) const fn start_marker(&self) -> &'static str {
@@ -128,6 +123,14 @@ mod tests {
             SUBAGENT_NOTIFICATION_FRAGMENT
                 .matches_text("<SUBAGENT_NOTIFICATION>{}</subagent_notification>")
         );
+    }
+
+    #[test]
+    fn detects_truncated_user_shell_command_fragment_without_closing_tag() {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: "<user_shell_command>\n<command>\necho hi\n</command>\n<result>\nExit code: 0\n"
+                .to_string(),
+        }));
     }
 
     #[test]

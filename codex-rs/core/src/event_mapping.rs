@@ -350,6 +350,16 @@ mod tests {
                 end_turn: None,
                 phase: None,
             },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "<user_shell_command>\n<command>\necho 42\n</command>\n<result>\nOutput:\n"
+                        .to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
         ];
 
         for item in items {
