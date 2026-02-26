@@ -189,7 +189,7 @@ impl MessageProcessor {
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features
-                    .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
+                    .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
             },
         ));
         let cloud_requirements = Arc::new(RwLock::new(cloud_requirements));

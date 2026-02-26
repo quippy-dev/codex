@@ -2431,6 +2431,10 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
+        if let TurnItem::Plan(plan_item) = &item {
+            self.set_latest_proposed_plan_text(Some(plan_item.text.clone()))
+                .await;
+        }
         self.send_event(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {

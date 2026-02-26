@@ -354,7 +354,7 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
         codex_home.path(),
         &server.uri(),
         "never",
-        &BTreeMap::from([(Feature::DefaultModeRequestUserInput, true)]),
+        &BTreeMap::from([(Feature::RequestUserInputOutsidePlanMode, true)]),
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
@@ -447,7 +447,7 @@ async fn turn_start_uses_thread_feature_overrides_for_collaboration_mode_instruc
         .send_thread_start_request(ThreadStartParams {
             model: Some("gpt-5.2-codex".to_string()),
             config: Some(HashMap::from([(
-                "features.default_mode_request_user_input".to_string(),
+                "features.request_user_input_outside_plan_mode".to_string(),
                 json!(true),
             )])),
             ..Default::default()

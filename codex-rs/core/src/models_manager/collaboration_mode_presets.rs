@@ -19,7 +19,11 @@ const ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER: &str = "{{ASKING_QUESTIONS_GUIDANCE
 /// signatures.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CollaborationModesConfig {
-    /// Enables `request_user_input` availability in Default mode.
+    /// Enables `request_user_input` availability outside Plan mode.
+    ///
+    /// Keep the legacy field name for minimal churn; callers should source this
+    /// from `Feature::RequestUserInputOutsidePlanMode` so mode instructions stay
+    /// aligned with runtime tool gating.
     pub default_mode_request_user_input: bool,
 }
 
@@ -65,13 +69,14 @@ fn execute_preset() -> CollaborationModeMask {
 
 fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfig) -> String {
     let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
+    let request_user_input_outside_plan_mode =
+        collaboration_modes_config.default_mode_request_user_input;
     let request_user_input_availability = request_user_input_availability_message(
         ModeKind::Default,
-        collaboration_modes_config.default_mode_request_user_input,
+        request_user_input_outside_plan_mode,
     );
-    let asking_questions_guidance = asking_questions_guidance_message(
-        collaboration_modes_config.default_mode_request_user_input,
-    );
+    let asking_questions_guidance =
+        asking_questions_guidance_message(request_user_input_outside_plan_mode);
     COLLABORATION_MODE_DEFAULT
         .replace(KNOWN_MODE_NAMES_PLACEHOLDER, &known_mode_names)
         .replace(
@@ -96,11 +101,11 @@ fn format_mode_names(modes: &[ModeKind]) -> String {
 
 fn request_user_input_availability_message(
     mode: ModeKind,
-    default_mode_request_user_input: bool,
+    request_user_input_outside_plan_mode: bool,
 ) -> String {
     let mode_name = mode.display_name();
     if mode.allows_request_user_input()
-        || (default_mode_request_user_input && mode == ModeKind::Default)
+        || (request_user_input_outside_plan_mode && mode == ModeKind::Default)
     {
         format!("The `request_user_input` tool is available in {mode_name} mode.")
     } else {
@@ -110,8 +115,8 @@ fn request_user_input_availability_message(
     }
 }
 
-fn asking_questions_guidance_message(default_mode_request_user_input: bool) -> String {
-    if default_mode_request_user_input {
+fn asking_questions_guidance_message(request_user_input_outside_plan_mode: bool) -> String {
+    if request_user_input_outside_plan_mode {
         "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, prefer using the `request_user_input` tool rather than writing a multiple choice question as a textual assistant message. Never write a multiple choice question as a textual assistant message.".to_string()
     } else {
         "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.".to_string()
