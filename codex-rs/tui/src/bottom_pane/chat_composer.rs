@@ -1225,14 +1225,12 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
-        if matches!(key_event.kind, KeyEventKind::Release)
-            && matches!(key_event.code, KeyCode::Char(' '))
-        {
+        if matches!(key_event.kind, KeyEventKind::Release) {
             self.voice_state.key_release_supported = true;
         }
 
         // Timer-based conversion is handled in the pre-draw tick.
-        // If recording, stop on Space release once we've observed a Space release in this session.
+        // If recording, stop on Space release once we've observed a key release in this session.
         // Until then, Space repeat events are handled as "still held" and stop is driven by
         // timeout in `process_space_hold_trigger`.
         if let Some(result) = self.handle_key_event_while_recording(key_event) {
@@ -6348,6 +6346,49 @@ mod tests {
         assert_eq!("x ", composer.textarea.text());
         assert!(composer.voice_state.space_hold_started_at.is_none());
         assert!(!composer.voice_state.space_hold_repeat_seen);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn first_space_hold_without_repeat_uses_release_path_after_any_release() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyEventKind;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_voice_transcription_enabled(true);
+
+        composer.set_text_content("x ".to_string(), Vec::new(), Vec::new());
+        composer.move_cursor_to_end();
+
+        let _ = composer.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(composer.voice_state.key_release_supported);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(composer.voice_state.space_hold_started_at.is_some());
+        assert!(!composer.voice_state.space_hold_repeat_seen);
+
+        let _ = composer.on_space_hold_timeout();
+
+        assert_eq!("x ", composer.textarea.text());
+        assert!(composer.voice_state.space_hold_started_at.is_none());
+        assert!(!composer.voice_state.space_hold_repeat_seen);
+        if composer.is_recording() {
+            let _ = composer.stop_recording_and_start_transcription();
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
