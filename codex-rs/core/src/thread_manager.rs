@@ -11,6 +11,7 @@ use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherEvent;
+use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
@@ -144,7 +145,7 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         session_source: SessionSource,
         model_catalog: Option<ModelsResponse>,
-        request_user_input_outside_plan_mode: bool,
+        collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
@@ -157,7 +158,7 @@ impl ThreadManager {
                     codex_home,
                     auth_manager.clone(),
                     model_catalog,
-                    request_user_input_outside_plan_mode,
+                    collaboration_modes_config,
                 )),
                 skills_manager,
                 file_watcher,

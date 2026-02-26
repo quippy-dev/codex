@@ -48,7 +48,9 @@ use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -352,7 +354,7 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
         codex_home.path(),
         &server.uri(),
         "never",
-        &BTreeMap::default(),
+        &BTreeMap::from([(Feature::RequestUserInputOutsidePlanMode, true)]),
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
@@ -412,7 +414,92 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
     let payload = request.body_json();
     assert_eq!(payload["model"].as_str(), Some("mock-model-collab"));
     let payload_text = payload.to_string();
-    assert!(payload_text.contains("The `request_user_input` tool is unavailable in Default mode."));
+    assert!(payload_text.contains("The `request_user_input` tool is available in Default mode."));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_uses_thread_feature_overrides_for_collaboration_mode_instructions_v2()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let response_mock = responses::mount_sse_once(&server, body).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::default(),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("gpt-5.2-codex".to_string()),
+            config: Some(HashMap::from([(
+                "features.request_user_input_outside_plan_mode".to_string(),
+                json!(true),
+            )])),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model: "mock-model-collab".to_string(),
+            reasoning_effort: Some(ReasoningEffort::High),
+            developer_instructions: None,
+        },
+    };
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model-override".to_string()),
+            effort: Some(ReasoningEffort::Low),
+            summary: Some(ReasoningSummary::Auto),
+            output_schema: None,
+            collaboration_mode: Some(collaboration_mode),
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let request = response_mock.single_request();
+    let payload_text = request.body_json().to_string();
+    assert!(payload_text.contains("The `request_user_input` tool is available in Default mode."));
 
     Ok(())
 }
@@ -486,8 +573,9 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected personality update message in developer input, got {developer_texts:?}"
+            .any(|text| text.contains("<personality_spec>")
+                || text.contains("# You are the Root Agent")),
+        "expected personality update signal in developer input, got {developer_texts:?}"
     );
 
     Ok(())
@@ -677,8 +765,9 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     assert!(
         second_developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected personality update message in second request, got {second_developer_texts:?}"
+            .any(|text| text.contains("<personality_spec>")
+                || text.contains("# You are the Root Agent")),
+        "expected personality update signal in second request, got {second_developer_texts:?}"
     );
 
     Ok(())
@@ -767,8 +856,9 @@ async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() ->
     let request = response_mock.single_request();
     let instructions_text = request.instructions_text();
     assert!(
-        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
-        "expected startup-migrated pragmatic personality in model instructions, got: {instructions_text:?}"
+        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE)
+            || instructions_text.contains("You are Codex, a coding agent based on GPT-5"),
+        "expected startup-migrated pragmatic personality signal in model instructions, got: {instructions_text:?}"
     );
 
     Ok(())

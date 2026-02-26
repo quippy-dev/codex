@@ -61,9 +61,6 @@ use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 use codex_app_server_protocol::ReasoningTextDeltaNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
-use codex_app_server_protocol::SkillApprovalDecision as V2SkillApprovalDecision;
-use codex_app_server_protocol::SkillRequestApprovalParams;
-use codex_app_server_protocol::SkillRequestApprovalResponse;
 use codex_app_server_protocol::TerminalInteractionNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
@@ -114,7 +111,6 @@ use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
-use codex_protocol::skill_approval::SkillApprovalResponse as CoreSkillApprovalResponse;
 use codex_shell_command::parse_command::shlex_join;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -339,6 +335,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .note_permission_requested(&conversation_id.to_string())
                 .await;
             let approval_id_for_op = ev.effective_approval_id();
+            let available_decisions = ev
+                .effective_available_decisions()
+                .into_iter()
+                .map(CommandExecutionApprovalDecision::from)
+                .collect::<Vec<_>>();
             let ExecApprovalRequestEvent {
                 call_id,
                 approval_id,
@@ -435,6 +436,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         additional_permissions,
                         proposed_execpolicy_amendment: proposed_execpolicy_amendment_v2,
                         proposed_network_policy_amendments: proposed_network_policy_amendments_v2,
+                        available_decisions: Some(available_decisions),
                     };
                     let rx = outgoing
                         .send_request(ServerRequestPayload::CommandExecutionRequestApproval(
@@ -519,37 +521,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                 {
                     error!("failed to submit UserInputAnswer: {err}");
                 }
-            }
-        }
-        EventMsg::SkillRequestApproval(request) => {
-            if matches!(api_version, ApiVersion::V2) {
-                let item_id = request.item_id;
-                let skill_name = request.skill_name;
-                let params = SkillRequestApprovalParams {
-                    item_id: item_id.clone(),
-                    skill_name,
-                };
-                let rx = outgoing
-                    .send_request(ServerRequestPayload::SkillRequestApproval(params))
-                    .await;
-                tokio::spawn(async move {
-                    let approved = match rx.await {
-                        Ok(Ok(value)) => {
-                            serde_json::from_value::<SkillRequestApprovalResponse>(value)
-                                .map(|response| {
-                                    matches!(response.decision, V2SkillApprovalDecision::Approve)
-                                })
-                                .unwrap_or(false)
-                        }
-                        _ => false,
-                    };
-                    let _ = conversation
-                        .submit(Op::SkillApproval {
-                            id: item_id,
-                            response: CoreSkillApprovalResponse { approved },
-                        })
-                        .await;
-                });
             }
         }
         EventMsg::DynamicToolCallRequest(request) => {
@@ -2604,7 +2575,11 @@ mod tests {
         let event_turn_id = "complete1".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let thread_state = new_thread_state();
 
         handle_turn_complete(
@@ -2645,7 +2620,11 @@ mod tests {
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         handle_turn_interrupted(
             conversation_id,
@@ -2685,7 +2664,11 @@ mod tests {
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         handle_turn_complete(
             conversation_id,
@@ -2719,7 +2702,11 @@ mod tests {
     async fn test_handle_turn_plan_update_emits_notification_for_v2() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let update = UpdatePlanArgs {
             explanation: Some("need plan".to_string()),
             plan: vec![
@@ -2769,7 +2756,11 @@ mod tests {
         let turn_id = "turn-123".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         let info = TokenUsageInfo {
             total_token_usage: TokenUsage {
@@ -2853,7 +2844,11 @@ mod tests {
         let turn_id = "turn-456".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         handle_token_count_event(
             conversation_id,
@@ -2920,7 +2915,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         // Turn 1 on conversation A
         let a_turn1 = "a_turn1".to_string();
@@ -3143,7 +3142,11 @@ mod tests {
     async fn test_handle_turn_diff_emits_v2_notification() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let unified_diff = "--- a\n+++ b\n".to_string();
         let conversation_id = ThreadId::new();
 
@@ -3177,7 +3180,11 @@ mod tests {
     async fn test_handle_turn_diff_is_noop_for_v1() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let conversation_id = ThreadId::new();
 
         handle_turn_diff(

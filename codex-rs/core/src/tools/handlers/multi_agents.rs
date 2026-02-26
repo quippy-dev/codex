@@ -1863,6 +1863,7 @@ mod tests {
             .set(AskForApproval::OnRequest)
             .expect("approval policy should be set");
         turn.config = Arc::new(config);
+        let expected_model = turn.model_info.slug.clone();
 
         let invocation = invocation(
             Arc::new(session),
@@ -1899,7 +1900,7 @@ mod tests {
             .expect("spawned agent thread should exist")
             .config_snapshot()
             .await;
-        assert_eq!(snapshot.model, "gpt-5.2-codex");
+        assert_eq!(snapshot.model, expected_model);
         assert_eq!(snapshot.approval_policy, AskForApproval::Never);
     }
 

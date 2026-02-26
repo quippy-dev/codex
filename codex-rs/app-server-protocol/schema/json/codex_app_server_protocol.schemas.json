@@ -482,6 +482,30 @@
             },
             "method": {
               "enum": [
+                "thread/unsubscribe"
+              ],
+              "title": "Thread/unsubscribeRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadUnsubscribeParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/unsubscribeRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/name/set"
               ],
               "title": "Thread/name/setRequestMethod",
@@ -1349,7 +1373,7 @@
           "type": "string"
         },
         {
-          "description": "User approved the command and future identical commands should run without prompting.",
+          "description": "User approved the command and future prompts in the same session-scoped approval cache should run without prompting.",
           "enum": [
             "acceptForSession"
           ],
@@ -2750,6 +2774,16 @@
                 "null"
               ]
             },
+            "available_decisions": {
+              "description": "Ordered list of decisions the client may present for this prompt.\n\nWhen absent, clients should derive the legacy default set from the other fields on this request.",
+              "items": {
+                "$ref": "#/definitions/ReviewDecision"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "call_id": {
               "description": "Identifier for the associated command execution item.",
               "type": "string"
@@ -2957,30 +2991,6 @@
             "type"
           ],
           "title": "DynamicToolCallResponseEventMsg",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "item_id": {
-              "type": "string"
-            },
-            "skill_name": {
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "skill_request_approval"
-              ],
-              "title": "SkillRequestApprovalEventMsgType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "item_id",
-            "skill_name",
-            "type"
-          ],
-          "title": "SkillRequestApprovalEventMsg",
           "type": "object"
         },
         {
@@ -5616,7 +5626,7 @@
           "type": "object"
         },
         {
-          "description": "User has approved this command and wants to automatically approve any future identical instances (`command` and `cwd` match exactly) for the remainder of the session.",
+          "description": "User has approved this request and wants future prompts in the same session-scoped approval cache to be automatically approved for the remainder of the session.",
           "enum": [
             "approved_for_session"
           ],
@@ -5841,6 +5851,26 @@
             "params"
           ],
           "title": "Thread/unarchivedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/closed"
+              ],
+              "title": "Thread/closedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadClosedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/closedNotification",
           "type": "object"
         },
         {
@@ -6629,30 +6659,6 @@
           "type": "object"
         },
         {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "skill/requestApproval"
-              ],
-              "title": "Skill/requestApprovalRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/SkillRequestApprovalParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Skill/requestApprovalRequest",
-          "type": "object"
-        },
-        {
           "description": "Execute a dynamic tool call on the client.",
           "properties": {
             "id": {
@@ -6771,43 +6777,6 @@
         "http_addr",
         "socks_addr"
       ],
-      "type": "object"
-    },
-    "SkillApprovalDecision": {
-      "enum": [
-        "approve",
-        "decline"
-      ],
-      "type": "string"
-    },
-    "SkillRequestApprovalParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "itemId": {
-          "type": "string"
-        },
-        "skillName": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "itemId",
-        "skillName"
-      ],
-      "title": "SkillRequestApprovalParams",
-      "type": "object"
-    },
-    "SkillRequestApprovalResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "decision": {
-          "$ref": "#/definitions/SkillApprovalDecision"
-        }
-      },
-      "required": [
-        "decision"
-      ],
-      "title": "SkillRequestApprovalResponse",
       "type": "object"
     },
     "StepStatus": {
@@ -8104,14 +8073,8 @@
         "type": "object"
       },
       "CollaborationModeMask": {
-        "description": "A mask for collaboration mode settings, allowing partial updates. All fields except `name` are optional, enabling selective updates.",
+        "description": "EXPERIMENTAL - collaboration mode preset metadata for clients.",
         "properties": {
-          "developer_instructions": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "mode": {
             "anyOf": [
               {
@@ -12542,6 +12505,19 @@
         "title": "ThreadArchivedNotification",
         "type": "object"
       },
+      "ThreadClosedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadClosedNotification",
+        "type": "object"
+      },
       "ThreadCompactStartParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -14082,6 +14058,40 @@
         ],
         "title": "ThreadUnarchivedNotification",
         "type": "object"
+      },
+      "ThreadUnsubscribeParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadUnsubscribeParams",
+        "type": "object"
+      },
+      "ThreadUnsubscribeResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "status": {
+            "$ref": "#/definitions/v2/ThreadUnsubscribeStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ThreadUnsubscribeResponse",
+        "type": "object"
+      },
+      "ThreadUnsubscribeStatus": {
+        "enum": [
+          "notLoaded",
+          "notSubscribed",
+          "unsubscribed"
+        ],
+        "type": "string"
       },
       "TokenUsageBreakdown": {
         "properties": {

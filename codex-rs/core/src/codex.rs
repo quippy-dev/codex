@@ -31,6 +31,8 @@ use crate::features::FEATURES;
 use crate::features::Feature;
 use crate::features::Features;
 use crate::features::maybe_push_unstable_features_warning;
+#[cfg(test)]
+use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
@@ -94,7 +96,6 @@ use codex_protocol::protocol::TurnContextNetworkItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
-use codex_protocol::skill_approval::SkillApprovalResponse;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_stream_parser::AssistantTextChunk;
@@ -219,7 +220,6 @@ use crate::protocol::ModelRerouteEvent;
 use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
-use crate::protocol::PatchApplyStatus;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReasoningContentDeltaEvent;
@@ -273,6 +273,7 @@ use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
+use crate::tools::js_repl::resolve_compatible_node;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
 use crate::tools::network_approval::build_network_policy_decider;
@@ -391,6 +392,18 @@ impl Codex {
             && depth >= config.agent_max_depth
         {
             config.features.disable(Feature::Collab);
+        }
+
+        if config.features.enabled(Feature::JsRepl)
+            && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
+        {
+            let message = format!(
+                "Disabled `js_repl` for this session because the configured Node runtime is unavailable or incompatible. {err}"
+            );
+            warn!("{message}");
+            config.features.disable(Feature::JsRepl);
+            config.features.disable(Feature::JsReplToolsOnly);
+            config.startup_warnings.push(message);
         }
 
         let allowed_skills_for_implicit_invocation =
@@ -1461,7 +1474,7 @@ impl Session {
             otel_manager,
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
-            execve_session_approvals: RwLock::new(HashSet::new()),
+            execve_session_approvals: RwLock::new(HashMap::new()),
             skills_manager,
             file_watcher,
             agent_control,
@@ -1782,6 +1795,16 @@ impl Session {
         state.clear_connector_selection();
     }
 
+    pub(crate) async fn latest_proposed_plan_text(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state.latest_proposed_plan_text()
+    }
+
+    pub(crate) async fn set_latest_proposed_plan_text(&self, plan_text: Option<String>) {
+        let mut state = self.state.lock().await;
+        state.set_latest_proposed_plan_text(plan_text);
+    }
+
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
         self.clear_mcp_tool_selection().await;
@@ -1980,16 +2003,6 @@ impl Session {
     pub(crate) async fn set_previous_model(&self, previous_model: Option<String>) {
         let mut state = self.state.lock().await;
         state.set_previous_model(previous_model);
-    }
-
-    pub(crate) async fn latest_proposed_plan_text(&self) -> Option<String> {
-        let state = self.state.lock().await;
-        state.latest_proposed_plan_text()
-    }
-
-    pub(crate) async fn set_latest_proposed_plan_text(&self, plan_text: Option<String>) {
-        let mut state = self.state.lock().await;
-        state.set_latest_proposed_plan_text(plan_text);
     }
 
     fn maybe_refresh_shell_snapshot_for_cwd(
@@ -2599,9 +2612,13 @@ impl Session {
 
     /// Emit an exec approval request event and await the user's decision.
     ///
-    /// The request is keyed by `call_id` + `approval_id` so matching responses are delivered
-    /// to the correct in-flight turn. If the task is aborted, this returns the
-    /// default `ReviewDecision` (`Denied`).
+    /// The request is keyed by `call_id` + `approval_id` so matching responses
+    /// are delivered to the correct in-flight turn. If the task is aborted,
+    /// this returns the default `ReviewDecision` (`Denied`).
+    ///
+    /// Note that if `available_decisions` is `None`, then the other fields will
+    /// be used to derive the available decisions via
+    /// [ExecApprovalRequestEvent::default_available_decisions].
     #[allow(clippy::too_many_arguments)]
     pub async fn request_command_approval(
         &self,
@@ -2614,6 +2631,7 @@ impl Session {
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
         additional_permissions: Option<PermissionProfile>,
+        available_decisions: Option<Vec<ReviewDecision>>,
     ) -> ReviewDecision {
         // command-level approvals use `call_id`.
         // `approval_id` is only present for subcommand callbacks (execve intercept).
@@ -2647,6 +2665,14 @@ impl Session {
                 },
             ]
         });
+        let available_decisions = available_decisions.unwrap_or_else(|| {
+            ExecApprovalRequestEvent::default_available_decisions(
+                network_approval_context.as_ref(),
+                proposed_execpolicy_amendment.as_ref(),
+                proposed_network_policy_amendments.as_deref(),
+                additional_permissions.as_ref(),
+            )
+        });
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
             approval_id,
@@ -2658,6 +2684,7 @@ impl Session {
             proposed_execpolicy_amendment,
             proposed_network_policy_amendments,
             additional_permissions,
+            available_decisions: Some(available_decisions),
             parsed_cmd,
         });
         self.send_event(turn_context, event).await;
@@ -2732,40 +2759,6 @@ impl Session {
         rx_response.await.ok()
     }
 
-    pub async fn request_skill_approval(
-        &self,
-        turn_context: &TurnContext,
-        item_id: String,
-        skill_name: String,
-    ) -> Option<SkillApprovalResponse> {
-        let (tx_response, rx_response) = oneshot::channel();
-        let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_skill_approval(item_id.clone(), tx_response)
-                }
-                None => None,
-            }
-        };
-        if prev_entry.is_some() {
-            warn!("Overwriting existing pending skill approval for item_id: {item_id}");
-        }
-
-        self.send_event(
-            turn_context,
-            EventMsg::SkillRequestApproval(
-                codex_protocol::skill_approval::SkillRequestApprovalEvent {
-                    item_id,
-                    skill_name,
-                },
-            ),
-        )
-        .await;
-        rx_response.await.ok()
-    }
-
     pub async fn notify_user_input_response(
         &self,
         sub_id: &str,
@@ -2808,31 +2801,6 @@ impl Session {
             }
             None => {
                 warn!("No pending dynamic tool call found for call_id: {call_id}");
-            }
-        }
-    }
-
-    pub async fn notify_skill_approval_response(
-        &self,
-        item_id: &str,
-        response: SkillApprovalResponse,
-    ) {
-        let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.remove_pending_skill_approval(item_id)
-                }
-                None => None,
-            }
-        };
-        match entry {
-            Some(tx_response) => {
-                tx_response.send(response).ok();
-            }
-            None => {
-                warn!("No pending skill approval found for item_id: {item_id}");
             }
         }
     }
@@ -3757,9 +3725,6 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::DynamicToolResponse { id, response } => {
                 handlers::dynamic_tool_response(&sess, id, response).await;
             }
-            Op::SkillApproval { id, response } => {
-                handlers::skill_approval_response(&sess, id, response).await;
-            }
             Op::AddToHistory { text } => {
                 handlers::add_to_history(&sess, &config, text).await;
             }
@@ -3920,7 +3885,6 @@ mod handlers {
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::WarningEvent;
     use codex_protocol::request_user_input::RequestUserInputResponse;
-    use codex_protocol::skill_approval::SkillApprovalResponse;
 
     use crate::context_manager::is_user_turn_boundary;
     use crate::parse_turn_item;
@@ -4238,14 +4202,6 @@ mod handlers {
         response: DynamicToolResponse,
     ) {
         sess.notify_dynamic_tool_response(&id, response).await;
-    }
-
-    pub async fn skill_approval_response(
-        sess: &Arc<Session>,
-        id: String,
-        response: SkillApprovalResponse,
-    ) {
-        sess.notify_skill_approval_response(&id, response).await;
     }
 
     pub async fn add_to_history(sess: &Arc<Session>, config: &Arc<Config>, text: String) {
@@ -4592,35 +4548,6 @@ mod handlers {
             msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns }),
         })
         .await;
-
-        let latest_proposed_plan_text = {
-            let rollout_path = {
-                let rollout = sess.services.rollout.lock().await;
-                rollout
-                    .as_ref()
-                    .map(|recorder| recorder.rollout_path().to_path_buf())
-            };
-
-            if let Some(rollout_path) = rollout_path {
-                match crate::rollout::RolloutRecorder::load_rollout_items(&rollout_path).await {
-                    Ok((rollout_items, _, _)) => {
-                        sess.reconstruct_history_from_rollout(turn_context.as_ref(), &rollout_items)
-                            .await
-                            .latest_proposed_plan_text
-                    }
-                    Err(err) => {
-                        warn!(
-                            "failed to reload rollout after rollback for plan cache refresh: {err}"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        };
-        sess.set_latest_proposed_plan_text(latest_proposed_plan_text)
-            .await;
     }
 
     /// Persists the thread name in the session index, updates in-memory state, and emits
@@ -5979,46 +5906,79 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
             TurnItem::AgentMessage(item) => Some(agent_message_text(item)),
             _ => None,
         },
-        EventMsg::ExecCommandBegin(event) => {
-            let command = event.command.join(" ");
-            Some(format!(
-                "Exec command started: {command}\nWorking directory: {}",
-                event.cwd.display()
-            ))
-        }
-        EventMsg::PatchApplyBegin(event) => {
-            let mut files: Vec<String> = event
-                .changes
-                .keys()
-                .map(|path| path.display().to_string())
-                .collect();
-            files.sort();
-            let file_list = if files.is_empty() {
-                "none".to_string()
-            } else {
-                files.join(", ")
-            };
-            Some(format!(
-                "apply_patch started ({count} file change(s))\nFiles: {file_list}",
-                count = files.len()
-            ))
-        }
-        EventMsg::PatchApplyEnd(event) => {
-            let status = match event.status {
-                PatchApplyStatus::Completed => "completed",
-                PatchApplyStatus::Failed => "failed",
-                PatchApplyStatus::Declined => "declined",
-            };
-            let mut text = format!("apply_patch {status}");
-            if !event.stdout.is_empty() {
-                text.push_str(&format!("\nstdout:\n{}", event.stdout));
-            }
-            if !event.stderr.is_empty() {
-                text.push_str(&format!("\nstderr:\n{}", event.stderr));
-            }
-            Some(text)
-        }
-        _ => None,
+        EventMsg::Error(_)
+        | EventMsg::Warning(_)
+        | EventMsg::RealtimeConversationStarted(_)
+        | EventMsg::RealtimeConversationRealtime(_)
+        | EventMsg::RealtimeConversationClosed(_)
+        | EventMsg::ModelReroute(_)
+        | EventMsg::ContextCompacted(_)
+        | EventMsg::ThreadRolledBack(_)
+        | EventMsg::TurnStarted(_)
+        | EventMsg::TurnComplete(_)
+        | EventMsg::TokenCount(_)
+        | EventMsg::UserMessage(_)
+        | EventMsg::AgentMessageDelta(_)
+        | EventMsg::AgentReasoning(_)
+        | EventMsg::AgentReasoningDelta(_)
+        | EventMsg::AgentReasoningRawContent(_)
+        | EventMsg::AgentReasoningRawContentDelta(_)
+        | EventMsg::AgentReasoningSectionBreak(_)
+        | EventMsg::SessionConfigured(_)
+        | EventMsg::ThreadNameUpdated(_)
+        | EventMsg::McpStartupUpdate(_)
+        | EventMsg::McpStartupComplete(_)
+        | EventMsg::McpToolCallBegin(_)
+        | EventMsg::McpToolCallEnd(_)
+        | EventMsg::WebSearchBegin(_)
+        | EventMsg::WebSearchEnd(_)
+        | EventMsg::ExecCommandBegin(_)
+        | EventMsg::ExecCommandOutputDelta(_)
+        | EventMsg::TerminalInteraction(_)
+        | EventMsg::ExecCommandEnd(_)
+        | EventMsg::PatchApplyBegin(_)
+        | EventMsg::PatchApplyEnd(_)
+        | EventMsg::ViewImageToolCall(_)
+        | EventMsg::ExecApprovalRequest(_)
+        | EventMsg::RequestUserInput(_)
+        | EventMsg::DynamicToolCallRequest(_)
+        | EventMsg::DynamicToolCallResponse(_)
+        | EventMsg::ElicitationRequest(_)
+        | EventMsg::ApplyPatchApprovalRequest(_)
+        | EventMsg::DeprecationNotice(_)
+        | EventMsg::BackgroundEvent(_)
+        | EventMsg::UndoStarted(_)
+        | EventMsg::UndoCompleted(_)
+        | EventMsg::StreamError(_)
+        | EventMsg::TurnDiff(_)
+        | EventMsg::GetHistoryEntryResponse(_)
+        | EventMsg::McpListToolsResponse(_)
+        | EventMsg::ListCustomPromptsResponse(_)
+        | EventMsg::ListSkillsResponse(_)
+        | EventMsg::ListRemoteSkillsResponse(_)
+        | EventMsg::RemoteSkillDownloaded(_)
+        | EventMsg::SkillsUpdateAvailable
+        | EventMsg::PlanUpdate(_)
+        | EventMsg::TurnAborted(_)
+        | EventMsg::ShutdownComplete
+        | EventMsg::EnteredReviewMode(_)
+        | EventMsg::ExitedReviewMode(_)
+        | EventMsg::RawResponseItem(_)
+        | EventMsg::ItemStarted(_)
+        | EventMsg::AgentMessageContentDelta(_)
+        | EventMsg::PlanDelta(_)
+        | EventMsg::ReasoningContentDelta(_)
+        | EventMsg::ReasoningRawContentDelta(_)
+        | EventMsg::CollabAgentSpawnBegin(_)
+        | EventMsg::CollabAgentSpawnEnd(_)
+        | EventMsg::CollabAgentInteractionBegin(_)
+        | EventMsg::CollabAgentInteractionEnd(_)
+        | EventMsg::CollabWaitingBegin(_)
+        | EventMsg::CollabWaitingEnd(_)
+        | EventMsg::CollabCloseBegin(_)
+        | EventMsg::CollabCloseEnd(_)
+        | EventMsg::CollabResumeBegin(_)
+        | EventMsg::CollabResumeEnd(_) => None,
     }
 }
 
@@ -7570,88 +7530,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_initial_history_resumed_hydrates_latest_surviving_proposed_plan() {
-        let (session, _) = make_session_and_context().await;
-        let thread_id = ThreadId::new();
-        let rollout_items = vec![
-            RolloutItem::EventMsg(EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
-                    turn_id: "turn-1".to_string(),
-                    model_context_window: Some(128_000),
-                    collaboration_mode_kind: ModeKind::Plan,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
-                    message: "draft plan".to_string(),
-                    images: None,
-                    local_images: Vec::new(),
-                    text_elements: Vec::new(),
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id: thread_id.clone(),
-                turn_id: "turn-1".to_string(),
-                item: TurnItem::Plan(PlanItem {
-                    id: "turn-1-plan".to_string(),
-                    text: "- Keep this plan".to_string(),
-                }),
-            })),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(
-                codex_protocol::protocol::TurnCompleteEvent {
-                    turn_id: "turn-1".to_string(),
-                    last_agent_message: None,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
-                    turn_id: "turn-2".to_string(),
-                    model_context_window: Some(128_000),
-                    collaboration_mode_kind: ModeKind::Plan,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
-                    message: "new plan".to_string(),
-                    images: None,
-                    local_images: Vec::new(),
-                    text_elements: Vec::new(),
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
-                thread_id,
-                turn_id: "turn-2".to_string(),
-                item: TurnItem::Plan(PlanItem {
-                    id: "turn-2-plan".to_string(),
-                    text: "- Rolled-back plan".to_string(),
-                }),
-            })),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(
-                codex_protocol::protocol::TurnCompleteEvent {
-                    turn_id: "turn-2".to_string(),
-                    last_agent_message: None,
-                },
-            )),
-            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-            )),
-        ];
-
-        session
-            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
-                conversation_id: ThreadId::default(),
-                history: rollout_items,
-                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
-            }))
-            .await;
-
-        assert_eq!(
-            session.latest_proposed_plan_text().await,
-            Some("- Keep this plan".to_string())
-        );
-    }
-
-    #[tokio::test]
     async fn record_initial_history_resumed_seeds_reference_context_item_without_compaction() {
         let (session, turn_context) = make_session_and_context().await;
         let previous_context_item = turn_context.to_turn_context_item();
@@ -7971,8 +7849,6 @@ mod tests {
         sess.record_into_history(&turn_2, tc.as_ref()).await;
         sess.set_previous_model(Some("previous-regular-model".to_string()))
             .await;
-        sess.set_latest_proposed_plan_text(Some("- stale plan".to_string()))
-            .await;
 
         handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
 
@@ -7989,7 +7865,6 @@ mod tests {
             sess.previous_model().await,
             Some("previous-regular-model".to_string())
         );
-        assert_eq!(sess.latest_proposed_plan_text().await, None);
     }
 
     #[tokio::test]
@@ -8522,9 +8397,7 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig::default(),
         ));
         let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
         let model_info =
@@ -8603,9 +8476,11 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::RequestUserInputOutsidePlanMode),
+            },
         ));
         let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
         let model_info =
@@ -8684,9 +8559,7 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig::default(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -8772,7 +8645,7 @@ mod tests {
             otel_manager: otel_manager.clone(),
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
-            execve_session_approvals: RwLock::new(HashSet::new()),
+            execve_session_approvals: RwLock::new(HashMap::new()),
             skills_manager,
             file_watcher,
             agent_control,
@@ -8848,9 +8721,7 @@ mod tests {
             config.codex_home.clone(),
             auth_manager.clone(),
             None,
-            config
-                .features
-                .enabled(Feature::RequestUserInputOutsidePlanMode),
+            CollaborationModesConfig::default(),
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
@@ -8936,7 +8807,7 @@ mod tests {
             otel_manager: otel_manager.clone(),
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
-            execve_session_approvals: RwLock::new(HashSet::new()),
+            execve_session_approvals: RwLock::new(HashMap::new()),
             skills_manager,
             file_watcher,
             agent_control,
@@ -10097,23 +9968,20 @@ mod tests {
 
         let timeout_ms = 1000;
         let sandbox_permissions = SandboxPermissions::RequireEscalated;
-        let command = if cfg!(windows) {
-            vec![
-                "cmd.exe".to_string(),
-                "/C".to_string(),
-                "echo hi".to_string(),
-            ]
-        } else {
-            vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "echo hi".to_string(),
-            ]
-        };
         let params = ExecParams {
-            command: command.clone(),
-            original_command: shlex::try_join(command.iter().map(String::as_str))
-                .unwrap_or_else(|_| command.join(" ")),
+            command: if cfg!(windows) {
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    "echo hi".to_string(),
+                ]
+            } else {
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo hi".to_string(),
+                ]
+            },
             cwd: turn_context.cwd.clone(),
             expiration: timeout_ms.into(),
             env: HashMap::new(),
@@ -10127,7 +9995,6 @@ mod tests {
         let params2 = ExecParams {
             sandbox_permissions: SandboxPermissions::UseDefault,
             command: params.command.clone(),
-            original_command: params.original_command.clone(),
             cwd: params.cwd.clone(),
             expiration: timeout_ms.into(),
             env: HashMap::new(),
