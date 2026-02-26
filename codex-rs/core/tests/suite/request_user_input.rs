@@ -233,6 +233,9 @@ where
     } = builder
         .with_config(|config| {
             config.features.enable(Feature::CollaborationModes);
+            config
+                .features
+                .disable(Feature::RequestUserInputOutsidePlanMode);
         })
         .build(&server)
         .await?;

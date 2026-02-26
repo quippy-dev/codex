@@ -273,7 +273,7 @@ async fn assistant_memory_citations_update_usage_and_reorder_phase2_selection() 
     seed_stage1_output(&test, cited_thread, owner, "workspace-cited", 100).await?;
     seed_stage1_output(&test, uncited_thread, owner, "workspace-uncited", 200).await?;
 
-    let initial_selection = db.get_phase2_input_selection(1).await?;
+    let initial_selection = db.get_phase2_input_selection(1, 36_500).await?;
     assert_eq!(
         initial_selection
             .selected
@@ -314,7 +314,7 @@ async fn assistant_memory_citations_update_usage_and_reorder_phase2_selection() 
         "usage-only citation should re-dirty phase 2"
     );
 
-    let updated_selection = db.get_phase2_input_selection(1).await?;
+    let updated_selection = db.get_phase2_input_selection(1, 36_500).await?;
     assert_eq!(
         updated_selection
             .selected

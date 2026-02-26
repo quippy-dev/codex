@@ -558,9 +558,6 @@ impl ChatComposer {
         self.collaboration_modes_enabled = enabled;
     }
 
-    #[cfg(test)]
-    pub fn set_steer_enabled(&mut self, _enabled: bool) {}
-
     pub fn set_connectors_enabled(&mut self, enabled: bool) {
         self.connectors_enabled = enabled;
     }

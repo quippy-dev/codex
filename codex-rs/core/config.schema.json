@@ -634,7 +634,7 @@
           "type": "integer"
         },
         "max_unused_days": {
-          "description": "Maximum age of a phase-1 memory's last use before phase 2 stops selecting it.",
+          "description": "Maximum number of days since a memory was last used before it becomes ineligible for phase 2 selection.",
           "format": "int64",
           "type": "integer"
         },

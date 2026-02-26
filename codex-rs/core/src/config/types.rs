@@ -364,7 +364,7 @@ pub struct FeedbackConfigToml {
 pub struct MemoriesToml {
     /// Maximum number of recent raw memories retained for global consolidation.
     pub max_raw_memories_for_global: Option<usize>,
-    /// Maximum age of a phase-1 memory's last use before phase 2 stops selecting it.
+    /// Maximum number of days since a memory was last used before it becomes ineligible for phase 2 selection.
     pub max_unused_days: Option<i64>,
     /// Maximum age of the threads used for memories.
     pub max_rollout_age_days: Option<i64>,
