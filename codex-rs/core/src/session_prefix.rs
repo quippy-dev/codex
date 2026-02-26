@@ -42,15 +42,9 @@ pub(crate) fn format_subagent_notification_message(agent_id: &str, status: &Agen
 
 pub(crate) fn parse_subagent_notification(text: &str) -> Option<SubagentNotification> {
     let trimmed = text.trim();
-    if !starts_with_ascii_case_insensitive(trimmed, SUBAGENT_NOTIFICATION_OPEN_TAG) {
-        return None;
-    }
-    let end_index = trimmed.find(SUBAGENT_NOTIFICATION_CLOSE_TAG)?;
-    let open_tag_len = SUBAGENT_NOTIFICATION_OPEN_TAG.len();
-    if end_index <= open_tag_len {
-        return None;
-    }
-    let payload = &trimmed[open_tag_len..end_index];
+    let payload = trimmed
+        .strip_prefix(SUBAGENT_NOTIFICATION_OPEN_TAG)?
+        .strip_suffix(SUBAGENT_NOTIFICATION_CLOSE_TAG)?;
     serde_json::from_str::<SubagentNotification>(payload.trim()).ok()
 }
 
@@ -72,6 +66,24 @@ mod tests {
             Some(SubagentNotification {
                 agent_id: "agent-1".to_string(),
                 status: AgentStatus::Completed(Some("done".to_string())),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_subagent_notification_handles_embedded_close_tag_in_payload() {
+        let embedded_close_tag = format!("contains {}", SUBAGENT_NOTIFICATION_CLOSE_TAG);
+        let message = format_subagent_notification_message(
+            "agent-1",
+            &AgentStatus::Completed(Some(embedded_close_tag.clone())),
+        );
+        let parsed = parse_subagent_notification(&message);
+
+        assert_eq!(
+            parsed,
+            Some(SubagentNotification {
+                agent_id: "agent-1".to_string(),
+                status: AgentStatus::Completed(Some(embedded_close_tag)),
             })
         );
     }

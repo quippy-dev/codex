@@ -664,6 +664,7 @@ impl ThreadHistoryBuilder {
         let mut receiver_thread_ids: Vec<String> =
             payload.statuses.keys().map(ToString::to_string).collect();
         receiver_thread_ids.sort();
+        let agent_statuses = wait_end_agent_statuses(payload);
         let agents_states = payload
             .statuses
             .iter()
@@ -676,19 +677,10 @@ impl ThreadHistoryBuilder {
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids,
-            receiver_agents: wait_end_receiver_agents(payload),
+            receiver_agents: wait_end_receiver_agents(payload, &agent_statuses),
             prompt: None,
             agents_states,
-            agent_statuses: payload
-                .agent_statuses
-                .iter()
-                .map(|entry| CollabAgentStatusEntry {
-                    thread_id: entry.thread_id.to_string(),
-                    agent_nickname: entry.agent_nickname.clone(),
-                    agent_role: entry.agent_role.clone(),
-                    status: CollabAgentState::from(entry.status.clone()),
-                })
-                .collect(),
+            agent_statuses,
         });
     }
 
@@ -1060,8 +1052,9 @@ fn wait_receiver_agents(
 
 fn wait_end_receiver_agents(
     payload: &codex_protocol::protocol::CollabWaitingEndEvent,
+    agent_statuses: &[CollabAgentStatusEntry],
 ) -> Vec<CollabAgentRef> {
-    if payload.agent_statuses.is_empty() {
+    if agent_statuses.is_empty() {
         let mut receiver_thread_ids: Vec<String> =
             payload.statuses.keys().map(ToString::to_string).collect();
         receiver_thread_ids.sort();
@@ -1075,15 +1068,31 @@ fn wait_end_receiver_agents(
             .collect();
     }
 
-    payload
-        .agent_statuses
+    agent_statuses
         .iter()
         .map(|entry| CollabAgentRef {
-            thread_id: entry.thread_id.to_string(),
+            thread_id: entry.thread_id.clone(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
         })
         .collect()
+}
+
+fn wait_end_agent_statuses(
+    payload: &codex_protocol::protocol::CollabWaitingEndEvent,
+) -> Vec<CollabAgentStatusEntry> {
+    let mut agent_statuses: Vec<CollabAgentStatusEntry> = payload
+        .agent_statuses
+        .iter()
+        .map(|entry| CollabAgentStatusEntry {
+            thread_id: entry.thread_id.to_string(),
+            agent_nickname: entry.agent_nickname.clone(),
+            agent_role: entry.agent_role.clone(),
+            status: CollabAgentState::from(entry.status.clone()),
+        })
+        .collect();
+    agent_statuses.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+    agent_statuses
 }
 
 const REVIEW_FALLBACK_MESSAGE: &str = "Reviewer failed to output a response.";
@@ -2325,6 +2334,160 @@ mod tests {
                         message: None,
                     },
                 }],
+            }
+        );
+    }
+
+    #[test]
+    fn collab_waiting_end_sorts_receiver_outputs_by_thread_id() {
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "wait".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabWaitingEnd(codex_protocol::protocol::CollabWaitingEndEvent {
+                sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000010")
+                    .expect("valid sender thread id"),
+                call_id: "wait-1".into(),
+                agent_statuses: vec![
+                    codex_protocol::protocol::CollabAgentStatusEntry {
+                        thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000003")
+                            .expect("valid receiver thread id"),
+                        agent_nickname: Some("charlie".into()),
+                        agent_role: Some("researcher".into()),
+                        status: AgentStatus::Completed(None),
+                    },
+                    codex_protocol::protocol::CollabAgentStatusEntry {
+                        thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+                            .expect("valid receiver thread id"),
+                        agent_nickname: Some("alpha".into()),
+                        agent_role: Some("planner".into()),
+                        status: AgentStatus::Completed(None),
+                    },
+                    codex_protocol::protocol::CollabAgentStatusEntry {
+                        thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+                            .expect("valid receiver thread id"),
+                        agent_nickname: Some("bravo".into()),
+                        agent_role: Some("reviewer".into()),
+                        status: AgentStatus::Completed(None),
+                    },
+                ],
+                statuses: [
+                    (
+                        ThreadId::try_from("00000000-0000-0000-0000-000000000003")
+                            .expect("valid receiver thread id"),
+                        AgentStatus::Completed(None),
+                    ),
+                    (
+                        ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+                            .expect("valid receiver thread id"),
+                        AgentStatus::Completed(None),
+                    ),
+                    (
+                        ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+                            .expect("valid receiver thread id"),
+                        AgentStatus::Completed(None),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "wait-1".into(),
+                tool: CollabAgentTool::Wait,
+                spawn_mode: None,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: "00000000-0000-0000-0000-000000000010".into(),
+                receiver_thread_ids: vec![
+                    "00000000-0000-0000-0000-000000000001".into(),
+                    "00000000-0000-0000-0000-000000000002".into(),
+                    "00000000-0000-0000-0000-000000000003".into(),
+                ],
+                receiver_agents: vec![
+                    CollabAgentRef {
+                        thread_id: "00000000-0000-0000-0000-000000000001".into(),
+                        agent_nickname: Some("alpha".into()),
+                        agent_role: Some("planner".into()),
+                    },
+                    CollabAgentRef {
+                        thread_id: "00000000-0000-0000-0000-000000000002".into(),
+                        agent_nickname: Some("bravo".into()),
+                        agent_role: Some("reviewer".into()),
+                    },
+                    CollabAgentRef {
+                        thread_id: "00000000-0000-0000-0000-000000000003".into(),
+                        agent_nickname: Some("charlie".into()),
+                        agent_role: Some("researcher".into()),
+                    },
+                ],
+                prompt: None,
+                agents_states: [
+                    (
+                        "00000000-0000-0000-0000-000000000001".into(),
+                        CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    ),
+                    (
+                        "00000000-0000-0000-0000-000000000002".into(),
+                        CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    ),
+                    (
+                        "00000000-0000-0000-0000-000000000003".into(),
+                        CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                agent_statuses: vec![
+                    CollabAgentStatusEntry {
+                        thread_id: "00000000-0000-0000-0000-000000000001".into(),
+                        agent_nickname: Some("alpha".into()),
+                        agent_role: Some("planner".into()),
+                        status: CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    },
+                    CollabAgentStatusEntry {
+                        thread_id: "00000000-0000-0000-0000-000000000002".into(),
+                        agent_nickname: Some("bravo".into()),
+                        agent_role: Some("reviewer".into()),
+                        status: CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    },
+                    CollabAgentStatusEntry {
+                        thread_id: "00000000-0000-0000-0000-000000000003".into(),
+                        agent_nickname: Some("charlie".into()),
+                        agent_role: Some("researcher".into()),
+                        status: CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    },
+                ],
             }
         );
     }

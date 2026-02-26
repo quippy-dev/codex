@@ -1116,9 +1116,7 @@ mod tests {
     use crate::agent::agent_status_from_event;
     use crate::config::Config;
     use crate::config::ConfigBuilder;
-    
-    use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
-    
+
     use assert_matches::assert_matches;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::models::ResponseItem;
@@ -1164,20 +1162,6 @@ mod tests {
             content.iter().any(|content_item| match content_item {
                 ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                     text.contains(needle)
-                }
-                ContentItem::InputImage { .. } => false,
-            })
-        })
-    }
-
-    fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
-        history_items.iter().any(|item| {
-            let ResponseItem::Message { content, .. } = item else {
-                return false;
-            };
-            content.iter().any(|content_item| match content_item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                    text.contains(SUBAGENT_NOTIFICATION_OPEN_TAG)
                 }
                 ContentItem::InputImage { .. } => false,
             })
