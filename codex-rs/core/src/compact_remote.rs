@@ -6,13 +6,12 @@ use crate::codex::TurnContext;
 use crate::compact::CompactTrigger;
 use crate::compact::InitialContextInjection;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
-use crate::compact::insert_retained_plan_context_message;
-use crate::compact::retained_proposed_plan_for_manual_plan_compaction;
+use crate::compact_remote_invariants::insert_retained_plan_for_remote_compaction;
+use crate::compact_remote_invariants::retry_once_invalid_encrypted_content_with_sanitized_prompt_input;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::context_manager::is_codex_generated_item;
-use crate::encrypted_content_fallback::apply_invalid_encrypted_content_fallback;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -146,14 +145,11 @@ async fn run_remote_compact_task_inner_impl(
         match result {
             Ok(new_history) => break new_history,
             Err(err) => {
-                if apply_invalid_encrypted_content_fallback(
+                if retry_once_invalid_encrypted_content_with_sanitized_prompt_input(
                     &mut retried_invalid_encrypted_content,
                     &err,
                     &mut compact_prompt.input,
                 ) {
-                    tracing::warn!(
-                        "invalid_encrypted_content during remote compact - retrying once with sanitized prompt input"
-                    );
                     continue;
                 }
                 let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
@@ -179,13 +175,15 @@ async fn run_remote_compact_task_inner_impl(
         previous_user_turn_model,
     )
     .await;
-    let retained_proposed_plan = retained_proposed_plan_for_manual_plan_compaction(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        compact_trigger,
-    )
-    .await;
-    new_history = insert_retained_plan_context_message(new_history, &retained_proposed_plan);
+    let (new_history_with_retained_plan, retained_proposed_plan) =
+        insert_retained_plan_for_remote_compaction(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            compact_trigger,
+            new_history,
+        )
+        .await;
+    new_history = new_history_with_retained_plan;
 
     if !ghost_snapshots.is_empty() {
         new_history.extend(ghost_snapshots);

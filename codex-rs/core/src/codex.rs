@@ -182,6 +182,7 @@ use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_tool_mentions_from_messages;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
+use crate::plan_retention_invariants::completed_plan_text_for_manual_compaction;
 use crate::project_doc::get_user_instructions;
 use crate::protocol::AgentMessageContentDeltaEvent;
 use crate::protocol::AgentReasoningSectionBreakEvent;
@@ -2438,9 +2439,8 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
-        if let TurnItem::Plan(plan_item) = &item {
-            self.set_latest_proposed_plan_text(Some(plan_item.text.clone()))
-                .await;
+        if let Some(plan_text) = completed_plan_text_for_manual_compaction(&item) {
+            self.set_latest_proposed_plan_text(Some(plan_text)).await;
         }
         self.send_event(
             turn_context,
