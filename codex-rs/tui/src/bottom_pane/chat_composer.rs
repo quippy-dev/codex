@@ -467,7 +467,7 @@ impl ChatComposer {
             frame_requester: None,
             attached_images: Vec::new(),
             placeholder_text,
-            voice_state: VoiceState::new(enhanced_keys_supported),
+            voice_state: VoiceState::new(false),
             spinner_stop_flags: HashMap::new(),
             is_task_running: false,
             input_enabled: true,
@@ -1239,14 +1239,16 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
-        if matches!(key_event.kind, KeyEventKind::Release) {
+        if matches!(key_event.kind, KeyEventKind::Release)
+            && matches!(key_event.code, KeyCode::Char(' '))
+        {
             self.voice_state.key_release_supported = true;
         }
 
         // Timer-based conversion is handled in the pre-draw tick.
-        // If recording, stop on Space release when supported. On terminals without key-release
-        // events, Space repeat events are handled as "still held" and stop is driven by timeout
-        // in `process_space_hold_trigger`.
+        // If recording, stop on Space release once we've observed a Space release in this session.
+        // Until then, Space repeat events are handled as "still held" and stop is driven by
+        // timeout in `process_space_hold_trigger`.
         if let Some(result) = self.handle_key_event_while_recording(key_event) {
             return result;
         }
