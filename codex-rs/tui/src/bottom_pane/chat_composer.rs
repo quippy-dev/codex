@@ -551,6 +551,9 @@ impl ChatComposer {
         self.collaboration_modes_enabled = enabled;
     }
 
+    #[cfg(test)]
+    pub fn set_steer_enabled(&mut self, _enabled: bool) {}
+
     pub fn set_connectors_enabled(&mut self, enabled: bool) {
         self.connectors_enabled = enabled;
     }
@@ -4383,6 +4386,13 @@ impl Drop for ChatComposer {
         for (_id, flag) in self.spinner_stop_flags.drain() {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+impl super::BottomPane {
+    pub fn set_steer_enabled(&mut self, enabled: bool) {
+        self.composer.set_steer_enabled(enabled);
     }
 }
 
