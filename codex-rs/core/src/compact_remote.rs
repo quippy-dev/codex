@@ -28,14 +28,12 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
-    previous_user_turn_model: Option<&str>,
 ) -> CodexResult<()> {
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
         initial_context_injection,
         CompactTrigger::Auto,
-        previous_user_turn_model,
     )
     .await?;
     Ok(())
@@ -57,7 +55,6 @@ pub(crate) async fn run_remote_compact_task(
         &turn_context,
         InitialContextInjection::DoNotInject,
         CompactTrigger::Manual,
-        None,
     )
     .await
 }
@@ -67,14 +64,12 @@ async fn run_remote_compact_task_inner(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
     compact_trigger: CompactTrigger,
-    previous_user_turn_model: Option<&str>,
 ) -> CodexResult<()> {
     if let Err(err) = run_remote_compact_task_inner_impl(
         sess,
         turn_context,
         initial_context_injection,
         compact_trigger,
-        previous_user_turn_model,
     )
     .await
     {
@@ -92,7 +87,6 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
     compact_trigger: CompactTrigger,
-    previous_user_turn_model: Option<&str>,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
@@ -170,7 +164,6 @@ async fn run_remote_compact_task_inner_impl(
         turn_context.as_ref(),
         new_history,
         initial_context_injection,
-        previous_user_turn_model,
     )
     .await;
     let (new_history_with_retained_plan, retained_proposed_plan) =
@@ -209,7 +202,6 @@ pub(crate) async fn process_compacted_history(
     turn_context: &TurnContext,
     mut compacted_history: Vec<ResponseItem>,
     initial_context_injection: InitialContextInjection,
-    previous_user_turn_model: Option<&str>,
 ) -> Vec<ResponseItem> {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
@@ -218,8 +210,7 @@ pub(crate) async fn process_compacted_history(
         initial_context_injection,
         InitialContextInjection::BeforeLastUserMessage
     ) {
-        sess.build_initial_context(turn_context, previous_user_turn_model)
-            .await
+        sess.build_initial_context(turn_context).await
     } else {
         Vec::new()
     };

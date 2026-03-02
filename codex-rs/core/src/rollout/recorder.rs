@@ -412,6 +412,8 @@ impl RolloutRecorder {
                         } else {
                             Some(dynamic_tools)
                         },
+                        memory_mode: (!config.memories.generate_memories)
+                            .then_some("disabled".to_string()),
                     };
 
                     (
@@ -1406,6 +1408,7 @@ mod tests {
                 model: "test-model".to_string(),
                 personality: None,
                 collaboration_mode: None,
+                realtime_active: None,
                 effort: None,
                 summary: ReasoningSummaryConfig::Auto,
                 user_instructions: None,

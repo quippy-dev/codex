@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::function_tool::FunctionCallError;
 use crate::memories::citations::get_thread_id_from_citations;
 use crate::parse_turn_item;
+use crate::state_db;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -57,10 +58,35 @@ pub(crate) async fn record_completed_response_item(
 ) {
     sess.record_conversation_items(turn_context, std::slice::from_ref(item))
         .await;
-    record_stage1_output_usage_for_completed_item(sess, item).await;
+    maybe_mark_thread_memory_mode_polluted_from_web_search(sess, turn_context, item).await;
+    record_stage1_output_usage_for_completed_item(turn_context, item).await;
 }
 
-async fn record_stage1_output_usage_for_completed_item(sess: &Session, item: &ResponseItem) {
+async fn maybe_mark_thread_memory_mode_polluted_from_web_search(
+    sess: &Session,
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+) {
+    if !turn_context
+        .config
+        .memories
+        .no_memories_if_mcp_or_web_search
+        || !matches!(item, ResponseItem::WebSearchCall { .. })
+    {
+        return;
+    }
+    state_db::mark_thread_memory_mode_polluted(
+        sess.services.state_db.as_deref(),
+        sess.conversation_id,
+        "record_completed_response_item",
+    )
+    .await;
+}
+
+async fn record_stage1_output_usage_for_completed_item(
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+) {
     let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
         return;
     };
@@ -71,7 +97,7 @@ async fn record_stage1_output_usage_for_completed_item(sess: &Session, item: &Re
         return;
     }
 
-    if let Some(db) = sess.services.state_db.as_deref() {
+    if let Some(db) = state_db::get_state_db(turn_context.config.as_ref(), None).await {
         let _ = db.record_stage1_output_usage(&thread_ids).await;
     }
 }
@@ -260,16 +286,6 @@ pub(crate) fn last_assistant_message_from_item(
 
 pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Option<ResponseItem> {
     match input {
-        ResponseInputItem::FunctionCall {
-            name,
-            arguments,
-            call_id,
-        } => Some(ResponseItem::FunctionCall {
-            id: None,
-            name: name.clone(),
-            arguments: arguments.clone(),
-            call_id: call_id.clone(),
-        }),
         ResponseInputItem::FunctionCallOutput { call_id, output } => {
             Some(ResponseItem::FunctionCallOutput {
                 call_id: call_id.clone(),

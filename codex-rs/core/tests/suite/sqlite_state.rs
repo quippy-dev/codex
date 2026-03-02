@@ -1,28 +1,36 @@
 use anyhow::Result;
-use chrono::DateTime;
-use chrono::Utc;
+use codex_core::config::types::McpServerConfig;
+use codex_core::config::types::McpServerTransportConfig;
 use codex_core::features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
-use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::ev_web_search_call_done;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
-use core_test_support::test_codex::TestCodex;
+use core_test_support::skip_if_no_network;
+use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use tokio::time::Duration;
 use tracing_subscriber::prelude::*;
@@ -133,6 +141,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     model_provider: None,
                     base_instructions: None,
                     dynamic_tools: Some(dynamic_tools_for_hook),
+                    memory_mode: None,
                 },
                 git: None,
             };
@@ -259,109 +268,144 @@ async fn user_messages_persist_in_state_db() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn assistant_memory_citations_update_usage_and_reorder_phase2_selection() -> Result<()> {
+async fn web_search_marks_thread_memory_mode_polluted_when_configured() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::Sqlite);
-    });
-    let test = builder.build(&server).await?;
-    let db = test.codex.state_db().expect("state db enabled");
-    let owner = test.session_configured.session_id;
-
-    let cited_thread = ThreadId::new();
-    let uncited_thread = ThreadId::new();
-    seed_stage1_output(&test, cited_thread, owner, "workspace-cited", 100).await?;
-    seed_stage1_output(&test, uncited_thread, owner, "workspace-uncited", 200).await?;
-
-    let initial_selection = db.get_phase2_input_selection(1, 36_500).await?;
-    assert_eq!(
-        initial_selection
-            .selected
-            .iter()
-            .map(|memory| memory.thread_id)
-            .collect::<Vec<_>>(),
-        vec![uncited_thread]
-    );
-
-    mark_phase2_clean(db.as_ref(), owner).await?;
-
-    let assistant_text = format!(
-        "Using a prior memory.\n<oai-mem-citation>\n<citation_entries>\nrollout_summaries/test.md:1-2|note=[integration]\n</citation_entries>\n<rollout_ids>\n{cited_thread}\n</rollout_ids>\n</oai-mem-citation>"
-    );
-    mount_sse_once(
+    mount_sse_sequence(
         &server,
-        responses::sse(vec![
+        vec![responses::sse(vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", &assistant_text),
+            ev_web_search_call_done("ws-1", "completed", "weather seattle"),
             ev_completed("resp-1"),
-        ]),
+        ])],
     )
     .await;
 
-    test.submit_turn("answer using memory").await?;
+    let mut builder = test_codex().with_config(|config| {
+        config.features.enable(Feature::Sqlite);
+        config.memories.no_memories_if_mcp_or_web_search = true;
+    });
+    let test = builder.build(&server).await?;
+    let db = test.codex.state_db().expect("state db enabled");
+    let thread_id = test.session_configured.session_id;
 
-    let usage_only_claim = db.try_claim_global_phase2_job(owner, 3600).await?;
-    let (ownership_token, input_watermark) = match usage_only_claim {
-        codex_state::Phase2JobClaimOutcome::Claimed {
-            ownership_token,
-            input_watermark,
-        } => (ownership_token, input_watermark),
-        other => panic!("expected usage-only phase2 claim, got {other:?}"),
-    };
-    assert!(
-        db.mark_global_phase2_job_succeeded(ownership_token.as_str(), input_watermark, &[])
-            .await?,
-        "usage-only citation should re-dirty phase 2"
-    );
+    test.submit_turn("search the web").await?;
 
-    let updated_selection = db.get_phase2_input_selection(1, 36_500).await?;
-    assert_eq!(
-        updated_selection
-            .selected
-            .iter()
-            .map(|memory| memory.thread_id)
-            .collect::<Vec<_>>(),
-        vec![cited_thread]
-    );
+    let mut memory_mode = None;
+    for _ in 0..100 {
+        memory_mode = db.get_thread_memory_mode(thread_id).await?;
+        if memory_mode.as_deref() == Some("polluted") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
+    assert_eq!(memory_mode.as_deref(), Some("polluted"));
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn assistant_messages_without_memory_citations_do_not_redirty_phase2() -> Result<()> {
+async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::Sqlite);
-    });
-    let test = builder.build(&server).await?;
-    let db = test.codex.state_db().expect("state db enabled");
-    let owner = test.session_configured.session_id;
-
-    let thread_id = ThreadId::new();
-    seed_stage1_output(&test, thread_id, owner, "workspace-plain", 100).await?;
-    mark_phase2_clean(db.as_ref(), owner).await?;
-
+    let call_id = "call-123";
+    let server_name = "rmcp";
+    let tool_name = format!("mcp__{server_name}__echo");
     mount_sse_once(
         &server,
         responses::sse(vec![
             ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "No memory references here."),
+            ev_function_call(call_id, &tool_name, "{\"message\":\"ping\"}"),
             ev_completed("resp-1"),
         ]),
     )
     .await;
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("msg-1", "rmcp echo tool completed."),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
 
-    test.submit_turn("answer without memory").await?;
+    let rmcp_test_server_bin = stdio_server_bin()?;
+    let mut builder = test_codex().with_config(move |config| {
+        config.features.enable(Feature::Sqlite);
+        config.memories.no_memories_if_mcp_or_web_search = true;
 
-    let phase2_claim = db.try_claim_global_phase2_job(owner, 3600).await?;
-    assert!(
-        matches!(
-            phase2_claim,
-            codex_state::Phase2JobClaimOutcome::SkippedNotDirty
-        ),
-        "non-citation assistant output should not enqueue phase 2"
-    );
+        let mut servers = config.mcp_servers.get().clone();
+        servers.insert(
+            server_name.to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: rmcp_test_server_bin,
+                    args: Vec::new(),
+                    env: Some(HashMap::from([(
+                        "MCP_TEST_VALUE".to_string(),
+                        "propagated-env".to_string(),
+                    )])),
+                    env_vars: Vec::new(),
+                    cwd: None,
+                },
+                enabled: true,
+                required: false,
+                disabled_reason: None,
+                startup_timeout_sec: Some(Duration::from_secs(10)),
+                tool_timeout_sec: None,
+                enabled_tools: None,
+                disabled_tools: None,
+                scopes: None,
+                oauth_resource: None,
+            },
+        );
+        config
+            .mcp_servers
+            .set(servers)
+            .expect("test mcp servers should accept any configuration");
+    });
+    let test = builder.build(&server).await?;
+    let db = test.codex.state_db().expect("state db enabled");
+    let thread_id = test.session_configured.session_id;
 
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "call the rmcp echo tool".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            model: test.session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::McpToolCallEnd(_))
+    })
+    .await;
+    wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::Error(err) => Some(Err(anyhow::anyhow!(err.message.clone()))),
+        EventMsg::TurnComplete(_) => Some(Ok(())),
+        _ => None,
+    })
+    .await?;
+
+    let mut memory_mode = None;
+    for _ in 0..100 {
+        memory_mode = db.get_thread_memory_mode(thread_id).await?;
+        if memory_mode.as_deref() == Some("polluted") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(memory_mode.as_deref(), Some("polluted"));
     Ok(())
 }
 
@@ -437,81 +481,4 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
     );
 
     Ok(())
-}
-
-async fn seed_stage1_output(
-    test: &TestCodex,
-    thread_id: ThreadId,
-    owner: ThreadId,
-    workspace_name: &str,
-    source_updated_at: i64,
-) -> Result<()> {
-    let db = test.codex.state_db().expect("state db enabled");
-    let metadata = seeded_thread_metadata(
-        test,
-        thread_id,
-        workspace_name,
-        DateTime::<Utc>::from_timestamp(source_updated_at, 0).expect("timestamp"),
-    );
-    db.upsert_thread(&metadata).await?;
-
-    let claim = db
-        .try_claim_stage1_job(thread_id, owner, source_updated_at, 3600, 64)
-        .await?;
-    let ownership_token = match claim {
-        codex_state::Stage1JobClaimOutcome::Claimed { ownership_token } => ownership_token,
-        other => panic!("expected stage1 claim, got {other:?}"),
-    };
-    assert!(
-        db.mark_stage1_job_succeeded(
-            thread_id,
-            ownership_token.as_str(),
-            source_updated_at,
-            "raw memory",
-            "rollout summary",
-            None,
-        )
-        .await?,
-        "stage1 success should persist output"
-    );
-
-    Ok(())
-}
-
-async fn mark_phase2_clean(db: &codex_state::StateRuntime, owner: ThreadId) -> Result<()> {
-    let claim = db.try_claim_global_phase2_job(owner, 3600).await?;
-    let (ownership_token, input_watermark) = match claim {
-        codex_state::Phase2JobClaimOutcome::Claimed {
-            ownership_token,
-            input_watermark,
-        } => (ownership_token, input_watermark),
-        other => panic!("expected phase2 claim, got {other:?}"),
-    };
-    assert!(
-        db.mark_global_phase2_job_succeeded(ownership_token.as_str(), input_watermark, &[])
-            .await?,
-        "phase2 success should clear dirty state"
-    );
-
-    Ok(())
-}
-
-fn seeded_thread_metadata(
-    test: &TestCodex,
-    thread_id: ThreadId,
-    workspace_name: &str,
-    timestamp: DateTime<Utc>,
-) -> codex_state::ThreadMetadata {
-    let mut builder = codex_state::ThreadMetadataBuilder::new(
-        thread_id,
-        test.config
-            .codex_home
-            .join(format!("sessions/seed-{thread_id}.jsonl")),
-        timestamp,
-        SessionSource::default(),
-    );
-    builder.updated_at = Some(timestamp);
-    builder.cwd = test.config.codex_home.join(workspace_name);
-    builder.cli_version = Some("test".to_string());
-    builder.build(&test.config.model_provider_id)
 }

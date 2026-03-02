@@ -15,6 +15,7 @@ use crate::find_thread_path_by_id_str;
 use crate::rollout::RolloutRecorder;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
+use crate::shell_snapshot::ShellSnapshot;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
@@ -152,6 +153,9 @@ impl AgentControl {
         let mut reservation = self
             .reserve_spawn_slot_with_reconcile(&state, config.agent_max_threads)
             .await?;
+        let inherited_shell_snapshot = self
+            .inherited_shell_snapshot_for_source(&state, session_source.as_ref())
+            .await;
         let session_source =
             self.maybe_reserve_thread_spawn_identity(&mut reservation, session_source)?;
         let notification_source = session_source.clone();
@@ -215,6 +219,7 @@ impl AgentControl {
                             self.clone(),
                             session_source,
                             false,
+                            inherited_shell_snapshot,
                         )
                         .await?
                 } else {
@@ -225,6 +230,7 @@ impl AgentControl {
                             session_source,
                             false,
                             None,
+                            inherited_shell_snapshot,
                         )
                         .await?
                 }
@@ -260,11 +266,21 @@ impl AgentControl {
             .await?;
         let session_source =
             self.maybe_reserve_thread_spawn_identity(&mut reservation, session_source)?;
+        let inherited_shell_snapshot = self
+            .inherited_shell_snapshot_for_source(&state, session_source.as_ref())
+            .await;
 
         let new_thread = match session_source {
             Some(session_source) => {
                 state
-                    .spawn_new_thread_with_source(config, self.clone(), session_source, false, None)
+                    .spawn_new_thread_with_source(
+                        config,
+                        self.clone(),
+                        session_source,
+                        false,
+                        None,
+                        inherited_shell_snapshot,
+                    )
                     .await?
             }
             None => state.spawn_new_thread(config, self.clone()).await?,
@@ -294,6 +310,9 @@ impl AgentControl {
         let session_source =
             self.reserve_thread_spawn_identity(&mut reservation, session_source)?;
         let notification_source = Some(session_source.clone());
+        let inherited_shell_snapshot = self
+            .inherited_shell_snapshot_for_source(&state, Some(&session_source))
+            .await;
 
         let live_rollout_path = match state.get_thread(parent_thread_id).await {
             Ok(parent_thread) => {
@@ -325,6 +344,7 @@ impl AgentControl {
                 false,
                 rollout_path,
                 session_source,
+                inherited_shell_snapshot,
             )
             .await?;
         reservation.commit(new_thread.thread_id);
@@ -350,6 +370,9 @@ impl AgentControl {
         let session_source =
             self.reserve_thread_spawn_identity(&mut reservation, session_source)?;
         let notification_source = Some(session_source.clone());
+        let inherited_shell_snapshot = self
+            .inherited_shell_snapshot_for_source(&state, Some(&session_source))
+            .await;
 
         let resumed_thread = state
             .resume_thread_from_rollout_with_source(
@@ -357,6 +380,7 @@ impl AgentControl {
                 rollout_path,
                 self.clone(),
                 session_source,
+                inherited_shell_snapshot,
             )
             .await?;
         reservation.commit(resumed_thread.thread_id);
@@ -1080,6 +1104,22 @@ impl AgentControl {
         session_source
             .map(|source| self.reserve_thread_spawn_identity(reservation, source))
             .transpose()
+    }
+
+    async fn inherited_shell_snapshot_for_source(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        session_source: Option<&SessionSource>,
+    ) -> Option<Arc<ShellSnapshot>> {
+        let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id, ..
+        })) = session_source
+        else {
+            return None;
+        };
+
+        let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
+        parent_thread.codex.session.user_shell().shell_snapshot()
     }
 }
 
