@@ -3711,10 +3711,7 @@ impl ChatWidget {
                 self.request_quit_without_confirmation();
             }
             SlashCommand::Logout => {
-                if let Err(e) = codex_core::auth::logout(
-                    &self.config.codex_home,
-                    self.config.cli_auth_credentials_store_mode,
-                ) {
+                if let Err(e) = self.auth_manager.logout() {
                     tracing::error!("failed to logout: {e}");
                 }
                 self.request_quit_without_confirmation();
@@ -7099,7 +7096,8 @@ impl ChatWidget {
         }
         match self.active_mode_kind() {
             ModeKind::Plan => Some(CollaborationModeIndicator::Plan),
-            ModeKind::Default | ModeKind::PairProgramming | ModeKind::Execute => None,
+            ModeKind::Execute => Some(CollaborationModeIndicator::Execute),
+            ModeKind::Default | ModeKind::PairProgramming => None,
         }
     }
 
@@ -7124,7 +7122,7 @@ impl ChatWidget {
         }
     }
 
-    /// Cycle to the next collaboration mode variant (Plan -> Default -> Plan).
+    /// Cycle to the next collaboration mode variant (Plan -> Default -> Execute -> Plan).
     fn cycle_collaboration_mode(&mut self) {
         if !self.collaboration_modes_enabled() {
             return;

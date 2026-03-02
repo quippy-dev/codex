@@ -187,24 +187,23 @@ Rules:
                         config_file: None,
                     }
                 ),
-                // Awaiter is temp removed
-//                 (
-//                     "awaiter".to_string(),
-//                     AgentRoleConfig {
-//                         description: Some(r#"Use an `awaiter` agent EVERY TIME you must run a command that will take some very long time.
-// This includes, but not only:
-// * testing
-// * monitoring of a long running process
-// * explicit ask to wait for something
-//
-// Rules:
-// - When an awaiter is running, you can work on something else. If you need to wait for its completion, use the largest possible timeout.
-// - Be patient with the `awaiter`.
-// - Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
-// - Close the awaiter when you're done with it."#.to_string()),
-//                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
-//                     }
-//                 )
+                (
+                    "awaiter".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use an `awaiter` agent EVERY TIME you must run a command that will take some very long time.
+This includes, but not only:
+* testing
+* monitoring of a long running process
+* explicit ask to wait for something
+
+Rules:
+- When an awaiter is running, you can work on something else. If you need to wait for its completion, use the largest possible timeout.
+- Be patient with the `awaiter`.
+- Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
+- Close the awaiter when you're done with it."#.to_string()),
+                        config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
+                    }
+                )
             ])
         });
         &CONFIG
@@ -539,6 +538,7 @@ enabled = false
 
         assert!(spec.contains("researcher: no description"));
         assert!(spec.contains("explorer: {\nuser override\n}"));
+        assert!(spec.contains("awaiter: {"));
         assert!(spec.contains("default: {\nDefault agent.\n}"));
         assert!(!spec.contains("Explorers are fast and authoritative."));
     }
@@ -563,7 +563,9 @@ enabled = false
     }
 
     #[test]
-    fn built_in_config_file_contents_resolves_explorer_only() {
+    fn built_in_config_file_contents_resolves_explorer_and_awaiter() {
+        assert!(built_in::config_file_contents(Path::new("explorer.toml")).is_some());
+        assert!(built_in::config_file_contents(Path::new("awaiter.toml")).is_some());
         assert_eq!(
             built_in::config_file_contents(Path::new("missing.toml")),
             None

@@ -223,11 +223,13 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         }
     };
 
-    let cloud_auth_manager = AuthManager::shared(
+    let cloud_auth_manager = AuthManager::shared_with_auth_file(
         codex_home.clone(),
         false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
-    );
+        auth_file.clone(),
+    )
+    .map_err(|err| anyhow::anyhow!("Error resolving auth storage path: {err}"))?;
     let chatgpt_base_url = config_toml
         .chatgpt_base_url
         .clone()
