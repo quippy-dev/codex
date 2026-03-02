@@ -162,7 +162,8 @@ use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
-const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
+const PLAN_IMPLEMENTATION_EXECUTE: &str = "Yes, implement in Execute mode";
+const PLAN_IMPLEMENTATION_DEFAULT: &str = "Yes, implement in Default mode";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
@@ -1520,7 +1521,22 @@ impl ChatWidget {
     }
 
     fn open_plan_implementation_prompt(&mut self) {
+        let execute_mask =
+            collaboration_modes::mask_for_kind(self.models_manager.as_ref(), ModeKind::Execute);
         let default_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
+        let (execute_actions, execute_disabled_reason) = match execute_mask {
+            Some(mask) => {
+                let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SubmitUserMessageWithMode {
+                        text: user_text.clone(),
+                        collaboration_mode: mask.clone(),
+                    });
+                })];
+                (actions, None)
+            }
+            None => (Vec::new(), Some("Execute mode unavailable".to_string())),
+        };
         let (implement_actions, implement_disabled_reason) = match default_mask {
             Some(mask) => {
                 let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
@@ -1536,7 +1552,17 @@ impl ChatWidget {
         };
         let items = vec![
             SelectionItem {
-                name: PLAN_IMPLEMENTATION_YES.to_string(),
+                name: PLAN_IMPLEMENTATION_EXECUTE.to_string(),
+                description: Some("Switch to Execute and execute the plan.".to_string()),
+                selected_description: None,
+                is_current: false,
+                actions: execute_actions,
+                disabled_reason: execute_disabled_reason,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: PLAN_IMPLEMENTATION_DEFAULT.to_string(),
                 description: Some("Switch to Default and start coding.".to_string()),
                 selected_description: None,
                 is_current: false,
