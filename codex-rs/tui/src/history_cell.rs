@@ -41,6 +41,8 @@ use crate::wrapping::adaptive_wrap_lines;
 use base64::Engine;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
+use codex_core::mcp::McpManager;
+use codex_core::plugins::PluginsManager;
 use codex_core::web_search::web_search_detail;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::account::PlanType;
@@ -1275,6 +1277,7 @@ pub(crate) fn new_session_info(
     requested_model: &str,
     event: SessionConfiguredEvent,
     is_first_event: bool,
+    tooltip_override: Option<String>,
     auth_plan: Option<PlanType>,
 ) -> SessionInfoCell {
     let SessionConfiguredEvent {
@@ -1328,7 +1331,9 @@ pub(crate) fn new_session_info(
         parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
     } else {
         if config.show_tooltips
-            && let Some(tooltips) = tooltips::get_tooltip(auth_plan).map(TooltipHistoryCell::new)
+            && let Some(tooltips) = tooltip_override
+                .or_else(|| tooltips::get_tooltip(auth_plan))
+                .map(TooltipHistoryCell::new)
         {
             parts.push(Box::new(tooltips));
         }
@@ -1944,7 +1949,9 @@ pub(crate) fn new_mcp_tools_output(
         lines.push("".into());
     }
 
-    let mut servers: Vec<_> = config.mcp_servers.iter().collect();
+    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
+    let effective_servers = mcp_manager.effective_servers(config, None);
+    let mut servers: Vec<_> = effective_servers.iter().collect();
     servers.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (server, cfg) in servers {
@@ -2630,13 +2637,19 @@ mod tests {
     use codex_core::config::types::McpServerTransportConfig;
     use codex_otel::RuntimeMetricTotals;
     use codex_otel::RuntimeMetricsSummary;
+    use codex_protocol::ThreadId;
+    use codex_protocol::account::PlanType;
     use codex_protocol::models::WebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
+    use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::McpAuthStatus;
+    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::SessionConfiguredEvent;
     use dirs::home_dir;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
@@ -2833,6 +2846,25 @@ mod tests {
         .expect("resource link content should serialize")
     }
 
+    fn session_configured_event(model: &str) -> SessionConfiguredEvent {
+        SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: model.to_string(),
+            model_provider_id: "test-provider".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/tmp/project"),
+            reasoning_effort: None,
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: Some(PathBuf::new()),
+        }
+    }
+
     #[test]
     fn unified_exec_interaction_cell_renders_input() {
         let cell =
@@ -2915,6 +2947,73 @@ mod tests {
         let cell = new_unified_exec_processes_output(Vec::new());
         let rendered = render_lines(&cell.display_lines(60)).join("\n");
         insta::assert_snapshot!(rendered);
+    }
+
+    #[tokio::test]
+    async fn session_info_uses_availability_nux_tooltip_override() {
+        let config = test_config().await;
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            false,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        assert!(rendered.contains("Model just became available"));
+    }
+
+    #[tokio::test]
+    async fn session_info_availability_nux_tooltip_snapshot() {
+        let mut config = test_config().await;
+        config.cwd = PathBuf::from("/tmp/project");
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            false,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[tokio::test]
+    async fn session_info_first_event_suppresses_tooltips_and_nux() {
+        let config = test_config().await;
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            true,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        assert!(!rendered.contains("Model just became available"));
+        assert!(rendered.contains("To get started"));
+    }
+
+    #[tokio::test]
+    async fn session_info_hides_tooltips_when_disabled() {
+        let mut config = test_config().await;
+        config.show_tooltips = false;
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            false,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        assert!(!rendered.contains("Model just became available"));
     }
 
     #[test]
@@ -3003,6 +3102,7 @@ mod tests {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth_resource: None,
         };
         let mut servers = config.mcp_servers.get().clone();
         servers.insert("docs".to_string(), stdio_config);
@@ -3026,6 +3126,7 @@ mod tests {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth_resource: None,
         };
         servers.insert("http".to_string(), http_config);
         config

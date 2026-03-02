@@ -111,7 +111,7 @@ impl Session {
                     } else {
                         let user_messages = collect_user_messages(history.raw_items());
                         let rebuilt = compact::build_compacted_history(
-                            self.build_initial_context(turn_context, None).await,
+                            Vec::new(),
                             &user_messages,
                             &compacted.message,
                         );

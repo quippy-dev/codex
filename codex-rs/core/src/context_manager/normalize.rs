@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -40,10 +39,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                         idx,
                         ResponseItem::FunctionCallOutput {
                             call_id: call_id.clone(),
-                            output: FunctionCallOutputPayload {
-                                body: FunctionCallOutputBody::Text("aborted".to_string()),
-                                ..Default::default()
-                            },
+                            output: FunctionCallOutputPayload::from_text("aborted".to_string()),
                         },
                     ));
                 }
@@ -64,7 +60,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                         idx,
                         ResponseItem::CustomToolCallOutput {
                             call_id: call_id.clone(),
-                            output: "aborted".to_string(),
+                            output: FunctionCallOutputPayload::from_text("aborted".to_string()),
                         },
                     ));
                 }
@@ -87,10 +83,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                             idx,
                             ResponseItem::FunctionCallOutput {
                                 call_id: call_id.clone(),
-                                output: FunctionCallOutputPayload {
-                                    body: FunctionCallOutputBody::Text("aborted".to_string()),
-                                    ..Default::default()
-                                },
+                                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
                             },
                         ));
                     }
@@ -345,7 +338,8 @@ pub(crate) fn strip_images_when_unsupported(
                 }
                 *content = normalized_content;
             }
-            ResponseItem::FunctionCallOutput { output, .. } => {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
                 if let Some(content_items) = output.content_items_mut() {
                     let mut normalized_content_items = Vec::with_capacity(content_items.len());
                     for content_item in content_items.iter() {

@@ -58,7 +58,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -76,6 +76,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             summary: None,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -91,7 +92,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: next_model.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -146,7 +147,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -164,6 +165,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             summary: None,
             collaboration_mode: None,
             personality: Some(Personality::Pragmatic),
+            service_tier: None,
         })
         .await?;
 
@@ -179,7 +181,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: next_model.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -237,6 +239,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
+        availability_nux: None,
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
@@ -294,7 +297,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -313,7 +316,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: text_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -395,6 +398,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
+        availability_nux: None,
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
@@ -471,7 +475,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: large_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -511,6 +515,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             summary: None,
             collaboration_mode: None,
             personality: None,
+            service_tier: None,
         })
         .await?;
 
@@ -526,7 +531,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: smaller_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })

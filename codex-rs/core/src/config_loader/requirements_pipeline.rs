@@ -6,7 +6,7 @@ pub(super) async fn load_config_requirements_with_sources(
 ) -> io::Result<ConfigRequirementsWithSources> {
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
-    if let Some(requirements) = cloud_requirements.get().await {
+    if let Some(requirements) = cloud_requirements.get().await.map_err(io::Error::other)? {
         config_requirements_toml
             .merge_unset_fields(RequirementSource::CloudRequirements, requirements);
     }

@@ -42,6 +42,8 @@ the same prefix using the assistant role.
 This setting applies to non-subagent threads (for example, the root thread). Messages sent to
 subagents via `send_input` are still delivered as user input.
 
+When Codex knows which client started the turn, the legacy notify JSON payload also includes a top-level `client` field. The TUI reports `codex-tui`, and the app server reports the `clientInfo.name` value from `initialize`.
+
 ## JSON Schema
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.

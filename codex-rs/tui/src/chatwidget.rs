@@ -37,6 +37,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::app_event::RealtimeAudioDeviceKind;
+#[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
+use crate::audio_device::list_realtime_audio_device_names;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::status::RateLimitWindowDisplay;
@@ -60,7 +63,9 @@ use codex_core::find_thread_name_by_id;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::local_git_branches;
+use codex_core::mcp::McpManager;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::plugins::PluginsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::terminal::TerminalName;
@@ -76,7 +81,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -498,6 +503,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) is_first_run: bool,
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) model: Option<String>,
+    pub(crate) startup_tooltip_override: Option<String>,
     // Shared latch so we only warn once about invalid status-line item IDs.
     pub(crate) status_line_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) otel_manager: OtelManager,
@@ -640,6 +646,8 @@ pub(crate) struct ChatWidget {
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
     show_welcome_banner: bool,
+    // One-shot tooltip override for the primary startup session.
+    startup_tooltip_override: Option<String>,
     // When resuming an existing session (selected via resume picker), avoid an
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
@@ -893,6 +901,10 @@ impl ChatWidget {
     fn realtime_conversation_enabled(&self) -> bool {
         self.config.features.enabled(Feature::RealtimeConversation)
             && cfg!(not(target_os = "linux"))
+    }
+
+    fn realtime_audio_device_selection_enabled(&self) -> bool {
+        self.realtime_conversation_enabled() && cfg!(feature = "voice-input")
     }
 
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
@@ -1177,11 +1189,13 @@ impl ChatWidget {
         );
         self.refresh_model_display();
         self.sync_personality_command_enabled();
+        let startup_tooltip_override = self.startup_tooltip_override.take();
         let session_info_cell = history_cell::new_session_info(
             &self.config,
             &model_for_header,
             event,
             self.show_welcome_banner,
+            startup_tooltip_override,
             self.auth_manager
                 .auth_cached()
                 .and_then(|auth| auth.account_plan_type()),
@@ -2734,6 +2748,8 @@ impl ChatWidget {
 
         let available_decisions = ev.effective_available_decisions();
         let request = ApprovalRequest::Exec {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             id: ev.effective_approval_id(),
             command: ev.command,
             reason: ev.reason,
@@ -2750,6 +2766,8 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
 
         let request = ApprovalRequest::ApplyPatch {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             id: ev.call_id,
             reason: ev.reason,
             changes: ev.changes.clone(),
@@ -2772,10 +2790,18 @@ impl ChatWidget {
         });
 
         let request = ApprovalRequest::McpElicitation {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             server_name: ev.server_name,
             request_id: ev.id,
             message: ev.message,
         };
+        self.bottom_pane
+            .push_approval_request(request, &self.config.features);
+        self.request_redraw();
+    }
+
+    pub(crate) fn push_approval_request(&mut self, request: ApprovalRequest) {
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
         self.request_redraw();
@@ -2912,6 +2938,7 @@ impl ChatWidget {
             is_first_run,
             feedback_audience,
             model,
+            startup_tooltip_override,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3010,6 +3037,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
+            startup_tooltip_override,
             suppress_session_configured_redraw: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -3047,6 +3075,9 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_realtime_conversation_enabled(widget.realtime_conversation_enabled());
+        widget
+            .bottom_pane
+            .set_audio_device_selection_enabled(widget.realtime_audio_device_selection_enabled());
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
@@ -3088,6 +3119,7 @@ impl ChatWidget {
             is_first_run,
             feedback_audience,
             model,
+            startup_tooltip_override,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3189,6 +3221,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
+            startup_tooltip_override,
             suppress_session_configured_redraw: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -3224,6 +3257,9 @@ impl ChatWidget {
             .set_realtime_conversation_enabled(widget.realtime_conversation_enabled());
         widget
             .bottom_pane
+            .set_audio_device_selection_enabled(widget.realtime_audio_device_selection_enabled());
+        widget
+            .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
         widget.bottom_pane.set_collaboration_modes_enabled(true);
         widget.sync_personality_command_enabled();
@@ -3252,6 +3288,7 @@ impl ChatWidget {
             is_first_run: _,
             feedback_audience,
             model,
+            startup_tooltip_override: _,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3349,6 +3386,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: false,
+            startup_tooltip_override: None,
             suppress_session_configured_redraw: true,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -3386,6 +3424,9 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_realtime_conversation_enabled(widget.realtime_conversation_enabled());
+        widget
+            .bottom_pane
+            .set_audio_device_selection_enabled(widget.realtime_audio_device_selection_enabled());
         widget
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
@@ -3688,6 +3729,14 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Fast => {
+                let next_tier = if self.config.service_tier.is_fast() {
+                    ServiceTier::Standard
+                } else {
+                    ServiceTier::Fast
+                };
+                self.set_service_tier_selection(next_tier);
+            }
             SlashCommand::Realtime => {
                 if !self.realtime_conversation_enabled() {
                     return;
@@ -3697,6 +3746,12 @@ impl ChatWidget {
                 } else {
                     self.start_realtime_conversation();
                 }
+            }
+            SlashCommand::Settings => {
+                if !self.realtime_audio_device_selection_enabled() {
+                    return;
+                }
+                self.open_realtime_audio_popup();
             }
             SlashCommand::Personality => {
                 self.open_personality_popup();
@@ -3958,6 +4013,27 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Fast => {
+                if trimmed.is_empty() {
+                    self.dispatch_command(cmd);
+                    return;
+                }
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "on" => self.set_service_tier_selection(ServiceTier::Fast),
+                    "off" => self.set_service_tier_selection(ServiceTier::Standard),
+                    "status" => {
+                        let status = if self.config.service_tier.is_fast() {
+                            "on"
+                        } else {
+                            "off"
+                        };
+                        self.add_info_message(format!("Fast mode is {status}."), None);
+                    }
+                    _ => {
+                        self.add_error_message("Usage: /fast [on|off|status]".to_string());
+                    }
+                }
+            }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 self.otel_manager.counter("codex.thread.rename", 1, &[]);
                 let Some((prepared_args, _prepared_elements)) =
@@ -4311,10 +4387,7 @@ impl ChatWidget {
             sandbox_policy: self.config.permissions.sandbox_policy.get().clone(),
             model: effective_mode.model().to_string(),
             effort: effective_mode.reasoning_effort(),
-            summary: self
-                .config
-                .model_reasoning_summary
-                .unwrap_or(ReasoningSummary::Auto),
+            summary: None,
             final_output_json_schema: None,
             collaboration_mode,
             personality,
@@ -5295,6 +5368,7 @@ impl ChatWidget {
                 model: Some(switch_model_for_events.clone()),
                 effort: Some(Some(default_effort)),
                 summary: None,
+                service_tier: None,
                 collaboration_mode: None,
                 personality: None,
             }));
@@ -5414,6 +5488,7 @@ impl ChatWidget {
                         model: None,
                         effort: None,
                         summary: None,
+                        service_tier: None,
                         collaboration_mode: None,
                         windows_sandbox_level: None,
                         personality: Some(personality),
@@ -5436,6 +5511,161 @@ impl ChatWidget {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Select Personality".bold()));
         header.push(Line::from("Choose a communication style for Codex.".dim()));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_realtime_audio_popup(&mut self) {
+        let items = [
+            RealtimeAudioDeviceKind::Microphone,
+            RealtimeAudioDeviceKind::Speaker,
+        ]
+        .into_iter()
+        .map(|kind| {
+            let description = Some(format!(
+                "Current: {}",
+                self.current_realtime_audio_selection_label(kind)
+            ));
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::OpenRealtimeAudioDeviceSelection { kind });
+            })];
+            SelectionItem {
+                name: kind.title().to_string(),
+                description,
+                actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            }
+        })
+        .collect();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Settings".to_string()),
+            subtitle: Some("Configure settings for Codex.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
+    pub(crate) fn open_realtime_audio_device_selection(&mut self, kind: RealtimeAudioDeviceKind) {
+        match list_realtime_audio_device_names(kind) {
+            Ok(device_names) => {
+                self.open_realtime_audio_device_selection_with_names(kind, device_names);
+            }
+            Err(err) => {
+                self.add_error_message(format!(
+                    "Failed to load realtime {} devices: {err}",
+                    kind.noun()
+                ));
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", not(feature = "voice-input")))]
+    pub(crate) fn open_realtime_audio_device_selection(&mut self, kind: RealtimeAudioDeviceKind) {
+        let _ = kind;
+    }
+
+    #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
+    fn open_realtime_audio_device_selection_with_names(
+        &mut self,
+        kind: RealtimeAudioDeviceKind,
+        device_names: Vec<String>,
+    ) {
+        let current_selection = self.current_realtime_audio_device_name(kind);
+        let current_available = current_selection
+            .as_deref()
+            .is_some_and(|name| device_names.iter().any(|device_name| device_name == name));
+        let mut items = vec![SelectionItem {
+            name: "System default".to_string(),
+            description: Some("Use your operating system default device.".to_string()),
+            is_current: current_selection.is_none(),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::PersistRealtimeAudioDeviceSelection { kind, name: None });
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        }];
+
+        if let Some(selection) = current_selection.as_deref()
+            && !current_available
+        {
+            items.push(SelectionItem {
+                name: format!("Unavailable: {selection}"),
+                description: Some("Configured device is not currently available.".to_string()),
+                is_current: true,
+                is_disabled: true,
+                disabled_reason: Some("Reconnect the device or choose another one.".to_string()),
+                ..Default::default()
+            });
+        }
+
+        items.extend(device_names.into_iter().map(|device_name| {
+            let persisted_name = device_name.clone();
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::PersistRealtimeAudioDeviceSelection {
+                    kind,
+                    name: Some(persisted_name.clone()),
+                });
+            })];
+            SelectionItem {
+                is_current: current_selection.as_deref() == Some(device_name.as_str()),
+                name: device_name,
+                actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            }
+        }));
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from(format!("Select {}", kind.title()).bold()));
+        header.push(Line::from(
+            "Saved devices apply to realtime voice only.".dim(),
+        ));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_realtime_audio_restart_prompt(&mut self, kind: RealtimeAudioDeviceKind) {
+        let restart_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::RestartRealtimeAudioDevice { kind });
+        })];
+        let items = vec![
+            SelectionItem {
+                name: "Restart now".to_string(),
+                description: Some(format!("Restart local {} audio now.", kind.noun())),
+                actions: restart_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Apply later".to_string(),
+                description: Some(format!(
+                    "Keep the current {} until local audio starts again.",
+                    kind.noun()
+                )),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from(format!("Restart {} now?", kind.title()).bold()));
+        header.push(Line::from(
+            "Configuration is saved. Restart local audio to use it immediately.".dim(),
+        ));
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
@@ -6172,6 +6402,7 @@ impl ChatWidget {
                 model: None,
                 effort: None,
                 summary: None,
+                service_tier: None,
                 collaboration_mode: None,
                 personality: None,
             }));
@@ -6698,6 +6929,8 @@ impl ChatWidget {
             let realtime_conversation_enabled = self.realtime_conversation_enabled();
             self.bottom_pane
                 .set_realtime_conversation_enabled(realtime_conversation_enabled);
+            self.bottom_pane
+                .set_audio_device_selection_enabled(self.realtime_audio_device_selection_enabled());
             if !realtime_conversation_enabled && self.realtime_conversation.is_live() {
                 self.request_realtime_conversation_close(Some(
                     "Realtime voice mode was closed because the feature was disabled.".to_string(),
@@ -6787,6 +7020,22 @@ impl ChatWidget {
         self.config.personality = Some(personality);
     }
 
+    /// Set Fast mode in the widget's config copy.
+    pub(crate) fn set_service_tier(&mut self, service_tier: ServiceTier) {
+        self.config.service_tier = service_tier;
+    }
+
+    pub(crate) fn set_realtime_audio_device(
+        &mut self,
+        kind: RealtimeAudioDeviceKind,
+        name: Option<String>,
+    ) {
+        match kind {
+            RealtimeAudioDeviceKind::Microphone => self.config.realtime_audio.microphone = name,
+            RealtimeAudioDeviceKind::Speaker => self.config.realtime_audio.speaker = name,
+        }
+    }
+
     /// Set the syntax theme override in the widget's config copy.
     pub(crate) fn set_tui_theme(&mut self, theme: Option<String>) {
         self.config.tui_theme = theme;
@@ -6805,6 +7054,26 @@ impl ChatWidget {
         self.refresh_model_display();
     }
 
+    fn set_service_tier_selection(&mut self, service_tier: ServiceTier) {
+        self.app_event_tx
+            .send(AppEvent::CodexOp(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                windows_sandbox_level: None,
+                model: None,
+                effort: None,
+                summary: None,
+                service_tier: Some(service_tier),
+                collaboration_mode: None,
+                personality: None,
+            }));
+        self.app_event_tx
+            .send(AppEvent::UpdateServiceTier(service_tier));
+        self.app_event_tx
+            .send(AppEvent::PersistServiceTierSelection { service_tier });
+    }
+
     pub(crate) fn current_model(&self) -> &str {
         if !self.collaboration_modes_enabled() {
             return self.current_collaboration_mode.model();
@@ -6813,6 +7082,22 @@ impl ChatWidget {
             .as_ref()
             .and_then(|mask| mask.model.as_deref())
             .unwrap_or_else(|| self.current_collaboration_mode.model())
+    }
+
+    pub(crate) fn realtime_conversation_is_live(&self) -> bool {
+        self.realtime_conversation.is_active()
+    }
+
+    fn current_realtime_audio_device_name(&self, kind: RealtimeAudioDeviceKind) -> Option<String> {
+        match kind {
+            RealtimeAudioDeviceKind::Microphone => self.config.realtime_audio.microphone.clone(),
+            RealtimeAudioDeviceKind::Speaker => self.config.realtime_audio.speaker.clone(),
+        }
+    }
+
+    fn current_realtime_audio_selection_label(&self, kind: RealtimeAudioDeviceKind) -> String {
+        self.current_realtime_audio_device_name(kind)
+            .unwrap_or_else(|| "System default".to_string())
     }
 
     fn sync_personality_command_enabled(&mut self) {
@@ -7130,7 +7415,10 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_mcp_output(&mut self) {
-        if self.config.mcp_servers.is_empty() {
+        let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
+            self.config.codex_home.clone(),
+        )));
+        if mcp_manager.effective_servers(&self.config, None).is_empty() {
             self.add_to_history(history_cell::empty_mcp_output());
         } else {
             self.submit_op(Op::ListMcpTools);
@@ -7500,6 +7788,11 @@ impl ChatWidget {
     #[cfg(test)]
     pub(crate) fn pending_thread_approvals(&self) -> &[String] {
         self.bottom_pane.pending_thread_approvals()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_view(&self) -> bool {
+        self.bottom_pane.has_active_view()
     }
 
     pub(crate) fn show_esc_backtrack_hint(&mut self) {

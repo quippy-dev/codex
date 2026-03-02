@@ -97,7 +97,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -143,7 +143,7 @@ async fn config_personality_some_sets_instructions_template() -> anyhow::Result<
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -196,7 +196,7 @@ async fn config_personality_none_sends_no_personality() -> anyhow::Result<()> {
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -255,7 +255,7 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -302,7 +302,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -321,6 +321,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
             summary: None,
             collaboration_mode: None,
             personality: Some(Personality::Friendly),
+            service_tier: None,
         })
         .await?;
 
@@ -336,7 +337,7 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -398,7 +399,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -417,6 +418,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
             summary: None,
             collaboration_mode: None,
             personality: Some(Personality::Pragmatic),
+            service_tier: None,
         })
         .await?;
 
@@ -432,7 +434,7 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -504,7 +506,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -523,6 +525,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
             summary: None,
             collaboration_mode: None,
             personality: Some(Personality::Pragmatic),
+            service_tier: None,
         })
         .await?;
 
@@ -538,7 +541,7 @@ async fn user_turn_personality_skips_if_feature_disabled() -> anyhow::Result<()>
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -602,6 +605,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
+        availability_nux: None,
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
@@ -647,7 +651,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: remote_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: Some(Personality::Friendly),
         })
@@ -710,6 +714,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
+        availability_nux: None,
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
@@ -758,7 +763,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: remote_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -777,6 +782,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
             summary: None,
             collaboration_mode: None,
             personality: Some(Personality::Friendly),
+            service_tier: None,
         })
         .await?;
 
@@ -792,7 +798,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: remote_slug.to_string(),
             effort: test.config.model_reasoning_effort,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })

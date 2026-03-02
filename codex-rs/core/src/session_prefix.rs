@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn parse_subagent_notification_handles_embedded_close_tag_in_payload() {
-        let embedded_close_tag = format!("contains {}", SUBAGENT_NOTIFICATION_CLOSE_TAG);
+        let embedded_close_tag = format!("contains {SUBAGENT_NOTIFICATION_CLOSE_TAG}");
         let message = format_subagent_notification_message(
             "agent-1",
             &AgentStatus::Completed(Some(embedded_close_tag.clone())),

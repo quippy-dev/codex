@@ -226,9 +226,13 @@ mod tests {
     use super::*;
     use crate::config::ConfigBuilder;
     use crate::config_loader::ConfigLayerStackOrdering;
+    use crate::plugins::PluginsManager;
+    use crate::skills::SkillsManager;
     use codex_protocol::openai_models::ReasoningEffort;
     use pretty_assertions::assert_eq;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn test_config_with_cli_overrides(
@@ -469,6 +473,54 @@ writable_roots = ["./sandbox-root"]
         assert_eq!(session_flags_layer_count(&config), before_layers + 1);
     }
 
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn apply_role_skills_config_disables_skill_for_spawned_agent() {
+        let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+        let skill_dir = home.path().join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill_path = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_path,
+            "---\nname: demo-skill\ndescription: demo description\n---\n\n# Body\n",
+        )
+        .expect("write skill");
+        let role_path = write_role_config(
+            &home,
+            "skills-role.toml",
+            &format!(
+                r#"[[skills.config]]
+path = "{}"
+enabled = false
+"#,
+                skill_path.display()
+            ),
+        )
+        .await;
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: None,
+                config_file: Some(role_path),
+            },
+        );
+
+        apply_role_to_config(&mut config, Some("custom"))
+            .await
+            .expect("custom role should apply");
+
+        let plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
+        let skills_manager = SkillsManager::new(home.path().to_path_buf(), plugins_manager);
+        let outcome = skills_manager.skills_for_config(&config);
+        let skill = outcome
+            .skills
+            .iter()
+            .find(|skill| skill.name == "demo-skill")
+            .expect("demo skill should be discovered");
+
+        assert_eq!(outcome.is_skill_enabled(skill), false);
+    }
+
     #[test]
     fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
         let user_defined_roles = BTreeMap::from([
@@ -486,6 +538,7 @@ writable_roots = ["./sandbox-root"]
 
         assert!(spec.contains("researcher: no description"));
         assert!(spec.contains("explorer: {\nuser override\n}"));
+        assert!(spec.contains("awaiter: {"));
         assert!(spec.contains("default: {\nDefault agent.\n}"));
         assert!(!spec.contains("Explorers are fast and authoritative."));
     }
@@ -510,7 +563,9 @@ writable_roots = ["./sandbox-root"]
     }
 
     #[test]
-    fn built_in_config_file_contents_resolves_explorer_only() {
+    fn built_in_config_file_contents_resolves_explorer_and_awaiter() {
+        assert!(built_in::config_file_contents(Path::new("explorer.toml")).is_some());
+        assert!(built_in::config_file_contents(Path::new("awaiter.toml")).is_some());
         assert_eq!(
             built_in::config_file_contents(Path::new("missing.toml")),
             None
