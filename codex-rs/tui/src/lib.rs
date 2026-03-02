@@ -1282,6 +1282,7 @@ mod tests {
             model,
             personality: None,
             collaboration_mode: None,
+            realtime_active: Some(false),
             effort: config.model_reasoning_effort,
             summary: config
                 .model_reasoning_summary

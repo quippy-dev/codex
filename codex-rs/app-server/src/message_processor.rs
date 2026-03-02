@@ -174,7 +174,7 @@ impl MessageProcessor {
             config_warnings,
         } = args;
         let auth_manager = AuthManager::shared(
-            auth_storage_home.clone(),
+            auth_storage_home,
             false,
             config.cli_auth_credentials_store_mode,
         );

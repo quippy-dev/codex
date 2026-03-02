@@ -4,6 +4,8 @@ use crate::ModelProviderInfo;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+#[cfg(test)]
+use crate::codex::PreviousTurnSettings;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
@@ -61,7 +63,6 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
-    previous_user_turn_model: Option<&str>,
 ) -> CodexResult<()> {
     let prompt = turn_context.compact_prompt().to_string();
     let input = vec![UserInput::Text {
@@ -76,7 +77,6 @@ pub(crate) async fn run_inline_auto_compact_task(
         input,
         initial_context_injection,
         CompactTrigger::Auto,
-        previous_user_turn_model,
     )
     .await?;
     Ok(())
@@ -99,7 +99,6 @@ pub(crate) async fn run_compact_task(
         input,
         InitialContextInjection::DoNotInject,
         CompactTrigger::Manual,
-        None,
     )
     .await
 }
@@ -110,7 +109,6 @@ async fn run_compact_task_inner(
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compact_trigger: CompactTrigger,
-    previous_user_turn_model: Option<&str>,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -225,9 +223,7 @@ async fn run_compact_task_inner(
         initial_context_injection,
         InitialContextInjection::BeforeLastUserMessage
     ) {
-        let initial_context = sess
-            .build_initial_context(turn_context.as_ref(), previous_user_turn_model)
-            .await;
+        let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
@@ -531,18 +527,18 @@ mod tests {
 
     async fn process_compacted_history_with_test_session(
         compacted_history: Vec<ResponseItem>,
-        previous_user_turn_model: Option<&str>,
+        previous_turn_settings: Option<&PreviousTurnSettings>,
     ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
         let (session, turn_context) = crate::codex::make_session_and_context().await;
-        let initial_context = session
-            .build_initial_context(&turn_context, previous_user_turn_model)
+        session
+            .set_previous_turn_settings(previous_turn_settings.cloned())
             .await;
+        let initial_context = session.build_initial_context(&turn_context).await;
         let refreshed = crate::compact_remote::process_compacted_history(
             &session,
             &turn_context,
             compacted_history,
             InitialContextInjection::BeforeLastUserMessage,
-            previous_user_turn_model,
         )
         .await;
         (refreshed, initial_context)
@@ -966,9 +962,13 @@ keep me updated
             phase: None,
         }];
 
+        let previous_turn_settings = PreviousTurnSettings {
+            model: "previous-regular-model".to_string(),
+            realtime_active: None,
+        };
         let (refreshed, initial_context) = process_compacted_history_with_test_session(
             compacted_history,
-            Some("previous-regular-model"),
+            Some(&previous_turn_settings),
         )
         .await;
 
