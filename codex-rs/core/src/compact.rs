@@ -24,7 +24,6 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
 use tracing::error;
@@ -128,7 +127,10 @@ async fn run_compact_task_inner(
 
     let max_retries = turn_context.provider.stream_max_retries();
     let mut retries = 0;
-    let mut client_session = sess.services.model_client.new_session();
+    let mut client_session = sess
+        .services
+        .model_client
+        .new_session_with_service_tier(turn_context.config.service_tier);
     // Reuse one client session so turn-scoped state (sticky routing, websocket append tracking)
     // survives retries within this compact turn.
 
@@ -239,17 +241,14 @@ async fn run_compact_task_inner(
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
     };
-    sess.replace_history(new_history.clone(), reference_context_item)
-        .await;
-    sess.recompute_token_usage(&turn_context).await;
-
-    let rollout_item = RolloutItem::Compacted(CompactedItem {
+    let compacted_item = CompactedItem {
         message: summary_text.clone(),
         retained_proposed_plan,
-        replacement_history: Some(new_history),
-    });
-    sess.persist_rollout_items(&[rollout_item]).await;
-
+        replacement_history: Some(new_history.clone()),
+    };
+    sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
+        .await;
+    sess.recompute_token_usage(&turn_context).await;
     sess.emit_turn_item_completed(&turn_context, compaction_item)
         .await;
     let warning = EventMsg::Warning(WarningEvent {

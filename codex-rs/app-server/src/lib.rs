@@ -65,6 +65,7 @@ mod message_processor;
 mod models;
 mod outgoing_message;
 mod runtime_bootstrap;
+mod server_request_error;
 mod thread_state;
 mod thread_status;
 mod transport;

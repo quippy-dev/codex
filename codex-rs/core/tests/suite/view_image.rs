@@ -107,7 +107,7 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -209,7 +209,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -339,7 +339,7 @@ console.log(JSON.stringify(out));
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -368,19 +368,23 @@ console.log(JSON.stringify(out));
         Some(false),
         "js_repl call failed unexpectedly: {js_repl_output}"
     );
+    let custom_output = req.custom_tool_call_output(call_id);
+    let output_items = custom_output
+        .get("output")
+        .and_then(Value::as_array)
+        .expect("custom_tool_call_output should be a content item array");
+    let image_url = output_items
+        .iter()
+        .find_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("input_image"))
+                .then(|| item.get("image_url").and_then(Value::as_str))
+                .flatten()
+        })
+        .expect("image_url present in js_repl custom tool output");
     assert!(
-        js_repl_output.contains("function_call_output"),
-        "expected function_call_output payload, got {js_repl_output}"
+        image_url.starts_with("data:image/png;base64,"),
+        "expected png data URL image_url, got {image_url}"
     );
-    assert!(
-        js_repl_output.contains("input_image"),
-        "expected input_image payload, got {js_repl_output}"
-    );
-    assert!(
-        js_repl_output.contains("data:image/png;base64,"),
-        "expected png data URL, got {js_repl_output}"
-    );
-
     Ok(())
 }
 
@@ -431,7 +435,7 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -506,7 +510,7 @@ async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()>
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -598,7 +602,7 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -662,6 +666,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
+        availability_nux: None,
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
@@ -721,7 +726,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: model_slug.to_string(),
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -797,7 +802,7 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
             collaboration_mode: None,
             personality: None,
         })
