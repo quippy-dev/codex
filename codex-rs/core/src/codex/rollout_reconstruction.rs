@@ -196,6 +196,22 @@ impl Session {
                         }
                     }
                 }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    if let codex_protocol::items::TurnItem::Plan(item) = &event.item {
+                        if active_segment.turn_id.is_none() {
+                            active_segment.turn_id = Some(event.turn_id.clone());
+                        }
+                        if turn_ids_are_compatible(
+                            active_segment.turn_id.as_deref(),
+                            Some(event.turn_id.as_str()),
+                        ) && active_segment.latest_proposed_plan_text.is_none()
+                        {
+                            active_segment.latest_proposed_plan_text = Some(item.text.clone());
+                        }
+                    }
+                }
                 RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
                     // `TurnStarted` is the oldest boundary of the active reverse segment.
                     if active_segment.as_ref().is_some_and(|active_segment| {

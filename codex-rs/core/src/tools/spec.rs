@@ -636,10 +636,19 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             },
         ),
         (
-            "fork_context".to_string(),
-            JsonSchema::Boolean {
+            "spawn_mode".to_string(),
+            JsonSchema::String {
                 description: Some(
-                    "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
+                    "Spawn behavior: use `spawn` for a fresh thread (default), `fork` to inherit parent history, or `watchdog` to create an idle watchdog handle."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "interval_s".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Watchdog check-in interval in seconds. Only used when spawn_mode is `watchdog`; defaults to 60."
                         .to_string(),
                 ),
             },

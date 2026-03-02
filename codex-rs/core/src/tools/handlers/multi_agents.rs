@@ -129,8 +129,6 @@ mod spawn {
         #[serde(default, alias = "mode")]
         spawn_mode: SpawnMode,
         interval_s: Option<i64>,
-        #[serde(default)]
-        fork_context: bool,
     }
 
     #[derive(Debug, Serialize)]
@@ -175,11 +173,6 @@ mod spawn {
         {
             return Err(FunctionCallError::RespondToModel(
                 "watchdogs can only be spawned by root agents".to_string(),
-            ));
-        }
-        if matches!(spawn_mode, SpawnMode::Watchdog) && args.fork_context {
-            return Err(FunctionCallError::RespondToModel(
-                "fork_context is not supported when spawn_mode=watchdog".to_string(),
             ));
         }
         let max_depth = turn.config.agent_max_depth;
@@ -228,7 +221,8 @@ mod spawn {
                         input_items,
                         Some(spawn_source),
                         SpawnAgentOptions {
-                            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+                            fork_parent_spawn_call_id: matches!(spawn_mode, SpawnMode::Fork)
+                                .then(|| call_id.clone()),
                         },
                     )
                     .await

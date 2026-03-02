@@ -2,9 +2,12 @@ use super::*;
 
 use crate::protocol::CompactedItem;
 use crate::protocol::InitialHistory;
+use crate::protocol::ItemCompletedEvent;
 use crate::protocol::ResumedHistory;
 use crate::protocol::RetainedProposedPlan;
 use codex_protocol::ThreadId;
+use codex_protocol::items::PlanItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
@@ -239,6 +242,55 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
         serde_json::to_value(Some(first_context_item))
             .expect("serialize expected reference context item")
     );
+}
+
+#[tokio::test]
+async fn reconstruct_history_hydrates_latest_proposed_plan_text_from_plan_item_completed_event() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context_item = turn_context.to_turn_context_item();
+    let turn_id = context_item
+        .turn_id
+        .clone()
+        .expect("turn context should have turn_id");
+    let plan_text = "- one\n- two".to_string();
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "plan please".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::TurnContext(context_item),
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::default(),
+            turn_id: turn_id.clone(),
+            item: TurnItem::Plan(PlanItem {
+                id: "plan-item-id".to_string(),
+                text: plan_text.clone(),
+            }),
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id,
+                last_agent_message: None,
+            },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.latest_proposed_plan_text, Some(plan_text));
 }
 
 #[tokio::test]

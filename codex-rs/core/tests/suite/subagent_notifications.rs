@@ -424,7 +424,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
 
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_PROMPT,
-        "fork_context": true,
+        "spawn_mode": "fork",
     }))?;
     let spawn_turn = mount_sse_once_match(
         &server,
