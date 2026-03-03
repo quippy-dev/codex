@@ -698,9 +698,9 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         SessionSource::Exec,
         config.model_catalog.clone(),
         CollaborationModesConfig {
-            default_mode_request_user_input: config
+            request_user_input_outside_plan_mode: config
                 .features
-                .enabled(Feature::DefaultModeRequestUserInput),
+                .enabled(Feature::RequestUserInputOutsidePlanMode),
         },
     );
     let NewThread { thread: codex, .. } = thread_manager

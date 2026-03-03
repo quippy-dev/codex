@@ -8807,7 +8807,7 @@ mod tests {
             auth_manager.clone(),
             None,
             CollaborationModesConfig {
-                default_mode_request_user_input: config
+                request_user_input_outside_plan_mode: config
                     .features
                     .enabled(Feature::RequestUserInputOutsidePlanMode),
             },

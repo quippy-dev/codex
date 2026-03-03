@@ -171,6 +171,22 @@ impl Session {
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.counts_as_user_turn = true;
                 }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    if let codex_protocol::items::TurnItem::Plan(item) = &event.item {
+                        if active_segment.turn_id.is_none() {
+                            active_segment.turn_id = Some(event.turn_id.clone());
+                        }
+                        if turn_ids_are_compatible(
+                            active_segment.turn_id.as_deref(),
+                            Some(event.turn_id.as_str()),
+                        ) && active_segment.latest_proposed_plan_text.is_none()
+                        {
+                            active_segment.latest_proposed_plan_text = Some(item.text.clone());
+                        }
+                    }
+                }
                 RolloutItem::TurnContext(ctx) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
@@ -193,22 +209,6 @@ impl Session {
                         ) {
                             active_segment.reference_context_item =
                                 TurnReferenceContextItem::Latest(Box::new(ctx.clone()));
-                        }
-                    }
-                }
-                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
-                    let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
-                    if let codex_protocol::items::TurnItem::Plan(item) = &event.item {
-                        if active_segment.turn_id.is_none() {
-                            active_segment.turn_id = Some(event.turn_id.clone());
-                        }
-                        if turn_ids_are_compatible(
-                            active_segment.turn_id.as_deref(),
-                            Some(event.turn_id.as_str()),
-                        ) && active_segment.latest_proposed_plan_text.is_none()
-                        {
-                            active_segment.latest_proposed_plan_text = Some(item.text.clone());
                         }
                     }
                 }

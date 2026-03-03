@@ -5845,7 +5845,7 @@ impl CodexMessageProcessor {
         }
 
         let collaboration_modes_config = CollaborationModesConfig {
-            default_mode_request_user_input: thread
+            request_user_input_outside_plan_mode: thread
                 .enabled(Feature::RequestUserInputOutsidePlanMode),
         };
         let collaboration_mode = params.collaboration_mode.map(|mode| {
