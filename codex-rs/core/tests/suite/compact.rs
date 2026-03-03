@@ -456,6 +456,7 @@ async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
             model: session_configured.model,
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             final_output_json_schema: None,
             collaboration_mode: Some(plan_mode),
             personality: None,
@@ -1756,6 +1757,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
             model: resumed.session_configured.model.clone(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1845,6 +1847,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1868,6 +1871,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1977,6 +1981,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -2024,6 +2029,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -3226,6 +3232,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -3249,6 +3256,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })

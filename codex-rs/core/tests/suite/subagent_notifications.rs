@@ -89,6 +89,7 @@ async fn submit_turn_no_wait(test: &TestCodex, prompt: &str) -> Result<()> {
             model: session_model,
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })

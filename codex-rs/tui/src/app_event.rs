@@ -198,9 +198,6 @@ pub(crate) enum AppEvent {
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
 
-    /// Update the current service tier in the running app and widget.
-    UpdateServiceTier(ServiceTier),
-
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {
         model: String,
@@ -214,7 +211,7 @@ pub(crate) enum AppEvent {
 
     /// Persist the selected service tier to the appropriate config.
     PersistServiceTierSelection {
-        service_tier: ServiceTier,
+        service_tier: Option<ServiceTier>,
     },
 
     /// Open the device picker for a realtime microphone or speaker.

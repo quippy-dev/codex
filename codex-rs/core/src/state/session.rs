@@ -1,5 +1,7 @@
 //! Session-wide mutable state.
 
+use codex_artifact_presentation::PresentationArtifactManager;
+use codex_artifact_spreadsheet::SpreadsheetArtifactManager;
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -22,6 +24,12 @@ use tracing::warn;
 const DEFERRED_COLLAB_ITEMS_MAX: usize = 8192;
 const DEFERRED_COLLAB_BYTES_MAX: usize = 64 * 1024 * 1024;
 
+#[derive(Default)]
+pub(crate) struct SessionArtifacts {
+    pub(crate) presentation: PresentationArtifactManager,
+    pub(crate) spreadsheet: SpreadsheetArtifactManager,
+}
+
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
@@ -43,6 +51,7 @@ pub(crate) struct SessionState {
     post_interrupt_collab_hold_armed: bool,
     deferred_collab_items: Vec<ResponseInputItem>,
     deferred_collab_items_bytes: usize,
+    pub(crate) artifacts: SessionArtifacts,
 }
 
 impl SessionState {
@@ -64,6 +73,7 @@ impl SessionState {
             post_interrupt_collab_hold_armed: false,
             deferred_collab_items: Vec::new(),
             deferred_collab_items_bytes: 0,
+            artifacts: SessionArtifacts::default(),
         }
     }
 

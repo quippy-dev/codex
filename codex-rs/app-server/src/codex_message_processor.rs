@@ -141,6 +141,7 @@ use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
@@ -172,7 +173,6 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
-use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
@@ -274,6 +274,7 @@ use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url;
+use codex_state::log_db::LogDbLayer;
 use codex_utils_json_to_toml::json_to_toml;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -374,7 +375,6 @@ pub(crate) struct CodexMessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
-    single_client_mode: bool,
     cli_overrides: Vec<(String, TomlValue)>,
     cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
@@ -384,6 +384,7 @@ pub(crate) struct CodexMessageProcessor {
     pending_fuzzy_searches: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     fuzzy_search_sessions: Arc<Mutex<HashMap<String, FuzzyFileSearchSession>>>,
     feedback: CodexFeedback,
+    log_db: Option<LogDbLayer>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -401,7 +402,6 @@ struct ListenerTaskContext {
     thread_watch_manager: ThreadWatchManager,
     fallback_model_provider: String,
     codex_home: PathBuf,
-    single_client_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,8 +418,8 @@ pub(crate) struct CodexMessageProcessorArgs {
     pub(crate) config: Arc<Config>,
     pub(crate) cli_overrides: Vec<(String, TomlValue)>,
     pub(crate) cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
-    pub(crate) single_client_mode: bool,
     pub(crate) feedback: CodexFeedback,
+    pub(crate) log_db: Option<LogDbLayer>,
 }
 
 impl CodexMessageProcessor {
@@ -463,8 +463,8 @@ impl CodexMessageProcessor {
             config,
             cli_overrides,
             cloud_requirements,
-            single_client_mode,
             feedback,
+            log_db,
         } = args;
         Self {
             auth_manager,
@@ -472,7 +472,6 @@ impl CodexMessageProcessor {
             outgoing: outgoing.clone(),
             arg0_paths,
             config,
-            single_client_mode,
             cli_overrides,
             cloud_requirements,
             active_login: Arc::new(Mutex::new(None)),
@@ -482,6 +481,7 @@ impl CodexMessageProcessor {
             pending_fuzzy_searches: Arc::new(Mutex::new(HashMap::new())),
             fuzzy_search_sessions: Arc::new(Mutex::new(HashMap::new())),
             feedback,
+            log_db,
         }
     }
 
@@ -2047,6 +2047,7 @@ impl CodexMessageProcessor {
         let ThreadStartParams {
             model,
             model_provider,
+            service_tier,
             cwd,
             approval_policy,
             sandbox,
@@ -2064,6 +2065,7 @@ impl CodexMessageProcessor {
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
+            service_tier,
             cwd,
             approval_policy,
             sandbox,
@@ -2081,7 +2083,6 @@ impl CodexMessageProcessor {
             thread_watch_manager: self.thread_watch_manager.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.clone(),
-            single_client_mode: self.single_client_mode,
         };
 
         tokio::spawn(async move {
@@ -2204,7 +2205,7 @@ impl CodexMessageProcessor {
 
                 listener_task_context
                     .thread_watch_manager
-                    .upsert_thread(thread.clone())
+                    .upsert_thread_silently(thread.clone())
                     .await;
 
                 thread.status = resolve_thread_status(
@@ -2219,6 +2220,7 @@ impl CodexMessageProcessor {
                     thread: thread.clone(),
                     model: config_snapshot.model,
                     model_provider: config_snapshot.model_provider_id,
+                    service_tier: config_snapshot.service_tier,
                     cwd: config_snapshot.cwd,
                     approval_policy: config_snapshot.approval_policy.into(),
                     sandbox: config_snapshot.sandbox_policy.into(),
@@ -2255,6 +2257,7 @@ impl CodexMessageProcessor {
         &self,
         model: Option<String>,
         model_provider: Option<String>,
+        service_tier: Option<Option<codex_protocol::config_types::ServiceTier>>,
         cwd: Option<String>,
         approval_policy: Option<codex_app_server_protocol::AskForApproval>,
         sandbox: Option<SandboxMode>,
@@ -2265,6 +2268,7 @@ impl CodexMessageProcessor {
         ConfigOverrides {
             model,
             model_provider,
+            service_tier,
             cwd: cwd.map(PathBuf::from),
             approval_policy: approval_policy
                 .map(codex_app_server_protocol::AskForApproval::to_core),
@@ -2341,6 +2345,14 @@ impl CodexMessageProcessor {
 
     async fn thread_set_name(&self, request_id: ConnectionRequestId, params: ThreadSetNameParams) {
         let ThreadSetNameParams { thread_id, name } = params;
+        let thread_id = match ThreadId::from_string(&thread_id) {
+            Ok(id) => id,
+            Err(err) => {
+                self.send_invalid_request_error(request_id, format!("invalid thread id: {err}"))
+                    .await;
+                return;
+            }
+        };
         let Some(name) = codex_core::util::normalize_thread_name(&name) else {
             self.send_invalid_request_error(
                 request_id,
@@ -2350,15 +2362,43 @@ impl CodexMessageProcessor {
             return;
         };
 
-        let (_, thread) = match self.load_thread(&thread_id).await {
-            Ok(v) => v,
-            Err(error) => {
-                self.outgoing.send_error(request_id, error).await;
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            if let Err(err) = thread.submit(Op::SetThreadName { name }).await {
+                self.send_internal_error(request_id, format!("failed to set thread name: {err}"))
+                    .await;
                 return;
             }
-        };
 
-        if let Err(err) = thread.submit(Op::SetThreadName { name }).await {
+            self.outgoing
+                .send_response(request_id, ThreadSetNameResponse {})
+                .await;
+            return;
+        }
+
+        let thread_exists =
+            match find_thread_path_by_id_str(&self.config.codex_home, &thread_id.to_string()).await
+            {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(err) => {
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!("failed to locate thread id {thread_id}: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+        if !thread_exists {
+            self.send_invalid_request_error(request_id, format!("thread not found: {thread_id}"))
+                .await;
+            return;
+        }
+
+        if let Err(err) =
+            codex_core::append_thread_name(&self.config.codex_home, thread_id, &name).await
+        {
             self.send_internal_error(request_id, format!("failed to set thread name: {err}"))
                 .await;
             return;
@@ -2366,6 +2406,13 @@ impl CodexMessageProcessor {
 
         self.outgoing
             .send_response(request_id, ThreadSetNameResponse {})
+            .await;
+        let notification = ThreadNameUpdatedNotification {
+            thread_id: thread_id.to_string(),
+            thread_name: Some(name),
+        };
+        self.outgoing
+            .send_server_notification(ServerNotification::ThreadNameUpdated(notification))
             .await;
     }
 
@@ -3023,6 +3070,7 @@ impl CodexMessageProcessor {
             path,
             model,
             model_provider,
+            service_tier,
             cwd,
             approval_policy,
             sandbox,
@@ -3055,6 +3103,7 @@ impl CodexMessageProcessor {
         let typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
+            service_tier,
             cwd,
             approval_policy,
             sandbox,
@@ -3153,6 +3202,7 @@ impl CodexMessageProcessor {
                     thread,
                     model: session_configured.model,
                     model_provider: session_configured.model_provider_id,
+                    service_tier: session_configured.service_tier,
                     cwd: session_configured.cwd,
                     approval_policy: session_configured.approval_policy.into(),
                     sandbox: session_configured.sandbox_policy.into(),
@@ -3460,6 +3510,7 @@ impl CodexMessageProcessor {
             path,
             model,
             model_provider,
+            service_tier,
             cwd,
             approval_policy,
             sandbox,
@@ -3543,6 +3594,7 @@ impl CodexMessageProcessor {
         let typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
+            service_tier,
             cwd,
             approval_policy,
             sandbox,
@@ -3702,7 +3754,7 @@ impl CodexMessageProcessor {
         }
 
         self.thread_watch_manager
-            .upsert_thread(thread.clone())
+            .upsert_thread_silently(thread.clone())
             .await;
 
         thread.status = resolve_thread_status(
@@ -3716,6 +3768,7 @@ impl CodexMessageProcessor {
             thread: thread.clone(),
             model: session_configured.model,
             model_provider: session_configured.model_provider_id,
+            service_tier: session_configured.service_tier,
             cwd: session_configured.cwd,
             approval_policy: session_configured.approval_policy.into(),
             sandbox: session_configured.sandbox_policy.into(),
@@ -4624,6 +4677,7 @@ impl CodexMessageProcessor {
                         SessionConfiguredNotification {
                             session_id: session_configured.session_id,
                             model: session_configured.model.clone(),
+                            service_tier: session_configured.service_tier,
                             reasoning_effort: session_configured.reasoning_effort,
                             history_log_id: session_configured.history_log_id,
                             history_entry_count: session_configured.history_entry_count,
@@ -4845,6 +4899,7 @@ impl CodexMessageProcessor {
                 SessionConfiguredNotification {
                     session_id: session_configured.session_id,
                     model: session_configured.model.clone(),
+                    service_tier: session_configured.service_tier,
                     reasoning_effort: session_configured.reasoning_effort,
                     history_log_id: session_configured.history_log_id,
                     history_entry_count: session_configured.history_entry_count,
@@ -5272,6 +5327,7 @@ impl CodexMessageProcessor {
             approval_policy,
             sandbox_policy,
             model,
+            service_tier,
             effort,
             summary,
             output_schema,
@@ -5321,6 +5377,7 @@ impl CodexMessageProcessor {
                 model,
                 effort,
                 summary: Some(summary),
+                service_tier,
                 final_output_json_schema: output_schema,
                 collaboration_mode: None,
                 personality: None,
@@ -5863,6 +5920,7 @@ impl CodexMessageProcessor {
             || params.approval_policy.is_some()
             || params.sandbox_policy.is_some()
             || params.model.is_some()
+            || params.service_tier.is_some()
             || params.effort.is_some()
             || params.summary.is_some()
             || collaboration_mode.is_some()
@@ -5879,7 +5937,7 @@ impl CodexMessageProcessor {
                     model: params.model,
                     effort: params.effort.map(Some),
                     summary: params.summary,
-                    service_tier: None,
+                    service_tier: params.service_tier,
                     collaboration_mode,
                     personality: params.personality,
                 })
@@ -5903,17 +5961,8 @@ impl CodexMessageProcessor {
                     status: TurnStatus::InProgress,
                 };
 
-                let response = TurnStartResponse { turn: turn.clone() };
+                let response = TurnStartResponse { turn };
                 self.outgoing.send_response(request_id, response).await;
-
-                // Emit v2 turn/started notification.
-                let notif = TurnStartedNotification {
-                    thread_id: params.thread_id,
-                    turn,
-                };
-                self.outgoing
-                    .send_server_notification(ServerNotification::TurnStarted(notif))
-                    .await;
             }
             Err(err) => {
                 let error = JSONRPCErrorError {
@@ -6204,23 +6253,14 @@ impl CodexMessageProcessor {
         &self,
         request_id: &ConnectionRequestId,
         turn: Turn,
-        parent_thread_id: String,
         review_thread_id: String,
     ) {
         let response = ReviewStartResponse {
-            turn: turn.clone(),
+            turn,
             review_thread_id,
         };
         self.outgoing
             .send_response(request_id.clone(), response)
-            .await;
-
-        let notif = TurnStartedNotification {
-            thread_id: parent_thread_id,
-            turn,
-        };
-        self.outgoing
-            .send_server_notification(ServerNotification::TurnStarted(notif))
             .await;
     }
 
@@ -6237,13 +6277,8 @@ impl CodexMessageProcessor {
         match turn_id {
             Ok(turn_id) => {
                 let turn = Self::build_review_turn(turn_id, display_text);
-                self.emit_review_started(
-                    request_id,
-                    turn,
-                    parent_thread_id.clone(),
-                    parent_thread_id,
-                )
-                .await;
+                self.emit_review_started(request_id, turn, parent_thread_id)
+                    .await;
                 Ok(())
             }
             Err(err) => Err(JSONRPCErrorError {
@@ -6318,7 +6353,7 @@ impl CodexMessageProcessor {
                 Ok(summary) => {
                     let mut thread = summary_to_thread(summary);
                     self.thread_watch_manager
-                        .upsert_thread(thread.clone())
+                        .upsert_thread_silently(thread.clone())
                         .await;
                     thread.status = resolve_thread_status(
                         self.thread_watch_manager
@@ -6357,7 +6392,7 @@ impl CodexMessageProcessor {
 
         let turn = Self::build_review_turn(turn_id, display_text);
         let review_thread_id = thread_id.to_string();
-        self.emit_review_started(request_id, turn, review_thread_id.clone(), review_thread_id)
+        self.emit_review_started(request_id, turn, review_thread_id)
             .await;
 
         Ok(())
@@ -6533,7 +6568,6 @@ impl CodexMessageProcessor {
                 thread_watch_manager: self.thread_watch_manager.clone(),
                 fallback_model_provider: self.config.model_provider_id.clone(),
                 codex_home: self.config.codex_home.clone(),
-                single_client_mode: self.single_client_mode,
             },
             conversation_id,
             connection_id,
@@ -6621,7 +6655,6 @@ impl CodexMessageProcessor {
                 thread_watch_manager: self.thread_watch_manager.clone(),
                 fallback_model_provider: self.config.model_provider_id.clone(),
                 codex_home: self.config.codex_home.clone(),
-                single_client_mode: self.single_client_mode,
             },
             conversation_id,
             conversation,
@@ -6653,7 +6686,6 @@ impl CodexMessageProcessor {
             thread_watch_manager,
             fallback_model_provider,
             codex_home,
-            single_client_mode,
         } = listener_task_context;
         let outgoing_for_task = Arc::clone(&outgoing);
         tokio::spawn(async move {
@@ -6703,9 +6735,7 @@ impl CodexMessageProcessor {
                         );
                         let raw_events_enabled = {
                             let mut thread_state = thread_state.lock().await;
-                            if !single_client_mode {
-                                thread_state.track_current_turn_event(&event.msg);
-                            }
+                            thread_state.track_current_turn_event(&event.msg);
                             thread_state.experimental_raw_events
                         };
                         let subscribed_connection_ids = thread_state_manager
@@ -6955,6 +6985,30 @@ impl CodexMessageProcessor {
 
         let snapshot = self.feedback.snapshot(conversation_id);
         let thread_id = snapshot.thread_id.clone();
+        let sqlite_feedback_logs = if include_logs {
+            if let Some(log_db) = self.log_db.as_ref() {
+                log_db.flush().await;
+            }
+            let state_db_ctx = get_state_db(&self.config, None).await;
+            match (state_db_ctx.as_ref(), conversation_id) {
+                (Some(state_db_ctx), Some(conversation_id)) => {
+                    let thread_id_text = conversation_id.to_string();
+                    match state_db_ctx.query_feedback_logs(&thread_id_text).await {
+                        Ok(logs) if logs.is_empty() => None,
+                        Ok(logs) => Some(logs),
+                        Err(err) => {
+                            warn!(
+                                "failed to query feedback logs from sqlite for thread_id={thread_id_text}: {err}"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let validated_rollout_path = if include_logs {
             match conversation_id {
@@ -6978,6 +7032,7 @@ impl CodexMessageProcessor {
                 include_logs,
                 &attachment_paths,
                 Some(session_source),
+                sqlite_feedback_logs,
             )
         })
         .await;
@@ -7179,6 +7234,7 @@ async fn handle_pending_thread_resume_request(
     let ThreadConfigSnapshot {
         model,
         model_provider_id,
+        service_tier,
         approval_policy,
         sandbox_policy,
         cwd,
@@ -7189,6 +7245,7 @@ async fn handle_pending_thread_resume_request(
         thread,
         model,
         model_provider: model_provider_id,
+        service_tier,
         cwd,
         approval_policy: approval_policy.into(),
         sandbox: sandbox_policy.into(),

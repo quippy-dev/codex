@@ -108,6 +108,7 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -210,6 +211,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -340,6 +342,7 @@ console.log(JSON.stringify(out));
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -436,6 +439,7 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -511,6 +515,7 @@ async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()>
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -603,6 +608,7 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -727,6 +733,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
             model: model_slug.to_string(),
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -803,6 +810,7 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
             model: session_model,
             effort: None,
             summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })

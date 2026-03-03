@@ -893,6 +893,7 @@ impl McpProcess {
             id: RequestId::Integer(request_id),
             method: method.to_string(),
             params,
+            trace: None,
         });
         self.send_jsonrpc_message(message).await?;
         Ok(request_id)
