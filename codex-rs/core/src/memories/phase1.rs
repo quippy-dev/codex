@@ -37,7 +37,7 @@ pub(in crate::memories) struct RequestContext {
     pub(in crate::memories) otel_manager: OtelManager,
     pub(in crate::memories) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(in crate::memories) reasoning_summary: ReasoningSummaryConfig,
-    pub(in crate::memories) service_tier: ServiceTier,
+    pub(in crate::memories) service_tier: Option<ServiceTier>,
     pub(in crate::memories) turn_metadata_header: Option<String>,
 }
 
@@ -328,6 +328,7 @@ mod job {
                 &stage_one_context.otel_manager,
                 stage_one_context.reasoning_effort,
                 stage_one_context.reasoning_summary,
+                stage_one_context.service_tier,
                 stage_one_context.turn_metadata_header.as_deref(),
             )
             .await?;

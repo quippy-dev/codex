@@ -346,6 +346,9 @@
             "experimental_windows_sandbox": {
               "type": "boolean"
             },
+            "fast_mode": {
+              "type": "boolean"
+            },
             "include_apply_patch_tool": {
               "type": "boolean"
             },
@@ -1325,11 +1328,21 @@
       "type": "object"
     },
     "ServiceTier": {
-      "enum": [
-        "standard",
-        "fast"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "fast"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Legacy compatibility value for older local config files.",
+          "enum": [
+            "standard"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ShellEnvironmentPolicyInherit": {
       "oneOf": [
@@ -1667,11 +1680,15 @@
       "$ref": "#/definitions/AbsolutePathBuf"
     },
     "experimental_realtime_ws_backend_prompt": {
-      "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport backend prompt (the `Op::RealtimeConversation` `/ws` session.create backend_prompt) without changing normal prompts.",
+      "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport instructions (the `Op::RealtimeConversation` `/ws` session.update instructions) without changing normal prompts.",
       "type": "string"
     },
     "experimental_realtime_ws_base_url": {
-      "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport base URL (the `Op::RealtimeConversation` `/ws` connection) without changing normal provider HTTP requests.",
+      "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport base URL (the `Op::RealtimeConversation` `/v1/realtime` connection) without changing normal provider HTTP requests.",
+      "type": "string"
+    },
+    "experimental_realtime_ws_model": {
+      "description": "Experimental / do not use. Selects the realtime websocket model/snapshot used for the `Op::RealtimeConversation` connection.",
       "type": "string"
     },
     "experimental_use_freeform_apply_patch": {
@@ -1725,6 +1742,9 @@
           "type": "boolean"
         },
         "experimental_windows_sandbox": {
+          "type": "boolean"
+        },
+        "fast_mode": {
           "type": "boolean"
         },
         "include_apply_patch_tool": {
@@ -2124,7 +2144,7 @@
           "$ref": "#/definitions/ServiceTier"
         }
       ],
-      "description": "Service tier preference for new turns."
+      "description": "Optional explicit service tier preference for new turns."
     },
     "shell_environment_policy": {
       "allOf": [

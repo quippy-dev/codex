@@ -220,6 +220,7 @@ async fn responses_stream_sends_service_tier_when_service_tier_enabled() {
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
             None,
+            None,
         )
         .await
         .expect("stream failed");
@@ -324,7 +325,15 @@ async fn responses_stream_includes_subagent_header_on_other() {
     }];
 
     let mut stream = client_session
-        .stream(&prompt, &model_info, &otel_manager, effort, summary, None)
+        .stream(
+            &prompt,
+            &model_info,
+            &otel_manager,
+            effort,
+            summary.unwrap_or(model_info.default_reasoning_summary),
+            None,
+            None,
+        )
         .await
         .expect("stream failed");
     while let Some(event) = stream.next().await {
@@ -430,7 +439,15 @@ async fn responses_respects_model_info_overrides_from_config() {
     }];
 
     let mut stream = client_session
-        .stream(&prompt, &model_info, &otel_manager, effort, summary, None)
+        .stream(
+            &prompt,
+            &model_info,
+            &otel_manager,
+            effort,
+            summary.unwrap_or(model_info.default_reasoning_summary),
+            None,
+            None,
+        )
         .await
         .expect("stream failed");
     while let Some(event) = stream.next().await {

@@ -186,8 +186,8 @@ pub struct Config {
     /// Optional override of model selection.
     pub model: Option<String>,
 
-    /// Service tier preference for new turns.
-    pub service_tier: ServiceTier,
+    /// Effective service tier preference for new turns.
+    pub service_tier: Option<ServiceTier>,
 
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
@@ -439,12 +439,16 @@ pub struct Config {
     pub realtime_audio: RealtimeAudioConfig,
 
     /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport base URL (the `Op::RealtimeConversation` `/ws`
+    /// websocket transport base URL (the `Op::RealtimeConversation`
+    /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
+    /// Experimental / do not use. Selects the realtime websocket model/snapshot
+    /// used for the `Op::RealtimeConversation` connection.
+    pub experimental_realtime_ws_model: Option<String>,
     /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport backend prompt (the `Op::RealtimeConversation`
-    /// `/ws` session.create backend_prompt) without changing normal prompts.
+    /// websocket transport instructions (the `Op::RealtimeConversation`
+    /// `/ws` session.update instructions) without changing normal prompts.
     pub experimental_realtime_ws_backend_prompt: Option<String>,
     /// When set, restricts ChatGPT login to a specific workspace identifier.
     pub forced_chatgpt_workspace_id: Option<String>,
@@ -1184,7 +1188,7 @@ pub struct ConfigToml {
     /// Optionally specify a personality for the model
     pub personality: Option<Personality>,
 
-    /// Service tier preference for new turns.
+    /// Optional explicit service tier preference for new turns.
     pub service_tier: Option<ServiceTier>,
 
     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
@@ -1195,12 +1199,16 @@ pub struct ConfigToml {
     pub audio: Option<RealtimeAudioToml>,
 
     /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport base URL (the `Op::RealtimeConversation` `/ws`
+    /// websocket transport base URL (the `Op::RealtimeConversation`
+    /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
+    /// Experimental / do not use. Selects the realtime websocket model/snapshot
+    /// used for the `Op::RealtimeConversation` connection.
+    pub experimental_realtime_ws_model: Option<String>,
     /// Experimental / do not use. Overrides only the realtime conversation
-    /// websocket transport backend prompt (the `Op::RealtimeConversation`
-    /// `/ws` session.create backend_prompt) without changing normal prompts.
+    /// websocket transport instructions (the `Op::RealtimeConversation`
+    /// `/ws` session.update instructions) without changing normal prompts.
     pub experimental_realtime_ws_backend_prompt: Option<String>,
     pub projects: Option<HashMap<String, ProjectConfig>>,
 
@@ -1947,10 +1955,14 @@ impl Config {
         let forced_login_method = cfg.forced_login_method;
 
         let model = model.or(config_profile.model).or(cfg.model);
-        let service_tier = config_profile
-            .service_tier
-            .or(cfg.service_tier)
-            .unwrap_or_default();
+        let service_tier = if features.enabled(Feature::FastMode) {
+            config_profile
+                .service_tier
+                .or(cfg.service_tier)
+                .filter(|tier| matches!(tier, ServiceTier::Fast))
+        } else {
+            None
+        };
 
         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
             let trimmed = value.trim();
@@ -2194,6 +2206,7 @@ impl Config {
                     speaker: audio.speaker,
                 }),
             experimental_realtime_ws_base_url: cfg.experimental_realtime_ws_base_url,
+            experimental_realtime_ws_model: cfg.experimental_realtime_ws_model,
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             forced_chatgpt_workspace_id,
             forced_login_method,
@@ -4885,7 +4898,7 @@ model_verbosity = "high"
                 review_model: None,
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
-                service_tier: ServiceTier::Standard,
+                service_tier: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: fixture.openai_provider.clone(),
                 permissions: Permissions {
@@ -4941,6 +4954,7 @@ model_verbosity = "high"
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 realtime_audio: RealtimeAudioConfig::default(),
                 experimental_realtime_ws_base_url: None,
+                experimental_realtime_ws_model: None,
                 experimental_realtime_ws_backend_prompt: None,
                 base_instructions: None,
                 developer_instructions: None,
@@ -5014,7 +5028,7 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
-            service_tier: ServiceTier::Standard,
+            service_tier: None,
             model_provider_id: "openai-custom".to_string(),
             model_provider: fixture.openai_custom_provider.clone(),
             permissions: Permissions {
@@ -5070,6 +5084,7 @@ model_verbosity = "high"
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_ws_base_url: None,
+            experimental_realtime_ws_model: None,
             experimental_realtime_ws_backend_prompt: None,
             base_instructions: None,
             developer_instructions: None,
@@ -5141,7 +5156,7 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
-            service_tier: ServiceTier::Standard,
+            service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             permissions: Permissions {
@@ -5197,6 +5212,7 @@ model_verbosity = "high"
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_ws_base_url: None,
+            experimental_realtime_ws_model: None,
             experimental_realtime_ws_backend_prompt: None,
             base_instructions: None,
             developer_instructions: None,
@@ -5254,7 +5270,7 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
-            service_tier: ServiceTier::Standard,
+            service_tier: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             permissions: Permissions {
@@ -5310,6 +5326,7 @@ model_verbosity = "high"
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_ws_base_url: None,
+            experimental_realtime_ws_model: None,
             experimental_realtime_ws_backend_prompt: None,
             base_instructions: None,
             developer_instructions: None,
@@ -5638,6 +5655,33 @@ trust_level = "untrusted"
                 "Expected WorkspaceWrite for untrusted project, got {resolution:?}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_standard_service_tier_loads_as_default_none() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = toml::from_str::<ConfigToml>(
+            r#"
+service_tier = "standard"
+
+[features]
+fast_mode = true
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides {
+                cwd: Some(codex_home.path().to_path_buf()),
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.service_tier, None);
 
         Ok(())
     }
@@ -6151,6 +6195,34 @@ experimental_realtime_ws_backend_prompt = "prompt from config"
         assert_eq!(
             config.experimental_realtime_ws_backend_prompt.as_deref(),
             Some("prompt from config")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn experimental_realtime_ws_model_loads_from_config_toml() -> std::io::Result<()> {
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+experimental_realtime_ws_model = "realtime-test-model"
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        assert_eq!(
+            cfg.experimental_realtime_ws_model.as_deref(),
+            Some("realtime-test-model")
+        );
+
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.experimental_realtime_ws_model.as_deref(),
+            Some("realtime-test-model")
         );
         Ok(())
     }

@@ -203,7 +203,7 @@ pub(crate) enum AppEvent {
 
     /// Persist the selected service tier to the appropriate config.
     PersistServiceTierSelection {
-        service_tier: ServiceTier,
+        service_tier: Option<ServiceTier>,
     },
 
     /// Open the device picker for a realtime microphone or speaker.

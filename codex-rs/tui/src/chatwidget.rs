@@ -1158,6 +1158,7 @@ impl ChatWidget {
             mask.reasoning_effort = Some(event.reasoning_effort);
         }
         self.refresh_model_display();
+        self.sync_fast_command_enabled();
         self.sync_personality_command_enabled();
         let startup_tooltip_override = self.startup_tooltip_override.take();
         let session_info_cell = history_cell::new_session_info(
@@ -2987,6 +2988,7 @@ impl ChatWidget {
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
         widget.bottom_pane.set_collaboration_modes_enabled(true);
+        widget.sync_fast_command_enabled();
         widget.sync_personality_command_enabled();
         widget
             .bottom_pane
@@ -3166,6 +3168,7 @@ impl ChatWidget {
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
         widget.bottom_pane.set_collaboration_modes_enabled(true);
+        widget.sync_fast_command_enabled();
         widget.sync_personality_command_enabled();
         widget
             .bottom_pane
@@ -3334,6 +3337,7 @@ impl ChatWidget {
             .bottom_pane
             .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
         widget.bottom_pane.set_collaboration_modes_enabled(true);
+        widget.sync_fast_command_enabled();
         widget.sync_personality_command_enabled();
         widget
             .bottom_pane
@@ -3633,10 +3637,10 @@ impl ChatWidget {
                 self.open_model_popup();
             }
             SlashCommand::Fast => {
-                let next_tier = if self.config.service_tier.is_fast() {
-                    ServiceTier::Standard
+                let next_tier = if self.config.service_tier.is_some() {
+                    None
                 } else {
-                    ServiceTier::Fast
+                    Some(ServiceTier::Fast)
                 };
                 self.set_service_tier_selection(next_tier);
             }
@@ -3922,10 +3926,10 @@ impl ChatWidget {
                     return;
                 }
                 match trimmed.to_ascii_lowercase().as_str() {
-                    "on" => self.set_service_tier_selection(ServiceTier::Fast),
-                    "off" => self.set_service_tier_selection(ServiceTier::Standard),
+                    "on" => self.set_service_tier_selection(Some(ServiceTier::Fast)),
+                    "off" => self.set_service_tier_selection(None),
                     "status" => {
-                        let status = if self.config.service_tier.is_fast() {
+                        let status = if self.config.service_tier.is_some() {
                             "on"
                         } else {
                             "off"
@@ -4275,6 +4279,7 @@ impl ChatWidget {
             .personality
             .filter(|_| self.config.features.enabled(Feature::Personality))
             .filter(|_| self.current_model_supports_personality());
+        let service_tier = self.fast_mode_enabled().then_some(self.config.service_tier);
         let op = Op::UserTurn {
             items,
             cwd: self.config.cwd.clone(),
@@ -4283,6 +4288,7 @@ impl ChatWidget {
             model: effective_mode.model().to_string(),
             effort: effective_mode.reasoning_effort(),
             summary: None,
+            service_tier,
             final_output_json_schema: None,
             collaboration_mode,
             personality,
@@ -6836,6 +6842,9 @@ impl ChatWidget {
                 self.reset_realtime_conversation_state();
             }
         }
+        if feature == Feature::FastMode {
+            self.sync_fast_command_enabled();
+        }
         if feature == Feature::Personality {
             self.sync_personality_command_enabled();
         }
@@ -6919,10 +6928,17 @@ impl ChatWidget {
     }
 
     /// Set Fast mode in the widget's config copy.
-    pub(crate) fn set_service_tier(&mut self, service_tier: ServiceTier) {
+    pub(crate) fn set_service_tier(&mut self, service_tier: Option<ServiceTier>) {
         self.config.service_tier = service_tier;
     }
 
+    pub(crate) fn current_service_tier(&self) -> Option<ServiceTier> {
+        self.config.service_tier
+    }
+
+    fn fast_mode_enabled(&self) -> bool {
+        self.config.features.enabled(Feature::FastMode)
+    }
     pub(crate) fn set_realtime_audio_device(
         &mut self,
         kind: RealtimeAudioDeviceKind,
@@ -6952,7 +6968,8 @@ impl ChatWidget {
         self.refresh_model_display();
     }
 
-    fn set_service_tier_selection(&mut self, service_tier: ServiceTier) {
+    fn set_service_tier_selection(&mut self, service_tier: Option<ServiceTier>) {
+        self.set_service_tier(service_tier);
         self.app_event_tx
             .send(AppEvent::CodexOp(Op::OverrideTurnContext {
                 cwd: None,
@@ -6966,8 +6983,6 @@ impl ChatWidget {
                 collaboration_mode: None,
                 personality: None,
             }));
-        self.app_event_tx
-            .send(AppEvent::UpdateServiceTier(service_tier));
         self.app_event_tx
             .send(AppEvent::PersistServiceTierSelection { service_tier });
     }
@@ -6996,6 +7011,11 @@ impl ChatWidget {
     fn current_realtime_audio_selection_label(&self, kind: RealtimeAudioDeviceKind) -> String {
         self.current_realtime_audio_device_name(kind)
             .unwrap_or_else(|| "System default".to_string())
+    }
+
+    fn sync_fast_command_enabled(&mut self) {
+        self.bottom_pane
+            .set_fast_command_enabled(self.fast_mode_enabled());
     }
 
     fn sync_personality_command_enabled(&mut self) {

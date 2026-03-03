@@ -84,6 +84,16 @@ pub struct Submission {
     pub op: Op,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct W3cTraceContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tracestate: Option<String>,
+}
+
 /// Config payload for refreshing MCP servers.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
 pub struct McpServerRefreshConfig {
@@ -108,11 +118,31 @@ pub struct RealtimeAudioFrame {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeHandoffMessage {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeHandoffRequested {
+    pub handoff_id: String,
+    pub item_id: String,
+    pub input_transcript: String,
+    pub messages: Vec<RealtimeHandoffMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub enum RealtimeEvent {
-    SessionCreated { session_id: String },
-    SessionUpdated { backend_prompt: Option<String> },
+    SessionUpdated {
+        session_id: String,
+        instructions: Option<String>,
+    },
     AudioOut(RealtimeAudioFrame),
     ConversationItemAdded(Value),
+    ConversationItemDone {
+        item_id: String,
+    },
+    HandoffRequested(RealtimeHandoffRequested),
     Error(String),
 }
 
@@ -194,6 +224,13 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<ReasoningSummaryConfig>,
 
+        /// Optional service tier override for this turn.
+        ///
+        /// Use `Some(Some(_))` to set a specific tier for this turn, `Some(None)` to
+        /// explicitly clear the tier for this turn, or `None` to keep the existing
+        /// session preference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<Option<ServiceTier>>,
         // The JSON schema to use for the final assistant message
         final_output_json_schema: Option<Value>,
 
@@ -247,8 +284,11 @@ pub enum Op {
         summary: Option<ReasoningSummaryConfig>,
 
         /// Updated service tier preference for future turns.
+        ///
+        /// Use `Some(Some(_))` to set a specific tier, `Some(None)` to clear the
+        /// preference, or `None` to leave the existing value unchanged.
         #[serde(skip_serializing_if = "Option::is_none")]
-        service_tier: Option<ServiceTier>,
+        service_tier: Option<Option<ServiceTier>>,
 
         /// EXPERIMENTAL - set a pre-set collaboration mode.
         /// Takes precedence over model, effort, and developer instructions if set.
