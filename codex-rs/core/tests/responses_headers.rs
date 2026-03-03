@@ -206,7 +206,7 @@ async fn responses_stream_sends_service_tier_when_service_tier_enabled() {
         false,
         None,
     );
-    let mut client_session = client.new_session_with_service_tier(ServiceTier::Fast);
+    let mut client_session = client.new_session();
 
     let mut prompt = Prompt::default();
     prompt.input = vec![ResponseItem::Message {
@@ -226,7 +226,7 @@ async fn responses_stream_sends_service_tier_when_service_tier_enabled() {
             &otel_manager,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
-            None,
+            Some(ServiceTier::Fast),
             None,
         )
         .await

@@ -103,12 +103,16 @@ async fn responses_websocket_streams_service_tier_when_service_tier_enabled() {
     .await;
 
     let harness = websocket_harness(&server).await;
-    let mut client_session = harness
-        .client
-        .new_session_with_service_tier(ServiceTier::Fast);
+    let mut client_session = harness.client.new_session();
     let prompt = prompt_with_input(vec![message_item("hello")]);
 
-    stream_until_complete(&mut client_session, &harness, &prompt).await;
+    stream_until_complete_with_service_tier(
+        &mut client_session,
+        &harness,
+        &prompt,
+        Some(ServiceTier::Fast),
+    )
+    .await;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 1);
@@ -190,50 +194,6 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     assert_eq!(follow_up["type"].as_str(), Some("response.create"));
     assert_eq!(follow_up["previous_response_id"].as_str(), Some("warm-1"));
     assert_eq!(follow_up["input"], serde_json::json!([]));
-
-    server.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_request_prewarm_resets_request_state_when_service_tier_changes() {
-    skip_if_no_network!();
-
-    let server = start_websocket_server(vec![vec![
-        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
-        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
-    ]])
-    .await;
-
-    let harness = websocket_harness_with_options(&server, false, false, true, true).await;
-    let mut client_session = harness.client.new_session();
-    let prompt = prompt_with_input(vec![message_item("hello")]);
-    client_session
-        .prewarm_websocket(
-            &prompt,
-            &harness.model_info,
-            &harness.otel_manager,
-            harness.effort,
-            harness.summary,
-            None,
-            None,
-        )
-        .await
-        .expect("websocket prewarm failed");
-
-    client_session.reset_prewarm_for_service_tier(ServiceTier::Fast);
-    stream_until_complete(&mut client_session, &harness, &prompt).await;
-
-    assert_eq!(server.handshakes().len(), 1);
-    let connection = server.single_connection();
-    assert_eq!(connection.len(), 2);
-    let follow_up = connection
-        .get(1)
-        .expect("missing follow-up request")
-        .body_json();
-
-    assert_eq!(follow_up["type"].as_str(), Some("response.create"));
-    assert_eq!(follow_up["service_tier"].as_str(), Some("priority"));
-    assert_eq!(follow_up.get("previous_response_id"), None);
 
     server.shutdown().await;
 }

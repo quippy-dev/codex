@@ -36,8 +36,7 @@ impl RegularTask {
         turn_context: Arc<TurnContext>,
         turn_metadata_header: Option<String>,
     ) -> CodexResult<Self> {
-        let mut client_session = model_client
-            .new_session_with_service_tier(turn_context.config.service_tier.unwrap_or_default());
+        let mut client_session = model_client.new_session();
         client_session
             .prewarm_websocket(
                 &prompt,
