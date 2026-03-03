@@ -5,7 +5,7 @@
       "properties": {
         "read": {
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
           "type": [
             "array",
@@ -14,7 +14,7 @@
         },
         "write": {
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
           "type": [
             "array",
@@ -1382,7 +1382,7 @@
         "thread_id": {
           "allOf": [
             {
-              "$ref": "#/definitions/ThreadId"
+              "$ref": "#/definitions/v2/ThreadId"
             }
           ],
           "description": "Thread ID of the receiver/new agent."
@@ -1420,7 +1420,7 @@
         "thread_id": {
           "allOf": [
             {
-              "$ref": "#/definitions/ThreadId"
+              "$ref": "#/definitions/v2/ThreadId"
             }
           ],
           "description": "Thread ID of the receiver/new agent."
@@ -2305,6 +2305,16 @@
                 }
               ],
               "description": "How to sandbox commands executed in the system"
+            },
+            "service_tier": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/v2/ServiceTier"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "session_id": {
               "$ref": "#/definitions/v2/ThreadId"
@@ -4722,7 +4732,7 @@
       "properties": {
         "read": {
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
           "type": [
             "array",
@@ -4731,7 +4741,7 @@
         },
         "write": {
           "items": {
-            "$ref": "#/definitions/AbsolutePathBuf"
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
           "type": [
             "array",
@@ -7121,7 +7131,7 @@
           "properties": {
             "content": {
               "items": {
-                "$ref": "#/definitions/UserInput"
+                "$ref": "#/definitions/v2/UserInput"
               },
               "type": "array"
             },
@@ -7159,7 +7169,7 @@
             "phase": {
               "anyOf": [
                 {
-                  "$ref": "#/definitions/MessagePhase"
+                  "$ref": "#/definitions/v2/MessagePhase"
                 },
                 {
                   "type": "null"
@@ -7244,7 +7254,7 @@
         {
           "properties": {
             "action": {
-              "$ref": "#/definitions/WebSearchAction"
+              "$ref": "#/definitions/v2/WebSearchAction"
             },
             "id": {
               "type": "string"
@@ -8589,6 +8599,16 @@
             "anyOf": [
               {
                 "$ref": "#/definitions/v2/SandboxWorkspaceWrite"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service_tier": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ServiceTier"
               },
               {
                 "type": "null"
@@ -10846,6 +10866,16 @@
               }
             ]
           },
+          "service_tier": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ServiceTier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "web_search": {
             "anyOf": [
               {
@@ -11997,6 +12027,13 @@
         "title": "ServerRequestResolvedNotification",
         "type": "object"
       },
+      "ServiceTier": {
+        "enum": [
+          "standard",
+          "fast"
+        ],
+        "type": "string"
+      },
       "SessionSource": {
         "oneOf": [
           {
@@ -12812,6 +12849,23 @@
               }
             ]
           },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/ServiceTier"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "threadId": {
             "type": "string"
           }
@@ -12849,6 +12903,16 @@
           },
           "sandbox": {
             "$ref": "#/definitions/v2/SandboxPolicy"
+          },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ServiceTier"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
@@ -13795,6 +13859,23 @@
               }
             ]
           },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/ServiceTier"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "threadId": {
             "type": "string"
           }
@@ -13832,6 +13913,16 @@
           },
           "sandbox": {
             "$ref": "#/definitions/v2/SandboxPolicy"
+          },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ServiceTier"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
@@ -14011,6 +14102,23 @@
               "string",
               "null"
             ]
+          },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/ServiceTier"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "ThreadStartParams",
@@ -14043,6 +14151,16 @@
           },
           "sandbox": {
             "$ref": "#/definitions/v2/SandboxPolicy"
+          },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ServiceTier"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
@@ -14610,6 +14728,24 @@
               }
             ],
             "description": "Override the sandbox policy for this turn and subsequent turns."
+          },
+          "serviceTier": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/ServiceTier"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Override the service tier for this turn and subsequent turns."
           },
           "summary": {
             "anyOf": [

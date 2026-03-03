@@ -833,7 +833,6 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
             service_tier: None,
             collaboration_mode: None,
             personality: None,
-            service_tier: None,
         })
         .await
         .unwrap();

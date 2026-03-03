@@ -75,6 +75,13 @@
         "danger-full-access"
       ],
       "type": "string"
+    },
+    "ServiceTier": {
+      "enum": [
+        "standard",
+        "fast"
+      ],
+      "type": "string"
     }
   },
   "properties": {
@@ -155,6 +162,23 @@
       "type": [
         "string",
         "null"
+      ]
+    },
+    "serviceTier": {
+      "anyOf": [
+        {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceTier"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        {
+          "type": "null"
+        }
       ]
     }
   },

@@ -738,6 +738,13 @@
       ],
       "type": "string"
     },
+    "ServiceTier": {
+      "enum": [
+        "standard",
+        "fast"
+      ],
+      "type": "string"
+    },
     "WebSearchAction": {
       "oneOf": [
         {
@@ -904,6 +911,23 @@
       "anyOf": [
         {
           "$ref": "#/definitions/SandboxMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "serviceTier": {
+      "anyOf": [
+        {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServiceTier"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         {
           "type": "null"

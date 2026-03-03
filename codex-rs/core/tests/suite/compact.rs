@@ -456,6 +456,7 @@ async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
             model: session_configured.model,
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             final_output_json_schema: None,
             collaboration_mode: Some(plan_mode),
             personality: None,
