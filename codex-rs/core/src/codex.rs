@@ -2029,13 +2029,9 @@ impl Session {
                     );
                 }
                 let mut rollout_items = rollout_items;
-                let fork_reference = rollout_items.iter().find_map(|item| match item {
-                    RolloutItem::ForkReference(_) => Some(item.clone()),
-                    _ => None,
-                });
-                // During the initial fork startup we already have inherited rollout items in
-                // memory; keep fork references for on-disk resume, but do not recurse into them
-                // during this startup reconstruction.
+                // `ForkReference` markers are metadata-only; reconstruction ignores them.
+                // Keep inherited rollout content persisted so on-disk resume can rebuild full
+                // forked history without requiring marker expansion.
                 rollout_items.retain(|item| !matches!(item, RolloutItem::ForkReference(_)));
 
                 // Always add response items to conversation history
@@ -2055,12 +2051,7 @@ impl Session {
                     self.set_mcp_tool_selection(selected_tools).await;
                 }
 
-                // For forks, persist only a compact fork reference marker instead of copying all
-                // inherited rollout items into the child rollout file.
-                if let Some(reference) = fork_reference {
-                    self.persist_rollout_items(&[reference]).await;
-                } else if !rollout_items.is_empty() {
-                    // Fallback for older forks that do not include a fork reference marker.
+                if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
                 }
 
@@ -6892,6 +6883,7 @@ mod tests {
 
     use crate::protocol::CompactedItem;
     use crate::protocol::CreditsSnapshot;
+    use crate::protocol::ForkReferenceItem;
     use crate::protocol::InitialHistory;
     use crate::protocol::NetworkApprovalProtocol;
     use crate::protocol::RateLimitSnapshot;
@@ -8098,6 +8090,61 @@ mod tests {
                 realtime_active: Some(turn_context.realtime_active),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_forked_resume_preserves_inherited_history() {
+        let (session, turn_context) = make_session_and_context().await;
+        let (rollout_items, _) = sample_rollout(&session, &turn_context).await;
+        let config = session.get_config().await;
+        let recorder = RolloutRecorder::new(
+            config.as_ref(),
+            RolloutRecorderParams::new(
+                ThreadId::default(),
+                None,
+                SessionSource::Exec,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        {
+            let mut rollout = session.services.rollout.lock().await;
+            *rollout = Some(recorder);
+        }
+
+        let mut forked_rollout = rollout_items;
+        forked_rollout.insert(
+            0,
+            RolloutItem::ForkReference(ForkReferenceItem {
+                rollout_path: PathBuf::from("/tmp/parent-rollout.jsonl"),
+                nth_user_message: 3,
+            }),
+        );
+        session
+            .record_initial_history(InitialHistory::Forked(forked_rollout))
+            .await;
+        let fork_start_history = session.clone_history().await.raw_items().to_vec();
+
+        let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("read rollout history")
+        else {
+            panic!("expected resumed rollout history");
+        };
+
+        let (resumed_session, _) = make_session_and_context().await;
+        resumed_session
+            .record_initial_history(InitialHistory::Resumed(resumed))
+            .await;
+        let resumed_history = resumed_session.clone_history().await;
+
+        assert_eq!(fork_start_history, resumed_history.raw_items().to_vec());
     }
 
     #[tokio::test]
