@@ -31,6 +31,7 @@ use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::review_format::render_review_output_text;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::terminal::TerminalName;
 use codex_otel::OtelManager;
@@ -81,6 +82,10 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::RateLimitWindow;
+use codex_protocol::protocol::ReviewCodeLocation;
+use codex_protocol::protocol::ReviewFinding;
+use codex_protocol::protocol::ReviewLineRange;
+use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SessionSource;
@@ -4879,6 +4884,86 @@ async fn slash_copy_state_is_preserved_during_running_task() {
 }
 
 #[tokio::test]
+async fn slash_copy_state_uses_review_output_on_first_turn() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let review_output = ReviewOutputEvent {
+        findings: vec![ReviewFinding {
+            title: "P1: capture plan completions".to_string(),
+            body: "Replay reconstruction skips plan completion events.".to_string(),
+            confidence_score: 0.96,
+            priority: 1,
+            code_location: ReviewCodeLocation {
+                absolute_file_path: PathBuf::from(
+                    "/Users/dev/Documents/GitHub/codex/codex-rs/core/src/codex/rollout_reconstruction.rs",
+                ),
+                line_range: ReviewLineRange {
+                    start: 218,
+                    end: 220,
+                },
+            },
+        }],
+        overall_correctness: "incorrect".to_string(),
+        overall_explanation: "The merge introduces behavioral regressions.".to_string(),
+        overall_confidence_score: 0.96,
+    };
+    let expected = render_review_output_text(&review_output);
+
+    chat.handle_codex_event(Event {
+        id: "review-end".into(),
+        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            review_output: Some(review_output),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "turn-complete-review".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-review".to_string(),
+            last_agent_message: None,
+        }),
+    });
+
+    assert_eq!(chat.last_copyable_output, Some(expected));
+}
+
+#[tokio::test]
+async fn slash_copy_state_review_output_overrides_previous_turn_output() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Previous completed reply".to_string()),
+        }),
+    });
+
+    let review_output = ReviewOutputEvent {
+        findings: vec![],
+        overall_correctness: "incorrect".to_string(),
+        overall_explanation: "Esc handling regressed for /multi-agents.".to_string(),
+        overall_confidence_score: 0.91,
+    };
+    let expected = render_review_output_text(&review_output);
+
+    chat.handle_codex_event(Event {
+        id: "review-end".into(),
+        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            review_output: Some(review_output),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "turn-complete-review".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-review".to_string(),
+            last_agent_message: None,
+        }),
+    });
+
+    assert_eq!(chat.last_copyable_output, Some(expected));
+}
+
+#[tokio::test]
 async fn slash_copy_state_clears_on_thread_rollback() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -4895,6 +4980,31 @@ async fn slash_copy_state_clears_on_thread_rollback() {
     });
 
     assert_eq!(chat.last_copyable_output, None);
+}
+
+#[tokio::test]
+async fn slash_copy_state_is_unchanged_when_review_exits_without_output() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Previous completed reply".to_string()),
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "review-end".into(),
+        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            review_output: None,
+        }),
+    });
+
+    assert_eq!(
+        chat.last_copyable_output,
+        Some("Previous completed reply".to_string())
+    );
 }
 
 #[tokio::test]
