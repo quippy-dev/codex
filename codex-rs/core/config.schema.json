@@ -328,9 +328,6 @@
             "connectors": {
               "type": "boolean"
             },
-            "default_mode_request_user_input": {
-              "type": "boolean"
-            },
             "elevated_windows_sandbox": {
               "type": "boolean"
             },
@@ -1710,9 +1707,6 @@
           "type": "boolean"
         },
         "connectors": {
-          "type": "boolean"
-        },
-        "default_mode_request_user_input": {
           "type": "boolean"
         },
         "elevated_windows_sandbox": {

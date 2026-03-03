@@ -20,11 +20,7 @@ const ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER: &str = "{{ASKING_QUESTIONS_GUIDANCE
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CollaborationModesConfig {
     /// Enables `request_user_input` availability outside Plan mode.
-    ///
-    /// Keep the legacy field name for minimal churn; callers should source this
-    /// from `Feature::RequestUserInputOutsidePlanMode` so mode instructions stay
-    /// aligned with runtime tool gating.
-    pub default_mode_request_user_input: bool,
+    pub request_user_input_outside_plan_mode: bool,
 }
 
 pub(crate) fn builtin_collaboration_mode_presets(
@@ -70,7 +66,7 @@ fn execute_preset() -> CollaborationModeMask {
 fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfig) -> String {
     let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
     let request_user_input_outside_plan_mode =
-        collaboration_modes_config.default_mode_request_user_input;
+        collaboration_modes_config.request_user_input_outside_plan_mode;
     let request_user_input_availability = request_user_input_availability_message(
         ModeKind::Default,
         request_user_input_outside_plan_mode,
@@ -145,7 +141,7 @@ mod tests {
     #[test]
     fn default_mode_instructions_replace_mode_names_placeholder() {
         let default_instructions = default_preset(CollaborationModesConfig {
-            default_mode_request_user_input: true,
+            request_user_input_outside_plan_mode: true,
         })
         .developer_instructions
         .expect("default preset should include instructions")

@@ -1526,9 +1526,9 @@ impl App {
             SessionSource::Cli,
             config.model_catalog.clone(),
             CollaborationModesConfig {
-                default_mode_request_user_input: config
+                request_user_input_outside_plan_mode: config
                     .features
-                    .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
+                    .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
             },
         ));
         let mut model = thread_manager

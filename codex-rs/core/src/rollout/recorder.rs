@@ -596,7 +596,12 @@ impl RolloutRecorder {
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
-        let (items, thread_id, _parse_errors) = Self::load_rollout_items(path).await?;
+        let (items, thread_id, parse_errors) = Self::load_rollout_items(path).await?;
+        if parse_errors > 0 {
+            return Err(IoError::other(format!(
+                "failed to parse {parse_errors} rollout line(s) from {path:?}; legacy or invalid rollout files are unsupported"
+            )));
+        }
         let conversation_id = thread_id
             .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
 
