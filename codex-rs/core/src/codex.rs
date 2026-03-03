@@ -5006,9 +5006,10 @@ pub(crate) async fn run_turn(
     let mut client_session = prewarmed_client_session.unwrap_or_else(|| {
         sess.services
             .model_client
-            .new_session_with_service_tier(turn_context.config.service_tier)
+            .new_session_with_service_tier(turn_context.config.service_tier.unwrap_or_default())
     });
-    client_session.reset_prewarm_for_service_tier(turn_context.config.service_tier);
+    client_session
+        .reset_prewarm_for_service_tier(turn_context.config.service_tier.unwrap_or_default());
 
     loop {
         // Note that pending_input would be something like a message the user

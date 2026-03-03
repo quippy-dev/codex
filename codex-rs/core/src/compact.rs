@@ -128,7 +128,7 @@ async fn run_compact_task_inner(
     let mut client_session = sess
         .services
         .model_client
-        .new_session_with_service_tier(turn_context.config.service_tier);
+        .new_session_with_service_tier(turn_context.config.service_tier.unwrap_or_default());
     // Reuse one client session so turn-scoped state (sticky routing, websocket append tracking)
     // survives retries within this compact turn.
 

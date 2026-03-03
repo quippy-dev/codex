@@ -320,7 +320,7 @@ mod job {
         let mut client_session = session
             .services
             .model_client
-            .new_session_with_service_tier(stage_one_context.service_tier);
+            .new_session_with_service_tier(stage_one_context.service_tier.unwrap_or_default());
         let mut stream = client_session
             .stream(
                 &prompt,

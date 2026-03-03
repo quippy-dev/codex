@@ -2237,10 +2237,6 @@ impl App {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
             }
-            AppEvent::UpdateServiceTier(service_tier) => {
-                self.chat_widget.set_service_tier(service_tier);
-                self.refresh_status_line();
-            }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);
                 self.refresh_status_line();
