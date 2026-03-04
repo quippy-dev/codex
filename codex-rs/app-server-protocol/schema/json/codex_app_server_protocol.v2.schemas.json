@@ -1019,6 +1019,30 @@
             },
             "method": {
               "enum": [
+                "thread/metadata/update"
+              ],
+              "title": "Thread/metadata/updateRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadMetadataUpdateParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/metadata/updateRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/unarchive"
               ],
               "title": "Thread/unarchiveRequestMethod",
@@ -2856,6 +2880,15 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "featureRequirements": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "type": [
+            "object",
+            "null"
           ]
         }
       },
@@ -6518,6 +6551,16 @@
         },
         {
           "properties": {
+            "detail": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "image_url": {
               "type": "string"
             },
@@ -6803,6 +6846,15 @@
         "ts"
       ],
       "type": "object"
+    },
+    "ImageDetail": {
+      "enum": [
+        "auto",
+        "low",
+        "high",
+        "original"
+      ],
+      "type": "string"
     },
     "InitializeCapabilities": {
       "description": "Client-declared capabilities negotiated during initialize.",
@@ -7773,6 +7825,17 @@
       ],
       "type": "string"
     },
+    "NetworkPermissions": {
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "NetworkPolicyAmendment": {
       "properties": {
         "action": {
@@ -8097,9 +8160,13 @@
           ]
         },
         "network": {
-          "type": [
-            "boolean",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NetworkPermissions"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -9701,6 +9768,10 @@
                 "type": "fullAccess"
               }
             },
+            "networkAccess": {
+              "default": false,
+              "type": "boolean"
+            },
             "type": {
               "enum": [
                 "readOnly"
@@ -9933,6 +10004,26 @@
             "params"
           ],
           "title": "Thread/closedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "skills/changed"
+              ],
+              "title": "Skills/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/SkillsChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Skills/changedNotification",
           "type": "object"
         },
         {
@@ -10680,7 +10771,6 @@
     },
     "ServiceTier": {
       "enum": [
-        "standard",
         "fast"
       ],
       "type": "string"
@@ -10929,6 +11019,12 @@
         "type",
         "value"
       ],
+      "type": "object"
+    },
+    "SkillsChangedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Notification emitted when watched local skill files change.\n\nTreat this as an invalidation signal and re-run `skills/list` with the client's current parameters when refreshed skill metadata is needed.",
+      "title": "SkillsChangedNotification",
       "type": "object"
     },
     "SkillsConfigWriteParams": {
@@ -12289,6 +12385,69 @@
         "data"
       ],
       "title": "ThreadLoadedListResponse",
+      "type": "object"
+    },
+    "ThreadMetadataGitInfoUpdateParams": {
+      "properties": {
+        "branch": {
+          "description": "Omit to leave the stored branch unchanged, set to `null` to clear it, or provide a non-empty string to replace it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "originUrl": {
+          "description": "Omit to leave the stored origin URL unchanged, set to `null` to clear it, or provide a non-empty string to replace it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sha": {
+          "description": "Omit to leave the stored commit unchanged, set to `null` to clear it, or provide a non-empty string to replace it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ThreadMetadataUpdateParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "gitInfo": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadMetadataGitInfoUpdateParams"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Patch the stored Git metadata for this thread. Omit a field to leave it unchanged, set it to `null` to clear it, or provide a string to replace the stored value."
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadMetadataUpdateParams",
+      "type": "object"
+    },
+    "ThreadMetadataUpdateResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "thread": {
+          "$ref": "#/definitions/Thread"
+        }
+      },
+      "required": [
+        "thread"
+      ],
+      "title": "ThreadMetadataUpdateResponse",
       "type": "object"
     },
     "ThreadNameUpdatedNotification": {

@@ -64,7 +64,7 @@ impl MessageProcessor {
             SessionSource::Mcp,
             config.model_catalog.clone(),
             CollaborationModesConfig {
-                request_user_input_outside_plan_mode: config
+                default_mode_request_user_input: config
                     .features
                     .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
             },
@@ -576,6 +576,7 @@ impl MessageProcessor {
             .submit_with_id(Submission {
                 id: request_id_string,
                 op: codex_protocol::protocol::Op::Interrupt,
+                trace: None,
             })
             .await
         {

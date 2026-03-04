@@ -133,7 +133,10 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
     let mut builder = test_codex()
         .with_model("gpt-5.2-codex")
         .with_config(|config| {
-            config.features.enable(Feature::Personality);
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
         });
     let test = builder.build(&server).await?;
     let next_model = "exp-codex-personality";
@@ -278,6 +281,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
+        supports_image_detail_original: false,
         context_window: Some(272_000),
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
@@ -439,6 +443,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(10_000),
         supports_parallel_tool_calls: false,
+        supports_image_detail_original: false,
         context_window: Some(large_context_window),
         auto_compact_token_limit: None,
         effective_context_window_percent,

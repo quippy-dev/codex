@@ -707,7 +707,6 @@
     },
     "ServiceTier": {
       "enum": [
-        "standard",
         "fast"
       ],
       "type": "string"
