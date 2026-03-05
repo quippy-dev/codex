@@ -25,6 +25,7 @@ use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
+use crate::encrypted_content_fallback::apply_invalid_encrypted_content_fallback;
 use crate::exec_policy::ExecPolicyManager;
 use crate::features::FEATURES;
 use crate::features::Feature;
@@ -5583,12 +5584,13 @@ async fn run_sampling_request(
 
     let base_instructions = sess.get_base_instructions().await;
 
-    let prompt = build_prompt(
+    let mut prompt = build_prompt(
         input,
         router.as_ref(),
         turn_context.as_ref(),
         base_instructions,
     );
+    let mut retried_invalid_encrypted_content = false;
     let mut retries = 0;
     loop {
         let err = match try_run_sampling_request(
@@ -5620,6 +5622,15 @@ async fn run_sampling_request(
             }
             Err(err) => err,
         };
+
+        if apply_invalid_encrypted_content_fallback(
+            &mut retried_invalid_encrypted_content,
+            &err,
+            &mut prompt.input,
+        ) {
+            warn!("invalid_encrypted_content - retrying once with sanitized prompt input");
+            continue;
+        }
 
         if !err.is_retryable() {
             return Err(err);
