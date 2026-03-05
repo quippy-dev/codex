@@ -82,6 +82,7 @@ async fn request_user_input_round_trip_for_mode(
     let server = start_mock_server().await;
 
     let builder = test_codex();
+    #[allow(clippy::expect_used)]
     let TestCodex {
         codex,
         cwd,
@@ -89,11 +90,15 @@ async fn request_user_input_round_trip_for_mode(
         ..
     } = builder
         .with_config(move |config| {
-            config.features.enable(Feature::CollaborationModes);
+            config
+                .features
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow collaboration modes feature");
             if request_user_input_outside_plan_mode {
                 config
                     .features
-                    .enable(Feature::RequestUserInputOutsidePlanMode);
+                    .enable(Feature::RequestUserInputOutsidePlanMode)
+                    .expect("test config should allow request_user_input outside plan mode");
             }
         })
         .build(&server)
@@ -232,10 +237,14 @@ where
         ..
     } = builder
         .with_config(|config| {
-            config.features.enable(Feature::CollaborationModes);
             config
                 .features
-                .disable(Feature::RequestUserInputOutsidePlanMode);
+                .enable(Feature::CollaborationModes)
+                .expect("test config should allow collaboration modes feature");
+            config
+                .features
+                .disable(Feature::RequestUserInputOutsidePlanMode)
+                .expect("test config should allow disabling request_user_input outside plan mode");
         })
         .build(&server)
         .await?;

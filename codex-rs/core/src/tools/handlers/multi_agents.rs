@@ -496,7 +496,6 @@ mod resume_agent {
     use super::*;
     use crate::agent::exceeds_thread_spawn_depth_limit;
     use crate::agent::next_thread_spawn_depth;
-    use crate::rollout::find_thread_path_by_id_str;
     use std::sync::Arc;
 
     #[derive(Debug, Deserialize)]
@@ -551,15 +550,7 @@ mod resume_agent {
             .get_status(receiver_thread_id)
             .await;
         let error = if matches!(status, AgentStatus::NotFound) {
-            match try_resume_closed_agent(
-                &session,
-                &turn,
-                receiver_thread_id,
-                &args.id,
-                child_depth,
-            )
-            .await
-            {
+            match try_resume_closed_agent(&session, &turn, receiver_thread_id, child_depth).await {
                 Ok(resumed_status) => {
                     status = resumed_status;
                     None
@@ -618,25 +609,8 @@ mod resume_agent {
         session: &Arc<Session>,
         turn: &Arc<TurnContext>,
         receiver_thread_id: ThreadId,
-        receiver_id: &str,
         child_depth: i32,
     ) -> Result<AgentStatus, FunctionCallError> {
-        let rollout_path = find_thread_path_by_id_str(
-            turn.config.codex_home.as_path(),
-            receiver_id,
-        )
-        .await
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "tool failed: failed to locate rollout for agent {receiver_thread_id}: {err}"
-            ))
-        })?
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "agent with id {receiver_thread_id} not found"
-            ))
-        })?;
-
         let config = build_agent_resume_config(turn.as_ref(), child_depth)?;
         let (agent_nickname, agent_role) =
             match crate::state_db::get_state_db(&turn.config, None).await {
@@ -651,7 +625,7 @@ mod resume_agent {
             .agent_control
             .resume_agent_from_rollout(
                 config,
-                rollout_path,
+                receiver_thread_id,
                 thread_spawn_source_with_metadata(
                     session.conversation_id,
                     child_depth,
@@ -1573,7 +1547,7 @@ pub(crate) fn build_agent_spawn_config(
                 child_depth + 1,
                 config.agent_max_depth,
             ) {
-                config.features.disable(Feature::Collab);
+                let _ = config.features.disable(Feature::Collab);
             }
         }
         SpawnConfigStrategy::ForkLike => {
@@ -1625,7 +1599,7 @@ fn build_agent_shared_config(
 fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
     if crate::agent::exceeds_thread_spawn_depth_limit(child_depth + 1, config.agent_max_depth) {
-        config.features.disable(Feature::Collab);
+        let _ = config.features.disable(Feature::Collab);
     }
 }
 
@@ -3582,7 +3556,10 @@ mod tests {
         let (_session, mut turn) = make_session_and_context().await;
         let mut base_config = (*turn.config).clone();
         base_config.developer_instructions = Some("base-dev".to_string());
-        base_config.features.enable(Feature::Collab);
+        base_config
+            .features
+            .enable(Feature::Collab)
+            .expect("collab feature enable");
         turn.config = Arc::new(base_config.clone());
         turn.developer_instructions = Some("turn-dev".to_string());
         let base_instructions = BaseInstructions {
@@ -3604,7 +3581,10 @@ mod tests {
     async fn build_agent_spawn_config_context_free_disables_multi_agent_tools_at_max_depth() {
         let (_session, mut turn) = make_session_and_context().await;
         let mut base_config = (*turn.config).clone();
-        base_config.features.enable(Feature::Collab);
+        base_config
+            .features
+            .enable(Feature::Collab)
+            .expect("collab feature enable");
         turn.config = Arc::new(base_config);
         let base_instructions = BaseInstructions {
             text: "base".to_string(),

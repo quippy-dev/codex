@@ -39,6 +39,25 @@ pub(crate) struct ThreadCapSnapshot {
     pub(crate) total_count: usize,
     pub(crate) in_flight_reservations: usize,
 }
+
+fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
+    match nickname_reset_count {
+        0 => name.to_string(),
+        reset_count => {
+            let value = reset_count + 1;
+            let suffix = match value % 100 {
+                11..=13 => "th",
+                _ => match value % 10 {
+                    1 => "st", // codespell:ignore
+                    2 => "nd", // codespell:ignore
+                    3 => "rd", // codespell:ignore
+                    _ => "th", // codespell:ignore
+                },
+            };
+            format!("{name} the {value}{suffix}")
+        }
+    }
+}
 fn session_depth(session_source: &SessionSource) -> i32 {
     match session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => *depth,
@@ -146,20 +165,23 @@ impl Guards {
             if names.is_empty() {
                 return None;
             }
-            let available_names: Vec<&str> = names
+            let available_names: Vec<String> = names
                 .iter()
-                .copied()
-                .filter(|name| !active_agents.used_agent_nicknames.contains(*name))
+                .map(|name| format_agent_nickname(name, active_agents.nickname_reset_count))
+                .filter(|name| !active_agents.used_agent_nicknames.contains(name))
                 .collect();
             if let Some(name) = available_names.choose(&mut rand::rng()) {
-                (*name).to_string()
+                name.clone()
             } else {
                 active_agents.used_agent_nicknames.clear();
                 active_agents.nickname_reset_count += 1;
                 if let Some(metrics) = codex_otel::metrics::global() {
                     let _ = metrics.counter("codex.multi_agent.nickname_pool_reset", 1, &[]);
                 }
-                names.choose(&mut rand::rng())?.to_string()
+                format_agent_nickname(
+                    names.choose(&mut rand::rng())?,
+                    active_agents.nickname_reset_count,
+                )
             }
         };
         active_agents
@@ -237,6 +259,16 @@ impl Drop for SpawnReservation {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::collections::HashSet;
+
+    #[test]
+    fn format_agent_nickname_adds_ordinals_after_reset() {
+        assert_eq!(format_agent_nickname("Plato", 0), "Plato");
+        assert_eq!(format_agent_nickname("Plato", 1), "Plato the 2nd");
+        assert_eq!(format_agent_nickname("Plato", 2), "Plato the 3rd");
+        assert_eq!(format_agent_nickname("Plato", 10), "Plato the 11th");
+        assert_eq!(format_agent_nickname("Plato", 20), "Plato the 21st");
+    }
 
     #[test]
     fn session_depth_defaults_to_zero_for_root_sources() {
@@ -392,5 +424,106 @@ mod tests {
         guards.release_spawned_thread(thread_id);
 
         assert_eq!(guards.was_spawned_thread(thread_id), true);
+    }
+
+    #[test]
+    fn agent_nickname_resets_used_pool_when_exhausted() {
+        let guards = Arc::new(Guards::default());
+
+        let mut first = guards.reserve_spawn_slot(None).expect("reserve first slot");
+        let first_name = first
+            .reserve_agent_nickname_with_preference(&["alpha"], None)
+            .expect("reserve first agent name");
+        let first_id = ThreadId::new();
+        first.commit(first_id);
+        assert_eq!(first_name, "alpha");
+
+        let mut second = guards
+            .reserve_spawn_slot(None)
+            .expect("reserve second slot");
+        let second_name = second
+            .reserve_agent_nickname_with_preference(&["alpha"], None)
+            .expect("name should be reused after pool reset");
+        assert_eq!(second_name, "alpha the 2nd");
+        let active_agents = guards
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(active_agents.nickname_reset_count, 1);
+    }
+
+    #[test]
+    fn released_nickname_stays_used_until_pool_reset() {
+        let guards = Arc::new(Guards::default());
+
+        let mut first = guards.reserve_spawn_slot(None).expect("reserve first slot");
+        let first_name = first
+            .reserve_agent_nickname_with_preference(&["alpha"], None)
+            .expect("reserve first agent name");
+        let first_id = ThreadId::new();
+        first.commit(first_id);
+        assert_eq!(first_name, "alpha");
+
+        guards.release_spawned_thread(first_id);
+
+        let mut second = guards
+            .reserve_spawn_slot(None)
+            .expect("reserve second slot");
+        let second_name = second
+            .reserve_agent_nickname_with_preference(&["alpha", "beta"], None)
+            .expect("released name should still be marked used");
+        assert_eq!(second_name, "beta");
+        let second_id = ThreadId::new();
+        second.commit(second_id);
+        guards.release_spawned_thread(second_id);
+
+        let mut third = guards.reserve_spawn_slot(None).expect("reserve third slot");
+        let third_name = third
+            .reserve_agent_nickname_with_preference(&["alpha", "beta"], None)
+            .expect("pool reset should permit a duplicate");
+        let expected_names =
+            HashSet::from(["alpha the 2nd".to_string(), "beta the 2nd".to_string()]);
+        assert!(expected_names.contains(&third_name));
+        let active_agents = guards
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(active_agents.nickname_reset_count, 1);
+    }
+
+    #[test]
+    fn repeated_resets_advance_the_ordinal_suffix() {
+        let guards = Arc::new(Guards::default());
+
+        let mut first = guards.reserve_spawn_slot(None).expect("reserve first slot");
+        let first_name = first
+            .reserve_agent_nickname_with_preference(&["Plato"], None)
+            .expect("reserve first agent name");
+        let first_id = ThreadId::new();
+        first.commit(first_id);
+        assert_eq!(first_name, "Plato");
+        guards.release_spawned_thread(first_id);
+
+        let mut second = guards
+            .reserve_spawn_slot(None)
+            .expect("reserve second slot");
+        let second_name = second
+            .reserve_agent_nickname_with_preference(&["Plato"], None)
+            .expect("reserve second agent name");
+        let second_id = ThreadId::new();
+        second.commit(second_id);
+        assert_eq!(second_name, "Plato the 2nd");
+        guards.release_spawned_thread(second_id);
+
+        let mut third = guards.reserve_spawn_slot(None).expect("reserve third slot");
+        let third_name = third
+            .reserve_agent_nickname_with_preference(&["Plato"], None)
+            .expect("reserve third agent name");
+        assert_eq!(third_name, "Plato the 3rd");
+        let active_agents = guards
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(active_agents.nickname_reset_count, 2);
     }
 }

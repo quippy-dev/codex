@@ -787,7 +787,6 @@ pub struct SkillConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PluginConfig {
-    pub path: AbsolutePathBuf,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }

@@ -20,7 +20,7 @@ const ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER: &str = "{{ASKING_QUESTIONS_GUIDANCE
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CollaborationModesConfig {
     /// Enables `request_user_input` availability outside Plan mode.
-    pub request_user_input_outside_plan_mode: bool,
+    pub default_mode_request_user_input: bool,
 }
 
 pub(crate) fn builtin_collaboration_mode_presets(
@@ -65,14 +65,12 @@ fn execute_preset() -> CollaborationModeMask {
 
 fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfig) -> String {
     let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
-    let request_user_input_outside_plan_mode =
-        collaboration_modes_config.request_user_input_outside_plan_mode;
-    let request_user_input_availability = request_user_input_availability_message(
-        ModeKind::Default,
-        request_user_input_outside_plan_mode,
-    );
+    let default_mode_request_user_input =
+        collaboration_modes_config.default_mode_request_user_input;
+    let request_user_input_availability =
+        request_user_input_availability_message(ModeKind::Default, default_mode_request_user_input);
     let asking_questions_guidance =
-        asking_questions_guidance_message(request_user_input_outside_plan_mode);
+        asking_questions_guidance_message(default_mode_request_user_input);
     COLLABORATION_MODE_DEFAULT
         .replace(KNOWN_MODE_NAMES_PLACEHOLDER, &known_mode_names)
         .replace(
@@ -97,11 +95,11 @@ fn format_mode_names(modes: &[ModeKind]) -> String {
 
 fn request_user_input_availability_message(
     mode: ModeKind,
-    request_user_input_outside_plan_mode: bool,
+    default_mode_request_user_input: bool,
 ) -> String {
     let mode_name = mode.display_name();
     if mode.allows_request_user_input()
-        || (request_user_input_outside_plan_mode && mode == ModeKind::Default)
+        || (default_mode_request_user_input && mode == ModeKind::Default)
     {
         format!("The `request_user_input` tool is available in {mode_name} mode.")
     } else {
@@ -111,8 +109,8 @@ fn request_user_input_availability_message(
     }
 }
 
-fn asking_questions_guidance_message(request_user_input_outside_plan_mode: bool) -> String {
-    if request_user_input_outside_plan_mode {
+fn asking_questions_guidance_message(default_mode_request_user_input: bool) -> String {
+    if default_mode_request_user_input {
         "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, prefer using the `request_user_input` tool rather than writing a multiple choice question as a textual assistant message. Never write a multiple choice question as a textual assistant message.".to_string()
     } else {
         "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.".to_string()
@@ -141,7 +139,7 @@ mod tests {
     #[test]
     fn default_mode_instructions_replace_mode_names_placeholder() {
         let default_instructions = default_preset(CollaborationModesConfig {
-            request_user_input_outside_plan_mode: true,
+            default_mode_request_user_input: true,
         })
         .developer_instructions
         .expect("default preset should include instructions")
