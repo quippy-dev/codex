@@ -16,6 +16,8 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
+use wiremock::ResponseTemplate;
 
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
@@ -140,5 +142,85 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
     assert_eq!(handshakes[2].header(TURN_STATE_HEADER), None);
 
     server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_encrypted_content_retries_once_with_sanitized_prompt_input() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_reasoning_item("reasoning-1", &["thinking"], &[]),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-1"),
+    ]);
+    let invalid_encrypted_content_response = ResponseTemplate::new(400).set_body_json(json!({
+        "error": {
+            "message": "bad request",
+            "type": "invalid_request_error",
+            "code": "invalid_encrypted_content"
+        }
+    }));
+    let retry_response = sse(vec![
+        ev_response_created("resp-2"),
+        ev_assistant_message("msg-2", "recovered"),
+        ev_completed("resp-2"),
+    ]);
+
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(first_response),
+            invalid_encrypted_content_response,
+            sse_response(retry_response),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn("first turn").await?;
+    test.submit_turn("second turn").await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+
+    let reasoning_items = |request_index: usize| {
+        requests[request_index]
+            .input()
+            .into_iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .collect::<Vec<_>>()
+    };
+
+    let initial_retry_reasoning = reasoning_items(1);
+    assert_eq!(initial_retry_reasoning.len(), 1);
+    assert_eq!(initial_retry_reasoning[0]["summary"][0]["text"], "thinking");
+    assert!(
+        initial_retry_reasoning[0]["encrypted_content"]
+            .as_str()
+            .is_some(),
+        "first retryable request should include encrypted reasoning content"
+    );
+
+    let sanitized_retry_reasoning = reasoning_items(2);
+    assert_eq!(sanitized_retry_reasoning.len(), 1);
+    assert_eq!(
+        sanitized_retry_reasoning[0]["summary"][0]["text"],
+        "thinking"
+    );
+    assert!(
+        sanitized_retry_reasoning[0]["encrypted_content"].is_null(),
+        "sanitized retry should clear encrypted reasoning content"
+    );
+
     Ok(())
 }
