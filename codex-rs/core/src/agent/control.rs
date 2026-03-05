@@ -1,6 +1,7 @@
 use super::watchdog::RemovedWatchdog;
 use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
+use crate::AuthManager;
 use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
 use crate::agent::guards::SpawnReservation;
@@ -177,6 +178,9 @@ impl AgentControl {
         let session_source =
             self.maybe_reserve_thread_spawn_identity(&config, &mut reservation, session_source)?;
         let notification_source = session_source.clone();
+        let auth_manager = self
+            .auth_manager_for_source(&state, session_source.as_ref())
+            .await;
 
         // The same `AgentControl` is sent to spawn the thread.
         let new_thread = match session_source {
@@ -234,6 +238,7 @@ impl AgentControl {
                         .spawn_thread_from_history_with_source(
                             config,
                             initial_history,
+                            auth_manager,
                             self.clone(),
                             session_source,
                             false,
@@ -244,6 +249,7 @@ impl AgentControl {
                     state
                         .spawn_new_thread_with_source(
                             config,
+                            auth_manager,
                             self.clone(),
                             session_source,
                             false,
@@ -287,12 +293,16 @@ impl AgentControl {
         let inherited_shell_snapshot = self
             .inherited_shell_snapshot_for_source(&state, session_source.as_ref())
             .await;
+        let auth_manager = self
+            .auth_manager_for_source(&state, session_source.as_ref())
+            .await;
 
         let new_thread = match session_source {
             Some(session_source) => {
                 state
                     .spawn_new_thread_with_source(
                         config,
+                        auth_manager,
                         self.clone(),
                         session_source,
                         false,
@@ -331,6 +341,9 @@ impl AgentControl {
         let inherited_shell_snapshot = self
             .inherited_shell_snapshot_for_source(&state, Some(&session_source))
             .await;
+        let auth_manager = self
+            .auth_manager_for_parent_thread(&state, parent_thread_id)
+            .await;
 
         let live_rollout_path = match state.get_thread(parent_thread_id).await {
             Ok(parent_thread) => {
@@ -358,6 +371,7 @@ impl AgentControl {
             .fork_thread_with_source(
                 nth_user_message,
                 config,
+                auth_manager,
                 self.clone(),
                 false,
                 rollout_path,
@@ -430,6 +444,9 @@ impl AgentControl {
         let inherited_shell_snapshot = self
             .inherited_shell_snapshot_for_source(&state, Some(&session_source))
             .await;
+        let auth_manager = self
+            .auth_manager_for_source(&state, Some(&session_source))
+            .await;
         let rollout_path =
             find_thread_path_by_id_str(config.codex_home.as_path(), &thread_id.to_string())
                 .await?
@@ -439,6 +456,7 @@ impl AgentControl {
             .resume_thread_from_rollout_with_source(
                 config,
                 rollout_path,
+                auth_manager,
                 self.clone(),
                 session_source,
                 inherited_shell_snapshot,
@@ -1189,6 +1207,33 @@ impl AgentControl {
         let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
         parent_thread.codex.session.user_shell().shell_snapshot()
     }
+
+    async fn auth_manager_for_source(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        session_source: Option<&SessionSource>,
+    ) -> Arc<AuthManager> {
+        let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id, ..
+        })) = session_source
+        else {
+            return state.default_auth_manager();
+        };
+
+        self.auth_manager_for_parent_thread(state, *parent_thread_id)
+            .await
+    }
+
+    async fn auth_manager_for_parent_thread(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        parent_thread_id: ThreadId,
+    ) -> Arc<AuthManager> {
+        match state.get_thread(parent_thread_id).await {
+            Ok(parent_thread) => Arc::clone(&parent_thread.codex.session.services.auth_manager),
+            Err(_) => state.default_auth_manager(),
+        }
+    }
 }
 
 fn build_collab_inbox_items(
@@ -1253,10 +1298,12 @@ fn build_collab_inbox_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AuthManager;
     use crate::CodexAuth;
     use crate::CodexThread;
     use crate::ThreadManager;
     use crate::agent::agent_status_from_event;
+    use crate::auth::AuthCredentialsStoreMode;
     use crate::config::AgentRoleConfig;
     use crate::config::Config;
     use crate::config::ConfigBuilder;
@@ -1351,6 +1398,20 @@ mod tests {
             .is_ok()
     }
 
+    fn auth_manager_with_auth_file(
+        config: &Config,
+        root: &TempDir,
+        label: &str,
+    ) -> Arc<AuthManager> {
+        AuthManager::shared_with_auth_file(
+            config.codex_home.clone(),
+            false,
+            AuthCredentialsStoreMode::File,
+            Some(root.path().join(label).join("auth.json")),
+        )
+        .expect("auth manager with override auth file")
+    }
+
     struct AgentControlHarness {
         _home: TempDir,
         config: Config,
@@ -1379,6 +1440,23 @@ mod tests {
             let new_thread = self
                 .manager
                 .start_thread(self.config.clone())
+                .await
+                .expect("start thread");
+            (new_thread.thread_id, new_thread.thread)
+        }
+
+        async fn start_thread_with_auth_manager(
+            &self,
+            auth_manager: Arc<AuthManager>,
+        ) -> (ThreadId, Arc<CodexThread>) {
+            let new_thread = self
+                .manager
+                .resume_thread_with_history(
+                    self.config.clone(),
+                    InitialHistory::New,
+                    auth_manager,
+                    false,
+                )
                 .await
                 .expect("start thread");
             (new_thread.thread_id, new_thread.thread)
@@ -3023,6 +3101,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_uses_parent_thread_auth_manager_when_parent_differs_from_manager_default()
+    {
+        let harness = AgentControlHarness::new().await;
+        let parent_auth_manager =
+            auth_manager_with_auth_file(&harness.config, &harness._home, "spawn-parent");
+        let (parent_thread_id, parent_thread) = harness
+            .start_thread_with_auth_manager(parent_auth_manager.clone())
+            .await;
+
+        let child_thread_id = harness
+            .control
+            .spawn_agent(
+                harness.config.clone(),
+                text_input("hello child"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: Some("explorer".to_string()),
+                })),
+            )
+            .await
+            .expect("child spawn should succeed");
+
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        assert!(Arc::ptr_eq(
+            &parent_thread.codex.session.services.auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+        assert!(Arc::ptr_eq(
+            &parent_auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_fork_from_parent_history_uses_parent_thread_auth_manager() {
+        let harness = AgentControlHarness::new().await;
+        let parent_auth_manager =
+            auth_manager_with_auth_file(&harness.config, &harness._home, "history-parent");
+        let (parent_thread_id, parent_thread) = harness
+            .start_thread_with_auth_manager(parent_auth_manager.clone())
+            .await;
+        let turn_context = parent_thread.codex.session.new_default_turn().await;
+        let parent_spawn_call_id = "spawn-call-auth".to_string();
+        let parent_spawn_call = ResponseItem::FunctionCall {
+            id: None,
+            name: "spawn_agent".to_string(),
+            arguments: "{}".to_string(),
+            call_id: parent_spawn_call_id.clone(),
+        };
+        parent_thread
+            .codex
+            .session
+            .record_conversation_items(turn_context.as_ref(), &[parent_spawn_call])
+            .await;
+        parent_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.codex.session.flush_rollout().await;
+
+        let child_thread_id = harness
+            .control
+            .spawn_agent_with_options(
+                harness.config.clone(),
+                text_input("child task"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                SpawnAgentOptions {
+                    fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                },
+            )
+            .await
+            .expect("forked spawn should succeed");
+
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        assert!(Arc::ptr_eq(
+            &parent_thread.codex.session.services.auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+        assert!(Arc::ptr_eq(
+            &parent_auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+    }
+
+    #[tokio::test]
+    async fn fork_agent_uses_parent_thread_auth_manager_when_parent_differs_from_manager_default() {
+        let harness = AgentControlHarness::new().await;
+        let parent_auth_manager =
+            auth_manager_with_auth_file(&harness.config, &harness._home, "fork-parent");
+        let (parent_thread_id, parent_thread) = harness
+            .start_thread_with_auth_manager(parent_auth_manager.clone())
+            .await;
+        parent_thread
+            .inject_user_message_without_turn("parent seed context".to_string())
+            .await;
+        parent_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.codex.session.flush_rollout().await;
+
+        let child_thread_id = harness
+            .control
+            .fork_agent(
+                harness.config.clone(),
+                text_input("forked"),
+                parent_thread_id,
+                usize::MAX,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: Some("explorer".to_string()),
+                }),
+            )
+            .await
+            .expect("fork_agent should succeed");
+
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        assert!(Arc::ptr_eq(
+            &parent_thread.codex.session.services.auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+        assert!(Arc::ptr_eq(
+            &parent_auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+    }
+
+    #[tokio::test]
     async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
         let mut harness = AgentControlHarness::new().await;
         harness.config.agent_roles.insert(
@@ -3167,6 +3396,87 @@ mod tests {
         assert_eq!(resumed_depth, 1);
         assert_eq!(agent_nickname, Some(original_nickname));
         assert_eq!(agent_role, Some("explorer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn resume_agent_uses_parent_thread_auth_manager_when_parent_differs_from_manager_default()
+    {
+        let harness = AgentControlHarness::new().await;
+        let parent_auth_manager =
+            auth_manager_with_auth_file(&harness.config, &harness._home, "resume-parent");
+        let (parent_thread_id, parent_thread) = harness
+            .start_thread_with_auth_manager(parent_auth_manager.clone())
+            .await;
+        let child_thread_id = harness
+            .control
+            .spawn_agent(
+                harness.config.clone(),
+                text_input("hello child"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: Some("explorer".to_string()),
+                })),
+            )
+            .await
+            .expect("child spawn should succeed");
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should exist");
+        child_thread.flush_rollout().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let rollout_path = crate::find_thread_path_by_id_str(
+                    harness.config.codex_home.as_path(),
+                    &child_thread_id.to_string(),
+                )
+                .await
+                .expect("rollout lookup should succeed");
+                if rollout_path.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("resumable thread rollout should be discoverable before shutdown");
+        let _ = harness
+            .control
+            .shutdown_agent(child_thread_id)
+            .await
+            .expect("shutdown child thread");
+
+        let resumed_thread_id = harness
+            .control
+            .resume_agent_from_rollout(
+                harness.config.clone(),
+                child_thread_id,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: Some("explorer".to_string()),
+                }),
+            )
+            .await
+            .expect("resume should succeed");
+
+        let resumed_thread = harness
+            .manager
+            .get_thread(resumed_thread_id)
+            .await
+            .expect("resumed child thread should exist");
+        assert!(Arc::ptr_eq(
+            &parent_thread.codex.session.services.auth_manager,
+            &resumed_thread.codex.session.services.auth_manager,
+        ));
+        assert!(Arc::ptr_eq(
+            &parent_auth_manager,
+            &resumed_thread.codex.session.services.auth_manager,
+        ));
     }
 
     #[test]

@@ -413,6 +413,7 @@ impl ThreadManager {
             .fork_thread_with_source(
                 nth_user_message,
                 config,
+                Arc::clone(&self.state.auth_manager),
                 self.agent_control(),
                 persist_extended_history,
                 path,
@@ -436,6 +437,7 @@ impl ThreadManager {
             .fork_thread_with_source(
                 nth_user_message,
                 config,
+                Arc::clone(&self.state.auth_manager),
                 self.agent_control(),
                 persist_extended_history,
                 path,
@@ -506,6 +508,7 @@ impl ThreadManagerState {
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_new_thread_with_source(
             config,
+            Arc::clone(&self.auth_manager),
             agent_control,
             self.session_source.clone(),
             false,
@@ -518,6 +521,7 @@ impl ThreadManagerState {
     pub(crate) async fn spawn_new_thread_with_source(
         &self,
         config: Config,
+        auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
         persist_extended_history: bool,
@@ -527,7 +531,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
-            Arc::clone(&self.auth_manager),
+            auth_manager,
             agent_control,
             session_source,
             Vec::new(),
@@ -542,6 +546,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         rollout_path: PathBuf,
+        auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
@@ -550,7 +555,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
-            Arc::clone(&self.auth_manager),
+            auth_manager,
             agent_control,
             session_source,
             Vec::new(),
@@ -565,6 +570,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
         persist_extended_history: bool,
@@ -573,7 +579,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
-            Arc::clone(&self.auth_manager),
+            auth_manager,
             agent_control,
             session_source,
             Vec::new(),
@@ -684,10 +690,15 @@ impl ThreadManagerState {
         let _ = self.thread_created_tx.send(thread_id);
     }
 
+    pub(crate) fn default_auth_manager(&self) -> Arc<AuthManager> {
+        Arc::clone(&self.auth_manager)
+    }
+
     pub(crate) async fn fork_thread_with_source(
         &self,
         nth_user_message: usize,
         config: Config,
+        auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         persist_extended_history: bool,
         path: PathBuf,
@@ -708,7 +719,7 @@ impl ThreadManagerState {
         self.spawn_thread_with_source(
             config,
             history,
-            Arc::clone(&self.auth_manager),
+            auth_manager,
             agent_control,
             session_source,
             Vec::new(),
