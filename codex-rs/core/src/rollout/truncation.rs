@@ -1,13 +1,12 @@
 //! Helpers for truncating rollouts based on "user turn" boundaries.
 //!
 //! In core, "user turns" are detected by scanning `ResponseItem::Message` items and
-//! evaluating them with `context_manager::is_user_turn_boundary(...)`.
+//! interpreting them via `event_mapping::parse_turn_item(...)`.
 
-use crate::context_manager::is_user_turn_boundary;
-use crate::find_archived_thread_path_by_id_str;
-use crate::find_thread_path_by_id_str;
+use crate::event_mapping;
+use crate::resolve_fork_reference_rollout_path;
 use crate::rollout::RolloutRecorder;
-use crate::rollout::list::parse_timestamp_uuid_from_filename;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
@@ -29,7 +28,10 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
     for (idx, item) in items.iter().enumerate() {
         match item {
             RolloutItem::ResponseItem(item @ ResponseItem::Message { .. })
-                if is_user_turn_boundary(item) =>
+                if matches!(
+                    event_mapping::parse_turn_item(item),
+                    Some(TurnItem::UserMessage(_))
+                ) =>
             {
                 user_positions.push(idx);
             }
@@ -85,35 +87,6 @@ fn rollout_items_start_with(items: &[RolloutItem], prefix: &[RolloutItem]) -> bo
             .iter()
             .zip(prefix.iter())
             .all(|(item, prefix_item)| rollout_items_match(item, prefix_item))
-}
-
-async fn resolve_fork_reference_rollout_path(
-    codex_home: &Path,
-    rollout_path: &Path,
-) -> std::io::Result<std::path::PathBuf> {
-    match tokio::fs::try_exists(rollout_path).await {
-        Ok(true) => return Ok(rollout_path.to_path_buf()),
-        Ok(false) => {}
-        Err(err) => return Err(err),
-    }
-
-    let Some(file_name) = rollout_path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(rollout_path.to_path_buf());
-    };
-    let Some((_, thread_uuid)) = parse_timestamp_uuid_from_filename(file_name) else {
-        return Ok(rollout_path.to_path_buf());
-    };
-    let thread_id = thread_uuid.to_string();
-
-    if let Some(active_path) = find_thread_path_by_id_str(codex_home, &thread_id).await? {
-        return Ok(active_path);
-    }
-    if let Some(archived_path) = find_archived_thread_path_by_id_str(codex_home, &thread_id).await?
-    {
-        return Ok(archived_path);
-    }
-
-    Ok(rollout_path.to_path_buf())
 }
 
 fn materialize_rollout_items_for_replay_at_depth<'a>(
@@ -218,11 +191,11 @@ fn materialize_rollout_items_for_replay_at_depth<'a>(
     })
 }
 
-pub(crate) fn materialize_rollout_items_for_replay<'a>(
-    codex_home: &'a Path,
-    rollout_items: &'a [RolloutItem],
-) -> Pin<Box<dyn Future<Output = Vec<RolloutItem>> + Send + 'a>> {
-    materialize_rollout_items_for_replay_at_depth(codex_home, rollout_items, 0)
+pub(crate) async fn materialize_rollout_items_for_replay(
+    codex_home: &Path,
+    rollout_items: &[RolloutItem],
+) -> Vec<RolloutItem> {
+    materialize_rollout_items_for_replay_at_depth(codex_home, rollout_items, 0).await
 }
 
 #[cfg(test)]
