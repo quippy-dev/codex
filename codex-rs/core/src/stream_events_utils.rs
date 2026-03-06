@@ -293,6 +293,16 @@ pub(crate) fn last_assistant_message_from_item(
 
 pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Option<ResponseItem> {
     match input {
+        ResponseInputItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+        } => Some(ResponseItem::FunctionCall {
+            id: None,
+            name: name.clone(),
+            arguments: arguments.clone(),
+            call_id: call_id.clone(),
+        }),
         ResponseInputItem::FunctionCallOutput { call_id, output } => {
             Some(ResponseItem::FunctionCallOutput {
                 call_id: call_id.clone(),
@@ -326,8 +336,10 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
 mod tests {
     use super::handle_non_tool_response_item;
     use super::last_assistant_message_from_item;
+    use super::response_input_to_response_item;
     use codex_protocol::items::TurnItem;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseInputItem;
     use codex_protocol::models::ResponseItem;
     use pretty_assertions::assert_eq;
 
@@ -387,5 +399,26 @@ mod tests {
         let item = assistant_output_text("<proposed_plan>\n- x\n</proposed_plan>");
 
         assert_eq!(last_assistant_message_from_item(&item, true), None);
+    }
+
+    #[test]
+    fn response_input_to_response_item_converts_function_call() {
+        let input = ResponseInputItem::FunctionCall {
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+            call_id: "call-1".to_string(),
+        };
+
+        let item = response_input_to_response_item(&input);
+
+        assert_eq!(
+            item,
+            Some(ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+                call_id: "call-1".to_string(),
+            })
+        );
     }
 }

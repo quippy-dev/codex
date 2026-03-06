@@ -55,6 +55,7 @@ use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelPreset;
@@ -71,7 +72,9 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
+use codex_protocol::protocol::COLLAB_INBOX_MESSAGE_PREFIX;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::CollabInboxPayload;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -184,6 +187,27 @@ fn snapshot(percent: f64) -> RateLimitSnapshot {
     }
 }
 
+fn collab_inbox_function_call_output(sender: ThreadId, message: &str) -> ResponseItem {
+    let payload = serde_json::to_string(&CollabInboxPayload::new(sender, message.to_string()))
+        .expect("collab inbox payload should serialize");
+    ResponseItem::FunctionCallOutput {
+        call_id: "call-collab-inbox".to_string(),
+        output: FunctionCallOutputPayload::from_text(payload),
+    }
+}
+
+fn collab_inbox_message(sender: ThreadId, message: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: format!("{COLLAB_INBOX_MESSAGE_PREFIX}{sender}] {message}"),
+        }],
+        end_turn: None,
+        phase: None,
+    }
+}
+
 #[tokio::test]
 async fn resumed_initial_messages_render_history() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
@@ -283,6 +307,177 @@ async fn thread_snapshot_replay_does_not_duplicate_agent_message_history() {
         rendered.contains("assistant reply"),
         "expected replayed assistant message, got {rendered:?}"
     );
+}
+
+#[tokio::test]
+async fn thread_snapshot_replay_deduplicates_collab_inbox_compatibility_items() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Please review the latest diff";
+
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_function_call_output(sender, message),
+        }),
+    });
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-message".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_message(sender, message),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(
+        cells.len(),
+        2,
+        "expected replayed collab inbox compatibility items to render one header/body pair"
+    );
+
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(combined.matches("Agent message:").count(), 1);
+    assert_eq!(combined.matches("Please review the latest diff").count(), 1);
+    assert_eq!(
+        combined
+            .matches("from 019cbff7-558b-77d3-8653-8238ab5361ec")
+            .count(),
+        1
+    );
+    assert_snapshot!(
+        combined,
+        @r###"
+        • Agent message: from 019cbff7-558b-77d3-8653-8238ab5361ec
+          Please review the latest diff
+        "###
+    );
+}
+
+#[tokio::test]
+async fn thread_snapshot_replay_resets_collab_inbox_dedupe_after_non_collab_raw_item() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Please review the latest diff";
+
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output-1".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_function_call_output(sender, message),
+        }),
+    });
+    chat.handle_codex_event_replay(Event {
+        id: "evt-non-collab".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "not a collab inbox compatibility item".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        }),
+    });
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output-2".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_function_call_output(sender, message),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(
+        cells.len(),
+        4,
+        "expected repeated replayed collab inbox items separated by a non-collab raw item to render twice"
+    );
+
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(combined.matches("Agent message:").count(), 2);
+    assert_eq!(combined.matches("Please review the latest diff").count(), 2);
+}
+
+#[tokio::test]
+async fn thread_snapshot_replay_keeps_adjacent_identical_function_call_outputs() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Please review the latest diff";
+
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output-1".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_function_call_output(sender, message),
+        }),
+    });
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output-2".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_function_call_output(sender, message),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(
+        cells.len(),
+        4,
+        "expected adjacent identical real replayed collab inbox messages to render twice"
+    );
+
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(combined.matches("Agent message:").count(), 2);
+    assert_eq!(combined.matches("Please review the latest diff").count(), 2);
+}
+
+#[tokio::test]
+async fn live_collab_inbox_messages_are_not_deduplicated() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Please review the latest diff";
+
+    chat.handle_codex_event(Event {
+        id: "evt-live-output".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_function_call_output(sender, message),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "evt-live-message".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: collab_inbox_message(sender, message),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(
+        cells.len(),
+        4,
+        "expected live collab inbox compatibility encodings to render independently"
+    );
+
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(combined.matches("Agent message:").count(), 2);
+    assert_eq!(combined.matches("Please review the latest diff").count(), 2);
 }
 
 #[tokio::test]
@@ -1878,6 +2073,7 @@ async fn make_chatwidget_manual(
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
+        last_replayed_collab_inbox_message: None,
         last_rendered_user_message_event: None,
     };
     widget.set_model(&resolved_model);
