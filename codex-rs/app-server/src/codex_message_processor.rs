@@ -2708,8 +2708,18 @@ impl CodexMessageProcessor {
         } else {
             read_summary_from_state_db_by_thread_id(&self.config, thread_uuid).await
         };
+        let loaded_rollout_path = loaded_thread
+            .as_ref()
+            .and_then(|thread| thread.rollout_path());
         let mut rollout_path = db_summary.as_ref().map(|summary| summary.path.clone());
-        if rollout_path.is_none() || include_turns {
+        if rollout_path.is_none()
+            && let Some(path) = loaded_rollout_path.as_ref()
+            && tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            rollout_path = Some(path.clone());
+        }
+        let should_lookup_rollout = rollout_path.is_none() && loaded_thread.is_none();
+        if should_lookup_rollout {
             rollout_path =
                 match find_thread_path_by_id_str(&self.config.codex_home, &thread_uuid.to_string())
                     .await
@@ -2744,6 +2754,41 @@ impl CodexMessageProcessor {
 
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
+        } else if let Some(thread) = loaded_thread {
+            let config_snapshot = thread.config_snapshot().await;
+            if include_turns && loaded_rollout_path.is_none() {
+                self.send_invalid_request_error(
+                    request_id,
+                    "ephemeral threads do not support includeTurns".to_string(),
+                )
+                .await;
+                return;
+            }
+            if include_turns {
+                rollout_path = loaded_rollout_path.clone();
+            }
+
+            let mut thread =
+                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path);
+            if let Some(rollout_path) = rollout_path.as_ref() {
+                let fallback_provider = self.config.model_provider_id.as_str();
+                match read_summary_from_rollout(rollout_path, fallback_provider).await {
+                    Ok(summary) => merge_loaded_thread_rollout_summary(&mut thread, summary),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!(
+                                "failed to load rollout `{}` for thread {thread_uuid}: {err}",
+                                rollout_path.display()
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            thread
         } else if let Some(rollout_path) = rollout_path.as_ref() {
             let fallback_provider = self.config.model_provider_id.as_str();
             match read_summary_from_rollout(rollout_path, fallback_provider).await {
@@ -2761,28 +2806,12 @@ impl CodexMessageProcessor {
                 }
             }
         } else {
-            let Some(thread) = loaded_thread else {
-                self.send_invalid_request_error(
-                    request_id,
-                    format!("thread not loaded: {thread_uuid}"),
-                )
-                .await;
-                return;
-            };
-            let config_snapshot = thread.config_snapshot().await;
-            let loaded_rollout_path = thread.rollout_path();
-            if include_turns && loaded_rollout_path.is_none() {
-                self.send_invalid_request_error(
-                    request_id,
-                    "ephemeral threads do not support includeTurns".to_string(),
-                )
-                .await;
-                return;
-            }
-            if include_turns {
-                rollout_path = loaded_rollout_path.clone();
-            }
-            build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
+            self.send_invalid_request_error(
+                request_id,
+                format!("thread not loaded: {thread_uuid}"),
+            )
+            .await;
+            return;
         };
         self.attach_thread_name(thread_uuid, &mut thread).await;
 
@@ -7222,6 +7251,15 @@ fn build_thread_from_snapshot(
         name: None,
         turns: Vec::new(),
     }
+}
+
+fn merge_loaded_thread_rollout_summary(thread: &mut Thread, summary: ConversationSummary) {
+    let rollout_thread = summary_to_thread(summary);
+    thread.preview = rollout_thread.preview;
+    thread.created_at = rollout_thread.created_at;
+    thread.updated_at = rollout_thread.updated_at;
+    thread.path = rollout_thread.path;
+    thread.git_info = rollout_thread.git_info;
 }
 
 pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {

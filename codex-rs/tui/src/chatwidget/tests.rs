@@ -1996,7 +1996,7 @@ async fn make_chatwidget_manual(
         codex_op_tx: op_tx,
         bottom_pane: bottom,
         active_cell: None,
-        pending_subagent_panel: None,
+        subagent_panel: None,
         active_cell_revision: 0,
         config: cfg,
         current_collaboration_mode,
@@ -2131,7 +2131,15 @@ async fn subagent_panel_is_not_flushed_into_transcript_history() {
             latest_update_at: Instant::now(),
         }],
     }));
-    chat.on_subagent_panel_updated(Arc::new(SubagentStatusCell::new(state, true)));
+    chat.on_subagent_panel_updated(Arc::new(SubagentStatusCell::new(Arc::clone(&state), true)));
+
+    assert!(chat.active_cell.is_none());
+    assert!(
+        chat.subagent_panel
+            .as_ref()
+            .is_some_and(|panel| panel.matches_state(&state)),
+        "fresh widget should mount the subagent panel without claiming the active transcript cell"
+    );
 
     chat.add_to_history(crate::history_cell::new_error_event(
         "follow-up cell".to_string(),
@@ -2147,10 +2155,81 @@ async fn subagent_panel_is_not_flushed_into_transcript_history() {
     assert!(rendered.contains("follow-up cell"));
     assert!(!rendered.contains("Subagents"));
     assert!(
+        chat.subagent_panel
+            .as_ref()
+            .is_some_and(|panel| panel.matches_state(&state)),
+        "subagent panel should stay mounted after other history cells are inserted"
+    );
+}
+
+#[tokio::test]
+async fn subagent_panel_mounts_while_placeholder_active_cell_exists_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.active_cell = Some(ChatWidget::placeholder_session_header_cell(
+        chat.config_ref(),
+    ));
+    chat.bottom_pane.set_composer_text(
+        "show current subagent state".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    let state = Arc::new(std::sync::Mutex::new(SubagentPanelState {
+        started_at: Instant::now(),
+        total_agents: 1,
+        running_count: 0,
+        running_agents: vec![SubagentPanelAgent {
+            ordinal: 1,
+            name: "watchdog-agent".to_string(),
+            status: AgentStatus::PendingInit,
+            is_watchdog: true,
+            preview: "watchdog idle".to_string(),
+            latest_update_at: Instant::now(),
+        }],
+    }));
+    chat.on_subagent_panel_updated(Arc::new(SubagentStatusCell::new(Arc::clone(&state), false)));
+
+    assert!(
         chat.active_cell
             .as_ref()
-            .is_some_and(|cell| cell.as_any().is::<SubagentStatusCell>()),
-        "subagent panel should stay mounted after other history cells are inserted"
+            .is_some_and(|cell| cell.as_any().is::<history_cell::SessionHeaderHistoryCell>()),
+        "placeholder session header should remain the active cell"
+    );
+    assert!(
+        chat.subagent_panel
+            .as_ref()
+            .is_some_and(|panel| panel.matches_state(&state)),
+        "subagent panel should mount even when another active cell already exists"
+    );
+
+    let width = 80;
+    let height = chat.desired_height(width);
+    let mut terminal =
+        ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
+    terminal.set_viewport_area(Rect::new(0, 0, width, height));
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("render chat with placeholder header and subagent panel");
+
+    assert_snapshot!(
+        terminal.backend().vt100().screen().contents(),
+        @r"
+
+        ╭──────────────────────────────────────────────────╮
+        │ >_ OpenAI Codex (v0.0.0)                         │
+        │                                                  │
+        │ model:     loading   /model to change            │
+        │ directory: ~/Documents/GitHub/codex/codex-rs/tui │
+        ╰──────────────────────────────────────────────────╯
+
+        • Subagents (0s • no subagents running • esc to interrupt)
+        • [#1] watchdog-agent idle — watchdog idle
+
+
+        › show current subagent state
+
+                                                                     100% context left
+        "
     );
 }
 

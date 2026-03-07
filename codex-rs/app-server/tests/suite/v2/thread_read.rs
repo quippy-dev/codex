@@ -1,7 +1,9 @@
 use anyhow::Result;
 use app_test_support::McpProcess;
+use app_test_support::create_fake_rollout;
 use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::rollout_path;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -24,13 +26,17 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_protocol::ThreadId;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_state::StateRuntime;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -196,6 +202,78 @@ async fn thread_read_loaded_thread_returns_precomputed_path_before_materializati
     assert_eq!(read.path, Some(thread_path));
     assert!(read.preview.is_empty());
     assert_eq!(read.turns.len(), 0);
+    assert_eq!(read.status, ThreadStatus::Idle);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_read_loaded_rollout_preserves_summary_when_state_db_entry_missing() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+
+    let preview = "Loaded thread preview";
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-30-00",
+        "2025-01-05T12:30:00Z",
+        preview,
+        Some("mock_provider"),
+        None,
+    )?;
+    let source_rollout_path = rollout_path(codex_home.path(), "2025-01-05T12-30-00", &thread_id);
+    let external_rollout_dir = TempDir::new()?;
+    let external_rollout_path = external_rollout_dir.path().join("loaded-rollout.jsonl");
+    let override_cwd = external_rollout_dir.path().join("override-cwd");
+    fs::create_dir_all(&override_cwd)?;
+    fs::copy(&source_rollout_path, &external_rollout_path)?;
+    fs::remove_file(source_rollout_path)?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: "not-a-valid-thread-id".to_string(),
+            path: Some(external_rollout_path.clone()),
+            cwd: Some(override_cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(resumed.path, Some(external_rollout_path.clone()));
+    let thread_id = ThreadId::from_string(&resumed.id)?;
+    state_db.delete_thread(thread_id).await?;
+    assert!(state_db.get_thread(thread_id).await?.is_none());
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: resumed.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: read } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert_eq!(read.id, resumed.id);
+    assert_eq!(read.path, Some(external_rollout_path));
+    assert_eq!(read.preview, preview);
+    assert_eq!(read.cwd, override_cwd);
+    assert_eq!(read.model_provider, "mock_provider");
     assert_eq!(read.status, ThreadStatus::Idle);
 
     Ok(())
@@ -408,6 +486,62 @@ async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Res
 }
 
 #[tokio::test]
+async fn thread_read_loaded_ephemeral_thread_ignores_unrelated_rollout_mentions() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let unrelated_preview = thread.id.clone();
+    let _unrelated_rollout_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T13-00-00",
+        "2025-01-05T13:00:00Z",
+        &unrelated_preview,
+        vec![],
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: read } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert_eq!(read.id, thread.id);
+    assert!(read.ephemeral);
+    assert_eq!(read.path, None);
+    assert!(read.preview.is_empty());
+    assert_eq!(read.status, ThreadStatus::Idle);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_read_reports_system_error_idle_flag_after_failed_turn() -> Result<()> {
     let server = responses::start_mock_server().await;
     let _response_mock = responses::mount_sse_once(
@@ -472,6 +606,13 @@ async fn thread_read_reports_system_error_idle_flag_after_failed_turn() -> Resul
     assert_eq!(thread.status, ThreadStatus::SystemError,);
 
     Ok(())
+}
+
+async fn init_state_db(codex_home: &Path) -> Result<Arc<StateRuntime>> {
+    let state_db =
+        StateRuntime::init(codex_home.to_path_buf(), "mock_provider".into(), None).await?;
+    state_db.mark_backfill_complete(None).await?;
+    Ok(state_db)
 }
 
 // Helper to create a config.toml pointing at the mock model server.

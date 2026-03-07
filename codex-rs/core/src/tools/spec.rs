@@ -66,6 +66,7 @@ pub(crate) struct ToolsConfig {
     pub js_repl_enabled: bool,
     pub js_repl_tools_only: bool,
     pub collab_tools: bool,
+    pub collab_parent_send_input: bool,
     pub artifact_tools: bool,
     pub request_user_input: bool,
     pub default_mode_request_user_input: bool,
@@ -94,6 +95,10 @@ impl ToolsConfig {
         let include_js_repl_tools_only =
             include_js_repl && features.enabled(Feature::JsReplToolsOnly);
         let include_collab_tools = features.enabled(Feature::Collab);
+        let collab_parent_send_input = matches!(
+            session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        );
         let include_request_user_input = !matches!(session_source, SessionSource::SubAgent(_));
         let include_default_mode_request_user_input = include_request_user_input
             && features.enabled(Feature::RequestUserInputOutsidePlanMode);
@@ -166,6 +171,7 @@ impl ToolsConfig {
             js_repl_enabled: include_js_repl,
             js_repl_tools_only: include_js_repl_tools_only,
             collab_tools: include_collab_tools,
+            collab_parent_send_input,
             artifact_tools: include_artifact_tools,
             request_user_input: include_request_user_input,
             default_mode_request_user_input: include_default_mode_request_user_input,
@@ -670,7 +676,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "spawn_mode".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Spawn behavior: use `spawn` for a fresh thread (default), `fork` to inherit parent history, or `watchdog` to create an idle watchdog handle."
+                    "Spawn behavior: use `spawn` for a fresh thread (default), `fork` to inherit parent history, or `watchdog` to create an idle watchdog handle. Watchdog mode returns a handle, not a conversational worker, and check-ins only happen after the current turn ends and the owner thread is idle."
                         .to_string(),
                 ),
             },
@@ -688,7 +694,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
-        description: r#"Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
+        description: r#"Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. Watchdog mode returns a control handle, not a conversational worker; watchdog check-ins are asynchronous and cannot arrive until the current turn ends and the owner thread becomes idle. This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
 
 ### When to delegate vs. do the subtask yourself
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
@@ -853,12 +859,17 @@ fn create_report_agent_job_result_tool() -> ToolSpec {
     })
 }
 
-fn create_send_input_tool() -> ToolSpec {
+fn create_send_input_tool(config: &ToolsConfig) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "id".to_string(),
             JsonSchema::String {
-                description: Some("Agent id to message (from spawn_agent).".to_string()),
+                description: Some(if config.collab_parent_send_input {
+                    "Agent id to message (from spawn_agent). Optional when the current thread has a parent: omit it, or use `parent` / `root`, to target that parent thread."
+                        .to_string()
+                } else {
+                    "Agent id to message (from spawn_agent).".to_string()
+                }),
             },
         ),
         (
@@ -889,7 +900,7 @@ fn create_send_input_tool() -> ToolSpec {
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["id".to_string()]),
+            required: (!config.collab_parent_send_input).then(|| vec!["id".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -918,6 +929,50 @@ fn create_resume_agent_tool() -> ToolSpec {
     })
 }
 
+fn create_list_agents_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Identifier of the parent agent whose spawned agents to list. Defaults to the current agent."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "recursive".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true (default), include all descendants recursively. When false, include only direct children."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "all".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true, ignore id/recursive and return all tracked open agents that currently count toward this session's agent limit."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "list_agents".to_string(),
+        description:
+            "List agents spawned by an agent, optionally recursively. This is a status view; polling it will not make a watchdog fire."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_wait_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -925,7 +980,7 @@ fn create_wait_tool() -> ToolSpec {
         JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
             description: Some(
-                "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first."
+                "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first. Watchdog handle ids are status-only here: if all ids are watchdog handles, wait returns an immediate correction instead of blocking; if mixed with normal agent ids, wait still waits on normal agents and includes current watchdog statuses."
                     .to_string(),
             ),
         },
@@ -941,7 +996,7 @@ fn create_wait_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Watchdog handles cannot be waited on for new check-ins, and sleeping or polling cannot make a watchdog fire while the current turn is active."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -1941,13 +1996,15 @@ pub(crate) fn build_specs(
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
         builder.push_spec(create_spawn_agent_tool(config));
-        builder.push_spec(create_send_input_tool());
+        builder.push_spec(create_send_input_tool(config));
         builder.push_spec(create_resume_agent_tool());
+        builder.push_spec(create_list_agents_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
+        builder.register_handler("list_agents", multi_agent_handler.clone());
         builder.register_handler("wait", multi_agent_handler.clone());
         builder.register_handler("close_agent", multi_agent_handler);
     }
@@ -2006,6 +2063,7 @@ mod tests {
     use crate::models_manager::manager::ModelsManager;
     use crate::models_manager::model_info::with_config_overrides;
     use crate::tools::registry::ConfiguredToolSpec;
+    use codex_protocol::ThreadId;
     use codex_protocol::openai_models::InputModality;
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::openai_models::ModelsResponse;
@@ -2253,6 +2311,8 @@ mod tests {
             &[
                 "spawn_agent",
                 "send_input",
+                "resume_agent",
+                "list_agents",
                 "wait",
                 "close_agent",
                 "spawn_agents_on_csv",
@@ -2303,6 +2363,7 @@ mod tests {
                 "spawn_agent",
                 "send_input",
                 "resume_agent",
+                "list_agents",
                 "wait",
                 "close_agent",
                 "spawn_agents_on_csv",
@@ -2310,6 +2371,55 @@ mod tests {
             ],
         );
         assert_lacks_tool_name(&tools, "request_user_input");
+    }
+
+    #[test]
+    fn send_input_tool_requires_id_without_parent_thread() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        });
+        let ToolSpec::Function(spec) = create_send_input_tool(&tools_config) else {
+            panic!("send_input should use a function tool spec");
+        };
+        let JsonSchema::Object { required, .. } = spec.parameters else {
+            panic!("send_input should use object parameters");
+        };
+
+        assert_eq!(required, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn send_input_tool_does_not_require_id_for_thread_spawn_sessions() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+        });
+        let ToolSpec::Function(spec) = create_send_input_tool(&tools_config) else {
+            panic!("send_input should use a function tool spec");
+        };
+        let JsonSchema::Object { required, .. } = spec.parameters else {
+            panic!("send_input should use object parameters");
+        };
+
+        assert_eq!(required, None);
     }
 
     #[test]
