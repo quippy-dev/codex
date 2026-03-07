@@ -808,7 +808,7 @@ impl AgentControl {
                 .await
                 == Some(parent_thread_id);
 
-            if parent_is_root_thread && !child_is_watchdog_helper_for_parent {
+            if parent_is_root_thread {
                 let child_used_collab_send_input = state
                     .get_thread(child_thread_id)
                     .await
@@ -817,7 +817,7 @@ impl AgentControl {
                 if let Some(message) = completed_message_for_collab_fallback(
                     &status,
                     child_used_collab_send_input,
-                    false,
+                    child_is_watchdog_helper_for_parent,
                 ) && let Err(err) = control
                     .send_collab_message(parent_thread_id, child_thread_id, message)
                     .await
@@ -1313,6 +1313,9 @@ mod tests {
     use crate::config::Config;
     use crate::config::ConfigBuilder;
     use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
+    use crate::tasks::CompactTask;
+    use crate::tasks::SessionTask;
+    use crate::tasks::SessionTaskContext;
 
     use assert_matches::assert_matches;
     use codex_protocol::config_types::ModeKind;
@@ -1363,16 +1366,19 @@ mod tests {
     }
 
     fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
-        history_items.iter().any(|item| {
-            let ResponseItem::Message { content, .. } = item else {
-                return false;
-            };
-            content.iter().any(|content_item| match content_item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                    text.contains(needle)
-                }
-                ContentItem::InputImage { .. } => false,
-            })
+        history_items.iter().any(|item| match item {
+            ResponseItem::Message { content, .. } => {
+                content.iter().any(|content_item| match content_item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        text.contains(needle)
+                    }
+                    ContentItem::InputImage { .. } => false,
+                })
+            }
+            ResponseItem::FunctionCallOutput { output, .. } => output
+                .text_content()
+                .is_some_and(|text| text.contains(needle)),
+            _ => false,
         })
     }
 
@@ -1404,6 +1410,27 @@ mod tests {
                     .raw_items()
                     .to_vec();
                 if has_subagent_notification(&history_items) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+            .await
+            .is_ok()
+    }
+
+    async fn wait_for_history_text(parent_thread: &Arc<CodexThread>, needle: &str) -> bool {
+        let wait = async {
+            loop {
+                let history_items = parent_thread
+                    .codex
+                    .session
+                    .clone_history()
+                    .await
+                    .raw_items()
+                    .to_vec();
+                if history_contains_text(&history_items, needle) {
                     return true;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1910,8 +1937,9 @@ mod tests {
             .expect("watchdog handle should spawn");
         let helper_thread_id = harness
             .control
-            .spawn_agent_handle(
+            .spawn_agent(
                 harness.config.clone(),
+                text_input("check in"),
                 Some(thread_spawn_source(owner_thread_id)),
             )
             .await
@@ -1932,10 +1960,6 @@ mod tests {
         harness
             .control
             .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
-            .await;
-        harness
-            .control
-            .force_watchdog_due_for_tests(watchdog_handle_id)
             .await;
 
         let mut helper_status_rx = harness
@@ -1961,38 +1985,86 @@ mod tests {
         })
         .await
         .expect("helper should reach shutdown");
-        harness.control.run_watchdogs_once_for_tests().await;
+        assert_eq!(
+            wait_for_history_text(&owner_thread, "before calling send_input").await,
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn root_watchdog_helper_shutdown_without_send_input_survives_handle_shutdown() {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+        let watchdog_handle_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog handle should spawn");
+        let helper_thread_id = harness
+            .control
+            .spawn_agent(
+                harness.config.clone(),
+                text_input("check in"),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog helper should spawn");
+        let removed = harness
+            .control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 1,
+                prompt: "check in".to_string(),
+                config: harness.config.clone(),
+            })
+            .await
+            .expect("watchdog registration should succeed");
+        assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+        harness
+            .control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
+            .await;
+
+        let mut helper_status_rx = harness
+            .control
+            .subscribe_status(helper_thread_id)
+            .await
+            .expect("helper status subscription should succeed");
+        let _ = harness
+            .control
+            .shutdown_agent(helper_thread_id)
+            .await
+            .expect("helper shutdown should submit");
         timeout(Duration::from_secs(2), async {
             loop {
-                let history = owner_thread.codex.session.clone_history().await;
-                let found_payload = history.raw_items().iter().any(|item| match item {
-                    ResponseItem::FunctionCallOutput { output, .. } => {
-                        output.text_content().is_some_and(|text| {
-                            text.contains(&helper_thread_id.to_string())
-                                && text.contains("Watchdog check-in ")
-                                && text.contains("before calling send_input")
-                        })
-                    }
-                    ResponseItem::Message { content, .. } => {
-                        content.iter().any(|content_item| match content_item {
-                            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                                text.contains(&helper_thread_id.to_string())
-                                    && text.contains("Watchdog check-in ")
-                                    && text.contains("before calling send_input")
-                            }
-                            ContentItem::InputImage { .. } => false,
-                        })
-                    }
-                    _ => false,
-                });
-                if found_payload {
-                    return;
+                if matches!(helper_status_rx.borrow().clone(), AgentStatus::Shutdown) {
+                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                helper_status_rx
+                    .changed()
+                    .await
+                    .expect("helper status should reach shutdown");
             }
         })
         .await
-        .expect("owner should receive fallback agent inbox payload");
+        .expect("helper should reach shutdown");
+        tokio::task::yield_now().await;
+
+        let _ = harness
+            .control
+            .shutdown_agent(watchdog_handle_id)
+            .await
+            .expect("watchdog handle shutdown should submit");
+
+        assert_eq!(
+            wait_for_history_text(&owner_thread, "before calling send_input").await,
+            true
+        );
     }
 
     #[tokio::test]
@@ -3098,6 +3170,94 @@ mod tests {
             .shutdown_agent(owner_thread_id)
             .await
             .expect("owner shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn compact_parent_for_watchdog_helper_unblocks_after_compact_abort_cleanup() {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+        let owner_control = owner_thread.codex.session.services.agent_control.clone();
+        let watchdog_handle_id = owner_control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog handle should spawn");
+        let helper_thread_id = owner_control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog helper should spawn");
+        let removed = owner_control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 1,
+                prompt: "compact if needed".to_string(),
+                config: harness.config.clone(),
+            })
+            .await
+            .expect("watchdog registration should succeed");
+        assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+        owner_control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
+            .await;
+
+        let result = owner_control
+            .compact_parent_for_watchdog_helper(helper_thread_id)
+            .await
+            .expect("first compact request should submit");
+        let submission_id = match result {
+            WatchdogParentCompactionResult::Submitted {
+                parent_thread_id,
+                submission_id,
+            } => {
+                assert_eq!(parent_thread_id, owner_thread_id);
+                submission_id
+            }
+            other => panic!("expected submitted compaction result, got {other:?}"),
+        };
+        assert!(!submission_id.is_empty());
+
+        let result = owner_control
+            .compact_parent_for_watchdog_helper(helper_thread_id)
+            .await
+            .expect("duplicate compact should be blocked");
+        assert_eq!(
+            result,
+            WatchdogParentCompactionResult::AlreadyInProgress {
+                parent_thread_id: owner_thread_id
+            }
+        );
+
+        Arc::new(CompactTask)
+            .abort(
+                Arc::new(SessionTaskContext::new(Arc::clone(
+                    &owner_thread.codex.session,
+                ))),
+                owner_thread.codex.session.new_default_turn().await,
+            )
+            .await;
+
+        let result = owner_control
+            .compact_parent_for_watchdog_helper(helper_thread_id)
+            .await
+            .expect("abort cleanup should unblock later requests");
+        let resubmitted_id = match result {
+            WatchdogParentCompactionResult::Submitted {
+                parent_thread_id,
+                submission_id,
+            } => {
+                assert_eq!(parent_thread_id, owner_thread_id);
+                submission_id
+            }
+            other => panic!("expected submitted compaction result after abort, got {other:?}"),
+        };
+        assert!(!resubmitted_id.is_empty());
     }
 
     #[tokio::test]

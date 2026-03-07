@@ -127,6 +127,8 @@ pub enum Feature {
     EnableRequestCompression,
     /// Enable collab tools.
     Collab,
+    /// Enable watchdog spawning and watchdog-only agent tools.
+    AgentWatchdog,
     /// Enable apps.
     Apps,
     /// Enable plugins.
@@ -636,6 +638,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::AgentWatchdog,
+        key: "agent_watchdog",
+        stage: Stage::UnderDevelopment,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::Apps,
         key: "apps",
         stage: Stage::Experimental {
@@ -890,5 +898,15 @@ mod tests {
     fn collab_is_legacy_alias_for_multi_agent() {
         assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
         assert_eq!(feature_for_key("collab"), Some(Feature::Collab));
+    }
+
+    #[test]
+    fn agent_watchdog_uses_canonical_key_and_defaults_enabled() {
+        assert_eq!(
+            canonical_feature_for_key("agent_watchdog"),
+            Some(Feature::AgentWatchdog)
+        );
+        assert_eq!(Feature::AgentWatchdog.stage(), Stage::UnderDevelopment);
+        assert!(Feature::AgentWatchdog.default_enabled());
     }
 }

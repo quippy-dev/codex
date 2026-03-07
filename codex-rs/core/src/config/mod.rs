@@ -1,3 +1,4 @@
+use crate::agent::DEFAULT_WATCHDOG_INTERVAL_S;
 use crate::auth::AuthCredentialsStoreMode;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
@@ -360,6 +361,9 @@ pub struct Config {
     pub agent_max_threads: Option<usize>,
     /// Maximum runtime in seconds for agent job workers before they are failed.
     pub agent_job_max_runtime_seconds: Option<u64>,
+
+    /// Watchdog polling interval in seconds.
+    pub watchdog_interval_s: i64,
 
     /// How inbound collaboration messages are delivered to non-subagent threads.
     pub collab_inbox_delivery_role: CollabInboxDeliveryRole,
@@ -1228,6 +1232,9 @@ pub struct ConfigToml {
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
 
+    /// Watchdog polling interval in seconds.
+    pub watchdog_interval_s: Option<i64>,
+
     /// Memories subsystem settings.
     pub memories: Option<MemoriesToml>,
 
@@ -1959,6 +1966,15 @@ impl Config {
                 "agents.job_max_runtime_seconds must fit within a 64-bit signed integer",
             ));
         }
+        let watchdog_interval_s = cfg
+            .watchdog_interval_s
+            .unwrap_or(DEFAULT_WATCHDOG_INTERVAL_S);
+        if watchdog_interval_s <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "watchdog_interval_s must be at least 1",
+            ));
+        }
         let background_terminal_max_timeout = cfg
             .background_terminal_max_timeout
             .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
@@ -2200,6 +2216,7 @@ impl Config {
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
             agent_max_threads,
+            watchdog_interval_s,
             collab_inbox_delivery_role,
             agent_max_depth,
             agent_roles,
@@ -5235,6 +5252,7 @@ model_verbosity = "high"
                 agent_roles: BTreeMap::new(),
                 memories: MemoriesConfig::default(),
                 agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
+                watchdog_interval_s: DEFAULT_WATCHDOG_INTERVAL_S,
                 codex_home: fixture.codex_home(),
                 sqlite_home: fixture.codex_home(),
                 log_dir: fixture.codex_home().join("log"),
@@ -5366,6 +5384,7 @@ model_verbosity = "high"
             agent_roles: BTreeMap::new(),
             memories: MemoriesConfig::default(),
             agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
+            watchdog_interval_s: DEFAULT_WATCHDOG_INTERVAL_S,
             codex_home: fixture.codex_home(),
             sqlite_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
@@ -5495,6 +5514,7 @@ model_verbosity = "high"
             agent_roles: BTreeMap::new(),
             memories: MemoriesConfig::default(),
             agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
+            watchdog_interval_s: DEFAULT_WATCHDOG_INTERVAL_S,
             codex_home: fixture.codex_home(),
             sqlite_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
@@ -5610,6 +5630,7 @@ model_verbosity = "high"
             agent_roles: BTreeMap::new(),
             memories: MemoriesConfig::default(),
             agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
+            watchdog_interval_s: DEFAULT_WATCHDOG_INTERVAL_S,
             codex_home: fixture.codex_home(),
             sqlite_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
@@ -6682,6 +6703,58 @@ speaker = "Desk Speakers"
             Some("Desk Speakers")
         );
         Ok(())
+    }
+
+    #[test]
+    fn agent_watchdog_defaults_enabled() {
+        let features = Features::with_defaults();
+        assert!(features.enabled(Feature::AgentWatchdog));
+    }
+
+    #[test]
+    fn watchdog_interval_defaults_from_config() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.watchdog_interval_s, DEFAULT_WATCHDOG_INTERVAL_S);
+        Ok(())
+    }
+
+    #[test]
+    fn watchdog_interval_loads_from_config_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                watchdog_interval_s: Some(17),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.watchdog_interval_s, 17);
+        Ok(())
+    }
+
+    #[test]
+    fn watchdog_interval_rejects_non_positive_values() {
+        let codex_home = TempDir::new().expect("temp dir");
+        let err = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                watchdog_interval_s: Some(0),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("non-positive watchdog_interval_s should be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "watchdog_interval_s must be at least 1");
     }
 }
 

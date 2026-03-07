@@ -36,6 +36,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 
 pub struct MultiAgentHandler;
@@ -83,6 +84,11 @@ impl ToolHandler for MultiAgentHandler {
             "spawn_agent" => spawn::handle(session, turn, call_id, arguments).await,
             "send_input" => send_input::handle(session, turn, call_id, arguments).await,
             "resume_agent" => resume_agent::handle(session, turn, call_id, arguments).await,
+            "compact_parent_context" if !turn.config.features.enabled(Feature::AgentWatchdog) => {
+                Err(FunctionCallError::RespondToModel(
+                    "watchdogs are disabled".to_string(),
+                ))
+            }
             "compact_parent_context" => {
                 compact_parent_context::handle(session, turn, call_id, arguments).await
             }
@@ -99,7 +105,6 @@ impl ToolHandler for MultiAgentHandler {
 mod spawn {
     use super::*;
     use crate::agent::AgentControl;
-    use crate::agent::DEFAULT_WATCHDOG_INTERVAL_S;
     use crate::agent::WatchdogRegistration;
     use crate::agent::control::SpawnAgentOptions;
     use crate::agent::exceeds_thread_spawn_depth_limit;
@@ -128,7 +133,6 @@ mod spawn {
         agent_type: Option<String>,
         #[serde(default, alias = "mode")]
         spawn_mode: SpawnMode,
-        interval_s: Option<i64>,
     }
 
     #[derive(Debug, Serialize)]
@@ -153,21 +157,33 @@ mod spawn {
         call_id: String,
         arguments: String,
     ) -> Result<ToolOutput, FunctionCallError> {
-        let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+        let raw_args: Value = parse_arguments(&arguments)?;
+        if raw_args.get("interval_s").is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent no longer accepts interval_s; configure watchdog_interval_s instead"
+                    .to_string(),
+            ));
+        }
+        let args: SpawnAgentArgs = serde_json::from_value(raw_args).map_err(|err| {
+            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
+        })?;
         let role_name = args
             .agent_type
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
         let spawn_mode = args.spawn_mode;
-        let interval_s = match spawn_mode {
-            SpawnMode::Watchdog => Some(watchdog_interval(args.interval_s)?),
-            _ => None,
-        };
         let input_items = parse_multi_agent_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
         let session_source = turn.session_source.clone();
         let child_depth = next_thread_spawn_depth(&session_source);
+        if matches!(spawn_mode, SpawnMode::Watchdog)
+            && !turn.config.features.enabled(Feature::AgentWatchdog)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "watchdogs are disabled".to_string(),
+            ));
+        }
         if matches!(spawn_mode, SpawnMode::Watchdog)
             && matches!(session_source, SessionSource::SubAgent(_))
         {
@@ -228,7 +244,7 @@ mod spawn {
                     .await
             }
             SpawnMode::Watchdog => {
-                let interval_s = interval_s.unwrap_or(DEFAULT_WATCHDOG_INTERVAL_S);
+                let interval_s = watchdog_interval(&config)?;
                 spawn_watchdog(
                     agent_control,
                     config,
@@ -294,11 +310,11 @@ mod spawn {
         })
     }
 
-    fn watchdog_interval(interval_s: Option<i64>) -> Result<i64, FunctionCallError> {
-        let interval = interval_s.unwrap_or(DEFAULT_WATCHDOG_INTERVAL_S);
+    fn watchdog_interval(config: &Config) -> Result<i64, FunctionCallError> {
+        let interval = config.watchdog_interval_s;
         if interval <= 0 {
             return Err(FunctionCallError::RespondToModel(
-                "interval_s must be greater than zero".to_string(),
+                "watchdog_interval_s must be greater than zero".to_string(),
             ));
         }
         Ok(interval)
@@ -942,7 +958,7 @@ pub(crate) mod wait {
             })?;
 
             return Err(FunctionCallError::RespondToModel(format!(
-                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins only happen after the current turn ends and the owner thread is idle for at least interval_s. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
+                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins only happen after the current turn ends and the owner thread is idle for at least watchdog_interval_s. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
             )));
         }
 
@@ -1691,8 +1707,7 @@ mod tests {
             "spawn_agent",
             function_payload(json!({
                 "message": "watchdog check-in",
-                "spawn_mode": "watchdog",
-                "interval_s": 5
+                "spawn_mode": "watchdog"
             })),
         );
         let output = MultiAgentHandler
@@ -1963,6 +1978,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_rejects_interval_override() {
+        let (session, turn) = make_session_and_context().await;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "watchdog check-in",
+                "spawn_mode": "watchdog",
+                "interval_s": 5
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("interval override should be rejected");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "spawn_agent no longer accepts interval_s; configure watchdog_interval_s instead"
+                    .to_string(),
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn spawn_agent_rejects_watchdog_from_subagent() {
         let (mut session, mut turn) = make_session_and_context().await;
         let manager = thread_manager();
@@ -1991,6 +2031,55 @@ mod tests {
             FunctionCallError::RespondToModel(
                 "watchdogs can only be spawned by root agents".to_string()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_watchdog_when_feature_disabled() {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let mut config = (*turn.config).clone();
+        let _ = config.features.disable(Feature::AgentWatchdog);
+        turn.config = Arc::new(config);
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "watchdog check-in",
+                "spawn_mode": "watchdog"
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("watchdog spawn should be rejected when the feature is disabled");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel("watchdogs are disabled".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_parent_context_rejects_when_feature_disabled() {
+        let (session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        let _ = config.features.disable(Feature::AgentWatchdog);
+        turn.config = Arc::new(config);
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "compact_parent_context",
+            function_payload(json!({})),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("compact_parent_context should be rejected when the feature is disabled");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel("watchdogs are disabled".to_string())
         );
     }
 
@@ -2902,6 +2991,7 @@ mod tests {
             panic!("expected respond-to-model error");
         };
         assert!(message.contains("wait cannot be used to wait for watchdog check-ins"));
+        assert!(message.contains("watchdog_interval_s"));
         assert!(message.contains("Continue the task now or end the turn"));
         assert!(message.contains(&watchdog_id.to_string()));
 

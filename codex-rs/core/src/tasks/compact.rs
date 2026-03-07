@@ -51,4 +51,13 @@ impl SessionTask for CompactTask {
             .await;
         None
     }
+
+    async fn abort(&self, session: Arc<SessionTaskContext>, _ctx: Arc<TurnContext>) {
+        let session = session.clone_session();
+        session
+            .services
+            .agent_control
+            .finish_watchdog_parent_compaction(session.conversation_id)
+            .await;
+    }
 }
