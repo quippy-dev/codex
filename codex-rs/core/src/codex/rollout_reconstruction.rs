@@ -89,6 +89,18 @@ fn finalize_active_segment<'a>(
 }
 
 impl Session {
+    pub(super) async fn materialize_rollout_items_for_replay(
+        &self,
+        rollout_items: &[RolloutItem],
+    ) -> Vec<RolloutItem> {
+        let codex_home = self.codex_home().await;
+        crate::rollout::truncation::materialize_rollout_items_for_replay(
+            codex_home.as_path(),
+            rollout_items,
+        )
+        .await
+    }
+
     pub(super) async fn reconstruct_history_from_rollout(
         &self,
         turn_context: &TurnContext,

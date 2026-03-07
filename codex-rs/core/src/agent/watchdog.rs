@@ -188,19 +188,17 @@ impl WatchdogManager {
             Err(_) => AgentStatus::NotFound,
         };
         if is_watchdog_terminated(&owner_status) {
-            if let Some(helper_id) = snapshot.active_helper_id {
-                let control_for_cleanup = AgentControl::from_parts(
-                    self.manager.clone(),
-                    Arc::clone(&self.guards),
-                    Arc::clone(self),
+            let control_for_cleanup = AgentControl::from_parts(
+                self.manager.clone(),
+                Arc::clone(&self.guards),
+                Arc::clone(self),
+            );
+            if let Err(err) = control_for_cleanup.shutdown_agent(target_thread_id).await {
+                warn!(
+                    target_thread_id = %target_thread_id,
+                    owner_thread_id = %snapshot.owner_thread_id,
+                    "watchdog cleanup failed while owner is final: {err}"
                 );
-                if let Err(err) = control_for_cleanup.shutdown_agent(helper_id).await {
-                    warn!(
-                        helper_id = %helper_id,
-                        owner_thread_id = %snapshot.owner_thread_id,
-                        "watchdog helper cleanup failed while owner is final: {err}"
-                    );
-                }
             }
             info!(
                 target_thread_id = %target_thread_id,
@@ -208,8 +206,6 @@ impl WatchdogManager {
                 owner_status = ?owner_status,
                 "removing watchdog registration because owner is in a final state"
             );
-            self.remove_if_generation(target_thread_id, generation)
-                .await;
             return;
         }
         let force_due = self
@@ -428,16 +424,6 @@ impl WatchdogManager {
         }
         entry.last_trigger = now;
         entry.active_helper_id = active_helper_id;
-    }
-
-    async fn remove_if_generation(&self, target_thread_id: ThreadId, generation: i64) {
-        let mut registrations = self.registrations.lock().await;
-        let Some(entry) = registrations.get(&target_thread_id) else {
-            return;
-        };
-        if entry.generation == generation {
-            registrations.remove(&target_thread_id);
-        }
     }
 
     pub(crate) async fn unregister(&self, target_thread_id: ThreadId) -> Option<RemovedWatchdog> {

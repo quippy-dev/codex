@@ -1272,7 +1272,41 @@ impl Session {
             ));
         }
 
-        let forked_from_id = initial_history.forked_from_id();
+        let event_initial_history = match &initial_history {
+            InitialHistory::New => None,
+            InitialHistory::Resumed(resumed)
+                if resumed
+                    .history
+                    .iter()
+                    .any(|item| matches!(item, RolloutItem::ForkReference(_))) =>
+            {
+                Some(InitialHistory::Resumed(crate::protocol::ResumedHistory {
+                    conversation_id: resumed.conversation_id,
+                    history: crate::rollout::truncation::materialize_rollout_items_for_replay(
+                        config.codex_home.as_path(),
+                        &resumed.history,
+                    )
+                    .await,
+                    rollout_path: resumed.rollout_path.clone(),
+                }))
+            }
+            InitialHistory::Forked(items)
+                if items
+                    .iter()
+                    .any(|item| matches!(item, RolloutItem::ForkReference(_))) =>
+            {
+                Some(InitialHistory::Forked(
+                    crate::rollout::truncation::materialize_rollout_items_for_replay(
+                        config.codex_home.as_path(),
+                        items,
+                    )
+                    .await,
+                ))
+            }
+            InitialHistory::Resumed(_) | InitialHistory::Forked(_) => None,
+        };
+        let event_initial_history = event_initial_history.as_ref().unwrap_or(&initial_history);
+        let forked_from_id = event_initial_history.forked_from_id();
 
         let (conversation_id, rollout_params) = match &initial_history {
             InitialHistory::New | InitialHistory::Forked(_) => {
@@ -1652,7 +1686,7 @@ impl Session {
         }
         // Dispatch the SessionConfiguredEvent first and then report any errors.
         // If resuming, include converted initial messages in the payload so UIs can render them immediately.
-        let initial_messages = initial_history.get_event_msgs();
+        let initial_messages = event_initial_history.get_event_msgs();
         let events = std::iter::once(Event {
             id: INITIAL_SUBMIT_ID.to_owned(),
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -1968,11 +2002,20 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
+                let hydrated_rollout_items = if rollout_items
+                    .iter()
+                    .any(|item| matches!(item, RolloutItem::ForkReference(_)))
+                {
+                    self.materialize_rollout_items_for_replay(&rollout_items)
+                        .await
+                } else {
+                    rollout_items.clone()
+                };
                 let restored_tool_selection =
-                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
+                    Self::extract_mcp_tool_selection_from_rollout(&hydrated_rollout_items);
 
                 let reconstructed_rollout = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+                    .reconstruct_history_from_rollout(&turn_context, &hydrated_rollout_items)
                     .await;
                 let previous_turn_settings = reconstructed_rollout.previous_turn_settings.clone();
                 let latest_proposed_plan_text =
@@ -2015,7 +2058,7 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                if let Some(info) = Self::last_token_info_from_rollout(&hydrated_rollout_items) {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
@@ -2030,11 +2073,24 @@ impl Session {
                 }
             }
             InitialHistory::Forked(rollout_items) => {
+                let persisted_rollout_items = rollout_items
+                    .iter()
+                    .position(|item| matches!(item, RolloutItem::ForkReference(_)))
+                    .map(|index| rollout_items[index..].to_vec());
+                let hydrated_rollout_items = if rollout_items
+                    .iter()
+                    .any(|item| matches!(item, RolloutItem::ForkReference(_)))
+                {
+                    self.materialize_rollout_items_for_replay(&rollout_items)
+                        .await
+                } else {
+                    rollout_items.clone()
+                };
                 let restored_tool_selection =
-                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
+                    Self::extract_mcp_tool_selection_from_rollout(&hydrated_rollout_items);
 
                 let reconstructed_rollout = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+                    .reconstruct_history_from_rollout(&turn_context, &hydrated_rollout_items)
                     .await;
                 self.set_previous_turn_settings(
                     reconstructed_rollout.previous_turn_settings.clone(),
@@ -2050,12 +2106,6 @@ impl Session {
                         reconstructed_rollout.reference_context_item.clone(),
                     );
                 }
-                let mut rollout_items = rollout_items;
-                // `ForkReference` markers are metadata-only; reconstruction ignores them.
-                // Keep inherited rollout content persisted so on-disk resume can rebuild full
-                // forked history without requiring marker expansion.
-                rollout_items.retain(|item| !matches!(item, RolloutItem::ForkReference(_)));
-
                 // Always add response items to conversation history
                 let reconstructed_history = reconstructed_rollout.history;
                 if !reconstructed_history.is_empty() {
@@ -2065,7 +2115,7 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                if let Some(info) = Self::last_token_info_from_rollout(&hydrated_rollout_items) {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
@@ -2073,7 +2123,9 @@ impl Session {
                     self.set_mcp_tool_selection(selected_tools).await;
                 }
 
-                if !rollout_items.is_empty() {
+                if let Some(persisted_rollout_items) = persisted_rollout_items {
+                    self.persist_rollout_items(&persisted_rollout_items).await;
+                } else if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
                 }
 

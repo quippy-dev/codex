@@ -4,9 +4,17 @@
 //! evaluating them with `context_manager::is_user_turn_boundary(...)`.
 
 use crate::context_manager::is_user_turn_boundary;
+use crate::find_archived_thread_path_by_id_str;
+use crate::find_thread_path_by_id_str;
+use crate::rollout::RolloutRecorder;
+use crate::rollout::list::parse_timestamp_uuid_from_filename;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use tracing::warn;
 
 /// Return the indices of user message boundaries in a rollout.
 ///
@@ -62,6 +70,159 @@ pub(crate) fn truncate_rollout_before_nth_user_message_from_start(
     // Cut strictly before the nth user message (do not keep the nth itself).
     let cut_idx = user_positions[n_from_start];
     items[..cut_idx].to_vec()
+}
+
+fn rollout_items_match(lhs: &RolloutItem, rhs: &RolloutItem) -> bool {
+    match (serde_json::to_value(lhs), serde_json::to_value(rhs)) {
+        (Ok(lhs), Ok(rhs)) => lhs == rhs,
+        _ => false,
+    }
+}
+
+fn rollout_items_start_with(items: &[RolloutItem], prefix: &[RolloutItem]) -> bool {
+    items.len() >= prefix.len()
+        && items
+            .iter()
+            .zip(prefix.iter())
+            .all(|(item, prefix_item)| rollout_items_match(item, prefix_item))
+}
+
+async fn resolve_fork_reference_rollout_path(
+    codex_home: &Path,
+    rollout_path: &Path,
+) -> std::io::Result<std::path::PathBuf> {
+    match tokio::fs::try_exists(rollout_path).await {
+        Ok(true) => return Ok(rollout_path.to_path_buf()),
+        Ok(false) => {}
+        Err(err) => return Err(err),
+    }
+
+    let Some(file_name) = rollout_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(rollout_path.to_path_buf());
+    };
+    let Some((_, thread_uuid)) = parse_timestamp_uuid_from_filename(file_name) else {
+        return Ok(rollout_path.to_path_buf());
+    };
+    let thread_id = thread_uuid.to_string();
+
+    if let Some(active_path) = find_thread_path_by_id_str(codex_home, &thread_id).await? {
+        return Ok(active_path);
+    }
+    if let Some(archived_path) = find_archived_thread_path_by_id_str(codex_home, &thread_id).await?
+    {
+        return Ok(archived_path);
+    }
+
+    Ok(rollout_path.to_path_buf())
+}
+
+fn materialize_rollout_items_for_replay_at_depth<'a>(
+    codex_home: &'a Path,
+    rollout_items: &'a [RolloutItem],
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Vec<RolloutItem>> + Send + 'a>> {
+    const MAX_FORK_REFERENCE_DEPTH: usize = 8;
+
+    Box::pin(async move {
+        let mut materialized = Vec::new();
+        let mut idx = 0;
+
+        while idx < rollout_items.len() {
+            match &rollout_items[idx] {
+                RolloutItem::ForkReference(reference) => {
+                    if depth >= MAX_FORK_REFERENCE_DEPTH {
+                        warn!(
+                            "skipping fork reference recursion at depth {} for {:?}",
+                            depth, reference.rollout_path
+                        );
+                        idx += 1;
+                        continue;
+                    }
+
+                    let resolved_rollout_path = match resolve_fork_reference_rollout_path(
+                        codex_home,
+                        &reference.rollout_path,
+                    )
+                    .await
+                    {
+                        Ok(path) => path,
+                        Err(err) => {
+                            warn!(
+                                "failed to resolve fork reference rollout {:?}: {err}",
+                                reference.rollout_path
+                            );
+                            idx += 1;
+                            continue;
+                        }
+                    };
+                    let parent_history = match RolloutRecorder::get_rollout_history(
+                        &resolved_rollout_path,
+                    )
+                    .await
+                    {
+                        Ok(history) => history,
+                        Err(err) => {
+                            warn!(
+                                "failed to load fork reference rollout {:?} (resolved from {:?}): {err}",
+                                resolved_rollout_path, reference.rollout_path
+                            );
+                            idx += 1;
+                            continue;
+                        }
+                    };
+                    let parent_history_items = parent_history.get_rollout_items();
+                    let raw_parent_items = truncate_rollout_before_nth_user_message_from_start(
+                        &parent_history_items,
+                        reference.nth_user_message,
+                    );
+                    let parent_items = materialize_rollout_items_for_replay_at_depth(
+                        codex_home,
+                        &parent_history_items,
+                        depth + 1,
+                    )
+                    .await;
+                    let truncated_parent_items =
+                        truncate_rollout_before_nth_user_message_from_start(
+                            &parent_items,
+                            reference.nth_user_message,
+                        );
+                    let remaining_items = &rollout_items[idx + 1..];
+                    let copied_materialized_parent_prefix =
+                        rollout_items_start_with(remaining_items, &truncated_parent_items);
+                    let copied_raw_parent_prefix =
+                        rollout_items_start_with(remaining_items, &raw_parent_items);
+                    let copied_parent_prefix =
+                        copied_materialized_parent_prefix || copied_raw_parent_prefix;
+                    let copied_parent_prefix_len = if copied_parent_prefix {
+                        if copied_materialized_parent_prefix {
+                            truncated_parent_items.len()
+                        } else {
+                            raw_parent_items.len()
+                        }
+                    } else {
+                        0
+                    };
+
+                    materialized.extend(truncated_parent_items);
+                    idx += 1;
+                    idx += copied_parent_prefix_len;
+                }
+                item => {
+                    materialized.push(item.clone());
+                    idx += 1;
+                }
+            }
+        }
+
+        materialized
+    })
+}
+
+pub(crate) fn materialize_rollout_items_for_replay<'a>(
+    codex_home: &'a Path,
+    rollout_items: &'a [RolloutItem],
+) -> Pin<Box<dyn Future<Output = Vec<RolloutItem>> + Send + 'a>> {
+    materialize_rollout_items_for_replay_at_depth(codex_home, rollout_items, 0)
 }
 
 #[cfg(test)]

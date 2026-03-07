@@ -1543,10 +1543,7 @@ pub(crate) fn build_agent_spawn_config(
             config.developer_instructions = base_config.developer_instructions.clone();
             // At max depth, a freshly spawned context-free child cannot spawn further descendants.
             // Hide multi-agent tools to match that capability boundary.
-            if crate::agent::exceeds_thread_spawn_depth_limit(
-                child_depth + 1,
-                config.agent_max_depth,
-            ) {
+            if crate::agent::exceeds_thread_spawn_depth_limit(child_depth, config.agent_max_depth) {
                 let _ = config.features.disable(Feature::Collab);
             }
         }
@@ -1598,7 +1595,7 @@ fn build_agent_shared_config(
 
 fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
     config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    if crate::agent::exceeds_thread_spawn_depth_limit(child_depth + 1, config.agent_max_depth) {
+    if crate::agent::exceeds_thread_spawn_depth_limit(child_depth, config.agent_max_depth) {
         let _ = config.features.disable(Feature::Collab);
     }
 }
@@ -3578,7 +3575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_agent_spawn_config_context_free_disables_multi_agent_tools_at_max_depth() {
+    async fn build_agent_spawn_config_context_free_keeps_multi_agent_tools_at_max_depth() {
         let (_session, mut turn) = make_session_and_context().await;
         let mut base_config = (*turn.config).clone();
         base_config
@@ -3594,6 +3591,30 @@ mod tests {
             &base_instructions,
             &turn,
             turn.config.agent_max_depth,
+            SpawnConfigStrategy::ContextFreeSpawn,
+        )
+        .expect("context-free spawn config");
+
+        assert!(config.features.enabled(Feature::Collab));
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_context_free_disables_multi_agent_tools_past_max_depth() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config
+            .features
+            .enable(Feature::Collab)
+            .expect("collab feature enable");
+        turn.config = Arc::new(base_config);
+        let base_instructions = BaseInstructions {
+            text: "base".to_string(),
+        };
+
+        let config = build_agent_spawn_config(
+            &base_instructions,
+            &turn,
+            turn.config.agent_max_depth + 1,
             SpawnConfigStrategy::ContextFreeSpawn,
         )
         .expect("context-free spawn config");
