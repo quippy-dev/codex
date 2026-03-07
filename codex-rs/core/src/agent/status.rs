@@ -21,13 +21,37 @@ pub(crate) fn is_final(status: &AgentStatus) -> bool {
 pub(crate) fn completed_message_for_collab_fallback(
     status: &AgentStatus,
     last_completed_turn_used_collab_send_input: bool,
-) -> Option<&str> {
+    require_message_for_final_status: bool,
+) -> Option<String> {
     if last_completed_turn_used_collab_send_input {
         return None;
     }
 
     match status {
-        AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => Some(message),
+        AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => Some(message.clone()),
+        AgentStatus::Completed(None) | AgentStatus::Completed(Some(_))
+            if require_message_for_final_status =>
+        {
+            Some(
+                "Watchdog check-in completed without calling send_input or returning a final message."
+                    .to_string(),
+            )
+        }
+        AgentStatus::Errored(message) if require_message_for_final_status => {
+            if message.trim().is_empty() {
+                Some("Watchdog check-in failed before calling send_input.".to_string())
+            } else {
+                Some(format!(
+                    "Watchdog check-in failed before calling send_input: {message}"
+                ))
+            }
+        }
+        AgentStatus::Shutdown if require_message_for_final_status => {
+            Some("Watchdog check-in ended before calling send_input.".to_string())
+        }
+        AgentStatus::NotFound if require_message_for_final_status => {
+            Some("Watchdog check-in disappeared before calling send_input.".to_string())
+        }
         AgentStatus::Completed(None)
         | AgentStatus::Completed(Some(_))
         | AgentStatus::PendingInit
@@ -51,34 +75,66 @@ mod tests {
         let errored = AgentStatus::Errored("boom".to_string());
 
         assert_eq!(
-            completed_message_for_collab_fallback(&completed, false),
-            Some("done")
+            completed_message_for_collab_fallback(&completed, false, false),
+            Some("done".to_string())
         );
         assert_eq!(
-            completed_message_for_collab_fallback(&completed, true),
+            completed_message_for_collab_fallback(&completed, true, false),
             None
         );
         assert_eq!(
-            completed_message_for_collab_fallback(&whitespace, false),
-            None
-        );
-        assert_eq!(completed_message_for_collab_fallback(&empty, false), None);
-        assert_eq!(completed_message_for_collab_fallback(&errored, false), None);
-        assert_eq!(
-            completed_message_for_collab_fallback(&AgentStatus::PendingInit, false),
+            completed_message_for_collab_fallback(&whitespace, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_collab_fallback(&AgentStatus::Running, false),
+            completed_message_for_collab_fallback(&empty, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_collab_fallback(&AgentStatus::Shutdown, false),
+            completed_message_for_collab_fallback(&errored, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_collab_fallback(&AgentStatus::NotFound, false),
+            completed_message_for_collab_fallback(&AgentStatus::PendingInit, false, false),
             None
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&AgentStatus::Running, false, false),
+            None
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&AgentStatus::Shutdown, false, false),
+            None
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&AgentStatus::NotFound, false, false),
+            None
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&empty, false, true),
+            Some(
+                "Watchdog check-in completed without calling send_input or returning a final message."
+                    .to_string(),
+            )
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&whitespace, false, true),
+            Some(
+                "Watchdog check-in completed without calling send_input or returning a final message."
+                    .to_string(),
+            )
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&errored, false, true),
+            Some("Watchdog check-in failed before calling send_input: boom".to_string())
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&AgentStatus::Shutdown, false, true),
+            Some("Watchdog check-in ended before calling send_input.".to_string())
+        );
+        assert_eq!(
+            completed_message_for_collab_fallback(&AgentStatus::NotFound, false, true),
+            Some("Watchdog check-in disappeared before calling send_input.".to_string())
         );
     }
 }

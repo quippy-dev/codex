@@ -13,7 +13,6 @@ Terms in this file:
 - **`send_input`**: primary way to deliver watchdog guidance to an existing thread; it does not spawn agents. Delivery is asynchronous.
 - **durable state**: thread-level task state that must still be available in later turns/check-ins (counters, plans, final decisions), not disk/database persistence.
 - **exact-only format**: parent constraint that says to return only specific fields/content.
-- **delivery-role config**: runtime fallback display mode. It decides whether fallback multi-agent inbox delivery appears as `collab_inbox` tool output or `[collab_inbox:…]` developer message. It does not change tool choice or target thread.
 
 ## Principles
 
@@ -67,7 +66,7 @@ Important: send watchdog check-in output with `send_input` to the owner/parent t
 
 Each watchdog check-in runs in a fresh one-shot watchdog check-in agent with no guaranteed continuity across check-ins. Do not keep durable state in watchdog-check-in-agent local memory/files; treat local state as run-local only. Ask the parent to track durable state, and use `send_input` (without `id`, or `id = "parent"`/`"root"`) to report results.
 
-`send_input` is the primary path for watchdog delivery to parent/owner. If a watchdog check-in agent finishes without `send_input`, runtime may forward one final multi-agent inbox message (for example `collab_inbox` tool output or `[collab_inbox:…]` developer message), depending on delivery-role config. This fallback is best-effort.
+`send_input` is the primary path for watchdog delivery to parent/owner. If a watchdog check-in agent finishes without `send_input`, runtime forwards one final multi-agent inbox message as the mandatory fallback wake-up path for the owner. Exiting without either `send_input` or a final message is a bug.
 
 For token protocols (for example `ping N` / `pong N`), treat those as literal text counters, not shell commands. Do not call command-execution tools unless the prompt explicitly asks you to execute commands.
 

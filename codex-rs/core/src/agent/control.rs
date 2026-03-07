@@ -803,18 +803,24 @@ impl AgentControl {
                 parent_thread.config_snapshot().await.session_source,
                 SessionSource::SubAgent(_)
             );
+            let child_is_watchdog_helper_for_parent = control
+                .watchdog_owner_for_active_helper(child_thread_id)
+                .await
+                == Some(parent_thread_id);
 
-            if parent_is_root_thread {
+            if parent_is_root_thread && !child_is_watchdog_helper_for_parent {
                 let child_used_collab_send_input = state
                     .get_thread(child_thread_id)
                     .await
                     .map(|thread| thread.last_completed_turn_used_collab_send_input())
                     .unwrap_or(false);
-                if let Some(message) =
-                    completed_message_for_collab_fallback(&status, child_used_collab_send_input)
-                    && let Err(err) = control
-                        .send_collab_message(parent_thread_id, child_thread_id, message.to_string())
-                        .await
+                if let Some(message) = completed_message_for_collab_fallback(
+                    &status,
+                    child_used_collab_send_input,
+                    false,
+                ) && let Err(err) = control
+                    .send_collab_message(parent_thread_id, child_thread_id, message)
+                    .await
                 {
                     warn!(
                         child_thread_id = %child_thread_id,
@@ -1888,6 +1894,105 @@ mod tests {
 
         let _ = harness.control.shutdown_agent(watchdog_handle_id).await;
         let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn root_watchdog_helper_shutdown_without_send_input_wakes_owner() {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+        let watchdog_handle_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog handle should spawn");
+        let helper_thread_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog helper should spawn");
+        let removed = harness
+            .control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 1,
+                prompt: "check in".to_string(),
+                config: harness.config.clone(),
+            })
+            .await
+            .expect("watchdog registration should succeed");
+        assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+        harness
+            .control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
+            .await;
+        harness
+            .control
+            .force_watchdog_due_for_tests(watchdog_handle_id)
+            .await;
+
+        let mut helper_status_rx = harness
+            .control
+            .subscribe_status(helper_thread_id)
+            .await
+            .expect("helper status subscription should succeed");
+        let _ = harness
+            .control
+            .shutdown_agent(helper_thread_id)
+            .await
+            .expect("helper shutdown should submit");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(helper_status_rx.borrow().clone(), AgentStatus::Shutdown) {
+                    break;
+                }
+                helper_status_rx
+                    .changed()
+                    .await
+                    .expect("helper status should reach shutdown");
+            }
+        })
+        .await
+        .expect("helper should reach shutdown");
+        harness.control.run_watchdogs_once_for_tests().await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let history = owner_thread.codex.session.clone_history().await;
+                let found_payload = history.raw_items().iter().any(|item| match item {
+                    ResponseItem::FunctionCallOutput { output, .. } => {
+                        output.text_content().is_some_and(|text| {
+                            text.contains(&helper_thread_id.to_string())
+                                && text.contains("Watchdog check-in ")
+                                && text.contains("before calling send_input")
+                        })
+                    }
+                    ResponseItem::Message { content, .. } => {
+                        content.iter().any(|content_item| match content_item {
+                            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                                text.contains(&helper_thread_id.to_string())
+                                    && text.contains("Watchdog check-in ")
+                                    && text.contains("before calling send_input")
+                            }
+                            ContentItem::InputImage { .. } => false,
+                        })
+                    }
+                    _ => false,
+                });
+                if found_payload {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("owner should receive fallback agent inbox payload");
     }
 
     #[tokio::test]

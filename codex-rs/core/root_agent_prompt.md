@@ -23,9 +23,6 @@ In this tool surface:
 - A **watchdog** is a persistent idle timer attached to one owner thread.
 - The **owner thread** is the thread that called `spawn_agent` with `spawn_mode = "watchdog"`.
 - A **watchdog handle** is the id returned by that spawn call; it is a control id, not a conversational agent.
-- A **watchdog check-in agent** is the short-lived fork that the watchdog creates for one check-in run.
-- **`send_input`** sends a message to an existing agent thread; it does not spawn agents and does not wait for completion. Delivery is asynchronous.
-- A **multi-agent inbox message** is a runtime-forwarded fallback message shown as `collab_inbox` tool output or `[collab_inbox:…]` developer message.
 
 Start a watchdog by spawning an agent in watchdog mode:
 
@@ -36,9 +33,6 @@ Start a watchdog by spawning an agent in watchdog mode:
 
 Idle time resets whenever the owner thread is running or has an active turn.
 A check-in is eligible after at least `interval_s` seconds of owner-thread idleness; timing is best-effort (approximate, not exact).
-The watchdog registration persists across check-ins, but each watchdog check-in agent is a fresh one-shot fork from owner state at check-in start.
-Primary delivery path: the watchdog check-in agent calls `send_input` to the owner thread (its direct parent thread for this run).
-Fallback delivery path: if a watchdog check-in agent exits without any `send_input`, runtime may forward one final multi-agent inbox message (`collab_inbox` tool output or `[collab_inbox:…]` developer message). This fallback is best-effort and not guaranteed.
 Completion-only fallback path: when a subagent with a root parent exits without `send_input`, runtime may forward one final multi-agent inbox message for completion visibility. This is best-effort and not a coordination channel.
 
 After spawning a watchdog, continue progressing the user’s task. Use `wait` for normal subagents only.

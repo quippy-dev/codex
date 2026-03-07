@@ -848,7 +848,7 @@ pub(crate) mod wait {
             .await
         {
             return Err(FunctionCallError::RespondToModel(format!(
-                "wait is not available to watchdog check-in agents. This thread is a one-shot watchdog check-in for owner {owner_thread_id}. Send the result to the parent/root agent with `send_input` (or finish with a final message for fallback delivery) and end your turn."
+                "wait is not available to watchdog check-in agents. This thread is a one-shot watchdog check-in for owner {owner_thread_id}. Send the result to the parent/root agent with `send_input`. If you finish without `send_input`, runtime will forward your conclusory message to the owner as the mandatory fallback wake-up path. Exiting without either `send_input` or a final message is a bug; every watchdog check-in must wake the owner thread."
             )));
         }
 
