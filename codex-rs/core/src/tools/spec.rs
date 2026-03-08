@@ -689,6 +689,24 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             },
         ),
         (
+            "model".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional model override for the spawned agent. When set, overrides the inherited turn model and any agent_type defaults."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "reasoning_effort".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional reasoning effort override for the spawned agent (one of: \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\"). When set, overrides the inherited turn reasoning effort and any agent_type defaults."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
             "spawn_mode".to_string(),
             JsonSchema::String {
                 description: Some(spawn_mode_description),
@@ -2521,6 +2539,8 @@ mod tests {
         };
 
         assert!(!properties.contains_key("interval_s"));
+        assert!(properties.contains_key("model"));
+        assert!(properties.contains_key("reasoning_effort"));
         assert!(spec.description.contains("watchdog_interval_s"));
     }
 
@@ -2554,6 +2574,8 @@ mod tests {
             panic!("spawn_mode should be a described string");
         };
 
+        assert!(properties.contains_key("model"));
+        assert!(properties.contains_key("reasoning_effort"));
         assert!(!spawn_mode_description.contains("watchdog"));
         assert!(!spawn_spec.description.contains("watchdog_interval_s"));
         assert!(!wait_spec.description.contains("Watchdog handles"));

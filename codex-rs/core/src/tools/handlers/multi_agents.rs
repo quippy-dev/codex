@@ -2,11 +2,13 @@ use crate::agent::AgentStatus;
 use crate::agent::WatchdogParentCompactionResult;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::codex::normalize_reasoning_effort_for_model;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::models_manager::manager::ModelsManager;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -17,6 +19,7 @@ use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
@@ -131,6 +134,8 @@ mod spawn {
         message: Option<String>,
         items: Option<Vec<UserInput>>,
         agent_type: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
         #[serde(default, alias = "mode")]
         spawn_mode: SpawnMode,
     }
@@ -167,6 +172,13 @@ mod spawn {
         let args: SpawnAgentArgs = serde_json::from_value(raw_args).map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
         })?;
+        if let Some(model) = args.model.as_deref()
+            && model.trim().is_empty()
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "model must be non-empty when provided".to_string(),
+            ));
+        }
         let role_name = args
             .agent_type
             .as_deref()
@@ -221,6 +233,13 @@ mod spawn {
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
+        apply_explicit_spawn_model_overrides(
+            &mut config,
+            args.model,
+            args.reasoning_effort,
+            session.services.models_manager.as_ref(),
+        )
+        .await;
         apply_spawn_agent_overrides(&mut config, child_depth);
         let spawn_source = thread_spawn_source_with_metadata(
             session.conversation_id,
@@ -526,6 +545,13 @@ mod resume_agent {
         pub(super) status: AgentStatus,
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(super) struct RecordedResumeContext {
+        pub(super) developer_instructions: Option<Option<String>>,
+        pub(super) model: Option<String>,
+        pub(super) reasoning_effort: Option<Option<ReasoningEffort>>,
+    }
+
     pub async fn handle(
         session: Arc<Session>,
         turn: Arc<TurnContext>,
@@ -629,10 +655,10 @@ mod resume_agent {
         receiver_thread_id: ThreadId,
         child_depth: i32,
     ) -> Result<AgentStatus, FunctionCallError> {
-        let recorded_developer_instructions =
-            load_recorded_developer_instructions(turn.as_ref(), receiver_thread_id).await?;
+        let recorded_resume_context =
+            load_recorded_resume_context(turn.as_ref(), receiver_thread_id).await?;
         let config =
-            build_agent_resume_config(turn.as_ref(), child_depth, recorded_developer_instructions)?;
+            build_agent_resume_config(turn.as_ref(), child_depth, &recorded_resume_context)?;
         let (agent_nickname, agent_role) =
             match crate::state_db::get_state_db(&turn.config, None).await {
                 Some(state_db_ctx) => match state_db_ctx.get_thread(receiver_thread_id).await {
@@ -664,10 +690,10 @@ mod resume_agent {
             .await)
     }
 
-    async fn load_recorded_developer_instructions(
+    async fn load_recorded_resume_context(
         turn: &TurnContext,
         receiver_thread_id: ThreadId,
-    ) -> Result<Option<Option<String>>, FunctionCallError> {
+    ) -> Result<RecordedResumeContext, FunctionCallError> {
         let rollout_path = find_thread_path_by_id_str(
             turn.config.codex_home.as_path(),
             &receiver_thread_id.to_string(),
@@ -679,7 +705,7 @@ mod resume_agent {
             ))
         })?;
         let Some(rollout_path) = rollout_path else {
-            return Ok(None);
+            return Ok(RecordedResumeContext::default());
         };
         let initial_history = RolloutRecorder::get_rollout_history(rollout_path.as_path())
             .await
@@ -688,23 +714,42 @@ mod resume_agent {
                     "failed to load recorded agent {receiver_thread_id}: {err}"
                 ))
             })?;
-        let fallback_fork_developer_instructions = initial_history
-            .forked_from_id()
-            .map(|_| turn.developer_instructions.clone());
-        let codex_protocol::protocol::InitialHistory::Resumed(resumed) = initial_history else {
-            return Ok(fallback_fork_developer_instructions);
-        };
-        Ok(resumed
-            .history
-            .iter()
+        let developer_instructions = initial_history
+            .get_rollout_items()
+            .into_iter()
             .rev()
             .find_map(|item| match item {
                 codex_protocol::protocol::RolloutItem::TurnContext(context) => {
-                    Some(context.developer_instructions.clone())
+                    Some(context.developer_instructions)
                 }
                 _ => None,
             })
-            .or(fallback_fork_developer_instructions))
+            .or_else(|| {
+                initial_history
+                    .forked_from_id()
+                    .map(|_| turn.developer_instructions.clone())
+            });
+        let model = initial_history
+            .get_rollout_items()
+            .into_iter()
+            .rev()
+            .find_map(|item| match item {
+                codex_protocol::protocol::RolloutItem::TurnContext(context) => Some(context.model),
+                _ => None,
+            });
+        let reasoning_effort = initial_history
+            .get_rollout_items()
+            .into_iter()
+            .rev()
+            .find_map(|item| match item {
+                codex_protocol::protocol::RolloutItem::TurnContext(context) => Some(context.effort),
+                _ => None,
+            });
+        Ok(RecordedResumeContext {
+            developer_instructions,
+            model,
+            reasoning_effort,
+        })
     }
 }
 
@@ -1623,12 +1668,18 @@ pub(crate) fn build_agent_spawn_config(
 fn build_agent_resume_config(
     turn: &TurnContext,
     child_depth: i32,
-    recorded_developer_instructions: Option<Option<String>>,
+    recorded_resume_context: &resume_agent::RecordedResumeContext,
 ) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn, child_depth)?;
     // For resume, keep base instructions sourced from rollout/session metadata.
     config.base_instructions = None;
-    config.developer_instructions = match recorded_developer_instructions {
+    if let Some(model) = recorded_resume_context.model.clone() {
+        config.model = Some(model);
+    }
+    if let Some(reasoning_effort) = recorded_resume_context.reasoning_effort {
+        config.model_reasoning_effort = reasoning_effort;
+    }
+    config.developer_instructions = match recorded_resume_context.developer_instructions.clone() {
         Some(developer_instructions) => developer_instructions,
         None => turn.config.developer_instructions.clone(),
     };
@@ -1667,6 +1718,30 @@ fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
     }
 }
 
+async fn apply_explicit_spawn_model_overrides(
+    config: &mut Config,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    models_manager: &ModelsManager,
+) {
+    let should_normalize = model.is_some() || reasoning_effort.is_some();
+    if let Some(model) = model {
+        config.model = Some(model);
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        config.model_reasoning_effort = Some(reasoning_effort);
+    }
+    if !should_normalize {
+        return;
+    }
+    let Some(model) = config.model.clone() else {
+        return;
+    };
+    let model_info = models_manager.get_model_info(model.as_str(), config).await;
+    config.model_reasoning_effort =
+        normalize_reasoning_effort_for_model(&model_info, config.model_reasoning_effort);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnConfigStrategy {
     ContextFreeSpawn,
@@ -1681,6 +1756,7 @@ mod tests {
     use crate::ThreadManager;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
+    use crate::config::AgentRoleConfig;
     use crate::config::types::ShellEnvironmentPolicy;
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
@@ -1696,6 +1772,7 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::TurnContextItem;
@@ -2055,6 +2132,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_rejects_empty_model_override() {
+        let (session, turn) = make_session_and_context().await;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "model": "   "
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("empty model override should be rejected");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel("model must be non-empty when provided".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn spawn_agent_rejects_watchdog_from_subagent() {
         let (mut session, mut turn) = make_session_and_context().await;
         let manager = thread_manager();
@@ -2111,6 +2209,215 @@ mod tests {
             err,
             FunctionCallError::RespondToModel("watchdogs are disabled".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_explicit_overrides_beat_custom_role_defaults() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let role_dir = tempfile::tempdir().expect("temp dir");
+        let role_path = role_dir.path().join("custom-role.toml");
+        tokio::fs::write(
+            &role_path,
+            "model = \"role-model\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .await
+        .expect("write role config");
+
+        let mut config = (*turn.config).clone();
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: None,
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
+        turn.config = Arc::new(config);
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "agent_type": "custom",
+                "model": "explicit-model",
+                "reasoning_effort": "minimal"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        let snapshot = manager
+            .get_thread(agent_id)
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
+        assert_eq!(snapshot.model, "explicit-model");
+        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_model_override_normalizes_inherited_unsupported_reasoning_effort() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        turn.reasoning_effort = Some(ReasoningEffort::XHigh);
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "model": "gpt-5.1-codex-mini"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        let snapshot = manager
+            .get_thread(agent_id)
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
+        assert_eq!(snapshot.model, "gpt-5.1-codex-mini");
+        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_normalizes_explicit_unsupported_reasoning_effort() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "model": "gpt-5.1-codex-mini",
+                "reasoning_effort": "xhigh"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        let snapshot = manager
+            .get_thread(agent_id)
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
+        assert_eq!(snapshot.model, "gpt-5.1-codex-mini");
+        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_watchdog_handle_uses_explicit_overrides() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let mut config = (*turn.config).clone();
+        let _ = config.features.enable(Feature::AgentWatchdog);
+        session.services.agent_control = manager.agent_control();
+        let turn = Arc::new(TurnContext {
+            config: Arc::new(config),
+            ..turn
+        });
+
+        let invocation = invocation(
+            Arc::new(session),
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "watchdog check-in",
+                "spawn_mode": "watchdog",
+                "model": "watchdog-model",
+                "reasoning_effort": "minimal"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("watchdog spawn should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let watchdog_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        let snapshot = manager
+            .get_thread(watchdog_id)
+            .await
+            .expect("watchdog handle should exist")
+            .config_snapshot()
+            .await;
+        assert_eq!(snapshot.model, "watchdog-model");
+        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
     }
 
     #[tokio::test]
@@ -2830,6 +3137,7 @@ mod tests {
         let mut config = turn.config.as_ref().clone();
         config.developer_instructions = Some("base-dev".to_string());
         turn.developer_instructions = Some("turn-dev".to_string());
+        turn.reasoning_effort = Some(ReasoningEffort::XHigh);
         turn.config = Arc::new(config.clone());
         let thread = manager
             .resume_thread_with_history(
@@ -2843,11 +3151,11 @@ mod tests {
                         approval_policy: turn.approval_policy.value(),
                         sandbox_policy: turn.sandbox_policy.get().clone(),
                         network: None,
-                        model: turn.model_info.slug.clone(),
+                        model: "gpt-5.1-codex-mini".to_string(),
                         personality: turn.personality,
                         collaboration_mode: Some(turn.collaboration_mode.clone()),
                         realtime_active: Some(turn.realtime_active),
-                        effort: turn.reasoning_effort,
+                        effort: Some(ReasoningEffort::High),
                         summary: turn.reasoning_summary,
                         user_instructions: turn.user_instructions.clone(),
                         developer_instructions: turn.developer_instructions.clone(),
@@ -2910,6 +3218,11 @@ mod tests {
             .await
             .expect("resumed thread should be registered");
         let resumed_config = resumed_thread.codex.session.get_config().await;
+        assert_eq!(resumed_config.model.as_deref(), Some("gpt-5.1-codex-mini"));
+        assert_eq!(
+            resumed_config.model_reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
         assert_eq!(
             resumed_config.developer_instructions,
             turn.developer_instructions
@@ -3765,7 +4078,9 @@ mod tests {
         turn.developer_instructions = Some("turn-dev".to_string());
         turn.config = Arc::new(base_config.clone());
 
-        let config = build_agent_resume_config(&turn, 0, None).expect("resume config");
+        let config =
+            build_agent_resume_config(&turn, 0, &resume_agent::RecordedResumeContext::default())
+                .expect("resume config");
 
         let mut expected = base_config;
         expected.base_instructions = None;
@@ -3799,15 +4114,20 @@ mod tests {
         turn.developer_instructions = Some("turn-dev".to_string());
         turn.config = Arc::new(base_config.clone());
 
-        let config = build_agent_resume_config(&turn, 0, Some(turn.developer_instructions.clone()))
-            .expect("resume config");
+        let recorded_resume_context = resume_agent::RecordedResumeContext {
+            developer_instructions: Some(turn.developer_instructions.clone()),
+            model: Some("gpt-5.1-codex-mini".to_string()),
+            reasoning_effort: Some(Some(ReasoningEffort::High)),
+        };
+        let config =
+            build_agent_resume_config(&turn, 0, &recorded_resume_context).expect("resume config");
 
         let mut expected = base_config;
         expected.base_instructions = None;
         expected.developer_instructions = turn.developer_instructions.clone();
-        expected.model = Some(turn.model_info.slug.clone());
+        expected.model = Some("gpt-5.1-codex-mini".to_string());
         expected.model_provider = turn.provider.clone();
-        expected.model_reasoning_effort = turn.reasoning_effort;
+        expected.model_reasoning_effort = Some(ReasoningEffort::High);
         expected.model_reasoning_summary = Some(turn.reasoning_summary);
         expected.compact_prompt = turn.compact_prompt.clone();
         expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();

@@ -843,26 +843,8 @@ impl TurnContext {
         config.model = Some(model.clone());
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
         let truncation_policy = model_info.truncation_policy.into();
-        let supported_reasoning_levels = model_info
-            .supported_reasoning_levels
-            .iter()
-            .map(|preset| preset.effort)
-            .collect::<Vec<_>>();
-        let reasoning_effort = if let Some(current_reasoning_effort) = self.reasoning_effort {
-            if supported_reasoning_levels.contains(&current_reasoning_effort) {
-                Some(current_reasoning_effort)
-            } else {
-                supported_reasoning_levels
-                    .get(supported_reasoning_levels.len().saturating_sub(1) / 2)
-                    .copied()
-                    .or(model_info.default_reasoning_level)
-            }
-        } else {
-            supported_reasoning_levels
-                .get(supported_reasoning_levels.len().saturating_sub(1) / 2)
-                .copied()
-                .or(model_info.default_reasoning_level)
-        };
+        let reasoning_effort =
+            normalize_reasoning_effort_for_model(&model_info, self.reasoning_effort);
         config.model_reasoning_effort = reasoning_effort;
 
         let collaboration_mode =
@@ -966,6 +948,29 @@ impl TurnContext {
             denied_domains: network.denied_domains.clone().unwrap_or_default(),
         })
     }
+}
+
+pub(crate) fn normalize_reasoning_effort_for_model(
+    model_info: &ModelInfo,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+) -> Option<ReasoningEffortConfig> {
+    let supported_reasoning_levels = model_info
+        .supported_reasoning_levels
+        .iter()
+        .map(|preset| preset.effort)
+        .collect::<Vec<_>>();
+    if supported_reasoning_levels.is_empty() && model_info.default_reasoning_level.is_none() {
+        return reasoning_effort;
+    }
+    if let Some(reasoning_effort) = reasoning_effort
+        && supported_reasoning_levels.contains(&reasoning_effort)
+    {
+        return Some(reasoning_effort);
+    }
+    supported_reasoning_levels
+        .get(supported_reasoning_levels.len().saturating_sub(1) / 2)
+        .copied()
+        .or(model_info.default_reasoning_level)
 }
 
 fn local_time_context() -> (String, String) {
