@@ -237,14 +237,13 @@ where
         ..
     } = builder
         .with_config(|config| {
-            config
-                .features
-                .enable(Feature::CollaborationModes)
-                .expect("test config should allow collaboration modes feature");
-            config
-                .features
-                .disable(Feature::RequestUserInputOutsidePlanMode)
-                .expect("test config should allow disabling request_user_input outside plan mode");
+            assert!(config.features.enable(Feature::CollaborationModes).is_ok());
+            assert!(
+                config
+                    .features
+                    .disable(Feature::RequestUserInputOutsidePlanMode)
+                    .is_ok()
+            );
         })
         .build(&server)
         .await?;

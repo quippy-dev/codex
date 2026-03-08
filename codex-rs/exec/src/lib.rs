@@ -700,6 +700,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     request_id: ev.id.clone(),
                     decision: ElicitationAction::Cancel,
                     content: None,
+                    meta: None,
                 })
                 .await?;
         }

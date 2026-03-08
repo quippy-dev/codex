@@ -28,18 +28,19 @@ use schemars::JsonSchema;
 
 use crate::mcp::CallToolResult;
 
-/// Controls whether a command should use the session sandbox or bypass it.
+/// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
     Debug, Clone, Copy, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxPermissions {
-    /// Run with the configured sandbox
+    /// Run with the turn's configured sandbox policy unchanged.
     #[default]
     UseDefault,
-    /// Request to run outside the sandbox
+    /// Request to run outside the sandbox.
     RequireEscalated,
-    /// Request to run in the sandbox with additional per-command permissions.
+    /// Request to stay in the sandbox while widening permissions for this
+    /// command only.
     WithAdditionalPermissions,
 }
 
@@ -49,9 +50,16 @@ impl SandboxPermissions {
         matches!(self, SandboxPermissions::RequireEscalated)
     }
 
-    /// True if SandboxPermissions requires permissions beyond UseDefault
-    pub fn requires_additional_permissions(self) -> bool {
+    /// True if SandboxPermissions requests any explicit per-command override
+    /// beyond `UseDefault`.
+    pub fn requests_sandbox_override(self) -> bool {
         !matches!(self, SandboxPermissions::UseDefault)
+    }
+
+    /// True if SandboxPermissions uses the sandboxed per-command permission
+    /// widening flow.
+    pub fn uses_additional_permissions(self) -> bool {
+        matches!(self, SandboxPermissions::WithAdditionalPermissions)
     }
 }
 
@@ -68,23 +76,6 @@ impl FileSystemPermissions {
 }
 
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-pub struct MacOsPermissions {
-    pub preferences: Option<MacOsPreferencesValue>,
-    pub automations: Option<MacOsAutomationValue>,
-    pub accessibility: Option<bool>,
-    pub calendar: Option<bool>,
-}
-
-impl MacOsPermissions {
-    pub fn is_empty(&self) -> bool {
-        self.preferences.is_none()
-            && self.automations.is_none()
-            && self.accessibility.is_none()
-            && self.calendar.is_none()
-    }
-}
-
-#[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct NetworkPermissions {
     pub enabled: Option<bool>,
 }
@@ -95,31 +86,32 @@ impl NetworkPermissions {
     }
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(untagged)]
-pub enum MacOsPreferencesValue {
-    Bool(bool),
-    Mode(String),
-}
-
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(untagged)]
-pub enum MacOsAutomationValue {
-    Bool(bool),
-    BundleIds(Vec<String>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    TS,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum MacOsPreferencesPermission {
+    None,
     // IMPORTANT: ReadOnly needs to be the default because it's the
     // security-sensitive default and keeps cf prefs working.
     #[default]
     ReadOnly,
     ReadWrite,
-    None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case", try_from = "MacOsAutomationPermissionDe")]
 pub enum MacOsAutomationPermission {
     #[default]
     None,
@@ -127,7 +119,56 @@ pub enum MacOsAutomationPermission {
     BundleIds(Vec<String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MacOsAutomationPermissionDe {
+    Mode(String),
+    BundleIds(Vec<String>),
+    BundleIdsObject { bundle_ids: Vec<String> },
+}
+
+impl TryFrom<MacOsAutomationPermissionDe> for MacOsAutomationPermission {
+    type Error = String;
+
+    /// Accepts one of:
+    /// - `"none"` or `"all"`
+    /// - a plain list of bundle IDs, e.g. `["com.apple.Notes"]`
+    /// - an object with bundle IDs, e.g. `{"bundle_ids": ["com.apple.Notes"]}`
+    fn try_from(value: MacOsAutomationPermissionDe) -> Result<Self, Self::Error> {
+        let permission = match value {
+            MacOsAutomationPermissionDe::Mode(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized == "all" {
+                    MacOsAutomationPermission::All
+                } else if normalized == "none" {
+                    MacOsAutomationPermission::None
+                } else {
+                    return Err(format!(
+                        "invalid macOS automation permission: {value}; expected none, all, or bundle ids"
+                    ));
+                }
+            }
+            MacOsAutomationPermissionDe::BundleIds(bundle_ids)
+            | MacOsAutomationPermissionDe::BundleIdsObject { bundle_ids } => {
+                let bundle_ids = bundle_ids
+                    .into_iter()
+                    .map(|bundle_id| bundle_id.trim().to_string())
+                    .filter(|bundle_id| !bundle_id.is_empty())
+                    .collect::<Vec<String>>();
+                if bundle_ids.is_empty() {
+                    MacOsAutomationPermission::None
+                } else {
+                    MacOsAutomationPermission::BundleIds(bundle_ids)
+                }
+            }
+        };
+
+        Ok(permission)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(default)]
 pub struct MacOsSeatbeltProfileExtensions {
     pub macos_preferences: MacOsPreferencesPermission,
     pub macos_automation: MacOsAutomationPermission,
@@ -139,25 +180,12 @@ pub struct MacOsSeatbeltProfileExtensions {
 pub struct PermissionProfile {
     pub network: Option<NetworkPermissions>,
     pub file_system: Option<FileSystemPermissions>,
-    pub macos: Option<MacOsPermissions>,
+    pub macos: Option<MacOsSeatbeltProfileExtensions>,
 }
 
 impl PermissionProfile {
     pub fn is_empty(&self) -> bool {
-        self.network
-            .as_ref()
-            .map(NetworkPermissions::is_empty)
-            .unwrap_or(true)
-            && self
-                .file_system
-                .as_ref()
-                .map(FileSystemPermissions::is_empty)
-                .unwrap_or(true)
-            && self
-                .macos
-                .as_ref()
-                .map(MacOsPermissions::is_empty)
-                .unwrap_or(true)
+        self.network.is_none() && self.file_system.is_none() && self.macos.is_none()
     }
 }
 
@@ -381,6 +409,8 @@ const APPROVAL_POLICY_ON_REQUEST_RULE: &str =
     include_str!("prompts/permissions/approval_policy/on_request_rule.md");
 const APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION: &str =
     include_str!("prompts/permissions/approval_policy/on_request_rule_request_permission.md");
+const GUARDIAN_APPROVAL_FEATURE: &str =
+    include_str!("prompts/permissions/approval_policy/guardian.md");
 
 const SANDBOX_MODE_DANGER_FULL_ACCESS: &str =
     include_str!("prompts/permissions/sandbox_mode/danger_full_access.md");
@@ -398,6 +428,7 @@ impl DeveloperInstructions {
 
     pub fn from(
         approval_policy: AskForApproval,
+        guardian_approval_enabled: bool,
         exec_policy: &Policy,
         request_permission_enabled: bool,
     ) -> DeveloperInstructions {
@@ -421,7 +452,14 @@ impl DeveloperInstructions {
             AskForApproval::Never => APPROVAL_POLICY_NEVER.to_string(),
             AskForApproval::UnlessTrusted => APPROVAL_POLICY_UNLESS_TRUSTED.to_string(),
             AskForApproval::OnFailure => APPROVAL_POLICY_ON_FAILURE.to_string(),
-            AskForApproval::OnRequest => on_request_instructions(),
+            AskForApproval::OnRequest => {
+                let mut instructions = on_request_instructions();
+                if guardian_approval_enabled {
+                    instructions.push_str("\n\n");
+                    instructions.push_str(GUARDIAN_APPROVAL_FEATURE);
+                }
+                instructions
+            }
             AskForApproval::Reject(reject_config) => {
                 let on_request_instructions = on_request_instructions();
                 let sandbox_approval = reject_config.sandbox_approval;
@@ -484,6 +522,7 @@ impl DeveloperInstructions {
     pub fn from_policy(
         sandbox_policy: &SandboxPolicy,
         approval_policy: AskForApproval,
+        guardian_approval_enabled: bool,
         exec_policy: &Policy,
         cwd: &Path,
         request_permission_enabled: bool,
@@ -508,6 +547,7 @@ impl DeveloperInstructions {
             sandbox_mode,
             network_access,
             approval_policy,
+            guardian_approval_enabled,
             exec_policy,
             writable_roots,
             request_permission_enabled,
@@ -532,6 +572,7 @@ impl DeveloperInstructions {
         sandbox_mode: SandboxMode,
         network_access: NetworkAccess,
         approval_policy: AskForApproval,
+        guardian_approval_enabled: bool,
         exec_policy: &Policy,
         writable_roots: Option<Vec<WritableRoot>>,
         request_permission_enabled: bool,
@@ -545,6 +586,7 @@ impl DeveloperInstructions {
             ))
             .concat(DeveloperInstructions::from(
                 approval_policy,
+                guardian_approval_enabled,
                 exec_policy,
                 request_permission_enabled,
             ))
@@ -866,6 +908,7 @@ pub struct LocalShellExecAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[schemars(rename = "ResponsesApiWebSearchAction")]
 pub enum WebSearchAction {
     Search {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1301,6 +1344,41 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn sandbox_permissions_helpers_match_documented_semantics() {
+        let cases = [
+            (SandboxPermissions::UseDefault, false, false, false),
+            (SandboxPermissions::RequireEscalated, true, true, false),
+            (
+                SandboxPermissions::WithAdditionalPermissions,
+                false,
+                true,
+                true,
+            ),
+        ];
+
+        for (
+            sandbox_permissions,
+            requires_escalated_permissions,
+            requests_sandbox_override,
+            uses_additional_permissions,
+        ) in cases
+        {
+            assert_eq!(
+                sandbox_permissions.requires_escalated_permissions(),
+                requires_escalated_permissions
+            );
+            assert_eq!(
+                sandbox_permissions.requests_sandbox_override(),
+                requests_sandbox_override
+            );
+            assert_eq!(
+                sandbox_permissions.uses_additional_permissions(),
+                uses_additional_permissions
+            );
+        }
+    }
+
+    #[test]
     fn convert_mcp_content_to_items_preserves_data_urls() {
         let contents = vec![serde_json::json!({
             "type": "image",
@@ -1358,6 +1436,110 @@ mod tests {
                 revised_prompt: None,
                 result: "Zm9v".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn permission_profile_is_empty_when_all_fields_are_none() {
+        assert_eq!(PermissionProfile::default().is_empty(), true);
+    }
+
+    #[test]
+    fn permission_profile_is_not_empty_when_field_is_present_but_nested_empty() {
+        let permission_profile = PermissionProfile {
+            network: Some(NetworkPermissions { enabled: None }),
+            file_system: None,
+            macos: None,
+        };
+        assert_eq!(permission_profile.is_empty(), false);
+    }
+
+    #[test]
+    fn macos_preferences_permission_deserializes_read_write() {
+        let permission = serde_json::from_str::<MacOsPreferencesPermission>("\"read_write\"")
+            .expect("deserialize macos preferences permission");
+        assert_eq!(permission, MacOsPreferencesPermission::ReadWrite);
+    }
+
+    #[test]
+    fn macos_preferences_permission_order_matches_permissiveness() {
+        assert!(MacOsPreferencesPermission::None < MacOsPreferencesPermission::ReadOnly);
+        assert!(MacOsPreferencesPermission::ReadOnly < MacOsPreferencesPermission::ReadWrite);
+    }
+
+    #[test]
+    fn permission_profile_deserializes_macos_seatbelt_profile_extensions() {
+        let permission_profile = serde_json::from_value::<PermissionProfile>(serde_json::json!({
+            "network": null,
+            "file_system": null,
+            "macos": {
+                "macos_preferences": "read_write",
+                "macos_automation": ["com.apple.Notes"],
+                "macos_accessibility": true,
+                "macos_calendar": true
+            }
+        }))
+        .expect("deserialize permission profile");
+
+        assert_eq!(
+            permission_profile,
+            PermissionProfile {
+                network: None,
+                file_system: None,
+                macos: Some(MacOsSeatbeltProfileExtensions {
+                    macos_preferences: MacOsPreferencesPermission::ReadWrite,
+                    macos_automation: MacOsAutomationPermission::BundleIds(vec![
+                        "com.apple.Notes".to_string(),
+                    ]),
+                    macos_accessibility: true,
+                    macos_calendar: true,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn macos_seatbelt_profile_extensions_deserializes_missing_fields_to_defaults() {
+        let permissions =
+            serde_json::from_value::<MacOsSeatbeltProfileExtensions>(serde_json::json!({
+                "macos_automation": ["com.apple.Notes"]
+            }))
+            .expect("deserialize macos permissions");
+
+        assert_eq!(
+            permissions,
+            MacOsSeatbeltProfileExtensions {
+                macos_preferences: MacOsPreferencesPermission::ReadOnly,
+                macos_automation: MacOsAutomationPermission::BundleIds(vec![
+                    "com.apple.Notes".to_string(),
+                ]),
+                macos_accessibility: false,
+                macos_calendar: false,
+            }
+        );
+    }
+
+    #[test]
+    fn macos_automation_permission_deserializes_all_and_none() {
+        let all = serde_json::from_str::<MacOsAutomationPermission>("\"all\"")
+            .expect("deserialize all automation permission");
+        let none = serde_json::from_str::<MacOsAutomationPermission>("\"none\"")
+            .expect("deserialize none automation permission");
+
+        assert_eq!(all, MacOsAutomationPermission::All);
+        assert_eq!(none, MacOsAutomationPermission::None);
+    }
+
+    #[test]
+    fn macos_automation_permission_deserializes_bundle_ids_object() {
+        let permission = serde_json::from_value::<MacOsAutomationPermission>(serde_json::json!({
+            "bundle_ids": ["com.apple.Notes"]
+        }))
+        .expect("deserialize bundle_ids object automation permission");
+
+        assert_eq!(
+            permission,
+            MacOsAutomationPermission::BundleIds(vec!["com.apple.Notes".to_string(),])
         );
     }
 
@@ -1472,6 +1654,7 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Enabled,
             AskForApproval::OnRequest,
+            false,
             &Policy::empty(),
             None,
             false,
@@ -1501,6 +1684,7 @@ mod tests {
         let instructions = DeveloperInstructions::from_policy(
             &policy,
             AskForApproval::UnlessTrusted,
+            false,
             &Policy::empty(),
             &PathBuf::from("/tmp"),
             false,
@@ -1523,6 +1707,7 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Enabled,
             AskForApproval::OnRequest,
+            false,
             &exec_policy,
             None,
             false,
@@ -1540,6 +1725,7 @@ mod tests {
             SandboxMode::WorkspaceWrite,
             NetworkAccess::Enabled,
             AskForApproval::OnRequest,
+            false,
             &Policy::empty(),
             None,
             true,
@@ -1548,6 +1734,23 @@ mod tests {
         let text = instructions.into_text();
         assert!(text.contains("with_additional_permissions"));
         assert!(text.contains("additional_permissions"));
+    }
+
+    #[test]
+    fn includes_guardian_feature_guidance_for_on_request_when_enabled() {
+        let instructions = DeveloperInstructions::from_permissions_with_network(
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Enabled,
+            AskForApproval::OnRequest,
+            true,
+            &Policy::empty(),
+            None,
+            false,
+        );
+
+        let text = instructions.into_text();
+        assert!(text.contains("guardian subagent"));
+        assert!(text.contains("approval prompts"));
     }
 
     #[test]
