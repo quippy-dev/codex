@@ -19,6 +19,7 @@ use crate::rollout::RolloutRecorder;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
+use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
@@ -406,16 +407,18 @@ impl AgentControl {
                 agent_nickname,
                 agent_role,
             }) => {
-                let (stored_agent_nickname, stored_agent_role) = if let Some(state_db_ctx) =
-                    crate::state_db::get_state_db(&config, None).await
-                {
-                    match state_db_ctx.get_thread(thread_id).await {
-                        Ok(Some(metadata)) => (metadata.agent_nickname, metadata.agent_role),
-                        Ok(None) | Err(_) => (None, None),
-                    }
-                } else {
-                    (None, None)
-                };
+                // Collab resume callers rebuild a placeholder ThreadSpawn source. Rehydrate the
+                // stored nickname/role from sqlite when available, then prefer any explicit
+                // values already present on the session source.
+                let (stored_agent_nickname, stored_agent_role) =
+                    if let Some(state_db_ctx) = state_db::get_state_db(&config).await {
+                        match state_db_ctx.get_thread(thread_id).await {
+                            Ok(Some(metadata)) => (metadata.agent_nickname, metadata.agent_role),
+                            Ok(None) | Err(_) => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    };
                 let resumed_agent_role = agent_role.or(stored_agent_role);
                 let resumed_agent_nickname = agent_nickname.or(stored_agent_nickname);
                 let reserved_agent_nickname = resumed_agent_nickname

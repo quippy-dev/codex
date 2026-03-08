@@ -481,7 +481,6 @@ mod phase2 {
             let state_db = codex_state::StateRuntime::init(
                 config.codex_home.clone(),
                 config.model_provider_id.clone(),
-                None,
             )
             .await
             .expect("initialize state db");
@@ -864,7 +863,6 @@ mod phase2 {
         let state_db = codex_state::StateRuntime::init(
             config.codex_home.clone(),
             config.model_provider_id.clone(),
-            None,
         )
         .await
         .expect("initialize state db");

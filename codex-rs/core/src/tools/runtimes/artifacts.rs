@@ -19,6 +19,8 @@ use futures::future::BoxFuture;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct ArtifactApprovalKey {
@@ -174,6 +176,8 @@ mod tests {
     #[tokio::test]
     async fn auto_approves_retry_when_exec_policy_already_allows_launcher() {
         let (session, turn) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
         let mut runtime = ArtifactRuntime;
         let req = ArtifactExecRequest {
             command: vec![

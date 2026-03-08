@@ -620,15 +620,43 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let permission_guard = thread_watch_manager
                     .note_permission_requested(&conversation_id.to_string())
                     .await;
-                let turn_id = {
-                    let state = thread_state.lock().await;
-                    state.active_turn_snapshot().map(|turn| turn.id)
+                let turn_id = match request.turn_id.clone() {
+                    Some(turn_id) => Some(turn_id),
+                    None => {
+                        let state = thread_state.lock().await;
+                        state.active_turn_snapshot().map(|turn| turn.id)
+                    }
+                };
+                let server_name = request.server_name.clone();
+                let request_body = match request.request.try_into() {
+                    Ok(request_body) => request_body,
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            server_name,
+                            request_id = ?request.id,
+                            "failed to parse typed MCP elicitation schema"
+                        );
+                        if let Err(err) = conversation
+                            .submit(Op::ResolveElicitation {
+                                server_name: request.server_name,
+                                request_id: request.id,
+                                decision: codex_protocol::approvals::ElicitationAction::Cancel,
+                                content: None,
+                                meta: None,
+                            })
+                            .await
+                        {
+                            error!("failed to submit ResolveElicitation: {err}");
+                        }
+                        return;
+                    }
                 };
                 let params = McpServerElicitationRequestParams {
                     thread_id: conversation_id.to_string(),
                     turn_id,
                     server_name: request.server_name.clone(),
-                    request: request.request.into(),
+                    request: request_body,
                 };
                 let (pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::McpServerElicitationRequest(params))
@@ -1626,7 +1654,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_name: thread_name_event.thread_name,
                 };
                 outgoing
-                    .send_server_notification(ServerNotification::ThreadNameUpdated(notification))
+                    .send_global_server_notification(ServerNotification::ThreadNameUpdated(
+                        notification,
+                    ))
                     .await;
             }
         }
@@ -2108,6 +2138,7 @@ async fn on_mcp_server_elicitation_response(
             request_id,
             decision: response.action.to_core(),
             content: response.content,
+            meta: response.meta,
         })
         .await
     {
@@ -2125,12 +2156,14 @@ fn mcp_server_elicitation_response_from_client_result(
                 McpServerElicitationRequestResponse {
                     action: McpServerElicitationAction::Decline,
                     content: None,
+                    meta: None,
                 }
             }),
         Ok(Err(err)) if is_turn_transition_server_request_error(&err) => {
             McpServerElicitationRequestResponse {
                 action: McpServerElicitationAction::Cancel,
                 content: None,
+                meta: None,
             }
         }
         Ok(Err(err)) => {
@@ -2138,6 +2171,7 @@ fn mcp_server_elicitation_response_from_client_result(
             McpServerElicitationRequestResponse {
                 action: McpServerElicitationAction::Decline,
                 content: None,
+                meta: None,
             }
         }
         Err(err) => {
@@ -2145,6 +2179,7 @@ fn mcp_server_elicitation_response_from_client_result(
             McpServerElicitationRequestResponse {
                 action: McpServerElicitationAction::Decline,
                 content: None,
+                meta: None,
             }
         }
     }
@@ -2672,6 +2707,7 @@ mod tests {
             McpServerElicitationRequestResponse {
                 action: McpServerElicitationAction::Cancel,
                 content: None,
+                meta: None,
             }
         );
     }

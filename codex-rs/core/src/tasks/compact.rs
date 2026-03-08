@@ -29,15 +29,15 @@ impl SessionTask for CompactTask {
         _cancellation_token: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
-        let _result = if crate::compact::should_use_remote_compact_task(&ctx.provider) {
-            let _ = session.services.otel_manager.counter(
+        let _ = if crate::compact::should_use_remote_compact_task(&ctx.provider) {
+            let _ = session.services.session_telemetry.counter(
                 "codex.task.compact",
                 1,
                 &[("type", "remote")],
             );
             crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
         } else {
-            let _ = session.services.otel_manager.counter(
+            let _ = session.services.session_telemetry.counter(
                 "codex.task.compact",
                 1,
                 &[("type", "local")],

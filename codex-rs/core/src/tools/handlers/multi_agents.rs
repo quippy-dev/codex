@@ -312,7 +312,7 @@ mod spawn {
             .await;
         let new_thread_id = result?;
         let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
-        turn.otel_manager
+        turn.session_telemetry
             .counter("codex.multi_agent.spawn", 1, &[("role", role_tag)]);
 
         let content = serde_json::to_string(&SpawnAgentResult {
@@ -636,7 +636,7 @@ mod resume_agent {
         if let Some(err) = error {
             return Err(err);
         }
-        turn.otel_manager
+        turn.session_telemetry
             .counter("codex.multi_agent.resume", 1, &[]);
 
         let content = serde_json::to_string(&ResumeAgentResult { status }).map_err(|err| {
@@ -659,14 +659,13 @@ mod resume_agent {
             load_recorded_resume_context(turn.as_ref(), receiver_thread_id).await?;
         let config =
             build_agent_resume_config(turn.as_ref(), child_depth, &recorded_resume_context)?;
-        let (agent_nickname, agent_role) =
-            match crate::state_db::get_state_db(&turn.config, None).await {
-                Some(state_db_ctx) => match state_db_ctx.get_thread(receiver_thread_id).await {
-                    Ok(Some(metadata)) => (metadata.agent_nickname, metadata.agent_role),
-                    Ok(None) | Err(_) => (None, None),
-                },
-                None => (None, None),
-            };
+        let (agent_nickname, agent_role) = match crate::state_db::get_state_db(&turn.config).await {
+            Some(state_db_ctx) => match state_db_ctx.get_thread(receiver_thread_id).await {
+                Ok(Some(metadata)) => (metadata.agent_nickname, metadata.agent_role),
+                Ok(None) | Err(_) => (None, None),
+            },
+            None => (None, None),
+        };
         let resumed_thread_id = session
             .services
             .agent_control
@@ -3148,6 +3147,7 @@ mod tests {
                         cwd: turn.cwd.clone(),
                         current_date: turn.current_date.clone(),
                         timezone: turn.timezone.clone(),
+                        trace_id: None,
                         approval_policy: turn.approval_policy.value(),
                         sandbox_policy: turn.sandbox_policy.get().clone(),
                         network: None,

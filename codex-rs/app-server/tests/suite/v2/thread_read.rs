@@ -609,8 +609,7 @@ async fn thread_read_reports_system_error_idle_flag_after_failed_turn() -> Resul
 }
 
 async fn init_state_db(codex_home: &Path) -> Result<Arc<StateRuntime>> {
-    let state_db =
-        StateRuntime::init(codex_home.to_path_buf(), "mock_provider".into(), None).await?;
+    let state_db = StateRuntime::init(codex_home.to_path_buf(), "mock_provider".into()).await?;
     state_db.mark_backfill_complete(None).await?;
     Ok(state_db)
 }
