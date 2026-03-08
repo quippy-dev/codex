@@ -512,6 +512,8 @@ mod resume_agent {
     use super::*;
     use crate::agent::exceeds_thread_spawn_depth_limit;
     use crate::agent::next_thread_spawn_depth;
+    use crate::rollout::RolloutRecorder;
+    use crate::rollout::find_thread_path_by_id_str;
     use std::sync::Arc;
 
     #[derive(Debug, Deserialize)]
@@ -627,7 +629,10 @@ mod resume_agent {
         receiver_thread_id: ThreadId,
         child_depth: i32,
     ) -> Result<AgentStatus, FunctionCallError> {
-        let config = build_agent_resume_config(turn.as_ref(), child_depth)?;
+        let recorded_developer_instructions =
+            load_recorded_developer_instructions(turn.as_ref(), receiver_thread_id).await?;
+        let config =
+            build_agent_resume_config(turn.as_ref(), child_depth, recorded_developer_instructions)?;
         let (agent_nickname, agent_role) =
             match crate::state_db::get_state_db(&turn.config, None).await {
                 Some(state_db_ctx) => match state_db_ctx.get_thread(receiver_thread_id).await {
@@ -657,6 +662,49 @@ mod resume_agent {
             .agent_control
             .get_status(resumed_thread_id)
             .await)
+    }
+
+    async fn load_recorded_developer_instructions(
+        turn: &TurnContext,
+        receiver_thread_id: ThreadId,
+    ) -> Result<Option<Option<String>>, FunctionCallError> {
+        let rollout_path = find_thread_path_by_id_str(
+            turn.config.codex_home.as_path(),
+            &receiver_thread_id.to_string(),
+        )
+        .await
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to inspect recorded agent {receiver_thread_id}: {err}"
+            ))
+        })?;
+        let Some(rollout_path) = rollout_path else {
+            return Ok(None);
+        };
+        let initial_history = RolloutRecorder::get_rollout_history(rollout_path.as_path())
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to load recorded agent {receiver_thread_id}: {err}"
+                ))
+            })?;
+        let fallback_fork_developer_instructions = initial_history
+            .forked_from_id()
+            .map(|_| turn.developer_instructions.clone());
+        let codex_protocol::protocol::InitialHistory::Resumed(resumed) = initial_history else {
+            return Ok(fallback_fork_developer_instructions);
+        };
+        Ok(resumed
+            .history
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                codex_protocol::protocol::RolloutItem::TurnContext(context) => {
+                    Some(context.developer_instructions.clone())
+                }
+                _ => None,
+            })
+            .or(fallback_fork_developer_instructions))
     }
 }
 
@@ -1575,12 +1623,15 @@ pub(crate) fn build_agent_spawn_config(
 fn build_agent_resume_config(
     turn: &TurnContext,
     child_depth: i32,
+    recorded_developer_instructions: Option<Option<String>>,
 ) -> Result<Config, FunctionCallError> {
-    let base_config = turn.config.as_ref();
     let mut config = build_agent_shared_config(turn, child_depth)?;
     // For resume, keep base instructions sourced from rollout/session metadata.
     config.base_instructions = None;
-    config.developer_instructions = base_config.developer_instructions.clone();
+    config.developer_instructions = match recorded_developer_instructions {
+        Some(developer_instructions) => developer_instructions,
+        None => turn.config.developer_instructions.clone(),
+    };
     Ok(config)
 }
 
@@ -1647,6 +1698,7 @@ mod tests {
     use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::TurnContextItem;
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
@@ -2771,6 +2823,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_agent_restores_closed_fork_agent_with_turn_developer_instructions() {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let mut config = turn.config.as_ref().clone();
+        config.developer_instructions = Some("base-dev".to_string());
+        turn.developer_instructions = Some("turn-dev".to_string());
+        turn.config = Arc::new(config.clone());
+        let thread = manager
+            .resume_thread_with_history(
+                config,
+                InitialHistory::Forked(vec![
+                    RolloutItem::TurnContext(TurnContextItem {
+                        turn_id: Some("turn-1".to_string()),
+                        cwd: turn.cwd.clone(),
+                        current_date: turn.current_date.clone(),
+                        timezone: turn.timezone.clone(),
+                        approval_policy: turn.approval_policy.value(),
+                        sandbox_policy: turn.sandbox_policy.get().clone(),
+                        network: None,
+                        model: turn.model_info.slug.clone(),
+                        personality: turn.personality,
+                        collaboration_mode: Some(turn.collaboration_mode.clone()),
+                        realtime_active: Some(turn.realtime_active),
+                        effort: turn.reasoning_effort,
+                        summary: turn.reasoning_summary,
+                        user_instructions: turn.user_instructions.clone(),
+                        developer_instructions: turn.developer_instructions.clone(),
+                        final_output_json_schema: turn.final_output_json_schema.clone(),
+                        truncation_policy: Some(turn.truncation_policy.into()),
+                    }),
+                    RolloutItem::ResponseItem(ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: "materialized".to_string(),
+                        }],
+                        end_turn: None,
+                        phase: None,
+                    }),
+                ]),
+                AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+                false,
+            )
+            .await
+            .expect("start thread");
+        let agent_id = thread.thread_id;
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown agent");
+        assert_eq!(
+            manager.agent_control().get_status(agent_id).await,
+            AgentStatus::NotFound
+        );
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        let resume_invocation = invocation(
+            session,
+            turn.clone(),
+            "resume_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+        let output = MultiAgentHandler
+            .handle(resume_invocation)
+            .await
+            .expect("resume_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: resume_agent::ResumeAgentResult =
+            serde_json::from_str(&content).expect("resume_agent result should be json");
+        assert_ne!(result.status, AgentStatus::NotFound);
+        assert_eq!(success, Some(true));
+
+        let resumed_thread = manager
+            .get_thread(agent_id)
+            .await
+            .expect("resumed thread should be registered");
+        let resumed_config = resumed_thread.codex.session.get_config().await;
+        assert_eq!(
+            resumed_config.developer_instructions,
+            turn.developer_instructions
+        );
+
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown resumed agent");
+    }
+
+    #[tokio::test]
     async fn resume_agent_rejects_when_depth_limit_exceeded() {
         let (mut session, mut turn) = make_session_and_context().await;
         let manager = thread_manager();
@@ -3605,7 +3757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_agent_resume_config_uses_shared_fields() {
+    async fn build_agent_resume_config_context_free_uses_shared_fields() {
         let (_session, mut turn) = make_session_and_context().await;
         let mut base_config = (*turn.config).clone();
         base_config.base_instructions = Some("caller-base".to_string());
@@ -3613,10 +3765,46 @@ mod tests {
         turn.developer_instructions = Some("turn-dev".to_string());
         turn.config = Arc::new(base_config.clone());
 
-        let config = build_agent_resume_config(&turn, 0).expect("resume config");
+        let config = build_agent_resume_config(&turn, 0, None).expect("resume config");
 
         let mut expected = base_config;
         expected.base_instructions = None;
+        expected.model = Some(turn.model_info.slug.clone());
+        expected.model_provider = turn.provider.clone();
+        expected.model_reasoning_effort = turn.reasoning_effort;
+        expected.model_reasoning_summary = Some(turn.reasoning_summary);
+        expected.compact_prompt = turn.compact_prompt.clone();
+        expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
+        expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
+        expected.cwd = turn.cwd.clone();
+        expected
+            .permissions
+            .approval_policy
+            .set(AskForApproval::Never)
+            .expect("approval policy set");
+        expected
+            .permissions
+            .sandbox_policy
+            .set(turn.sandbox_policy.get().clone())
+            .expect("sandbox policy set");
+        assert_eq!(config, expected);
+    }
+
+    #[tokio::test]
+    async fn build_agent_resume_config_prefers_recorded_developer_instructions() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.base_instructions = Some("caller-base".to_string());
+        base_config.developer_instructions = Some("base-dev".to_string());
+        turn.developer_instructions = Some("turn-dev".to_string());
+        turn.config = Arc::new(base_config.clone());
+
+        let config = build_agent_resume_config(&turn, 0, Some(turn.developer_instructions.clone()))
+            .expect("resume config");
+
+        let mut expected = base_config;
+        expected.base_instructions = None;
+        expected.developer_instructions = turn.developer_instructions.clone();
         expected.model = Some(turn.model_info.slug.clone());
         expected.model_provider = turn.provider.clone();
         expected.model_reasoning_effort = turn.reasoning_effort;
