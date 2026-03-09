@@ -16,6 +16,7 @@ use codex_app_server_protocol::ConfigLayerSource;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use dirs::home_dir;
 use dunce::canonicalize as canonicalize_path;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -145,21 +146,6 @@ impl fmt::Display for SkillParseError {
 }
 
 impl Error for SkillParseError {}
-
-fn user_home_dir_from_layer_stack(config_layer_stack: &ConfigLayerStack) -> Option<PathBuf> {
-    for layer in
-        config_layer_stack.get_layers(ConfigLayerStackOrdering::HighestPrecedenceFirst, true)
-    {
-        if matches!(layer.name, ConfigLayerSource::User { .. })
-            && let Some(config_folder) = layer.config_folder()
-            && let Some(parent) = config_folder.as_path().parent()
-        {
-            return Some(parent.to_path_buf());
-        }
-    }
-
-    None
-}
 pub(crate) struct SkillRoot {
     pub(crate) path: PathBuf,
     pub(crate) scope: SkillScope,
@@ -204,11 +190,10 @@ pub(crate) fn skill_roots(
     cwd: &Path,
     plugin_skill_roots: Vec<PathBuf>,
 ) -> Vec<SkillRoot> {
-    let home_dir = user_home_dir_from_layer_stack(config_layer_stack);
     skill_roots_with_home_dir(
         config_layer_stack,
         cwd,
-        home_dir.as_deref(),
+        home_dir().as_deref(),
         plugin_skill_roots,
     )
 }
@@ -2728,7 +2713,7 @@ permissions:
                 .map(|root| root.scope)
                 .collect();
         let mut expected = vec![SkillScope::User, SkillScope::System];
-        if user_home_dir_from_layer_stack(&cfg.config_layer_stack).is_some() {
+        if home_dir().is_some() {
             expected.insert(1, SkillScope::User);
         }
         expected.push(SkillScope::Admin);

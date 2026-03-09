@@ -1225,6 +1225,8 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         realtime_active: None,
     }))
     .await;
+    sess.set_latest_proposed_plan_text(Some("stale-plan".to_string()))
+        .await;
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
     let rollback_event = wait_for_thread_rolled_back(&rx).await;
@@ -1247,6 +1249,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         serde_json::to_value(Some(first_context_item))
             .expect("serialize expected reference context item")
     );
+    assert_eq!(sess.latest_proposed_plan_text().await, None);
 }
 
 #[tokio::test]
@@ -2144,6 +2147,28 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
 
     (session, turn_context)
+}
+
+#[tokio::test]
+async fn notify_request_permissions_response_ignores_unmatched_call_id() {
+    let (session, _turn_context) = make_session_and_context().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+
+    session
+        .notify_request_permissions_response(
+            "missing",
+            codex_protocol::request_permissions::RequestPermissionsResponse {
+                permissions: codex_protocol::models::PermissionProfile {
+                    network: Some(codex_protocol::models::NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+
+    assert_eq!(session.granted_turn_permissions().await, None);
 }
 
 #[tokio::test]
