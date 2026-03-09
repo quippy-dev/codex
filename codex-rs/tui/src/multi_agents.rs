@@ -468,7 +468,7 @@ mod tests {
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
             prompt: "Compute 11! and reply with just the integer result.".to_string(),
-            spawn_mode: codex_protocol::protocol::CollabAgentSpawnMode::Spawn,
+            spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
         });
 
@@ -549,7 +549,7 @@ mod tests {
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
             prompt: String::new(),
-            spawn_mode: codex_protocol::protocol::CollabAgentSpawnMode::Spawn,
+            spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
         });
 

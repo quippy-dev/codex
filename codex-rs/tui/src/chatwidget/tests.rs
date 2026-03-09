@@ -66,6 +66,8 @@ use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::AGENT_INBOX_MESSAGE_PREFIX;
+use codex_protocol::protocol::AgentInboxPayload;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
@@ -73,9 +75,7 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
-use codex_protocol::protocol::COLLAB_INBOX_MESSAGE_PREFIX;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::CollabInboxPayload;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -188,8 +188,8 @@ fn snapshot(percent: f64) -> RateLimitSnapshot {
     }
 }
 
-fn collab_inbox_function_call_output(sender: ThreadId, message: &str) -> ResponseItem {
-    let payload = serde_json::to_string(&CollabInboxPayload::new(sender, message.to_string()))
+fn agent_inbox_function_call_output(sender: ThreadId, message: &str) -> ResponseItem {
+    let payload = serde_json::to_string(&AgentInboxPayload::new(sender, message.to_string()))
         .expect("collab inbox payload should serialize");
     ResponseItem::FunctionCallOutput {
         call_id: "call-collab-inbox".to_string(),
@@ -197,12 +197,12 @@ fn collab_inbox_function_call_output(sender: ThreadId, message: &str) -> Respons
     }
 }
 
-fn collab_inbox_message(sender: ThreadId, message: &str) -> ResponseItem {
+fn agent_inbox_message(sender: ThreadId, message: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
-            text: format!("{COLLAB_INBOX_MESSAGE_PREFIX}{sender}] {message}"),
+            text: format!("{AGENT_INBOX_MESSAGE_PREFIX}{sender}] {message}"),
         }],
         end_turn: None,
         phase: None,
@@ -311,7 +311,7 @@ async fn thread_snapshot_replay_does_not_duplicate_agent_message_history() {
 }
 
 #[tokio::test]
-async fn thread_snapshot_replay_deduplicates_collab_inbox_compatibility_items() {
+async fn thread_snapshot_replay_deduplicates_agent_inbox_compatibility_items() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
 
     let sender =
@@ -321,13 +321,13 @@ async fn thread_snapshot_replay_deduplicates_collab_inbox_compatibility_items() 
     chat.handle_codex_event_replay(Event {
         id: "evt-collab-output".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_function_call_output(sender, message),
+            item: agent_inbox_function_call_output(sender, message),
         }),
     });
     chat.handle_codex_event_replay(Event {
         id: "evt-collab-message".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_message(sender, message),
+            item: agent_inbox_message(sender, message),
         }),
     });
 
@@ -360,7 +360,7 @@ async fn thread_snapshot_replay_deduplicates_collab_inbox_compatibility_items() 
 }
 
 #[tokio::test]
-async fn thread_snapshot_replay_resets_collab_inbox_dedupe_after_non_collab_raw_item() {
+async fn thread_snapshot_replay_resets_agent_inbox_dedupe_after_non_agent_raw_item() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
 
     let sender =
@@ -370,7 +370,7 @@ async fn thread_snapshot_replay_resets_collab_inbox_dedupe_after_non_collab_raw_
     chat.handle_codex_event_replay(Event {
         id: "evt-collab-output-1".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_function_call_output(sender, message),
+            item: agent_inbox_function_call_output(sender, message),
         }),
     });
     chat.handle_codex_event_replay(Event {
@@ -390,7 +390,7 @@ async fn thread_snapshot_replay_resets_collab_inbox_dedupe_after_non_collab_raw_
     chat.handle_codex_event_replay(Event {
         id: "evt-collab-output-2".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_function_call_output(sender, message),
+            item: agent_inbox_function_call_output(sender, message),
         }),
     });
 
@@ -420,13 +420,13 @@ async fn thread_snapshot_replay_keeps_adjacent_identical_function_call_outputs()
     chat.handle_codex_event_replay(Event {
         id: "evt-collab-output-1".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_function_call_output(sender, message),
+            item: agent_inbox_function_call_output(sender, message),
         }),
     });
     chat.handle_codex_event_replay(Event {
         id: "evt-collab-output-2".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_function_call_output(sender, message),
+            item: agent_inbox_function_call_output(sender, message),
         }),
     });
 
@@ -446,7 +446,7 @@ async fn thread_snapshot_replay_keeps_adjacent_identical_function_call_outputs()
 }
 
 #[tokio::test]
-async fn live_collab_inbox_messages_are_not_deduplicated() {
+async fn live_agent_inbox_messages_are_not_deduplicated() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
 
     let sender =
@@ -456,13 +456,13 @@ async fn live_collab_inbox_messages_are_not_deduplicated() {
     chat.handle_codex_event(Event {
         id: "evt-live-output".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_function_call_output(sender, message),
+            item: agent_inbox_function_call_output(sender, message),
         }),
     });
     chat.handle_codex_event(Event {
         id: "evt-live-message".into(),
         msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-            item: collab_inbox_message(sender, message),
+            item: agent_inbox_message(sender, message),
         }),
     });
 
@@ -2122,7 +2122,7 @@ async fn make_chatwidget_manual(
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
-        last_replayed_collab_inbox_message: None,
+        last_replayed_agent_inbox_message: None,
         last_rendered_user_message_event: None,
     };
     widget.set_model(&resolved_model);
@@ -10345,7 +10345,7 @@ async fn deltas_then_same_final_message_are_rendered_snapshot() {
 }
 
 #[tokio::test]
-async fn raw_collab_inbox_agent_message_renders_header_and_markdown_body_snapshot() {
+async fn raw_agent_inbox_agent_message_renders_header_and_markdown_body_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let tail_marker = "TAIL_END_0123456789";
     let padding = "x".repeat(220);
@@ -10360,7 +10360,7 @@ async fn raw_collab_inbox_agent_message_renders_header_and_markdown_body_snapsho
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: format!("[collab_inbox:agent-7] {markdown_body}"),
+                    text: format!("[agent_inbox:agent-7] {markdown_body}"),
                 }],
                 end_turn: None,
                 phase: None,

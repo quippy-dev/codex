@@ -214,7 +214,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
     ) {
-        self.snapshot_collab_send_input_on_turn_complete();
+        self.snapshot_agent_send_input_on_turn_complete();
 
         turn_context
             .turn_metadata_state
@@ -428,12 +428,12 @@ mod tests {
     #[tokio::test]
     async fn on_task_finished_snapshots_collab_send_input_once() {
         let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
-        session.mark_turn_used_collab_send_input();
+        session.mark_turn_used_agent_send_input();
 
         session
             .on_task_finished(Arc::clone(&turn_context), None)
             .await;
 
-        assert!(session.last_completed_turn_used_collab_send_input());
+        assert!(session.last_completed_turn_used_agent_send_input());
     }
 }

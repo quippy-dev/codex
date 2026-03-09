@@ -20,13 +20,13 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
-use codex_protocol::protocol::CollabAgentSpawnMode;
 use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
@@ -146,12 +146,12 @@ mod spawn {
         nickname: Option<String>,
     }
 
-    impl From<SpawnMode> for CollabAgentSpawnMode {
+    impl From<SpawnMode> for AgentSpawnMode {
         fn from(value: SpawnMode) -> Self {
             match value {
-                SpawnMode::Spawn => CollabAgentSpawnMode::Spawn,
-                SpawnMode::Fork => CollabAgentSpawnMode::Fork,
-                SpawnMode::Watchdog => CollabAgentSpawnMode::Watchdog,
+                SpawnMode::Spawn => AgentSpawnMode::Spawn,
+                SpawnMode::Fork => AgentSpawnMode::Fork,
+                SpawnMode::Watchdog => AgentSpawnMode::Watchdog,
             }
         }
     }
@@ -482,7 +482,7 @@ mod send_input {
             session
                 .services
                 .agent_control
-                .send_collab_message(receiver_thread_id, session.conversation_id, message)
+                .send_agent_message(receiver_thread_id, session.conversation_id, message)
                 .await
                 .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
         } else {
@@ -514,7 +514,7 @@ mod send_input {
             )
             .await;
         let submission_id = result?;
-        session.mark_turn_used_collab_send_input();
+        session.mark_turn_used_agent_send_input();
 
         let content = serde_json::to_string(&SendInputResult { submission_id }).map_err(|err| {
             FunctionCallError::Fatal(format!("failed to serialize send_input result: {err}"))

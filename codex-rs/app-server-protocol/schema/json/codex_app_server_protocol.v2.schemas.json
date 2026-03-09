@@ -163,6 +163,14 @@
       "title": "AgentMessageDeltaNotification",
       "type": "object"
     },
+    "AgentSpawnMode": {
+      "enum": [
+        "spawn",
+        "fork",
+        "watchdog"
+      ],
+      "type": "string"
+    },
     "AgentStatus": {
       "description": "Agent lifecycle status, derived from emitted events.",
       "oneOf": [
@@ -6161,7 +6169,7 @@
             "spawn_mode": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CollabAgentSpawnMode"
+                  "$ref": "#/definitions/AgentSpawnMode"
                 }
               ],
               "default": "spawn",

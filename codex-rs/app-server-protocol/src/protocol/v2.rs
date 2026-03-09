@@ -44,10 +44,10 @@ use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::parse_command::ParsedCommand as CoreParsedCommand;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
+use codex_protocol::protocol::AgentSpawnMode as CoreAgentSpawnMode;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
-use codex_protocol::protocol::CollabAgentSpawnMode as CoreCollabAgentSpawnMode;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
@@ -3885,7 +3885,7 @@ pub enum CollabAgentTool {
 }
 
 v2_enum_from_core! {
-    pub enum CollabAgentSpawnMode from CoreCollabAgentSpawnMode {
+    pub enum CollabAgentSpawnMode from CoreAgentSpawnMode {
         Spawn,
         Fork,
         Watchdog

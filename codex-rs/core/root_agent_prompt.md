@@ -51,7 +51,7 @@ Guidance:
 - When redirecting an agent, restate the new goal and the reason for the pivot.
 - Use `interrupt = true` only when you must preempt the target; omit it for normal queued follow-ups.
 - Subagents can call `send_input` without an `id` (or with `id = "parent"` / `id = "root"`). In this runtime those forms resolve to the immediate parent thread.
-- Treat explicit `send_input` deliveries as the primary path and multi-agent inbox messages (`collab_inbox` tool calls or `[collab_inbox:…]` messages) as fallback inbound agent messages.
+- Treat explicit `send_input` deliveries as the primary path and multi-agent inbox messages (`agent_inbox` tool calls or `[agent_inbox:…]` messages) as fallback inbound agent messages.
 - Use fallback inbox messages for completion visibility only; do not treat them as a replacement for deliberate `send_input` coordination.
 
 ### 3) `wait`

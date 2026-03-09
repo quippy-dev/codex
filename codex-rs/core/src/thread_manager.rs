@@ -706,7 +706,7 @@ impl ThreadManagerState {
         session_source: SessionSource,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     ) -> CodexResult<NewThread> {
-        let history = RolloutRecorder::get_rollout_history(&path).await?;
+        let history = RolloutRecorder::get_fork_history(&path).await?;
         let mut history = truncate_before_nth_user_message(
             config.codex_home.as_path(),
             history,
@@ -714,13 +714,24 @@ impl ThreadManagerState {
         )
         .await;
         if let InitialHistory::Forked(items) = &mut history {
-            items.insert(
-                0,
-                RolloutItem::ForkReference(ForkReferenceItem {
-                    rollout_path: path.clone(),
-                    nth_user_message,
-                }),
-            );
+            let source_session_meta = items.iter().find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => Some(meta_line.clone()),
+                RolloutItem::ForkReference(_)
+                | RolloutItem::ResponseItem(_)
+                | RolloutItem::Compacted(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::EventMsg(_) => None,
+            });
+            *items = source_session_meta
+                .into_iter()
+                .map(RolloutItem::SessionMeta)
+                .chain(std::iter::once(RolloutItem::ForkReference(
+                    ForkReferenceItem {
+                        rollout_path: path.clone(),
+                        nth_user_message,
+                    },
+                )))
+                .collect();
         }
         self.spawn_thread_with_source(
             config,

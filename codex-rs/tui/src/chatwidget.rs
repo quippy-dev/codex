@@ -94,6 +94,9 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::AGENT_INBOX_KIND;
+use codex_protocol::protocol::AGENT_INBOX_MESSAGE_PREFIX;
+use codex_protocol::protocol::AgentInboxPayload;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
@@ -102,10 +105,7 @@ use codex_protocol::protocol::AgentReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
-use codex_protocol::protocol::COLLAB_INBOX_KIND;
-use codex_protocol::protocol::COLLAB_INBOX_MESSAGE_PREFIX;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::CollabInboxPayload;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::ErrorEvent;
@@ -372,12 +372,12 @@ fn is_unified_exec_source(source: ExecCommandSource) -> bool {
     )
 }
 
-fn collab_inbox_message_from_item(item: &ResponseItem) -> Option<(Option<String>, String)> {
+fn agent_inbox_message_from_item(item: &ResponseItem) -> Option<(Option<String>, String)> {
     match item {
         ResponseItem::FunctionCallOutput { output, .. } => {
             let text = output.body.to_text()?;
-            let payload: CollabInboxPayload = serde_json::from_str(&text).ok()?;
-            if !payload.injected || payload.kind != COLLAB_INBOX_KIND {
+            let payload: AgentInboxPayload = serde_json::from_str(&text).ok()?;
+            if !payload.injected || payload.kind != AGENT_INBOX_KIND {
                 return None;
             }
             Some((Some(payload.sender_thread_id.to_string()), payload.message))
@@ -389,7 +389,7 @@ fn collab_inbox_message_from_item(item: &ResponseItem) -> Option<(Option<String>
                 }
                 _ => None,
             })?;
-            let rest = text.strip_prefix(COLLAB_INBOX_MESSAGE_PREFIX)?;
+            let rest = text.strip_prefix(AGENT_INBOX_MESSAGE_PREFIX)?;
             let (sender, message) = rest.split_once(']')?;
             let message = message.trim_start().to_string();
             let sender = sender.trim().to_string();
@@ -404,30 +404,30 @@ fn collab_inbox_message_from_item(item: &ResponseItem) -> Option<(Option<String>
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplayCollabInboxEncoding {
+enum ReplayAgentInboxEncoding {
     FunctionCallOutput,
     LegacyMessage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ReplayCollabInboxMessage {
+struct ReplayAgentInboxMessage {
     sender: Option<String>,
     message: String,
-    encoding: ReplayCollabInboxEncoding,
+    encoding: ReplayAgentInboxEncoding,
 }
 
-fn replay_collab_inbox_message_from_item(item: &ResponseItem) -> Option<ReplayCollabInboxMessage> {
+fn replay_agent_inbox_message_from_item(item: &ResponseItem) -> Option<ReplayAgentInboxMessage> {
     match item {
         ResponseItem::FunctionCallOutput { output, .. } => {
             let text = output.body.to_text()?;
-            let payload: CollabInboxPayload = serde_json::from_str(&text).ok()?;
-            if !payload.injected || payload.kind != COLLAB_INBOX_KIND {
+            let payload: AgentInboxPayload = serde_json::from_str(&text).ok()?;
+            if !payload.injected || payload.kind != AGENT_INBOX_KIND {
                 return None;
             }
-            Some(ReplayCollabInboxMessage {
+            Some(ReplayAgentInboxMessage {
                 sender: Some(payload.sender_thread_id.to_string()),
                 message: payload.message,
-                encoding: ReplayCollabInboxEncoding::FunctionCallOutput,
+                encoding: ReplayAgentInboxEncoding::FunctionCallOutput,
             })
         }
         ResponseItem::Message { content, .. } => {
@@ -437,18 +437,18 @@ fn replay_collab_inbox_message_from_item(item: &ResponseItem) -> Option<ReplayCo
                 }
                 _ => None,
             })?;
-            let rest = text.strip_prefix(COLLAB_INBOX_MESSAGE_PREFIX)?;
+            let rest = text.strip_prefix(AGENT_INBOX_MESSAGE_PREFIX)?;
             let (sender, message) = rest.split_once(']')?;
             let message = message.trim_start().to_string();
             let sender = sender.trim().to_string();
-            Some(ReplayCollabInboxMessage {
+            Some(ReplayAgentInboxMessage {
                 sender: if sender.is_empty() {
                     None
                 } else {
                     Some(sender)
                 },
                 message,
-                encoding: ReplayCollabInboxEncoding::LegacyMessage,
+                encoding: ReplayAgentInboxEncoding::LegacyMessage,
             })
         }
         _ => None,
@@ -794,7 +794,7 @@ pub(crate) struct ChatWidget {
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
-    last_replayed_collab_inbox_message: Option<ReplayCollabInboxMessage>,
+    last_replayed_agent_inbox_message: Option<ReplayAgentInboxMessage>,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
 }
 
@@ -2643,28 +2643,28 @@ impl ChatWidget {
         event: codex_protocol::protocol::RawResponseItemEvent,
         from_replay: bool,
     ) {
-        let Some(replay_message) = replay_collab_inbox_message_from_item(&event.item) else {
+        let Some(replay_message) = replay_agent_inbox_message_from_item(&event.item) else {
             if from_replay {
-                self.last_replayed_collab_inbox_message = None;
+                self.last_replayed_agent_inbox_message = None;
             }
             return;
         };
 
         if from_replay {
-            if let Some(previous) = &self.last_replayed_collab_inbox_message
+            if let Some(previous) = &self.last_replayed_agent_inbox_message
                 && previous.sender == replay_message.sender
                 && previous.message == replay_message.message
                 && previous.encoding != replay_message.encoding
             {
-                self.last_replayed_collab_inbox_message = None;
+                self.last_replayed_agent_inbox_message = None;
                 return;
             }
-            self.last_replayed_collab_inbox_message = Some(replay_message);
+            self.last_replayed_agent_inbox_message = Some(replay_message);
         } else {
-            self.last_replayed_collab_inbox_message = None;
+            self.last_replayed_agent_inbox_message = None;
         }
 
-        let Some((sender, message)) = collab_inbox_message_from_item(&event.item) else {
+        let Some((sender, message)) = agent_inbox_message_from_item(&event.item) else {
             return;
         };
         let hint = sender.map(|sender| format!("from {sender}"));
@@ -3434,7 +3434,7 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
-            last_replayed_collab_inbox_message: None,
+            last_replayed_agent_inbox_message: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3619,7 +3619,7 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
-            last_replayed_collab_inbox_message: None,
+            last_replayed_agent_inbox_message: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3796,7 +3796,7 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
-            last_replayed_collab_inbox_message: None,
+            last_replayed_agent_inbox_message: None,
             last_rendered_user_message_event: None,
         };
 
@@ -4985,7 +4985,7 @@ impl ChatWidget {
             self.restore_retry_status_header_if_present();
         }
         if !from_replay || !matches!(&msg, EventMsg::RawResponseItem(_)) {
-            self.last_replayed_collab_inbox_message = None;
+            self.last_replayed_agent_inbox_message = None;
         }
 
         match msg {

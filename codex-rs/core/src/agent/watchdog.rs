@@ -251,13 +251,13 @@ impl WatchdogManager {
             let helper_sent_input = manager_state
                 .get_thread(helper_id)
                 .await
-                .map(|thread| thread.last_completed_turn_used_collab_send_input())
+                .map(|thread| thread.last_completed_turn_used_agent_send_input())
                 .unwrap_or(false);
             if let Some(message) =
                 completed_message_for_collab_fallback(&helper_status, helper_sent_input, true)
             {
                 if let Err(err) = control_for_spawn
-                    .send_collab_message(snapshot.owner_thread_id, helper_id, message)
+                    .send_agent_message(snapshot.owner_thread_id, helper_id, message)
                     .await
                 {
                     warn!(

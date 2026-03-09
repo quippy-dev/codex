@@ -617,6 +617,22 @@ impl RolloutRecorder {
         }))
     }
 
+    pub async fn get_fork_history(path: &Path) -> std::io::Result<InitialHistory> {
+        let (items, _thread_id, parse_errors) = Self::load_rollout_items(path).await?;
+        if parse_errors > 0 {
+            return Err(IoError::other(format!(
+                "failed to parse {parse_errors} rollout line(s) from {path:?}; legacy or invalid rollout files are unsupported"
+            )));
+        }
+
+        if items.is_empty() {
+            return Ok(InitialHistory::New);
+        }
+
+        info!("Loaded rollout fork history from {path:?}");
+        Ok(InitialHistory::Forked(items))
+    }
+
     pub async fn shutdown(&self) -> std::io::Result<()> {
         let (tx_done, rx_done) = oneshot::channel();
         match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {

@@ -20,10 +20,10 @@ pub(crate) fn is_final(status: &AgentStatus) -> bool {
 
 pub(crate) fn completed_message_for_collab_fallback(
     status: &AgentStatus,
-    last_completed_turn_used_collab_send_input: bool,
+    last_completed_turn_used_agent_send_input: bool,
     require_message_for_final_status: bool,
 ) -> Option<String> {
-    if last_completed_turn_used_collab_send_input {
+    if last_completed_turn_used_agent_send_input {
         return None;
     }
 
