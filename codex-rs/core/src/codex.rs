@@ -4774,6 +4774,8 @@ mod handlers {
         .await;
         sess.set_previous_turn_settings(reconstructed.previous_turn_settings)
             .await;
+        sess.set_latest_proposed_plan_text(reconstructed.latest_proposed_plan_text)
+            .await;
         sess.recompute_token_usage(turn_context.as_ref()).await;
 
         sess.send_event_raw_flushed(Event {
