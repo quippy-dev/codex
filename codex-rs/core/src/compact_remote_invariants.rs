@@ -5,7 +5,7 @@ use crate::compact::insert_retained_plan_context_message;
 use crate::compact::retained_proposed_plan_for_manual_plan_compaction;
 use crate::encrypted_content_fallback::apply_invalid_encrypted_content_fallback;
 use crate::error::CodexErr;
-use crate::protocol::RetainedProposedPlan;
+use codex_protocol::RetainedProposedPlan;
 use codex_protocol::models::ResponseItem;
 
 pub(crate) fn retry_once_invalid_encrypted_content_with_sanitized_prompt_input(

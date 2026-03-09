@@ -5,8 +5,10 @@ use std::io::ErrorKind;
 use std::io::Result as IoResult;
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_core::auth::resolve_auth_storage_home;
 use codex_core::config::Config;
 use codex_utils_cli::CliConfigOverrides;
+use std::path::PathBuf;
 
 use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
@@ -54,6 +56,7 @@ type IncomingMessage = JsonRpcMessage<ClientRequest, Value, ClientNotification>;
 pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
+    auth_file: Option<PathBuf>,
 ) -> IoResult<()> {
     // Parse CLI overrides once and derive the base Config eagerly so later
     // components do not need to work with raw TOML values.
@@ -68,6 +71,17 @@ pub async fn run_main(
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
         })?;
+    let auth_storage_home = resolve_auth_storage_home(
+        config.codex_home.clone(),
+        auth_file.as_deref(),
+        config.cli_auth_credentials_store_mode,
+    )
+    .map_err(|e| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("error resolving auth storage path: {e}"),
+        )
+    })?;
 
     let otel = codex_core::otel_init::build_provider(
         &config,
@@ -128,6 +142,7 @@ pub async fn run_main(
             outgoing_message_sender,
             arg0_paths,
             std::sync::Arc::new(config),
+            auth_storage_home,
         );
         async move {
             while let Some(msg) = incoming_rx.recv().await {

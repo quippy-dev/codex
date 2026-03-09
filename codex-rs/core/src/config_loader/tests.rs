@@ -288,23 +288,17 @@ async fn returns_empty_when_all_layers_missing() {
     );
 
     let layers_high_to_low = layers.layers_high_to_low();
-    let system_layer = layers_high_to_low
-        .iter()
-        .find(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
-        .expect("system layer should always be present");
     let effective = layers.effective_config();
     assert_eq!(
-        effective, system_layer.config,
-        "expected no non-system config when all local layers are missing"
+        effective,
+        TomlValue::Table(toml::map::Map::new()),
+        "expected empty effective config when all layers are missing"
     );
     let num_system_layers = layers_high_to_low
         .iter()
         .filter(|layer| matches!(layer.name, super::ConfigLayerSource::System { .. }))
         .count();
-    assert_eq!(
-        num_system_layers, 1,
-        "system layer should always be present"
-    );
+    assert_eq!(num_system_layers, 0, "system layer should be absent");
 }
 
 #[cfg(target_os = "macos")]

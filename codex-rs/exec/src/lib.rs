@@ -81,6 +81,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 use supports_color::Stream;
 use tokio::sync::mpsc;
@@ -531,6 +532,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let default_approval_policy = config.permissions.approval_policy.value();
     let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
+    let auth_storage_home = in_process_start_args.auth_storage_home.clone();
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.
@@ -783,6 +785,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     &client,
                     request,
                     &config,
+                    &auth_storage_home,
                     &primary_thread_id_for_requests,
                     &mut error_seen,
                 )
@@ -1180,6 +1183,7 @@ async fn handle_server_request(
     client: &InProcessAppServerClient,
     request: ServerRequest,
     config: &Config,
+    auth_storage_home: &Path,
     _thread_id: &str,
     error_seen: &mut bool,
 ) {
@@ -1205,7 +1209,8 @@ async fn handle_server_request(
         ServerRequest::ChatgptAuthTokensRefresh { request_id, params } => {
             let refresh_result = tokio::task::spawn_blocking({
                 let config = config.clone();
-                move || local_external_chatgpt_tokens(&config)
+                let auth_storage_home = auth_storage_home.to_path_buf();
+                move || local_external_chatgpt_tokens(&config, &auth_storage_home)
             })
             .await;
 
@@ -1340,9 +1345,10 @@ async fn handle_server_request(
 
 fn local_external_chatgpt_tokens(
     config: &Config,
+    auth_storage_home: &Path,
 ) -> Result<ChatgptAuthTokensRefreshResponse, String> {
     let auth_manager = AuthManager::shared(
-        config.codex_home.clone(),
+        auth_storage_home.to_path_buf(),
         false,
         config.cli_auth_credentials_store_mode,
     );

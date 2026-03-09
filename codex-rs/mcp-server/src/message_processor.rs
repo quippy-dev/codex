@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::AuthManager;
@@ -51,10 +52,11 @@ impl MessageProcessor {
         outgoing: OutgoingMessageSender,
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
+        auth_storage_home: PathBuf,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
+            auth_storage_home,
             false,
             config.cli_auth_credentials_store_mode,
         );
