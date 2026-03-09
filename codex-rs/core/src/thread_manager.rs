@@ -714,24 +714,10 @@ impl ThreadManagerState {
         )
         .await;
         if let InitialHistory::Forked(items) = &mut history {
-            let source_session_meta = items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(meta_line.clone()),
-                RolloutItem::ForkReference(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::EventMsg(_) => None,
-            });
-            *items = source_session_meta
-                .into_iter()
-                .map(RolloutItem::SessionMeta)
-                .chain(std::iter::once(RolloutItem::ForkReference(
-                    ForkReferenceItem {
-                        rollout_path: path.clone(),
-                        nth_user_message,
-                    },
-                )))
-                .collect();
+            *items = vec![RolloutItem::ForkReference(ForkReferenceItem {
+                rollout_path: path.clone(),
+                nth_user_message,
+            })];
         }
         self.spawn_thread_with_source(
             config,

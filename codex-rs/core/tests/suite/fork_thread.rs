@@ -228,11 +228,6 @@ async fn fork_thread_twice_drops_to_first_message() {
         matches!(fork1_raw_items.first(), Some(RolloutItem::ForkReference(_))),
         "forked rollout should retain a fork reference marker"
     );
-    pretty_assertions::assert_eq!(
-        serde_json::to_value(&fork1_raw_items[1..1 + expected_after_first.len()]).unwrap(),
-        serde_json::to_value(&expected_after_first).unwrap(),
-        "forked rollout should remain self-contained after the fork reference marker"
-    );
     let fork1_items = read_items_materialized(&fork1_path);
     assert_eq!(
         find_user_input_positions(&fork1_items).len(),
@@ -359,16 +354,17 @@ async fn fork_thread_session_configured_preserves_parent_and_history() {
         .mount(&server)
         .await;
 
-    let test = test_codex()
-        .build(&server)
-        .await
-        .expect("create conversation");
+    let mut builder = test_codex();
+    let test = builder.build(&server).await.expect("create conversation");
     let codex = test.codex.clone();
+    let thread_manager = test.thread_manager.clone();
+    let config_for_fork = test.config.clone();
+    let parent_thread_id = test.session_configured.session_id;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "first".to_string(),
+                text: "seed".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -378,19 +374,20 @@ async fn fork_thread_session_configured_preserves_parent_and_history() {
     let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let base_path = codex.rollout_path().expect("rollout path");
-    let forked = test
-        .thread_manager
-        .fork_thread(usize::MAX, test.config.clone(), base_path, false)
+
+    let NewThread {
+        thread_id: child_thread_id,
+        session_configured,
+        ..
+    } = thread_manager
+        .fork_thread(usize::MAX, config_for_fork, base_path, false)
         .await
         .expect("fork thread");
 
-    assert_eq!(
-        forked.session_configured.forked_from_id,
-        Some(test.session_configured.session_id)
-    );
+    pretty_assertions::assert_eq!(session_configured.forked_from_id, Some(parent_thread_id));
+    assert_ne!(child_thread_id, parent_thread_id);
     assert!(
-        forked
-            .session_configured
+        session_configured
             .initial_messages
             .as_ref()
             .is_some_and(|messages| {
