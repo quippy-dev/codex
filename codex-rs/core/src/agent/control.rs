@@ -593,7 +593,7 @@ impl AgentControl {
             snapshot.collab_inbox_delivery_role,
             sender_thread_id,
             message,
-            !receiver_has_active_turn,
+            false,
         )?;
         state
             .send_op(agent_id, Op::InjectResponseItems { items })
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_agent_message_to_idle_thread_prepends_empty_user_message() {
+    async fn send_agent_message_to_idle_thread_avoids_empty_user_bootstrap() {
         let harness = AgentControlHarness::new().await;
         let (receiver_thread_id, _thread) = harness.start_thread().await;
         let sender_thread_id = ThreadId::new();
@@ -1764,20 +1764,8 @@ mod tests {
         let Op::InjectResponseItems { items } = captured.1 else {
             unreachable!("matched above");
         };
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 2);
         match &items[0] {
-            ResponseInputItem::Message { role, content } => {
-                assert_eq!(role, "user");
-                assert_eq!(
-                    content,
-                    &vec![ContentItem::InputText {
-                        text: String::new()
-                    }]
-                );
-            }
-            other => panic!("expected prepended user message, got {other:?}"),
-        }
-        match &items[1] {
             ResponseInputItem::FunctionCall {
                 name, arguments, ..
             } => {
@@ -1786,7 +1774,7 @@ mod tests {
             }
             other => panic!("expected collab function call, got {other:?}"),
         }
-        match &items[2] {
+        match &items[1] {
             ResponseInputItem::FunctionCallOutput { output, .. } => {
                 let output_text = output
                     .body
