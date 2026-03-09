@@ -149,7 +149,7 @@ impl Session {
                         rollout_suffix = &rollout_items[index + 1..];
                     }
                     if active_segment.latest_proposed_plan_text.is_none()
-                        && let crate::protocol::RetainedProposedPlan::ProposedPlan { text } =
+                        && let codex_protocol::RetainedProposedPlan::ProposedPlan { text } =
                             &compacted.retained_proposed_plan
                     {
                         active_segment.latest_proposed_plan_text = Some(text.clone());
@@ -320,7 +320,7 @@ impl Session {
                         history.replace(rebuilt);
                     }
                     if latest_proposed_plan_text.is_none()
-                        && let crate::protocol::RetainedProposedPlan::ProposedPlan { text } =
+                        && let codex_protocol::RetainedProposedPlan::ProposedPlan { text } =
                             &compacted.retained_proposed_plan
                     {
                         latest_proposed_plan_text = Some(text.clone());

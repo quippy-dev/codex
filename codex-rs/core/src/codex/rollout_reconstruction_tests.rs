@@ -4,7 +4,7 @@ use crate::protocol::CompactedItem;
 use crate::protocol::InitialHistory;
 use crate::protocol::ItemCompletedEvent;
 use crate::protocol::ResumedHistory;
-use crate::protocol::RetainedProposedPlan;
+use codex_protocol::RetainedProposedPlan;
 use codex_protocol::ThreadId;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;

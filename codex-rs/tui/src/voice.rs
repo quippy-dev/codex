@@ -3,7 +3,6 @@ use crate::app_event_sender::AppEventSender;
 use base64::Engine;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
-use codex_core::config::find_codex_home;
 use codex_core::default_client::get_codex_user_agent;
 use codex_login::AuthMode;
 use codex_login::CodexAuth;
@@ -18,7 +17,9 @@ use hound::WavSpec;
 use hound::WavWriter;
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
@@ -30,6 +31,7 @@ use tracing::trace;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
+static AUTH_STORAGE_HOME: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 
 struct TranscriptionAuthContext {
     mode: AuthMode,
@@ -51,6 +53,12 @@ pub struct VoiceCapture {
     data: Arc<Mutex<Vec<i16>>>,
     stopped: Arc<AtomicBool>,
     last_peak: Arc<AtomicU16>,
+}
+
+pub(crate) fn set_auth_storage_home(auth_storage_home: PathBuf) {
+    if let Ok(mut stored) = AUTH_STORAGE_HOME.lock() {
+        *stored = Some(auth_storage_home);
+    }
 }
 
 impl VoiceCapture {
@@ -764,8 +772,12 @@ fn normalize_chatgpt_base_url(input: &str) -> String {
 }
 
 async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
-    let codex_home = find_codex_home().map_err(|e| format!("failed to find codex home: {e}"))?;
-    let auth = CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Auto)
+    let auth_storage_home = AUTH_STORAGE_HOME
+        .lock()
+        .map_err(|_| "failed to access transcription auth storage path".to_string())?
+        .clone()
+        .ok_or_else(|| "transcription auth storage path was not initialized".to_string())?;
+    let auth = CodexAuth::from_auth_storage(&auth_storage_home, AuthCredentialsStoreMode::Auto)
         .map_err(|e| format!("failed to read auth.json: {e}"))?
         .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
 
@@ -872,11 +884,14 @@ async fn transcribe_bytes(
 
 #[cfg(test)]
 mod tests {
+    use super::AUTH_STORAGE_HOME;
     use super::RecordedAudio;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
+    use super::set_auth_storage_home;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     #[test]
     fn convert_pcm16_downmixes_and_resamples_for_model_input() {
@@ -904,5 +919,17 @@ mod tests {
         assert_eq!(spec.channels, 1);
         assert_eq!(spec.sample_rate, 24_000);
         assert_eq!(samples, vec![8_426, 29_490]);
+    }
+
+    #[test]
+    fn set_auth_storage_home_updates_transcription_auth_storage_path() {
+        let expected = PathBuf::from("/tmp/auth-home");
+        set_auth_storage_home(expected.clone());
+
+        let stored = AUTH_STORAGE_HOME
+            .lock()
+            .expect("lock auth storage path")
+            .clone();
+        assert_eq!(stored, Some(expected));
     }
 }

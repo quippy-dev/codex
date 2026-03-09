@@ -2332,6 +2332,10 @@ impl App {
                     .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
             },
         ));
+        // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
+        thread_manager
+            .plugins_manager()
+            .maybe_start_curated_repo_sync_for_config(&config);
         let mut model = thread_manager
             .get_models_manager()
             .get_default_model(&config.model, RefreshStrategy::Offline)
@@ -5700,10 +5704,7 @@ mod tests {
     #[tokio::test]
     async fn open_agent_picker_prompts_to_enable_multi_agent_when_disabled() -> Result<()> {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        app.config
-            .features
-            .disable(Feature::Collab)
-            .expect("collab feature disable");
+        app.config.features.disable(Feature::Collab)?;
 
         app.open_agent_picker().await;
         app.chat_widget
@@ -5819,10 +5820,7 @@ mod tests {
     async fn open_agent_picker_allows_existing_agent_threads_when_feature_is_disabled() -> Result<()>
     {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        app.config
-            .features
-            .disable(Feature::Collab)
-            .expect("collab feature disable");
+        app.config.features.disable(Feature::Collab)?;
         let thread_id = ThreadId::new();
         app.thread_event_channels
             .insert(thread_id, ThreadEventChannel::new(1));

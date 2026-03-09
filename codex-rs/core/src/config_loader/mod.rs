@@ -141,6 +141,7 @@ async fn load_config_layers_state_with_system_requirements_toml_file(
             cloud_requirements,
         )
         .await?;
+    let ignore_system_config = overrides.ignore_system_config;
     let ignore_system_requirements = overrides.ignore_system_requirements;
     let loaded_config_layers = layer_io::load_config_layers_internal(codex_home, overrides).await?;
     if !ignore_system_requirements {
@@ -170,18 +171,20 @@ async fn load_config_layers_state_with_system_requirements_toml_file(
 
     // Include an entry for the "system" config folder, loading its config.toml,
     // if it exists.
-    let system_config_toml_file = system_config_toml_file()?;
-    let system_layer =
-        load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
-            ConfigLayerEntry::new(
-                ConfigLayerSource::System {
-                    file: system_config_toml_file.clone(),
-                },
-                config_toml,
-            )
-        })
-        .await?;
-    layers.push(system_layer);
+    if !ignore_system_config {
+        let system_config_toml_file = system_config_toml_file()?;
+        let system_layer =
+            load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
+                ConfigLayerEntry::new(
+                    ConfigLayerSource::System {
+                        file: system_config_toml_file.clone(),
+                    },
+                    config_toml,
+                )
+            })
+            .await?;
+        layers.push(system_layer);
+    }
 
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file
     // exists, but is malformed, then this error should be propagated to the

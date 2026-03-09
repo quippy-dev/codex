@@ -603,7 +603,12 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::McpServer) => {
-            codex_mcp_server::run_main(arg0_paths.clone(), root_config_overrides).await?;
+            codex_mcp_server::run_main(
+                arg0_paths.clone(),
+                root_config_overrides,
+                auth_file.clone(),
+            )
+            .await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             // Propagate any root-level config overrides (e.g. `-c key=value`).
@@ -1547,6 +1552,20 @@ mod tests {
                 .expect("parse");
         let Some(Subcommand::AppServer(_)) = cli.subcommand else {
             panic!("expected app-server subcommand");
+        };
+        assert_eq!(
+            cli.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+    }
+
+    #[test]
+    fn mcp_server_auth_file_parses() {
+        let cli =
+            MultitoolCli::try_parse_from(["codex", "mcp-server", "--auth-file", "/tmp/auth.json"])
+                .expect("parse");
+        let Some(Subcommand::McpServer) = cli.subcommand else {
+            panic!("expected mcp-server subcommand");
         };
         assert_eq!(
             cli.auth_file,
