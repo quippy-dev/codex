@@ -106,6 +106,10 @@ impl Session {
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
     ) -> RolloutReconstruction {
+        let rollout_items = self
+            .materialize_rollout_items_for_replay(rollout_items)
+            .await;
+        let rollout_items = rollout_items.as_slice();
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -246,6 +250,7 @@ impl Session {
                 RolloutItem::ResponseItem(_)
                 | RolloutItem::ForkReference(_)
                 | RolloutItem::EventMsg(_)
+                | RolloutItem::ForkReference(_)
                 | RolloutItem::SessionMeta(_) => {}
             }
 

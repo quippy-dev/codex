@@ -7722,47 +7722,13 @@ fn materialize_rollout_items_for_replay_at_depth<'a>(
                     }
 
                     let resolved_rollout_path = if let Some(codex_home) = codex_home {
-                        match tokio::fs::try_exists(&reference.rollout_path).await {
-                            Ok(true) => reference.rollout_path.clone(),
-                            Ok(false) => {
-                                if let Some(thread_id) = reference
-                                    .rollout_path
-                                    .file_name()
-                                    .and_then(OsStr::to_str)
-                                    .and_then(|file_name| {
-                                        file_name
-                                            .strip_prefix("rollout-")
-                                            .and_then(|name| name.strip_suffix(".jsonl"))
-                                            .and_then(|core| {
-                                                core.match_indices('-').rev().find_map(|(i, _)| {
-                                                    Uuid::parse_str(&core[i + 1..])
-                                                        .ok()
-                                                        .map(|uuid| uuid.to_string())
-                                                })
-                                            })
-                                    })
-                                {
-                                    if let Some(active_path) =
-                                        find_thread_path_by_id_str(codex_home, &thread_id)
-                                            .await
-                                            .ok()
-                                            .flatten()
-                                    {
-                                        active_path
-                                    } else if let Some(archived_path) =
-                                        find_archived_thread_path_by_id_str(codex_home, &thread_id)
-                                            .await
-                                            .ok()
-                                            .flatten()
-                                    {
-                                        archived_path
-                                    } else {
-                                        reference.rollout_path.clone()
-                                    }
-                                } else {
-                                    reference.rollout_path.clone()
-                                }
-                            }
+                        match resolve_fork_reference_rollout_path(
+                            codex_home,
+                            &reference.rollout_path,
+                        )
+                        .await
+                        {
+                            Ok(path) => path,
                             Err(err) => {
                                 warn!(
                                     "failed to resolve fork reference rollout {:?}: {err}",

@@ -1365,6 +1365,40 @@ pub async fn find_archived_thread_path_by_id_str(
     find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str).await
 }
 
+/// Resolve a stored fork-reference rollout path to the current on-disk location.
+///
+/// Fork references persist a parent rollout filename. Archive and unarchive move that file
+/// between `sessions/` and `archived_sessions/`, so stale stored paths must be repaired by
+/// locating the rollout with the stable thread id embedded in the filename.
+pub async fn resolve_fork_reference_rollout_path(
+    codex_home: &Path,
+    rollout_path: &Path,
+) -> io::Result<PathBuf> {
+    match tokio::fs::try_exists(rollout_path).await {
+        Ok(true) => return Ok(rollout_path.to_path_buf()),
+        Ok(false) => {}
+        Err(err) => return Err(err),
+    }
+
+    let Some(file_name) = rollout_path.file_name().and_then(OsStr::to_str) else {
+        return Ok(rollout_path.to_path_buf());
+    };
+    let Some((_, thread_uuid)) = parse_timestamp_uuid_from_filename(file_name) else {
+        return Ok(rollout_path.to_path_buf());
+    };
+    let thread_id = thread_uuid.to_string();
+
+    if let Some(active_path) = find_thread_path_by_id_str(codex_home, &thread_id).await? {
+        return Ok(active_path);
+    }
+    if let Some(archived_path) = find_archived_thread_path_by_id_str(codex_home, &thread_id).await?
+    {
+        return Ok(archived_path);
+    }
+
+    Ok(rollout_path.to_path_buf())
+}
+
 /// Extract the `YYYY/MM/DD` directory components from a rollout filename.
 pub fn rollout_date_parts(file_name: &OsStr) -> Option<(String, String, String)> {
     let name = file_name.to_string_lossy();
