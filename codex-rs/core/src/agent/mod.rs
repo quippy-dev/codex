@@ -1,4 +1,4 @@
-mod collab_delivery;
+mod agent_delivery;
 pub(crate) mod control;
 mod guards;
 pub(crate) mod role;

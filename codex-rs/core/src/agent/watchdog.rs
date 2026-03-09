@@ -1,4 +1,4 @@
-use super::collab_delivery::completed_message_for_collab_fallback;
+use super::agent_delivery::completed_message_for_agent_fallback;
 use super::control::AgentControl;
 use super::guards::Guards;
 use super::guards::exceeds_thread_spawn_depth_limit;
@@ -254,7 +254,7 @@ impl WatchdogManager {
                 .map(|thread| thread.last_completed_turn_used_agent_send_input())
                 .unwrap_or(false);
             if let Some(message) =
-                completed_message_for_collab_fallback(&helper_status, helper_sent_input, true)
+                completed_message_for_agent_fallback(&helper_status, helper_sent_input, true)
             {
                 if let Err(err) = control_for_spawn
                     .send_agent_message(snapshot.owner_thread_id, helper_id, message)

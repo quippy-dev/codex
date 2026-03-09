@@ -1,6 +1,6 @@
-use super::collab_delivery::completed_message_for_collab_fallback;
-use super::collab_delivery::log_deferred_collab_enqueue_error;
-use super::collab_delivery::should_defer_collab_delivery;
+use super::agent_delivery::completed_message_for_agent_fallback;
+use super::agent_delivery::log_deferred_agent_enqueue_error;
+use super::agent_delivery::should_defer_agent_delivery;
 use super::watchdog::RemovedWatchdog;
 use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
@@ -549,7 +549,7 @@ impl AgentControl {
             .watchdog_owner_for_active_helper(sender_thread_id)
             .await
             == Some(agent_id);
-        if should_defer_collab_delivery(
+        if should_defer_agent_delivery(
             receiver_has_active_turn,
             post_interrupt_collab_hold_armed,
             sender_is_watchdog_helper_for_receiver,
@@ -569,7 +569,7 @@ impl AgentControl {
                 Ok(()) => {
                     return Ok(Uuid::now_v7().to_string());
                 }
-                Err(err) => log_deferred_collab_enqueue_error(agent_id, sender_thread_id, err),
+                Err(err) => log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err),
             }
         }
 
@@ -784,7 +784,7 @@ impl AgentControl {
                     .await
                     .map(|thread| thread.last_completed_turn_used_agent_send_input())
                     .unwrap_or(false);
-                if let Some(message) = completed_message_for_collab_fallback(
+                if let Some(message) = completed_message_for_agent_fallback(
                     &status,
                     child_used_agent_send_input,
                     child_is_watchdog_helper_for_parent,

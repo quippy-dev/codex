@@ -2632,7 +2632,7 @@ impl ChatWidget {
         self.had_work_activity = true;
     }
 
-    fn on_collab_event(&mut self, cell: PlainHistoryCell) {
+    fn on_agent_event(&mut self, cell: PlainHistoryCell) {
         self.flush_answer_stream_with_separator();
         self.add_to_history(cell);
         self.request_redraw();
@@ -5147,19 +5147,19 @@ impl ChatWidget {
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
             EventMsg::CollabAgentSpawnBegin(_) => {}
-            EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
+            EventMsg::CollabAgentSpawnEnd(ev) => self.on_agent_event(multi_agents::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
-                self.on_collab_event(multi_agents::interaction_end(ev))
+                self.on_agent_event(multi_agents::interaction_end(ev))
             }
             EventMsg::CollabWaitingBegin(ev) => {
-                self.on_collab_event(multi_agents::waiting_begin(ev))
+                self.on_agent_event(multi_agents::waiting_begin(ev))
             }
-            EventMsg::CollabWaitingEnd(ev) => self.on_collab_event(multi_agents::waiting_end(ev)),
+            EventMsg::CollabWaitingEnd(ev) => self.on_agent_event(multi_agents::waiting_end(ev)),
             EventMsg::CollabCloseBegin(_) => {}
-            EventMsg::CollabCloseEnd(ev) => self.on_collab_event(multi_agents::close_end(ev)),
-            EventMsg::CollabResumeBegin(ev) => self.on_collab_event(multi_agents::resume_begin(ev)),
-            EventMsg::CollabResumeEnd(ev) => self.on_collab_event(multi_agents::resume_end(ev)),
+            EventMsg::CollabCloseEnd(ev) => self.on_agent_event(multi_agents::close_end(ev)),
+            EventMsg::CollabResumeBegin(ev) => self.on_agent_event(multi_agents::resume_begin(ev)),
+            EventMsg::CollabResumeEnd(ev) => self.on_agent_event(multi_agents::resume_end(ev)),
             EventMsg::ThreadRolledBack(rollback) => {
                 // Conservatively clear `/copy` state on rollback. The app layer trims visible
                 // transcript cells, but we do not maintain rollback-aware raw-markdown history yet,

@@ -102,7 +102,7 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
     if let Some(line) = prompt_line(&prompt) {
         details.push(line);
     }
-    collab_event(title, details)
+    agent_event(title, details)
 }
 
 pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistoryCell {
@@ -129,7 +129,7 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
     if let Some(line) = prompt_line(&prompt) {
         details.push(line);
     }
-    collab_event(title, details)
+    agent_event(title, details)
 }
 
 pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
@@ -156,7 +156,7 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
         Vec::new()
     };
 
-    collab_event(title, details)
+    agent_event(title, details)
 }
 
 pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
@@ -167,7 +167,7 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         statuses,
     } = ev;
     let details = wait_complete_lines(&statuses, &agent_statuses);
-    collab_event(title_text("Finished waiting"), details)
+    agent_event(title_text("Finished waiting"), details)
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -180,7 +180,7 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
         status: _,
     } = ev;
 
-    collab_event(
+    agent_event(
         title_with_agent(
             "Closed",
             AgentLabel {
@@ -202,7 +202,7 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
         receiver_agent_role,
     } = ev;
 
-    collab_event(
+    agent_event(
         title_with_agent(
             "Resuming",
             AgentLabel {
@@ -225,7 +225,7 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
         status,
     } = ev;
 
-    collab_event(
+    agent_event(
         title_with_agent(
             "Resumed",
             AgentLabel {
@@ -238,7 +238,7 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
     )
 }
 
-fn collab_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell {
+fn agent_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell {
     let mut lines: Vec<Line<'static>> = vec![title];
     if !details.is_empty() {
         lines.extend(prefix_lines(details, "  └ ".dim(), "    ".into()));
@@ -453,7 +453,7 @@ mod tests {
     use ratatui::style::Modifier;
 
     #[test]
-    fn collab_events_snapshot() {
+    fn agent_events_snapshot() {
         let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
             .expect("valid sender thread id");
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
@@ -533,7 +533,7 @@ mod tests {
             .map(cell_to_text)
             .collect::<Vec<_>>()
             .join("\n\n");
-        assert_snapshot!("collab_agent_transcript", snapshot);
+        assert_snapshot!("agent_transcript", snapshot);
     }
 
     #[test]

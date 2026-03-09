@@ -8029,7 +8029,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_event_store_keeps_non_collab_events() {
+    fn thread_event_store_keeps_non_agent_events() {
         let mut store = ThreadEventStore::new(8);
         store.push_event(Event {
             id: "keep-me".to_string(),
