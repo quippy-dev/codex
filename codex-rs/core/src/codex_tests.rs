@@ -27,6 +27,7 @@ use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
 use crate::protocol::ResumedHistory;
 use crate::protocol::RetainedProposedPlan;
+use crate::protocol::RolloutLine;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
@@ -1349,6 +1350,66 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))))
         .count();
     assert_eq!(rollback_markers, 2);
+}
+
+#[tokio::test]
+async fn get_rollout_history_accepts_compacted_lines_without_retained_plan() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let rollout_path = attach_rollout_recorder(&session).await;
+
+    session
+        .record_into_history(
+            &session.build_initial_context(&turn_context).await,
+            &turn_context,
+        )
+        .await;
+    session.flush_rollout().await;
+
+    let legacy_compacted = RolloutLine {
+        timestamp: "2026-03-09T00:00:00Z".to_string(),
+        item: RolloutItem::Compacted(CompactedItem {
+            message: "legacy compacted message".to_string(),
+            retained_proposed_plan: RetainedProposedPlan::None,
+            replacement_history: None,
+        }),
+    };
+    let mut legacy_value =
+        serde_json::to_value(legacy_compacted).expect("serialize legacy compacted rollout line");
+    let serde_json::Value::Object(map) = &mut legacy_value else {
+        panic!("expected object rollout line");
+    };
+    map.remove("retained_proposed_plan");
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout path");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&legacy_value).expect("serialize rollout json")
+    )
+    .expect("append legacy compacted line");
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+
+    assert!(resumed.history.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(CompactedItem {
+                message,
+                retained_proposed_plan: RetainedProposedPlan::None,
+                replacement_history: None,
+            }) if message == "legacy compacted message"
+        )
+    }));
 }
 
 #[tokio::test]
