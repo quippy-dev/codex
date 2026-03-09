@@ -1,3 +1,6 @@
+use super::collab_delivery::completed_message_for_collab_fallback;
+use super::collab_delivery::log_deferred_collab_enqueue_error;
+use super::collab_delivery::should_defer_collab_delivery;
 use super::watchdog::RemovedWatchdog;
 use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
@@ -7,9 +10,7 @@ use crate::agent::guards::Guards;
 use crate::agent::guards::SpawnReservation;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
-use crate::agent::status::completed_message_for_collab_fallback;
 use crate::agent::status::is_final;
-use crate::codex::DeferredCollabEnqueueError;
 use crate::config::Config;
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::CodexErr;
@@ -539,70 +540,36 @@ impl AgentControl {
         }
 
         let receiver_has_active_turn = thread.has_active_turn().await;
-        if !receiver_has_active_turn
-            && thread
+        let post_interrupt_collab_hold_armed = thread
+            .codex
+            .session
+            .post_interrupt_collab_hold_armed()
+            .await;
+        let sender_is_watchdog_helper_for_receiver = self
+            .watchdog_owner_for_active_helper(sender_thread_id)
+            .await
+            == Some(agent_id);
+        if should_defer_collab_delivery(
+            receiver_has_active_turn,
+            post_interrupt_collab_hold_armed,
+            sender_is_watchdog_helper_for_receiver,
+        ) {
+            let deferred_items = build_agent_inbox_items(
+                snapshot.collab_inbox_delivery_role,
+                sender_thread_id,
+                message.clone(),
+                false,
+            )?;
+            match thread
                 .codex
                 .session
-                .post_interrupt_collab_hold_armed()
+                .enqueue_deferred_collab_items(deferred_items)
                 .await
-        {
-            let sender_is_watchdog_helper_for_receiver = self
-                .watchdog_owner_for_active_helper(sender_thread_id)
-                .await
-                == Some(agent_id);
-            if !sender_is_watchdog_helper_for_receiver {
-                let deferred_items = build_agent_inbox_items(
-                    snapshot.collab_inbox_delivery_role,
-                    sender_thread_id,
-                    message.clone(),
-                    false,
-                )?;
-                match thread
-                    .codex
-                    .session
-                    .enqueue_deferred_collab_items(deferred_items)
-                    .await
-                {
-                    Ok(()) => {
-                        return Ok(Uuid::now_v7().to_string());
-                    }
-                    Err(DeferredCollabEnqueueError::TooManyItems {
-                        existing_items,
-                        incoming_items,
-                        max_items,
-                    }) => {
-                        warn!(
-                            receiver_thread_id = %agent_id,
-                            sender_thread_id = %sender_thread_id,
-                            existing_items,
-                            incoming_items,
-                            max_items,
-                            "deferred collab queue item limit exceeded; injecting immediately and relaxing ordering guarantee"
-                        );
-                    }
-                    Err(DeferredCollabEnqueueError::TooManyBytes {
-                        existing_bytes,
-                        incoming_bytes,
-                        max_bytes,
-                    }) => {
-                        warn!(
-                            receiver_thread_id = %agent_id,
-                            sender_thread_id = %sender_thread_id,
-                            existing_bytes,
-                            incoming_bytes,
-                            max_bytes,
-                            "deferred collab queue byte limit exceeded; injecting immediately and relaxing ordering guarantee"
-                        );
-                    }
-                    Err(DeferredCollabEnqueueError::Serialization { message }) => {
-                        warn!(
-                            receiver_thread_id = %agent_id,
-                            sender_thread_id = %sender_thread_id,
-                            error = message,
-                            "failed to serialize deferred collab payload; injecting immediately and relaxing ordering guarantee"
-                        );
-                    }
+            {
+                Ok(()) => {
+                    return Ok(Uuid::now_v7().to_string());
                 }
+                Err(err) => log_deferred_collab_enqueue_error(agent_id, sender_thread_id, err),
             }
         }
 

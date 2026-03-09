@@ -1,7 +1,7 @@
+use super::collab_delivery::completed_message_for_collab_fallback;
 use super::control::AgentControl;
 use super::guards::Guards;
 use super::guards::exceeds_thread_spawn_depth_limit;
-use super::status::completed_message_for_collab_fallback;
 use super::status::is_final;
 use crate::codex::load_watchdog_prompt;
 use crate::config::Config;

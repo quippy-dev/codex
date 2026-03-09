@@ -29,6 +29,9 @@ use crate::shimmer::shimmer_spans;
 use crate::status_indicator_widget::fmt_elapsed_compact;
 use crate::style::proposed_plan_style;
 use crate::style::user_message_style;
+use crate::subagent_transcript::SubagentUpdateLevel;
+use crate::subagent_transcript::subagent_spawned_lines;
+use crate::subagent_transcript::subagent_update_lines;
 use crate::text_formatting::format_and_truncate_tool_result;
 use crate::text_formatting::truncate_text;
 use crate::tooltips;
@@ -602,28 +605,7 @@ impl HistoryCell for SubagentStatusCell {
 }
 
 pub(crate) fn new_subagent_spawned_cell(name: &str, prompt_preview: &str) -> PlainHistoryCell {
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        "• ".dim(),
-        "Spawned subagent ".into(),
-        Span::from(name.to_string()).bold(),
-    ]));
-
-    let preview = truncate_text(prompt_preview.trim(), 240);
-    if !preview.is_empty() {
-        lines.push(Line::from(vec![
-            "  └ ".dim(),
-            Span::from(format!("\"{preview}\"")).dim(),
-        ]));
-    }
-
-    PlainHistoryCell::new(lines)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubagentUpdateLevel {
-    Root,
-    Nested,
+    PlainHistoryCell::new(subagent_spawned_lines(name, prompt_preview))
 }
 
 pub(crate) fn new_subagent_update_cell(
@@ -632,27 +614,7 @@ pub(crate) fn new_subagent_update_cell(
     summary: &str,
     update_level: SubagentUpdateLevel,
 ) -> PlainHistoryCell {
-    let mut lines = vec![Line::from(vec![
-        "• ".dim(),
-        "Subagent update: ".into(),
-        Span::from(name.to_string()).bold(),
-        " ".into(),
-        status_label_span(status),
-    ])];
-
-    let summary = truncate_text(
-        &summary.split_whitespace().collect::<Vec<_>>().join(" "),
-        240,
-    );
-    let should_suppress_summary = matches!(
-        (status, update_level),
-        (AgentStatus::Completed(_), SubagentUpdateLevel::Root)
-    );
-    if !summary.is_empty() && !should_suppress_summary {
-        lines.push(Line::from(vec!["  └ ".dim(), summary.into()]));
-    }
-
-    PlainHistoryCell::new(lines)
+    PlainHistoryCell::new(subagent_update_lines(name, status, summary, update_level))
 }
 
 fn running_preview_budget(width: u16) -> usize {
@@ -683,16 +645,6 @@ fn should_shimmer(agent: &SubagentPanelAgent, now: Instant) -> bool {
     }
     is_running_status(&agent.status)
         && now.saturating_duration_since(agent.latest_update_at) <= SUBAGENT_SHIMMER_WINDOW
-}
-
-fn status_label_span(status: &AgentStatus) -> Span<'static> {
-    match status {
-        AgentStatus::PendingInit | AgentStatus::Running => "running".cyan().bold(),
-        AgentStatus::Completed(_) => "completed".green(),
-        AgentStatus::Errored(_) => "errored".red(),
-        AgentStatus::Shutdown => "shutdown".dim(),
-        AgentStatus::NotFound => "not found".red(),
-    }
 }
 
 fn subagent_count_label(total: i32, running: i32) -> String {

@@ -24,7 +24,6 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::SubagentPanelAgent;
 use crate::history_cell::SubagentPanelState;
 use crate::history_cell::SubagentStatusCell;
-use crate::history_cell::SubagentUpdateLevel;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::history_cell::new_subagent_spawned_cell;
@@ -40,6 +39,14 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
+use crate::subagent_identity::format_subagent_label;
+use crate::subagent_identity::merge_subagent_identity;
+use crate::subagent_transcript::SUBAGENT_UPDATE_PREVIEW_BUDGET;
+use crate::subagent_transcript::SubagentUpdateLevel;
+use crate::subagent_transcript::prompt_first_line;
+use crate::subagent_transcript::prompt_preview;
+use crate::subagent_transcript::running_preview;
+use crate::subagent_transcript::terminal_summary;
 use crate::text_formatting::extract_first_bold;
 use crate::text_formatting::truncate_text;
 use crate::tui;
@@ -421,8 +428,6 @@ impl ThreadEventChannel {
     }
 }
 
-const SUBAGENT_PROMPT_PREVIEW_BUDGET: usize = 120;
-const SUBAGENT_UPDATE_PREVIEW_BUDGET: usize = 160;
 const SUBAGENT_PENDING_EVENT_CAPACITY: usize = 12;
 const SUBAGENT_ANIMATION_TICK: Duration = Duration::from_millis(100);
 const SUBAGENT_SHIMMER_WINDOW: Duration = Duration::from_secs(1);
@@ -476,18 +481,12 @@ impl SubagentInfo {
     }
 
     fn merge_identity(&mut self, nickname: Option<&str>, agent_role: Option<&str>) {
-        if let Some(nickname) = nickname
-            .map(str::trim)
-            .filter(|nickname| !nickname.is_empty())
-        {
-            self.nickname = Some(nickname.to_string());
-        }
-        if let Some(agent_role) = agent_role
-            .map(str::trim)
-            .filter(|agent_role| !agent_role.is_empty())
-        {
-            self.agent_role = Some(agent_role.to_string());
-        }
+        merge_subagent_identity(
+            &mut self.nickname,
+            &mut self.agent_role,
+            nickname,
+            agent_role,
+        );
     }
 
     fn label(&self) -> String {
@@ -884,7 +883,12 @@ impl SubagentRegistry {
                 name: info.label(),
                 status: info.status.clone(),
                 is_watchdog: info.is_watchdog(),
-                preview: running_preview(info),
+                preview: running_preview(
+                    info.latest_summary.as_str(),
+                    info.inflight_message.as_str(),
+                    info.latest_preview.as_str(),
+                    info.prompt_preview.as_str(),
+                ),
                 latest_update_at: info.latest_update_at,
             })
             .collect();
@@ -929,82 +933,6 @@ fn is_terminal_status(status: &AgentStatus) -> bool {
             | AgentStatus::Shutdown
             | AgentStatus::NotFound
     )
-}
-
-fn terminal_summary(status: &AgentStatus) -> String {
-    match status {
-        AgentStatus::Completed(Some(message)) => {
-            let message = message.trim();
-            if message.is_empty() {
-                "completed".to_string()
-            } else {
-                message.to_string()
-            }
-        }
-        AgentStatus::Completed(None) => "completed".to_string(),
-        AgentStatus::Errored(message) => {
-            let message = message.trim();
-            if message.is_empty() {
-                "errored".to_string()
-            } else {
-                message.to_string()
-            }
-        }
-        AgentStatus::Shutdown => "shutdown".to_string(),
-        AgentStatus::NotFound => "not found".to_string(),
-        AgentStatus::PendingInit | AgentStatus::Running => "running".to_string(),
-    }
-}
-
-fn prompt_first_line(prompt: &str) -> String {
-    prompt
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn prompt_preview(prompt: &str) -> String {
-    let first_line = prompt_first_line(prompt);
-    truncate_text(first_line.trim(), SUBAGENT_PROMPT_PREVIEW_BUDGET)
-}
-
-fn running_preview(info: &SubagentInfo) -> String {
-    if !info.latest_summary.trim().is_empty() {
-        return truncate_text(info.latest_summary.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
-    }
-    if !info.inflight_message.trim().is_empty() {
-        return truncate_text(info.inflight_message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
-    }
-    if !info.latest_preview.trim().is_empty() {
-        return truncate_text(info.latest_preview.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
-    }
-    truncate_text(info.prompt_preview.trim(), SUBAGENT_PROMPT_PREVIEW_BUDGET)
-}
-
-fn format_subagent_label(
-    ordinal: i32,
-    agent_nickname: Option<&str>,
-    agent_role: Option<&str>,
-    spawn_mode: AgentSpawnMode,
-) -> String {
-    let base = agent_nickname
-        .map(str::trim)
-        .filter(|nickname| !nickname.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("Agent #{ordinal}"));
-    if spawn_mode == AgentSpawnMode::Watchdog {
-        return format!("{base} [watchdog]");
-    }
-
-    let agent_role = agent_role
-        .map(str::trim)
-        .filter(|agent_role| !agent_role.is_empty());
-    match agent_role {
-        Some(agent_role) => format!("{base} [{agent_role}]"),
-        None => base,
-    }
 }
 
 fn should_show_model_migration_prompt(

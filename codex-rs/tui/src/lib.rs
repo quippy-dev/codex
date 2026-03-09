@@ -109,6 +109,8 @@ mod status;
 mod status_indicator_widget;
 mod streaming;
 mod style;
+mod subagent_identity;
+mod subagent_transcript;
 mod terminal_palette;
 mod text_formatting;
 mod theme_picker;

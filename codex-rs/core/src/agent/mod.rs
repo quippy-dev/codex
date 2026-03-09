@@ -1,3 +1,4 @@
+mod collab_delivery;
 pub(crate) mod control;
 mod guards;
 pub(crate) mod role;
