@@ -1087,7 +1087,6 @@ async fn resume_candidate_matches_cwd(
             RolloutItem::SessionMeta(_)
             | RolloutItem::ForkReference(_)
             | RolloutItem::ResponseItem(_)
-            | RolloutItem::ForkReference(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::EventMsg(_) => None,
         })

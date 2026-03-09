@@ -250,7 +250,6 @@ impl Session {
                 RolloutItem::ResponseItem(_)
                 | RolloutItem::ForkReference(_)
                 | RolloutItem::EventMsg(_)
-                | RolloutItem::ForkReference(_)
                 | RolloutItem::SessionMeta(_) => {}
             }
 

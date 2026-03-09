@@ -221,6 +221,7 @@ use codex_core::plugins::PluginInstallRequest;
 use codex_core::plugins::load_plugin_apps;
 use codex_core::read_head_for_summary;
 use codex_core::read_session_meta_line;
+use codex_core::resolve_fork_reference_rollout_path;
 use codex_core::rollout_date_parts;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_core::skills::remote::export_remote_skill;
