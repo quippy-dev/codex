@@ -153,6 +153,7 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
         prompt,
         spawn_mode: _,
         status: _,
+        ..
     } = ev;
 
     let title = match new_thread_id {
