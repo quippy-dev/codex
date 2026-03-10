@@ -104,6 +104,7 @@ pub(crate) fn terminal_summary(status: &AgentStatus) -> String {
             }
         }
         AgentStatus::Completed(None) => "completed".to_string(),
+        AgentStatus::Interrupted => "interrupted".to_string(),
         AgentStatus::Errored(message) => {
             let message = message.trim();
             if message.is_empty() {
@@ -121,6 +122,7 @@ pub(crate) fn terminal_summary(status: &AgentStatus) -> String {
 fn status_label_span(status: &AgentStatus) -> Span<'static> {
     match status {
         AgentStatus::PendingInit | AgentStatus::Running => "running".cyan().bold(),
+        AgentStatus::Interrupted => "interrupted".yellow(),
         AgentStatus::Completed(_) => "completed".green(),
         AgentStatus::Errored(_) => "errored".red(),
         AgentStatus::Shutdown => "shutdown".dim(),

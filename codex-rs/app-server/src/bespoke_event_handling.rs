@@ -2568,6 +2568,7 @@ fn collab_send_input_status(
     match status {
         codex_protocol::protocol::AgentStatus::PendingInit
         | codex_protocol::protocol::AgentStatus::Running
+        | codex_protocol::protocol::AgentStatus::Interrupted
         | codex_protocol::protocol::AgentStatus::Completed(_)
         | codex_protocol::protocol::AgentStatus::Shutdown => V2CollabToolCallStatus::Completed,
         codex_protocol::protocol::AgentStatus::Errored(_)

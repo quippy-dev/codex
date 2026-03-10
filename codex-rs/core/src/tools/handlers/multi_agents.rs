@@ -3,7 +3,6 @@ use crate::agent::WatchdogParentCompactionResult;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
-use crate::config::Constrained;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
@@ -21,7 +20,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentSpawnMode;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
@@ -249,6 +247,7 @@ mod spawn {
             )
             .await?;
         }
+        apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);
         let spawn_source = thread_spawn_source_with_metadata(
             session.conversation_id,
@@ -1694,12 +1693,14 @@ fn build_agent_resume_config(
         Some(developer_instructions) => developer_instructions,
         None => turn.config.developer_instructions.clone(),
     };
+    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    apply_spawn_agent_overrides(&mut config, child_depth);
     Ok(config)
 }
 
 fn build_agent_shared_config(
     turn: &TurnContext,
-    child_depth: i32,
+    _child_depth: i32,
 ) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.as_ref();
     let mut config = base_config.clone();
@@ -1708,6 +1709,21 @@ fn build_agent_shared_config(
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = Some(turn.reasoning_summary);
     config.compact_prompt = turn.compact_prompt.clone();
+    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    Ok(config)
+}
+
+fn apply_spawn_agent_runtime_overrides(
+    config: &mut Config,
+    turn: &TurnContext,
+) -> Result<(), FunctionCallError> {
+    config
+        .permissions
+        .approval_policy
+        .set(turn.approval_policy.value())
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
+        })?;
     config.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
     config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
     config.cwd = turn.cwd.clone();
@@ -1718,12 +1734,10 @@ fn build_agent_shared_config(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
-    apply_spawn_agent_overrides(&mut config, child_depth);
-    Ok(config)
+    Ok(())
 }
 
 fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
-    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
     if crate::agent::exceeds_thread_spawn_depth_limit(child_depth, config.agent_max_depth) {
         let _ = config.features.disable(Feature::Collab);
     }
@@ -1952,13 +1966,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResultForTest =
             serde_json::from_str(&content).expect("spawn result should be json");
         agent_id(&result.agent_id).expect("spawn result should contain a valid agent id")
@@ -2319,9 +2327,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("interval override should be accepted");
-        let ToolOutput::Function { success, .. } = output else {
-            panic!("expected function output");
-        };
+        let (_, success) = expect_text_output(output);
         assert_eq!(success, Some(true));
     }
 
@@ -2472,13 +2478,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
@@ -2538,13 +2538,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
@@ -2607,13 +2601,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
@@ -2679,13 +2667,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         assert!(
@@ -2752,13 +2734,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
@@ -2913,13 +2889,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("watchdog spawn should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         let watchdog_id = agent_id(&result.agent_id).expect("agent_id should be valid");
@@ -3100,14 +3070,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("list_agents should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: ListAgentsResultForTest =
             serde_json::from_str(&content).expect("list_agents result should be json");
         let expected_child_status = manager.agent_control().get_status(child_id).await;
@@ -3183,14 +3146,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("list_agents should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: ListAgentsResultForTest =
             serde_json::from_str(&content).expect("list_agents result should be json");
         let expected_status = manager.agent_control().get_status(grandchild_id).await;
@@ -3693,14 +3649,7 @@ mod tests {
             .handle(resume_invocation)
             .await
             .expect("resume_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: resume_agent::ResumeAgentResult =
             serde_json::from_str(&content).expect("resume_agent result should be json");
         assert_ne!(result.status, AgentStatus::NotFound);
@@ -3755,12 +3704,6 @@ mod tests {
             panic!("expected respond-to-model error");
         };
         assert!(message.contains("depth limit reached"));
-    }
-
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
-    struct WaitResult {
-        status: HashMap<ThreadId, AgentStatus>,
-        timed_out: bool,
     }
 
     #[tokio::test]
@@ -3845,7 +3788,7 @@ mod tests {
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
-            WaitResult {
+            wait::WaitResult {
                 status: HashMap::from([
                     (id_a, AgentStatus::NotFound),
                     (id_b, AgentStatus::NotFound),
@@ -3882,7 +3825,7 @@ mod tests {
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
-            WaitResult {
+            wait::WaitResult {
                 status: HashMap::new(),
                 timed_out: true
             }
@@ -4086,20 +4029,13 @@ mod tests {
         .expect("wait should return quickly when non-watchdog is already final")
         .expect("wait should succeed");
 
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
-        let result: WaitResult =
+        let (content, success) = expect_text_output(output);
+        let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
         let expected_watchdog_status = session.services.agent_control.get_status(watchdog_id).await;
         assert_eq!(
             result,
-            WaitResult {
+            wait::WaitResult {
                 status: HashMap::from([
                     (watchdog_id, expected_watchdog_status),
                     (worker_id, AgentStatus::Shutdown),
@@ -4202,7 +4138,7 @@ mod tests {
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
-            WaitResult {
+            wait::WaitResult {
                 status: HashMap::from([(agent_id, AgentStatus::Shutdown)]),
                 timed_out: false
             }
@@ -4250,7 +4186,7 @@ mod tests {
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
-            WaitResult {
+            wait::WaitResult {
                 status: HashMap::from([(agent_id, AgentStatus::Errored("boom".to_string()))]),
                 timed_out: false
             }
@@ -4352,14 +4288,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("close_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: close_agent::CloseAgentResult =
             serde_json::from_str(&content).expect("close_agent result should be json");
         assert_eq!(result.status, AgentStatus::NotFound);
@@ -4387,14 +4316,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("close_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: close_agent::CloseAgentResult =
             serde_json::from_str(&content).expect("close_agent result should be json");
         assert_eq!(result.status, AgentStatus::NotFound);
@@ -4431,14 +4353,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("close_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: close_agent::CloseAgentResult =
             serde_json::from_str(&content).expect("close_agent result should be json");
         assert_eq!(result.status, AgentStatus::NotFound);
@@ -4492,6 +4407,9 @@ mod tests {
         turn.sandbox_policy
             .set(sandbox_policy)
             .expect("sandbox policy set");
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy set");
 
         let config = build_agent_spawn_config(
             &base_instructions,
@@ -4515,7 +4433,7 @@ mod tests {
         expected
             .permissions
             .approval_policy
-            .set(AskForApproval::Never)
+            .set(AskForApproval::OnRequest)
             .expect("approval policy set");
         expected
             .permissions
@@ -4555,6 +4473,9 @@ mod tests {
         base_config.developer_instructions = Some("base-dev".to_string());
         turn.developer_instructions = Some("turn-dev".to_string());
         turn.config = Arc::new(base_config.clone());
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy set");
 
         let config =
             build_agent_resume_config(&turn, 0, &resume_agent::RecordedResumeContext::default())
@@ -4573,7 +4494,7 @@ mod tests {
         expected
             .permissions
             .approval_policy
-            .set(AskForApproval::Never)
+            .set(AskForApproval::OnRequest)
             .expect("approval policy set");
         expected
             .permissions
@@ -4591,6 +4512,9 @@ mod tests {
         base_config.developer_instructions = Some("base-dev".to_string());
         turn.developer_instructions = Some("turn-dev".to_string());
         turn.config = Arc::new(base_config.clone());
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy set");
 
         let recorded_resume_context = resume_agent::RecordedResumeContext {
             developer_instructions: Some(turn.developer_instructions.clone()),
@@ -4614,7 +4538,7 @@ mod tests {
         expected
             .permissions
             .approval_policy
-            .set(AskForApproval::Never)
+            .set(AskForApproval::OnRequest)
             .expect("approval policy set");
         expected
             .permissions
