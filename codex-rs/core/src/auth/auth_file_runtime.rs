@@ -69,12 +69,17 @@ pub(crate) fn logout_all_stores_with_auth_file(
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     auth_file: Option<&Path>,
 ) -> std::io::Result<bool> {
+    let auth_storage_home = resolve_auth_storage_home(
+        codex_home.to_path_buf(),
+        auth_file,
+        auth_credentials_store_mode,
+    )?;
     if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-        return logout(codex_home, AuthCredentialsStoreMode::Ephemeral);
+        return logout(&auth_storage_home, AuthCredentialsStoreMode::Ephemeral);
     }
-    let removed_ephemeral = logout(codex_home, AuthCredentialsStoreMode::Ephemeral)?;
+    let removed_ephemeral = logout(&auth_storage_home, AuthCredentialsStoreMode::Ephemeral)?;
     let removed_managed = logout_with_auth_file(
-        codex_home,
+        &auth_storage_home,
         auth_credentials_store_mode,
         auth_file.map(Path::to_path_buf),
     )?;
@@ -88,11 +93,16 @@ pub(crate) fn load_auth_with_auth_file(
     auth_file: Option<PathBuf>,
 ) -> std::io::Result<Option<CodexAuth>> {
     validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
+    let auth_storage_home = resolve_auth_storage_home(
+        codex_home.to_path_buf(),
+        auth_file.as_deref(),
+        auth_credentials_store_mode,
+    )?;
 
     let build_auth = |auth_dot_json: AuthDotJson, storage_mode| {
         let client = crate::default_client::create_client();
         CodexAuth::from_auth_dot_json(
-            codex_home,
+            &auth_storage_home,
             auth_dot_json,
             storage_mode,
             auth_file.clone(),
@@ -109,7 +119,7 @@ pub(crate) fn load_auth_with_auth_file(
     }
 
     let ephemeral_storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
+        auth_storage_home.clone(),
         AuthCredentialsStoreMode::Ephemeral,
         auth_file.clone(),
     );
@@ -123,7 +133,7 @@ pub(crate) fn load_auth_with_auth_file(
     }
 
     let storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
+        auth_storage_home.clone(),
         auth_credentials_store_mode,
         auth_file.clone(),
     );

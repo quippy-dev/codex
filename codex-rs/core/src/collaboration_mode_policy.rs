@@ -1,6 +1,13 @@
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
 
+const REQUEST_USER_INPUT_SCHEMA_MODES: [ModeKind; 4] = [
+    ModeKind::Default,
+    ModeKind::Plan,
+    ModeKind::Execute,
+    ModeKind::PairProgramming,
+];
+
 pub fn format_mode_names(modes: &[ModeKind]) -> String {
     let mode_names: Vec<&str> = modes.iter().map(|mode| mode.display_name()).collect();
     match mode_names.as_slice() {
@@ -62,7 +69,7 @@ pub fn request_user_input_unavailable_message(
 }
 
 pub fn request_user_input_tool_description(request_user_input_outside_plan_mode: bool) -> String {
-    let mode_names: Vec<&str> = TUI_VISIBLE_COLLABORATION_MODES
+    let mode_names: Vec<&str> = REQUEST_USER_INPUT_SCHEMA_MODES
         .into_iter()
         .filter(|mode| {
             request_user_input_allowed_for_mode(*mode, request_user_input_outside_plan_mode)
@@ -121,7 +128,7 @@ mod tests {
         );
         assert_eq!(
             request_user_input_tool_description(true),
-            "Request user input for one to three short questions and wait for the response. This tool is only available in modes: Default, Plan, Execute.".to_string()
+            "Request user input for one to three short questions and wait for the response. This tool is only available in modes: Default, Plan, Execute, Pair Programming.".to_string()
         );
     }
 

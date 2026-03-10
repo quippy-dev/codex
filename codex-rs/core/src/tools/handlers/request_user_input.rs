@@ -141,7 +141,7 @@ mod tests {
         );
         assert_eq!(
             request_user_input_tool_description(true),
-            "Request user input for one to three short questions and wait for the response. This tool is only available in modes: Default, Plan, Execute.".to_string()
+            "Request user input for one to three short questions and wait for the response. This tool is only available in modes: Default, Plan, Execute, Pair Programming.".to_string()
         );
     }
 }
