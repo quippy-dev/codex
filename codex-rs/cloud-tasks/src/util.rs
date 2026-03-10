@@ -1,3 +1,4 @@
+use anyhow::Context;
 use base64::Engine as _;
 use chrono::DateTime;
 use chrono::Local;
@@ -6,7 +7,7 @@ use reqwest::header::HeaderMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use codex_core::auth::resolve_auth_storage_home;
+use codex_core::auth::AuthFileRuntime;
 use codex_core::config::Config;
 use codex_login::AuthManager;
 use codex_utils_cli::CliConfigOverrides;
@@ -66,23 +67,20 @@ pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
 pub async fn load_auth_manager(
     cli_overrides: &CliConfigOverrides,
     auth_file: Option<PathBuf>,
-) -> Option<Arc<AuthManager>> {
-    let config = Config::load_with_cli_overrides(cli_overrides.parse_overrides().ok()?)
-        .await
-        .ok()?;
-    let auth_storage_home = resolve_auth_storage_home(
-        config.codex_home,
-        auth_file.as_deref(),
-        config.cli_auth_credentials_store_mode,
+) -> anyhow::Result<Arc<AuthManager>> {
+    let config = Config::load_with_cli_overrides(
+        cli_overrides
+            .parse_overrides()
+            .map_err(anyhow::Error::msg)
+            .context("failed to parse cloud-tasks config overrides")?,
     )
-    .ok()?;
-    AuthManager::shared_with_auth_file(
-        auth_storage_home,
-        false,
-        config.cli_auth_credentials_store_mode,
-        auth_file,
-    )
-    .ok()
+    .await
+    .context("failed to load cloud-tasks config")?;
+    let auth_runtime = AuthFileRuntime::from_config(&config, auth_file)
+        .map_err(|err| anyhow::anyhow!("failed to resolve cloud-tasks auth storage: {err}"))?;
+    auth_runtime
+        .shared_auth_manager(false)
+        .map_err(|err| anyhow::anyhow!("failed to create cloud-tasks auth manager: {err}"))
 }
 
 /// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
@@ -90,7 +88,7 @@ pub async fn load_auth_manager(
 pub async fn build_chatgpt_headers(
     cli_overrides: &CliConfigOverrides,
     auth_file: Option<PathBuf>,
-) -> HeaderMap {
+) -> anyhow::Result<HeaderMap> {
     use reqwest::header::AUTHORIZATION;
     use reqwest::header::HeaderName;
     use reqwest::header::HeaderValue;
@@ -103,8 +101,8 @@ pub async fn build_chatgpt_headers(
         USER_AGENT,
         HeaderValue::from_str(&ua).unwrap_or(HeaderValue::from_static("codex-cli")),
     );
-    if let Some(am) = load_auth_manager(cli_overrides, auth_file).await
-        && let Some(auth) = am.auth().await
+    let auth_manager = load_auth_manager(cli_overrides, auth_file).await?;
+    if let Some(auth) = auth_manager.auth().await
         && let Ok(tok) = auth.get_token()
         && !tok.is_empty()
     {
@@ -121,7 +119,7 @@ pub async fn build_chatgpt_headers(
             headers.insert(name, hv);
         }
     }
-    headers
+    Ok(headers)
 }
 
 /// Construct a browser-friendly task URL for the given backend base URL.
@@ -214,12 +212,44 @@ mod tests {
             .expect("auth manager");
         assert_eq!(auth_manager.auth_mode(), Some(AuthMode::ApiKey));
 
-        let headers = build_chatgpt_headers(&cli_overrides, Some(auth_file)).await;
+        let headers = build_chatgpt_headers(&cli_overrides, Some(auth_file))
+            .await
+            .expect("headers");
         assert_eq!(
             headers
                 .get(AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer sk-cloud-override")
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_file_override_returns_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-cloud-tasks-auth-invalid-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("custom").join("auth.json");
+        let cli_overrides = CliConfigOverrides {
+            raw_overrides: vec![
+                format!("codex_home={}", dir.display()),
+                "cli_auth_credentials_store=auto".to_string(),
+            ],
+        };
+
+        let err = load_auth_manager(&cli_overrides, Some(auth_file))
+            .await
+            .expect_err("invalid override should fail");
+        assert!(
+            err.to_string().contains("--auth-file cannot be used"),
+            "expected auth-file validation error, got `{err}`"
         );
 
         std::fs::remove_dir_all(&dir).expect("remove temp dir");

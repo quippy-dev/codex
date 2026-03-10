@@ -1,5 +1,6 @@
 mod auth_file_contract;
 mod auth_file_ops;
+mod auth_file_runtime;
 mod storage;
 
 use async_trait::async_trait;
@@ -39,6 +40,9 @@ pub use auth_file_contract::validate_auth_file_override;
 pub use auth_file_ops::load_auth_dot_json_with_auth_file;
 pub use auth_file_ops::logout_with_auth_file;
 pub use auth_file_ops::save_auth_with_auth_file;
+pub use auth_file_runtime::AuthFileRuntime;
+use auth_file_runtime::load_auth_with_auth_file;
+use auth_file_runtime::logout_all_stores_with_auth_file;
 use codex_client::CodexHttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
 use serde_json::Value;
@@ -568,23 +572,6 @@ fn logout_all_stores(
     logout_all_stores_with_auth_file(codex_home, auth_credentials_store_mode, None)
 }
 
-fn logout_all_stores_with_auth_file(
-    codex_home: &Path,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    auth_file: Option<&Path>,
-) -> std::io::Result<bool> {
-    if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-        return logout(codex_home, AuthCredentialsStoreMode::Ephemeral);
-    }
-    let removed_ephemeral = logout(codex_home, AuthCredentialsStoreMode::Ephemeral)?;
-    let removed_managed = logout_with_auth_file(
-        codex_home,
-        auth_credentials_store_mode,
-        auth_file.map(Path::to_path_buf),
-    )?;
-    Ok(removed_ephemeral || removed_managed)
-}
-
 fn load_auth(
     codex_home: &Path,
     enable_codex_api_key_env: bool,
@@ -596,66 +583,6 @@ fn load_auth(
         auth_credentials_store_mode,
         None,
     )
-}
-
-fn load_auth_with_auth_file(
-    codex_home: &Path,
-    enable_codex_api_key_env: bool,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    auth_file: Option<PathBuf>,
-) -> std::io::Result<Option<CodexAuth>> {
-    validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
-
-    let build_auth = |auth_dot_json: AuthDotJson, storage_mode| {
-        let client = crate::default_client::create_client();
-        CodexAuth::from_auth_dot_json(
-            codex_home,
-            auth_dot_json,
-            storage_mode,
-            auth_file.clone(),
-            client,
-        )
-    };
-
-    // API key via env var takes precedence over any other auth method.
-    if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
-        let client = crate::default_client::create_client();
-        return Ok(Some(CodexAuth::from_api_key_with_client(
-            api_key.as_str(),
-            client,
-        )));
-    }
-
-    // External ChatGPT auth tokens live in the in-memory (ephemeral) store. Always check this
-    // first so external auth takes precedence over any persisted credentials.
-    let ephemeral_storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
-        AuthCredentialsStoreMode::Ephemeral,
-        auth_file.clone(),
-    );
-    if let Some(auth_dot_json) = ephemeral_storage.load()? {
-        let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral)?;
-        return Ok(Some(auth));
-    }
-
-    // If the caller explicitly requested ephemeral auth, there is no persisted fallback.
-    if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-        return Ok(None);
-    }
-
-    // Fall back to the configured persistent store (file/keyring/auto) for managed auth.
-    let storage = create_auth_storage_with_auth_file(
-        codex_home.to_path_buf(),
-        auth_credentials_store_mode,
-        auth_file.clone(),
-    );
-    let auth_dot_json = match storage.load()? {
-        Some(auth) => auth,
-        None => return Ok(None),
-    };
-
-    let auth = build_auth(auth_dot_json, auth_credentials_store_mode)?;
-    Ok(Some(auth))
 }
 
 // Persist refreshed tokens into auth storage and update last_refresh.
@@ -1060,8 +987,13 @@ impl AuthManager {
         auth_file: Option<PathBuf>,
     ) -> std::io::Result<Self> {
         validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
-        Ok(Self::new_impl(
+        let auth_storage_home = resolve_auth_storage_home(
             codex_home,
+            auth_file.as_deref(),
+            auth_credentials_store_mode,
+        )?;
+        Ok(Self::new_impl(
+            auth_storage_home,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             auth_file,
@@ -1845,6 +1777,53 @@ mod tests {
         let removed = manager.logout()?;
         assert!(removed);
         assert!(!auth_file.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_manager_new_with_auth_file_ignores_default_ephemeral_store() -> anyhow::Result<()>
+    {
+        let dir = tempdir()?;
+        let auth_file = dir.path().join("custom").join("auth.json");
+        let override_auth = AuthDotJson {
+            auth_mode: Some(ApiAuthMode::ApiKey),
+            openai_api_key: Some("sk-override".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+        save_auth_with_auth_file(
+            dir.path(),
+            &override_auth,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )?;
+
+        let default_ephemeral_storage = create_auth_storage_with_auth_file(
+            dir.path().to_path_buf(),
+            AuthCredentialsStoreMode::Ephemeral,
+            None,
+        );
+        default_ephemeral_storage.save(&AuthDotJson {
+            auth_mode: Some(ApiAuthMode::ApiKey),
+            openai_api_key: Some("sk-ephemeral".to_string()),
+            tokens: None,
+            last_refresh: None,
+        })?;
+
+        let manager = AuthManager::new_with_auth_file(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file),
+        )?;
+        let loaded = manager.auth().await;
+        assert_eq!(
+            loaded
+                .as_ref()
+                .and_then(CodexAuth::api_key)
+                .map(str::to_string),
+            Some("sk-override".to_string())
+        );
         Ok(())
     }
 

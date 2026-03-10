@@ -30,6 +30,7 @@ use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::AuthDotJson;
+use codex_core::auth::AuthFileRuntime;
 use codex_core::auth::save_auth;
 use codex_core::default_client::originator;
 use codex_core::token_data::TokenData;
@@ -82,11 +83,12 @@ impl ServerOptions {
     }
 
     pub fn with_auth_file_override(mut self, auth_file: Option<PathBuf>) -> io::Result<Self> {
-        self.codex_home = Self::resolve_auth_storage_home(
+        self.codex_home = AuthFileRuntime::new(
             self.codex_home,
-            auth_file.as_deref(),
             self.cli_auth_credentials_store_mode,
-        )?;
+            auth_file,
+        )?
+        .into_auth_storage_home();
         Ok(self)
     }
 
@@ -95,11 +97,12 @@ impl ServerOptions {
         auth_file: Option<&Path>,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> io::Result<PathBuf> {
-        codex_core::auth::resolve_auth_storage_home(
+        AuthFileRuntime::new(
             codex_home,
-            auth_file,
             cli_auth_credentials_store_mode,
+            auth_file.map(Path::to_path_buf),
         )
+        .map(AuthFileRuntime::into_auth_storage_home)
     }
 }
 

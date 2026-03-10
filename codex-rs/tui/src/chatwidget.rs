@@ -172,11 +172,6 @@ use tracing::debug;
 use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
-const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
-const PLAN_IMPLEMENTATION_EXECUTE: &str = "Yes, implement in Execute mode";
-const PLAN_IMPLEMENTATION_DEFAULT: &str = "Yes, implement in Default mode";
-const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
-const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 const MULTI_AGENT_ENABLE_TITLE: &str = "Enable multi-agent?";
 const MULTI_AGENT_ENABLE_YES: &str = "Yes, enable";
 const MULTI_AGENT_ENABLE_NO: &str = "Not now";
@@ -278,6 +273,12 @@ mod agent;
 use self::agent::spawn_agent;
 use self::agent::spawn_agent_from_existing;
 pub(crate) use self::agent::spawn_op_forwarder;
+mod copy_state;
+use self::copy_state::CopyState;
+mod plan_implementation_prompt;
+#[cfg(test)]
+pub(crate) use self::plan_implementation_prompt::PLAN_IMPLEMENTATION_CODING_MESSAGE;
+pub(crate) use self::plan_implementation_prompt::PLAN_IMPLEMENTATION_TITLE;
 mod session_header;
 use self::session_header::SessionHeader;
 mod skills;
@@ -668,7 +669,7 @@ pub(crate) struct ChatWidget {
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
     // Latest completed user-visible Codex output that `/copy` should place on the clipboard.
-    last_copyable_output: Option<String>,
+    last_copyable_output: CopyState,
     running_commands: HashMap<String, RunningCommand>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
@@ -1350,7 +1351,7 @@ impl ChatWidget {
                 Constrained::allow_only(event.sandbox_policy.clone());
         }
         let initial_messages = event.initial_messages.clone();
-        self.last_copyable_output = None;
+        self.last_copyable_output.clear();
         let forked_from_id = event.forked_from_id;
         let model_for_header = event.model.clone();
         self.session_header.set_model(&model_for_header);
@@ -1580,9 +1581,7 @@ impl ChatWidget {
         } else {
             text
         };
-        if !plan_text.trim().is_empty() {
-            self.last_copyable_output = Some(plan_text.clone());
-        }
+        self.last_copyable_output.record_plan_output(&plan_text);
         // Plan commit ticks can hide the status row; remember whether we streamed plan output so
         // completion can restore it once stream queues are idle.
         let should_restore_after_stream = self.plan_stream_controller.is_some();
@@ -1677,11 +1676,8 @@ impl ChatWidget {
 
     fn on_task_complete(&mut self, last_agent_message: Option<String>, from_replay: bool) {
         self.submit_pending_steers_after_interrupt = false;
-        if let Some(message) = last_agent_message.as_ref()
-            && !message.trim().is_empty()
-        {
-            self.last_copyable_output = Some(message.clone());
-        }
+        self.last_copyable_output
+            .record_agent_output(last_agent_message.as_deref());
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
         if let Some(mut controller) = self.plan_stream_controller.take()
@@ -1774,74 +1770,11 @@ impl ChatWidget {
     }
 
     fn open_plan_implementation_prompt(&mut self) {
-        let execute_mask =
-            collaboration_modes::mask_for_kind(self.models_manager.as_ref(), ModeKind::Execute);
-        let default_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
-        let (execute_actions, execute_disabled_reason) = match execute_mask {
-            Some(mask) => {
-                let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
-                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                    tx.send(AppEvent::SubmitUserMessageWithMode {
-                        text: user_text.clone(),
-                        collaboration_mode: mask.clone(),
-                    });
-                })];
-                (actions, None)
-            }
-            None => (Vec::new(), Some("Execute mode unavailable".to_string())),
-        };
-        let (implement_actions, implement_disabled_reason) = match default_mask {
-            Some(mask) => {
-                let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
-                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                    tx.send(AppEvent::SubmitUserMessageWithMode {
-                        text: user_text.clone(),
-                        collaboration_mode: mask.clone(),
-                    });
-                })];
-                (actions, None)
-            }
-            None => (Vec::new(), Some("Default mode unavailable".to_string())),
-        };
-        let items = vec![
-            SelectionItem {
-                name: PLAN_IMPLEMENTATION_EXECUTE.to_string(),
-                description: Some("Switch to Execute and execute the plan.".to_string()),
-                selected_description: None,
-                is_current: false,
-                actions: execute_actions,
-                disabled_reason: execute_disabled_reason,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: PLAN_IMPLEMENTATION_DEFAULT.to_string(),
-                description: Some("Switch to Default and start coding.".to_string()),
-                selected_description: None,
-                is_current: false,
-                actions: implement_actions,
-                disabled_reason: implement_disabled_reason,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: PLAN_IMPLEMENTATION_NO.to_string(),
-                description: Some("Continue planning with the model.".to_string()),
-                selected_description: None,
-                is_current: false,
-                actions: Vec::new(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some(PLAN_IMPLEMENTATION_TITLE.to_string()),
-            subtitle: None,
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            ..Default::default()
-        });
+        self.bottom_pane.show_selection_view(
+            plan_implementation_prompt::build_plan_implementation_prompt(
+                self.models_manager.as_ref(),
+            ),
+        );
         self.notify(Notification::PlanModePrompt {
             title: PLAN_IMPLEMENTATION_TITLE.to_string(),
         });
@@ -3434,7 +3367,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
-            last_copyable_output: None,
+            last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -3620,7 +3553,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
-            last_copyable_output: None,
+            last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -3798,7 +3731,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
-            last_copyable_output: None,
+            last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -4342,10 +4275,9 @@ impl ChatWidget {
                 });
             }
             SlashCommand::Copy => {
-                let Some(text) = self.last_copyable_output.as_deref() else {
+                let Some(text) = self.last_copyable_output.latest_output() else {
                     self.add_info_message(
-                        "`/copy` is unavailable before the first Codex output or right after a rollback."
-                            .to_string(),
+                        self.last_copyable_output.unavailable_message().to_string(),
                         None,
                     );
                     return;
@@ -4355,10 +4287,9 @@ impl ChatWidget {
 
                 match copy_result {
                     Ok(()) => {
-                        let hint = self.agent_turn_running.then_some(
-                            "Current turn is still running; copied the latest completed output (not the in-progress response)."
-                                .to_string(),
-                        );
+                        let hint = self
+                            .last_copyable_output
+                            .running_copy_hint(self.agent_turn_running);
                         self.add_info_message(
                             "Copied latest Codex output to clipboard.".to_string(),
                             hint,
@@ -5227,7 +5158,7 @@ impl ChatWidget {
                 // Conservatively clear `/copy` state on rollback. The app layer trims visible
                 // transcript cells, but we do not maintain rollback-aware raw-markdown history yet,
                 // so keeping the previous cache can return content that was just removed.
-                self.last_copyable_output = None;
+                self.last_copyable_output.clear_on_rollback();
                 if from_replay {
                     self.app_event_tx.send(AppEvent::ApplyThreadRollback {
                         num_turns: rollback.num_turns,
@@ -5331,9 +5262,7 @@ impl ChatWidget {
     fn on_exited_review_mode(&mut self, review: ExitedReviewModeEvent) {
         // Leave review mode; if output is present, flush pending stream + show results.
         if let Some(output) = review.review_output {
-            self.last_copyable_output = Some(codex_core::review_format::render_review_output_text(
-                &output,
-            ));
+            self.last_copyable_output.record_review_output(&output);
             self.flush_answer_stream_with_separator();
             self.flush_interrupt_queue();
             self.flush_active_cell();

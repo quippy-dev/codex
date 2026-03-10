@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::codex::built_tools;
 use crate::compact::CompactTrigger;
 use crate::compact::InitialContextInjection;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
@@ -21,6 +23,7 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
 
@@ -113,10 +116,20 @@ async fn run_remote_compact_task_inner_impl(
         .cloned()
         .collect();
 
+    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let tool_router = built_tools(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &prompt_input,
+        &HashSet::new(),
+        None,
+        &CancellationToken::new(),
+    )
+    .await?;
     let prompt = Prompt {
-        input: history.for_prompt(&turn_context.model_info.input_modalities),
-        tools: vec![],
-        parallel_tool_calls: false,
+        input: prompt_input,
+        tools: tool_router.specs(),
+        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         personality: turn_context.personality,
         output_schema: None,
@@ -131,6 +144,8 @@ async fn run_remote_compact_task_inner_impl(
             .compact_conversation_history(
                 &compact_prompt,
                 &turn_context.model_info,
+                turn_context.reasoning_effort,
+                turn_context.reasoning_summary,
                 &turn_context.session_telemetry,
             )
             .await;

@@ -74,11 +74,9 @@ async fn init_backend(
     append_error_log(format!("startup: base_url={base_url} path_style={style}"));
 
     let auth_manager =
-        util::load_auth_manager(&auth_context.cli_overrides, auth_context.auth_file.clone()).await;
-    let auth = match auth_manager.as_ref() {
-        Some(manager) => manager.auth().await,
-        None => None,
-    };
+        util::load_auth_manager(&auth_context.cli_overrides, auth_context.auth_file.clone())
+            .await?;
+    let auth = auth_manager.auth().await;
     let auth = match auth {
         Some(auth) => auth,
         None => {
@@ -206,7 +204,7 @@ async fn resolve_environment_id(
     let normalized = util::normalize_base_url(&ctx.base_url);
     let headers =
         util::build_chatgpt_headers(&auth_context.cli_overrides, auth_context.auth_file.clone())
-            .await;
+            .await?;
     let environments = crate::env_detect::list_environments(&normalized, &headers).await?;
     if environments.is_empty() {
         return Err(anyhow!(
@@ -892,7 +890,10 @@ pub async fn run_main(
                 auth_context.auth_file.clone(),
             )
             .await;
-            let res = crate::env_detect::list_environments(&base_url, &headers).await;
+            let res = match headers {
+                Ok(headers) => crate::env_detect::list_environments(&base_url, &headers).await,
+                Err(err) => Err(err),
+            };
             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
         });
     }
@@ -915,7 +916,12 @@ pub async fn run_main(
             .await;
 
             // Run autodetect. If it fails, we keep using "All".
-            let res = crate::env_detect::autodetect_environment_id(&base_url, &headers, None).await;
+            let res = match headers {
+                Ok(headers) => {
+                    crate::env_detect::autodetect_environment_id(&base_url, &headers, None).await
+                }
+                Err(err) => Err(err),
+            };
             let _ = tx.send(app::AppEvent::EnvironmentAutodetected(res));
         });
     }
@@ -1139,7 +1145,16 @@ pub async fn run_main(
                                                 auth_context.auth_file.clone(),
                                             )
                                             .await;
-                                            let res = crate::env_detect::list_environments(&base_url, &headers).await;
+                                            let res = match headers {
+                                                Ok(headers) => {
+                                                    crate::env_detect::list_environments(
+                                                        &base_url,
+                                                        &headers,
+                                                    )
+                                                    .await
+                                                }
+                                                Err(err) => Err(err),
+                                            };
                                             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
                                     }
@@ -1527,7 +1542,16 @@ pub async fn run_main(
                                             auth_context.auth_file.clone(),
                                         )
                                         .await;
-                                        let res = crate::env_detect::list_environments(&base_url, &headers).await;
+                                        let res = match headers {
+                                            Ok(headers) => {
+                                                crate::env_detect::list_environments(
+                                                    &base_url,
+                                                    &headers,
+                                                )
+                                                .await
+                                            }
+                                            Err(err) => Err(err),
+                                        };
                                         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                 });
                             }
@@ -1716,7 +1740,16 @@ pub async fn run_main(
                                                 auth_context.auth_file.clone(),
                                             )
                                             .await;
-                                            let res = crate::env_detect::list_environments(&base_url, &headers).await;
+                                            let res = match headers {
+                                                Ok(headers) => {
+                                                    crate::env_detect::list_environments(
+                                                        &base_url,
+                                                        &headers,
+                                                    )
+                                                    .await
+                                                }
+                                                Err(err) => Err(err),
+                                            };
                                             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
                                     }
@@ -1897,7 +1930,16 @@ pub async fn run_main(
                                             auth_context.auth_file.clone(),
                                         )
                                         .await;
-                                        let res = crate::env_detect::list_environments(&base_url, &headers).await;
+                                        let res = match headers {
+                                            Ok(headers) => {
+                                                crate::env_detect::list_environments(
+                                                    &base_url,
+                                                    &headers,
+                                                )
+                                                .await
+                                            }
+                                            Err(err) => Err(err),
+                                        };
                                         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
                                     }

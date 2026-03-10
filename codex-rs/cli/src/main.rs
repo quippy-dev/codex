@@ -36,12 +36,14 @@ use supports_color::Stream;
 
 #[cfg(target_os = "macos")]
 mod app_cmd;
+mod auth_file_dispatch;
 #[cfg(target_os = "macos")]
 mod desktop_app;
 mod mcp_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
+use crate::auth_file_dispatch::AuthFileDispatch;
 use crate::mcp_cmd::McpCli;
 
 use codex_core::config::Config;
@@ -573,6 +575,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
+    let auth_file_dispatch = AuthFileDispatch::new(auth_file);
 
     match subcommand {
         None => {
@@ -580,7 +583,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut interactive.config_overrides,
                 root_config_overrides.clone(),
             );
-            interactive.auth_file = auth_file.clone();
+            auth_file_dispatch.apply_to_tui(&mut interactive);
             let exit_info = run_interactive_tui(interactive, arg0_paths.clone()).await?;
             handle_app_exit(exit_info)?;
         }
@@ -589,7 +592,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            exec_cli.auth_file = auth_file.clone();
+            auth_file_dispatch.apply_to_exec(&mut exec_cli);
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::Review(review_args)) => {
@@ -599,14 +602,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            exec_cli.auth_file = auth_file.clone();
+            auth_file_dispatch.apply_to_exec(&mut exec_cli);
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::McpServer) => {
             codex_mcp_server::run_main(
                 arg0_paths.clone(),
                 root_config_overrides,
-                auth_file.clone(),
+                auth_file_dispatch.clone_path(),
             )
             .await?;
         }
@@ -623,7 +626,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     root_config_overrides,
                     codex_core::config_loader::LoaderOverrides::default(),
                     app_server_cli.analytics_default_enabled,
-                    auth_file.clone(),
+                    auth_file_dispatch.clone_path(),
                     transport,
                 )
                 .await?;
@@ -663,7 +666,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 last,
                 all,
                 config_overrides,
-                auth_file.clone(),
+                &auth_file_dispatch,
             );
             let exit_info = run_interactive_tui(interactive, arg0_paths.clone()).await?;
             handle_app_exit(exit_info)?;
@@ -681,7 +684,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 last,
                 all,
                 config_overrides,
-                auth_file.clone(),
+                &auth_file_dispatch,
             );
             let exit_info = run_interactive_tui(interactive, arg0_paths.clone()).await?;
             handle_app_exit(exit_info)?;
@@ -693,7 +696,8 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             );
             match login_cli.action {
                 Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides, auth_file.clone()).await;
+                    run_login_status(login_cli.config_overrides, auth_file_dispatch.clone_path())
+                        .await;
                 }
                 None => {
                     if login_cli.use_device_code {
@@ -701,7 +705,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                             login_cli.config_overrides,
                             login_cli.issuer_base_url,
                             login_cli.client_id,
-                            auth_file.clone(),
+                            auth_file_dispatch.clone_path(),
                         )
                         .await;
                     } else if login_cli.api_key.is_some() {
@@ -714,11 +718,15 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                         run_login_with_api_key(
                             login_cli.config_overrides,
                             api_key,
-                            auth_file.clone(),
+                            auth_file_dispatch.clone_path(),
                         )
                         .await;
                     } else {
-                        run_login_with_chatgpt(login_cli.config_overrides, auth_file.clone()).await;
+                        run_login_with_chatgpt(
+                            login_cli.config_overrides,
+                            auth_file_dispatch.clone_path(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -728,7 +736,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides, auth_file.clone()).await;
+            run_logout(logout_cli.config_overrides, auth_file_dispatch.clone_path()).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
@@ -741,7 +749,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             codex_cloud_tasks::run_main(
                 cloud_cli,
                 arg0_paths.codex_linux_sandbox_exe.clone(),
-                auth_file.clone(),
+                auth_file_dispatch.clone_path(),
             )
             .await?;
         }
@@ -1022,7 +1030,7 @@ fn finalize_resume_interactive(
     last: bool,
     show_all: bool,
     resume_cli: TuiCli,
-    auth_file: Option<PathBuf>,
+    auth_file_dispatch: &AuthFileDispatch,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
     // configuration surface area as `codex` without additional flags.
@@ -1037,7 +1045,7 @@ fn finalize_resume_interactive(
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
     prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
-    interactive.auth_file = auth_file;
+    auth_file_dispatch.apply_to_tui(&mut interactive);
 
     interactive
 }
@@ -1050,7 +1058,7 @@ fn finalize_fork_interactive(
     last: bool,
     show_all: bool,
     fork_cli: TuiCli,
-    auth_file: Option<PathBuf>,
+    auth_file_dispatch: &AuthFileDispatch,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so fork shares the same
     // configuration surface area as `codex` without additional flags.
@@ -1065,7 +1073,7 @@ fn finalize_fork_interactive(
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
     prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
-    interactive.auth_file = auth_file;
+    auth_file_dispatch.apply_to_tui(&mut interactive);
 
     interactive
 }
@@ -1159,7 +1167,7 @@ mod tests {
             last,
             all,
             resume_cli,
-            auth_file,
+            &AuthFileDispatch::new(auth_file),
         )
     }
 
@@ -1190,7 +1198,7 @@ mod tests {
             last,
             all,
             fork_cli,
-            auth_file,
+            &AuthFileDispatch::new(auth_file),
         )
     }
 

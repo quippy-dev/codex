@@ -1,6 +1,8 @@
+use crate::collaboration_mode_policy::asking_questions_guidance_message;
+use crate::collaboration_mode_policy::request_user_input_availability_message;
+use crate::collaboration_mode_policy::tui_visible_mode_names;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
 use codex_protocol::openai_models::ReasoningEffort;
 
 const COLLABORATION_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
@@ -64,7 +66,7 @@ fn execute_preset() -> CollaborationModeMask {
 }
 
 fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfig) -> String {
-    let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
+    let known_mode_names = tui_visible_mode_names();
     let default_mode_request_user_input =
         collaboration_modes_config.default_mode_request_user_input;
     let request_user_input_availability =
@@ -81,40 +83,6 @@ fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfi
             ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER,
             &asking_questions_guidance,
         )
-}
-
-fn format_mode_names(modes: &[ModeKind]) -> String {
-    let mode_names: Vec<&str> = modes.iter().map(|mode| mode.display_name()).collect();
-    match mode_names.as_slice() {
-        [] => "none".to_string(),
-        [mode_name] => (*mode_name).to_string(),
-        [first, second] => format!("{first} and {second}"),
-        [..] => mode_names.join(", "),
-    }
-}
-
-fn request_user_input_availability_message(
-    mode: ModeKind,
-    default_mode_request_user_input: bool,
-) -> String {
-    let mode_name = mode.display_name();
-    if mode.allows_request_user_input()
-        || (default_mode_request_user_input && mode == ModeKind::Default)
-    {
-        format!("The `request_user_input` tool is available in {mode_name} mode.")
-    } else {
-        format!(
-            "The `request_user_input` tool is unavailable in {mode_name} mode. If you call it while in {mode_name} mode, it will return an error."
-        )
-    }
-}
-
-fn asking_questions_guidance_message(default_mode_request_user_input: bool) -> String {
-    if default_mode_request_user_input {
-        "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, prefer using the `request_user_input` tool rather than writing a multiple choice question as a textual assistant message. Never write a multiple choice question as a textual assistant message.".to_string()
-    } else {
-        "In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.".to_string()
-    }
 }
 
 #[cfg(test)]
@@ -149,7 +117,7 @@ mod tests {
         assert!(!default_instructions.contains(REQUEST_USER_INPUT_AVAILABILITY_PLACEHOLDER));
         assert!(!default_instructions.contains(ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER));
 
-        let known_mode_names = format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES);
+        let known_mode_names = tui_visible_mode_names();
         let expected_snippet = format!("Known mode names are {known_mode_names}.");
         assert!(default_instructions.contains(&expected_snippet));
 

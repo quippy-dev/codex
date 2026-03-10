@@ -1,3 +1,7 @@
+#[cfg(test)]
+pub(crate) use crate::collaboration_mode_policy::request_user_input_allowed_for_mode;
+pub(crate) use crate::collaboration_mode_policy::request_user_input_tool_description;
+pub(crate) use crate::collaboration_mode_policy::request_user_input_unavailable_message;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
@@ -7,56 +11,9 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
+#[cfg(test)]
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
 use codex_protocol::request_user_input::RequestUserInputArgs;
-
-pub(crate) fn request_user_input_allowed_for_mode(
-    mode: ModeKind,
-    request_user_input_outside_plan_mode: bool,
-) -> bool {
-    mode.allows_request_user_input() || request_user_input_outside_plan_mode
-}
-
-fn format_allowed_modes(request_user_input_outside_plan_mode: bool) -> String {
-    let mode_names: Vec<&str> = TUI_VISIBLE_COLLABORATION_MODES
-        .into_iter()
-        .filter(|mode| {
-            request_user_input_allowed_for_mode(*mode, request_user_input_outside_plan_mode)
-        })
-        .map(ModeKind::display_name)
-        .collect();
-
-    match mode_names.as_slice() {
-        [] => "no modes".to_string(),
-        [mode] => format!("{mode} mode"),
-        [first, second] => format!("{first} and {second} modes"),
-        [..] => format!("modes: {}", mode_names.join(", ")),
-    }
-}
-
-pub(crate) fn request_user_input_unavailable_message(
-    mode: ModeKind,
-    request_user_input_outside_plan_mode: bool,
-) -> Option<String> {
-    if request_user_input_allowed_for_mode(mode, request_user_input_outside_plan_mode) {
-        None
-    } else {
-        let mode_name = mode.display_name();
-        Some(format!(
-            "request_user_input is unavailable in {mode_name} mode"
-        ))
-    }
-}
-
-pub(crate) fn request_user_input_tool_description(
-    request_user_input_outside_plan_mode: bool,
-) -> String {
-    let allowed_modes = format_allowed_modes(request_user_input_outside_plan_mode);
-    format!(
-        "Request user input for one to three short questions and wait for the response. This tool is only available in {allowed_modes}."
-    )
-}
 
 pub struct RequestUserInputHandler;
 
@@ -184,7 +141,7 @@ mod tests {
         );
         assert_eq!(
             request_user_input_tool_description(true),
-            "Request user input for one to three short questions and wait for the response. This tool is only available in modes: Default, Plan, Execute.".to_string()
+            "Request user input for one to three short questions and wait for the response. This tool is only available in modes: Default, Plan, Execute, Pair Programming.".to_string()
         );
     }
 }

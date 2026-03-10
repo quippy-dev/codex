@@ -12,9 +12,9 @@ use codex_core::AuthManager;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
 use codex_core::ThreadSortKey;
+use codex_core::auth::AuthFileRuntime;
 use codex_core::auth::AuthMode;
 use codex_core::auth::enforce_login_restrictions;
-use codex_core::auth::resolve_auth_storage_home;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -145,6 +145,12 @@ mod voice {
     pub(crate) struct RecordingMeterState;
 
     pub(crate) struct RealtimeAudioPlayer;
+
+    pub(crate) fn set_transcription_session_context(
+        _auth_storage_home: std::path::PathBuf,
+        _chatgpt_base_url: String,
+    ) {
+    }
 
     impl VoiceCapture {
         pub fn start() -> Result<Self, String> {
@@ -584,21 +590,18 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let auth_storage_home = resolve_auth_storage_home(
-        initial_config.codex_home.clone(),
-        cli.auth_file.as_deref(),
-        initial_config.cli_auth_credentials_store_mode,
-    )
-    .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
+    let auth_runtime = AuthFileRuntime::from_config(&initial_config, cli.auth_file.clone())
+        .map_err(|err| {
+            std::io::Error::other(format!("Error resolving auth storage path: {err}"))
+        })?;
     crate::voice::set_transcription_session_context(
-        auth_storage_home.clone(),
+        auth_runtime.auth_storage_home().to_path_buf(),
         initial_config.chatgpt_base_url.clone(),
     );
-    let auth_manager = AuthManager::shared(
-        auth_storage_home.clone(),
-        false,
-        initial_config.cli_auth_credentials_store_mode,
-    );
+    let auth_storage_home = auth_runtime.auth_storage_home().to_path_buf();
+    let auth_manager = auth_runtime.shared_auth_manager(false).map_err(|err| {
+        std::io::Error::other(format!("Error resolving auth storage path: {err}"))
+    })?;
     let login_status = get_login_status(&initial_config, auth_manager.as_ref());
     let should_show_trust_screen_flag = should_show_trust_screen(&initial_config);
     let should_show_onboarding =

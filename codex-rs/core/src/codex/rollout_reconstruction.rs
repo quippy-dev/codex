@@ -1,4 +1,5 @@
 use super::*;
+use crate::compact::plan_retention::replay as retained_plan_replay;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.
@@ -148,12 +149,10 @@ impl Session {
                         active_segment.base_replacement_history = Some(replacement_history);
                         rollout_suffix = &rollout_items[index + 1..];
                     }
-                    if active_segment.latest_proposed_plan_text.is_none()
-                        && let codex_protocol::RetainedProposedPlan::ProposedPlan { text } =
-                            &compacted.retained_proposed_plan
-                    {
-                        active_segment.latest_proposed_plan_text = Some(text.clone());
-                    }
+                    retained_plan_replay::hydrate_latest_proposed_plan_text(
+                        &mut active_segment.latest_proposed_plan_text,
+                        &compacted.retained_proposed_plan,
+                    );
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                     pending_rollback_turns = pending_rollback_turns
@@ -312,24 +311,17 @@ impl Session {
                         // prompt shape.
                         // TODO(ccunningham): if we drop support for None replacement_history compaction items,
                         // we can get rid of this second loop entirely and just build `history` directly in the first loop.
-                        let user_messages = collect_user_messages(history.raw_items());
-                        let rebuilt = compact::build_compacted_history(
-                            Vec::new(),
-                            &user_messages,
+                        let rebuilt = retained_plan_replay::rebuild_legacy_compaction_history(
+                            history.raw_items(),
                             &compacted.message,
-                        );
-                        let rebuilt = compact::insert_retained_plan_context_message(
-                            rebuilt,
                             &compacted.retained_proposed_plan,
                         );
                         history.replace(rebuilt);
                     }
-                    if latest_proposed_plan_text.is_none()
-                        && let codex_protocol::RetainedProposedPlan::ProposedPlan { text } =
-                            &compacted.retained_proposed_plan
-                    {
-                        latest_proposed_plan_text = Some(text.clone());
-                    }
+                    retained_plan_replay::hydrate_latest_proposed_plan_text(
+                        &mut latest_proposed_plan_text,
+                        &compacted.retained_proposed_plan,
+                    );
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                     history.drop_last_n_user_turns(rollback.num_turns);

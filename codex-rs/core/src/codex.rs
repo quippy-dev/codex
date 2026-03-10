@@ -22,6 +22,7 @@ use crate::apps::render_apps_section;
 use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
 use crate::compact::InitialContextInjection;
+use crate::compact::plan_retention::cache as plan_retention_cache;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
@@ -236,7 +237,6 @@ use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_explicit_plugin_mentions;
 use crate::mentions::collect_tool_mentions_from_messages;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
-use crate::plan_retention_invariants::completed_plan_text_for_manual_compaction;
 use crate::plugins::PluginsManager;
 use crate::plugins::build_plugin_injections;
 use crate::project_doc::get_user_instructions;
@@ -2224,7 +2224,7 @@ impl Session {
                     state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
                 }
                 self.set_previous_turn_settings(None).await;
-                self.set_latest_proposed_plan_text(None).await;
+                plan_retention_cache::clear_latest_proposed_plan_text(self).await;
                 // Ensure initial items are visible to immediate readers (e.g., tests, forks).
                 if !is_subagent {
                     self.flush_rollout().await;
@@ -2256,8 +2256,11 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_reference_context_item(reconstructed_rollout.reference_context_item);
                 }
-                self.set_latest_proposed_plan_text(latest_proposed_plan_text)
-                    .await;
+                plan_retention_cache::hydrate_latest_proposed_plan_text(
+                    self,
+                    latest_proposed_plan_text,
+                )
+                .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -2327,7 +2330,8 @@ impl Session {
                     reconstructed_rollout.previous_turn_settings.clone(),
                 )
                 .await;
-                self.set_latest_proposed_plan_text(
+                plan_retention_cache::hydrate_latest_proposed_plan_text(
+                    self,
                     reconstructed_rollout.latest_proposed_plan_text.clone(),
                 )
                 .await;
@@ -3130,9 +3134,7 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
-        if let Some(plan_text) = completed_plan_text_for_manual_compaction(&item) {
-            self.set_latest_proposed_plan_text(Some(plan_text)).await;
-        }
+        plan_retention_cache::cache_completed_plan_item(self, &item).await;
         record_turn_ttfm_metric(turn_context, &item).await;
         self.send_event(
             turn_context,
@@ -4985,6 +4987,7 @@ mod handlers {
     use crate::codex::Session;
     use crate::codex::SessionSettingsUpdate;
     use crate::codex::SteerInputError;
+    use crate::compact::plan_retention::cache as plan_retention_cache;
 
     use crate::codex::spawn_review_thread;
     use crate::config::Config;
@@ -5763,8 +5766,11 @@ mod handlers {
         .await;
         sess.set_previous_turn_settings(reconstructed.previous_turn_settings)
             .await;
-        sess.set_latest_proposed_plan_text(reconstructed.latest_proposed_plan_text)
-            .await;
+        plan_retention_cache::hydrate_latest_proposed_plan_text(
+            sess.as_ref(),
+            reconstructed.latest_proposed_plan_text,
+        )
+        .await;
         sess.recompute_token_usage(turn_context.as_ref()).await;
 
         sess.send_event_raw_flushed(Event {
@@ -7070,7 +7076,7 @@ async fn run_sampling_request(
     }
 }
 
-async fn built_tools(
+pub(crate) async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
     input: &[ResponseItem],
@@ -7565,7 +7571,7 @@ async fn maybe_complete_plan_item_from_message(
             }
         }
         let Some(plan_text) = extract_proposed_plan_text(&text) else {
-            sess.set_latest_proposed_plan_text(None).await;
+            plan_retention_cache::clear_latest_proposed_plan_text(sess).await;
             return;
         };
         let (plan_text, _citations) = strip_citations(&plan_text);
