@@ -588,7 +588,10 @@ async fn run_ratatui_app(
         initial_config.cli_auth_credentials_store_mode,
     )
     .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
-    crate::voice::set_auth_storage_home(auth_storage_home.clone());
+    crate::voice::set_transcription_session_context(
+        auth_storage_home.clone(),
+        initial_config.chatgpt_base_url.clone(),
+    );
     let auth_manager = AuthManager::shared(
         auth_storage_home.clone(),
         false,

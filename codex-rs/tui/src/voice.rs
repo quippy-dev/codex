@@ -31,7 +31,14 @@ use tracing::trace;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
-static AUTH_STORAGE_HOME: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+static TRANSCRIPTION_SESSION_CONTEXT: LazyLock<Mutex<Option<TranscriptionSessionContext>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptionSessionContext {
+    auth_storage_home: PathBuf,
+    chatgpt_base_url: String,
+}
 
 struct TranscriptionAuthContext {
     mode: AuthMode,
@@ -55,9 +62,15 @@ pub struct VoiceCapture {
     last_peak: Arc<AtomicU16>,
 }
 
-pub(crate) fn set_auth_storage_home(auth_storage_home: PathBuf) {
-    if let Ok(mut stored) = AUTH_STORAGE_HOME.lock() {
-        *stored = Some(auth_storage_home);
+pub(crate) fn set_transcription_session_context(
+    auth_storage_home: PathBuf,
+    chatgpt_base_url: String,
+) {
+    if let Ok(mut stored) = TRANSCRIPTION_SESSION_CONTEXT.lock() {
+        *stored = Some(TranscriptionSessionContext {
+            auth_storage_home,
+            chatgpt_base_url,
+        });
     }
 }
 
@@ -772,28 +785,28 @@ fn normalize_chatgpt_base_url(input: &str) -> String {
 }
 
 async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
-    let auth_storage_home = AUTH_STORAGE_HOME
+    let session_context = TRANSCRIPTION_SESSION_CONTEXT
         .lock()
-        .map_err(|_| "failed to access transcription auth storage path".to_string())?
+        .map_err(|_| "failed to access transcription session context".to_string())?
         .clone()
-        .ok_or_else(|| "transcription auth storage path was not initialized".to_string())?;
-    let auth = CodexAuth::from_auth_storage(&auth_storage_home, AuthCredentialsStoreMode::Auto)
-        .map_err(|e| format!("failed to read auth.json: {e}"))?
-        .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
+        .ok_or_else(|| "transcription session context was not initialized".to_string())?;
+    let auth = CodexAuth::from_auth_storage(
+        &session_context.auth_storage_home,
+        AuthCredentialsStoreMode::Auto,
+    )
+    .map_err(|e| format!("failed to read auth.json: {e}"))?
+    .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
 
     let chatgpt_account_id = auth.get_account_id();
 
     let token = auth
         .get_token()
         .map_err(|e| format!("failed to get auth token: {e}"))?;
-    let config = Config::load_with_cli_overrides(Vec::new())
-        .await
-        .map_err(|e| format!("failed to load config: {e}"))?;
     Ok(TranscriptionAuthContext {
         mode: auth.api_auth_mode(),
         bearer_token: token,
         chatgpt_account_id,
-        chatgpt_base_url: normalize_chatgpt_base_url(&config.chatgpt_base_url),
+        chatgpt_base_url: normalize_chatgpt_base_url(&session_context.chatgpt_base_url),
     })
 }
 
@@ -884,11 +897,11 @@ async fn transcribe_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::AUTH_STORAGE_HOME;
     use super::RecordedAudio;
+    use super::TRANSCRIPTION_SESSION_CONTEXT;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
-    use super::set_auth_storage_home;
+    use super::set_transcription_session_context;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -922,14 +935,24 @@ mod tests {
     }
 
     #[test]
-    fn set_auth_storage_home_updates_transcription_auth_storage_path() {
-        let expected = PathBuf::from("/tmp/auth-home");
-        set_auth_storage_home(expected.clone());
+    fn set_transcription_session_context_updates_voice_session_context() {
+        let expected_auth_storage_home = PathBuf::from("/tmp/auth-home");
+        let expected_chatgpt_base_url = "https://chatgpt.example.com/backend-api".to_string();
+        set_transcription_session_context(
+            expected_auth_storage_home.clone(),
+            expected_chatgpt_base_url.clone(),
+        );
 
-        let stored = AUTH_STORAGE_HOME
+        let stored = TRANSCRIPTION_SESSION_CONTEXT
             .lock()
-            .expect("lock auth storage path")
+            .expect("lock transcription session context")
             .clone();
-        assert_eq!(stored, Some(expected));
+        assert_eq!(
+            stored,
+            Some(super::TranscriptionSessionContext {
+                auth_storage_home: expected_auth_storage_home,
+                chatgpt_base_url: expected_chatgpt_base_url,
+            })
+        );
     }
 }
