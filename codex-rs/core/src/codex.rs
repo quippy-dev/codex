@@ -6946,16 +6946,18 @@ async fn maybe_complete_plan_item_from_message(
                 text.push_str(chunk);
             }
         }
-        if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            let (plan_text, _citations) = strip_citations(&plan_text);
-            if !state.plan_item_state.started {
-                state.plan_item_state.start(sess, turn_context).await;
-            }
-            state
-                .plan_item_state
-                .complete_with_text(sess, turn_context, plan_text)
-                .await;
+        let Some(plan_text) = extract_proposed_plan_text(&text) else {
+            sess.set_latest_proposed_plan_text(None).await;
+            return;
+        };
+        let (plan_text, _citations) = strip_citations(&plan_text);
+        if !state.plan_item_state.started {
+            state.plan_item_state.start(sess, turn_context).await;
         }
+        state
+            .plan_item_state
+            .complete_with_text(sess, turn_context, plan_text)
+            .await;
     }
 }
 

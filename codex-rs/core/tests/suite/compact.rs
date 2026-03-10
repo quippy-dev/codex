@@ -504,6 +504,130 @@ async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_plan_mode_compact_drops_stale_proposed_plan_after_plain_assistant_reply() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let plan_text = "- Step 1\n- Step 2\n";
+    let plan_block = format!("<proposed_plan>\n{plan_text}</proposed_plan>\n");
+    let first_turn = sse(vec![
+        ev_assistant_message("m0", &format!("Intro\n{plan_block}Outro")),
+        ev_completed("r0"),
+    ]);
+    let clarification_turn = sse(vec![
+        ev_assistant_message("m1", "I need more constraints before proposing a plan."),
+        ev_completed("r1"),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m2", SUMMARY_TEXT),
+        ev_completed("r2"),
+    ]);
+    let follow_up_turn = sse(vec![ev_completed("r3")]);
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![first_turn, clarification_turn, compact_turn, follow_up_turn],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200_000);
+    });
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex;
+    let session_configured = test.session_configured;
+
+    let plan_mode = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: session_configured.model.clone(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        },
+    };
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "please plan".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: std::env::current_dir().expect("cwd"),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
+            final_output_json_schema: None,
+            collaboration_mode: Some(plan_mode.clone()),
+            personality: None,
+        })
+        .await
+        .expect("submit initial plan turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "Need different constraints.".into(),
+                text_elements: Vec::new(),
+            }],
+            cwd: std::env::current_dir().expect("cwd"),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model,
+            effort: None,
+            summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
+            final_output_json_schema: None,
+            collaboration_mode: Some(plan_mode),
+            personality: None,
+        })
+        .await
+        .expect("submit clarification turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Implement the plan.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .expect("submit follow-up turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected initial plan, clarification, compact, and follow-up requests"
+    );
+    let body4 = requests[3].body_json();
+    let input4 = body4
+        .get("input")
+        .and_then(|v| v.as_array())
+        .expect("fourth request input array");
+    let serialized = serde_json::to_string(input4).expect("serialize fourth request input");
+    assert!(
+        serialized.contains("Implement the plan."),
+        "expected follow-up request to include implementation prompt"
+    );
+    assert!(
+        !serialized.contains("<proposed_plan>\\n- Step 1\\n- Step 2\\n</proposed_plan>"),
+        "expected follow-up request to drop a stale retained proposed plan after a plain assistant reply"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_uses_custom_prompt() {
     skip_if_no_network!();
 
