@@ -6,9 +6,8 @@ use crate::config::Config;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::TextToolOutput;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutputBox;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
@@ -53,6 +52,8 @@ struct CloseAgentArgs {
 
 #[async_trait]
 impl ToolHandler for MultiAgentHandler {
+    type Output = FunctionToolOutput;
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
@@ -61,7 +62,7 @@ impl ToolHandler for MultiAgentHandler {
         matches!(payload, ToolPayload::Function { .. })
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutputBox, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -163,7 +164,7 @@ mod spawn {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: SpawnAgentArgs = parse_arguments(&arguments)?;
         if let Some(model) = args.model.as_deref()
             && model.trim().is_empty()
@@ -342,10 +343,7 @@ mod spawn {
             FunctionCallError::Fatal(format!("failed to serialize spawn_agent result: {err}"))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: Some(true),
-        }))
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 
     fn watchdog_interval(
@@ -445,7 +443,7 @@ mod send_input {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = match args.id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() && !matches!(id, "parent" | "root") => agent_id(id)?,
@@ -531,10 +529,7 @@ mod send_input {
             FunctionCallError::Fatal(format!("failed to serialize send_input result: {err}"))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: Some(true),
-        }))
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 }
 
@@ -568,7 +563,7 @@ mod resume_agent {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: ResumeAgentArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = agent_id(&args.id)?;
         let child_depth = next_thread_spawn_depth(&turn.session_source);
@@ -654,10 +649,7 @@ mod resume_agent {
             FunctionCallError::Fatal(format!("failed to serialize resume_agent result: {err}"))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: Some(true),
-        }))
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 
     async fn try_resume_closed_agent(
@@ -784,7 +776,7 @@ mod compact_parent_context {
         _turn: Arc<TurnContext>,
         _call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: CompactParentContextArgs = parse_arguments(&arguments)?;
         let _reason = args.reason.and_then(|reason| {
             let trimmed = reason.trim();
@@ -836,10 +828,7 @@ mod compact_parent_context {
             ))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: Some(true),
-        }))
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 }
 
@@ -878,7 +867,7 @@ mod list_agents {
         _turn: Arc<TurnContext>,
         _call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
         let owner_thread_id = match args.id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() && id == "parent" => session
@@ -920,10 +909,7 @@ mod list_agents {
             FunctionCallError::Fatal(format!("failed to serialize list_agents result: {err}"))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: Some(true),
-        }))
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 }
 
@@ -959,7 +945,7 @@ pub(crate) mod wait {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         if let Some(owner_thread_id) = session
             .services
             .agent_control
@@ -1169,10 +1155,7 @@ pub(crate) mod wait {
             FunctionCallError::Fatal(format!("failed to serialize wait result: {err}"))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: None,
-        }))
+        Ok(FunctionToolOutput::from_text(content, None))
     }
 
     // Pub only for tests. Do not use.
@@ -1378,7 +1361,7 @@ pub mod close_agent {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutputBox, FunctionCallError> {
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
         let agent_id = agent_id(&args.id)?;
         let status_before = session.services.agent_control.get_status(agent_id).await;
@@ -1468,10 +1451,7 @@ pub mod close_agent {
                     ))
                 })?;
 
-                Ok(Box::new(TextToolOutput {
-                    text: content,
-                    success: Some(true),
-                }))
+                Ok(FunctionToolOutput::from_text(content, Some(true)))
             } else {
                 Err(multi_agent_tool_error(agent_id, err))
             };
@@ -1528,10 +1508,7 @@ pub mod close_agent {
             FunctionCallError::Fatal(format!("failed to serialize close_agent result: {err}"))
         })?;
 
-        Ok(Box::new(TextToolOutput {
-            text: content,
-            success: Some(true),
-        }))
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 }
 
@@ -1887,8 +1864,7 @@ mod tests {
     use crate::protocol::SandboxPolicy;
     use crate::protocol::SessionSource;
     use crate::protocol::SubAgentSource;
-    use crate::tools::context::TextToolOutput;
-    use crate::tools::context::ToolOutputBox;
+    use crate::tools::context::FunctionToolOutput;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
@@ -1990,11 +1966,12 @@ mod tests {
             .collect()
     }
 
-    fn expect_text_output(output: ToolOutputBox) -> (String, Option<bool>) {
-        let output = (&*output as &dyn std::any::Any)
-            .downcast_ref::<TextToolOutput>()
-            .expect("expected text output");
-        (output.text.clone(), output.success)
+    fn expect_text_output(output: FunctionToolOutput) -> (String, Option<bool>) {
+        (
+            codex_protocol::models::function_call_output_content_items_to_text(&output.body)
+                .unwrap_or_default(),
+            output.success,
+        )
     }
 
     #[tokio::test]
