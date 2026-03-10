@@ -12,6 +12,12 @@ use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+#[cfg(target_os = "macos")]
+use crossterm::event::KeyEventKind;
+#[cfg(target_os = "macos")]
+use crossterm::event::KeyModifiers;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -66,12 +72,75 @@ pub(crate) fn format_agent_picker_item_name(
     }
 }
 
-pub(crate) fn sort_agent_picker_threads(agent_threads: &mut [(ThreadId, AgentPickerThreadEntry)]) {
-    agent_threads.sort_by(|(left_id, left), (right_id, right)| {
-        left.is_closed
-            .cmp(&right.is_closed)
-            .then_with(|| left_id.to_string().cmp(&right_id.to_string()))
-    });
+pub(crate) fn previous_agent_shortcut() -> crate::key_hint::KeyBinding {
+    crate::key_hint::alt(KeyCode::Left)
+}
+
+pub(crate) fn next_agent_shortcut() -> crate::key_hint::KeyBinding {
+    crate::key_hint::alt(KeyCode::Right)
+}
+
+pub(crate) fn previous_agent_shortcut_matches(
+    key_event: KeyEvent,
+    allow_word_motion_fallback: bool,
+) -> bool {
+    previous_agent_shortcut().is_press(key_event)
+        || previous_agent_word_motion_fallback(key_event, allow_word_motion_fallback)
+}
+
+pub(crate) fn next_agent_shortcut_matches(
+    key_event: KeyEvent,
+    allow_word_motion_fallback: bool,
+) -> bool {
+    next_agent_shortcut().is_press(key_event)
+        || next_agent_word_motion_fallback(key_event, allow_word_motion_fallback)
+}
+
+#[cfg(target_os = "macos")]
+fn previous_agent_word_motion_fallback(
+    key_event: KeyEvent,
+    allow_word_motion_fallback: bool,
+) -> bool {
+    allow_word_motion_fallback
+        && matches!(
+            key_event,
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }
+        )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn previous_agent_word_motion_fallback(
+    _key_event: KeyEvent,
+    _allow_word_motion_fallback: bool,
+) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn next_agent_word_motion_fallback(key_event: KeyEvent, allow_word_motion_fallback: bool) -> bool {
+    allow_word_motion_fallback
+        && matches!(
+            key_event,
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::ALT,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }
+        )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn next_agent_word_motion_fallback(
+    _key_event: KeyEvent,
+    _allow_word_motion_fallback: bool,
+) -> bool {
+    false
 }
 
 pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
@@ -408,10 +477,13 @@ fn status_summary_line(status: &AgentStatus) -> Line<'static> {
     status_summary_spans(status).into()
 }
 
+// Allow `.yellow()`
+#[allow(clippy::disallowed_methods)]
 fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
     match status {
         AgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
         AgentStatus::Running => vec![Span::from("Running").cyan().bold()],
+        AgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
         AgentStatus::Completed(message) => {
             let mut spans = vec![Span::from("Completed").green()];
             if let Some(message) = message.as_ref() {
@@ -447,6 +519,10 @@ fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
 mod tests {
     use super::*;
     use crate::history_cell::HistoryCell;
+    #[cfg(target_os = "macos")]
+    use crossterm::event::KeyEvent;
+    #[cfg(target_os = "macos")]
+    use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::style::Color;
@@ -536,6 +612,27 @@ mod tests {
         assert_snapshot!("agent_transcript", snapshot);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn agent_shortcut_matches_option_arrow_word_motion_fallbacks() {
+        assert!(previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            true,
+        ));
+        assert!(next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            true,
+        ));
+        assert!(!previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            false,
+        ));
+        assert!(!next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            false,
+        ));
+    }
+
     #[test]
     fn title_styles_nickname_and_role() {
         let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
@@ -561,6 +658,25 @@ mod tests {
         assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
         assert_eq!(title.spans[4].style.fg, None);
         assert!(!title.spans[4].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn collab_resume_interrupted_snapshot() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+
+        let cell = resume_end(CollabResumeEndEvent {
+            call_id: "call-resume".to_string(),
+            sender_thread_id,
+            receiver_thread_id: robie_id,
+            receiver_agent_nickname: Some("Robie".to_string()),
+            receiver_agent_role: Some("explorer".to_string()),
+            status: AgentStatus::Interrupted,
+        });
+
+        assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
     }
 
     fn cell_to_text(cell: &PlainHistoryCell) -> String {

@@ -555,6 +555,8 @@ pub struct RejectConfig {
     pub sandbox_approval: bool,
     /// Reject prompts triggered by execpolicy `prompt` rules.
     pub rules: bool,
+    /// Reject approval prompts related to built-in permission requests.
+    pub request_permissions: bool,
     /// Reject MCP elicitation prompts.
     pub mcp_elicitations: bool,
 }
@@ -566,6 +568,10 @@ impl RejectConfig {
 
     pub const fn rejects_rules_approval(self) -> bool {
         self.rules
+    }
+
+    pub const fn rejects_request_permissions(self) -> bool {
+        self.request_permissions
     }
 
     pub const fn rejects_mcp_elicitations(self) -> bool {
@@ -1371,6 +1377,8 @@ pub enum AgentStatus {
     PendingInit,
     /// Agent is currently running.
     Running,
+    /// Agent's current turn was interrupted and it may receive more input.
+    Interrupted,
     /// Agent is done. Contains the final assistant message.
     Completed(Option<String>),
     /// Agent encountered an error.
@@ -2347,11 +2355,10 @@ pub struct TurnContextNetworkItem {
     pub denied_domains: Vec<String>,
 }
 
-/// Persist once per real user turn after computing that turn's model-visible
-/// context updates, and again after mid-turn compaction when replacement
-/// history re-establishes full context, so resume/fork replay can recover the
-/// latest durable baseline.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+/// Persist after each committed model-visible context update, and again after
+/// mid-turn compaction when replacement history re-establishes full context, so
+/// resume/fork replay can recover the latest durable baseline.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
 pub struct TurnContextItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -3308,12 +3315,6 @@ mod tests {
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
 
-    fn sorted_paths(paths: Vec<AbsolutePathBuf>) -> Vec<PathBuf> {
-        let mut sorted: Vec<PathBuf> = paths.into_iter().map(|path| path.to_path_buf()).collect();
-        sorted.sort();
-        sorted
-    }
-
     fn sorted_writable_roots(roots: Vec<WritableRoot>) -> Vec<(PathBuf, Vec<PathBuf>)> {
         let mut sorted_roots: Vec<(PathBuf, Vec<PathBuf>)> = roots
             .into_iter()
@@ -3329,6 +3330,53 @@ mod tests {
             .collect();
         sorted_roots.sort_by(|left, right| left.0.cmp(&right.0));
         sorted_roots
+    }
+
+    fn sandbox_policy_allows_read(policy: &SandboxPolicy, path: &Path, cwd: &Path) -> bool {
+        if policy.has_full_disk_read_access() {
+            return true;
+        }
+
+        policy
+            .get_readable_roots_with_cwd(cwd)
+            .iter()
+            .any(|root| path.starts_with(root.as_path()))
+            || policy
+                .get_writable_roots_with_cwd(cwd)
+                .iter()
+                .any(|root| path.starts_with(root.root.as_path()))
+    }
+
+    fn sandbox_policy_allows_write(policy: &SandboxPolicy, path: &Path, cwd: &Path) -> bool {
+        if policy.has_full_disk_write_access() {
+            return true;
+        }
+
+        policy
+            .get_writable_roots_with_cwd(cwd)
+            .iter()
+            .any(|root| root.is_path_writable(path))
+    }
+
+    fn sandbox_policy_probe_paths(policy: &SandboxPolicy, cwd: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![cwd.to_path_buf()];
+        paths.extend(
+            policy
+                .get_readable_roots_with_cwd(cwd)
+                .into_iter()
+                .map(|path| path.to_path_buf()),
+        );
+        for root in policy.get_writable_roots_with_cwd(cwd) {
+            paths.push(root.root.to_path_buf());
+            paths.extend(
+                root.read_only_subpaths
+                    .into_iter()
+                    .map(|path| path.to_path_buf()),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     fn assert_same_sandbox_policy_semantics(
@@ -3352,14 +3400,25 @@ mod tests {
             actual.include_platform_defaults(),
             expected.include_platform_defaults()
         );
-        assert_eq!(
-            sorted_paths(actual.get_readable_roots_with_cwd(cwd)),
-            sorted_paths(expected.get_readable_roots_with_cwd(cwd))
-        );
-        assert_eq!(
-            sorted_writable_roots(actual.get_writable_roots_with_cwd(cwd)),
-            sorted_writable_roots(expected.get_writable_roots_with_cwd(cwd))
-        );
+        let mut probe_paths = sandbox_policy_probe_paths(expected, cwd);
+        probe_paths.extend(sandbox_policy_probe_paths(actual, cwd));
+        probe_paths.sort();
+        probe_paths.dedup();
+
+        for path in probe_paths {
+            assert_eq!(
+                sandbox_policy_allows_read(actual, &path, cwd),
+                sandbox_policy_allows_read(expected, &path, cwd),
+                "read access mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                sandbox_policy_allows_write(actual, &path, cwd),
+                sandbox_policy_allows_write(expected, &path, cwd),
+                "write access mismatch for {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -3395,6 +3454,7 @@ mod tests {
             RejectConfig {
                 sandbox_approval: false,
                 rules: false,
+                request_permissions: false,
                 mcp_elicitations: true,
             }
             .rejects_mcp_elicitations()
@@ -3403,9 +3463,32 @@ mod tests {
             !RejectConfig {
                 sandbox_approval: false,
                 rules: false,
+                request_permissions: false,
                 mcp_elicitations: false,
             }
             .rejects_mcp_elicitations()
+        );
+    }
+
+    #[test]
+    fn reject_config_request_permissions_flag_is_field_driven() {
+        assert!(
+            RejectConfig {
+                sandbox_approval: false,
+                rules: false,
+                request_permissions: true,
+                mcp_elicitations: false,
+            }
+            .rejects_request_permissions()
+        );
+        assert!(
+            !RejectConfig {
+                sandbox_approval: false,
+                rules: false,
+                request_permissions: false,
+                mcp_elicitations: false,
+            }
+            .rejects_request_permissions()
         );
     }
 
@@ -3583,6 +3666,67 @@ mod tests {
     }
 
     #[test]
+    fn restricted_file_system_policy_treats_read_entries_as_read_only_subpaths() {
+        let cwd = TempDir::new().expect("tempdir");
+        let docs =
+            AbsolutePathBuf::resolve_path_against_base("docs", cwd.path()).expect("resolve docs");
+        let docs_public = AbsolutePathBuf::resolve_path_against_base("docs/public", cwd.path())
+            .expect("resolve docs/public");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: docs.clone() },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: docs_public.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        assert!(!policy.has_full_disk_write_access());
+        assert_eq!(
+            sorted_writable_roots(policy.get_writable_roots_with_cwd(cwd.path())),
+            vec![
+                (cwd.path().to_path_buf(), vec![docs.to_path_buf()]),
+                (docs_public.to_path_buf(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_write_nested_readable_root_stays_writable() {
+        let cwd = TempDir::new().expect("tempdir");
+        let docs =
+            AbsolutePathBuf::resolve_path_against_base("docs", cwd.path()).expect("resolve docs");
+        let policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            read_only_access: ReadOnlyAccess::Restricted {
+                include_platform_defaults: true,
+                readable_roots: vec![docs],
+            },
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        };
+
+        assert_eq!(
+            sorted_writable_roots(
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, cwd.path())
+                    .get_writable_roots_with_cwd(cwd.path())
+            ),
+            vec![(cwd.path().to_path_buf(), Vec::new())]
+        );
+    }
+
+    #[test]
     fn file_system_policy_rejects_legacy_bridge_for_non_workspace_writes() {
         let cwd = if cfg!(windows) {
             Path::new(r"C:\workspace")
@@ -3619,6 +3763,8 @@ mod tests {
             .expect("resolve readable root");
         let writable_root = AbsolutePathBuf::resolve_path_against_base("writable", cwd.path())
             .expect("resolve writable root");
+        let nested_readable_root = AbsolutePathBuf::resolve_path_against_base("docs", cwd.path())
+            .expect("resolve nested readable root");
         let policies = [
             SandboxPolicy::DangerFullAccess,
             SandboxPolicy::ExternalSandbox {
@@ -3655,10 +3801,20 @@ mod tests {
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: true,
             },
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                read_only_access: ReadOnlyAccess::Restricted {
+                    include_platform_defaults: true,
+                    readable_roots: vec![nested_readable_root],
+                },
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
         ];
 
         for expected in policies {
-            let actual = FileSystemSandboxPolicy::from(&expected)
+            let actual = FileSystemSandboxPolicy::from_legacy_sandbox_policy(&expected, cwd.path())
                 .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
                 .expect("legacy bridge should preserve legacy policy semantics");
 

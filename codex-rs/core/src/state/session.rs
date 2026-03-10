@@ -1,5 +1,6 @@
 //! Session-wide mutable state.
 
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -40,6 +41,7 @@ pub(crate) struct SessionState {
     pub(crate) startup_regular_task: Option<JoinHandle<CodexResult<RegularTask>>>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
+    granted_permissions: Option<PermissionProfile>,
     post_interrupt_collab_hold_armed: bool,
     deferred_collab_items: Vec<ResponseInputItem>,
     deferred_collab_items_bytes: usize,
@@ -61,6 +63,7 @@ impl SessionState {
             startup_regular_task: None,
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
+            granted_permissions: None,
             post_interrupt_collab_hold_armed: false,
             deferred_collab_items: Vec::new(),
             deferred_collab_items_bytes: 0,
@@ -239,6 +242,17 @@ impl SessionState {
 
     pub(crate) fn clear_mcp_tool_selection(&mut self) {
         self.active_mcp_tool_selection = None;
+    }
+
+    pub(crate) fn record_granted_permissions(&mut self, permissions: PermissionProfile) {
+        self.granted_permissions = crate::sandboxing::merge_permission_profiles(
+            self.granted_permissions.as_ref(),
+            Some(&permissions),
+        );
+    }
+
+    pub(crate) fn granted_permissions(&self) -> Option<PermissionProfile> {
+        self.granted_permissions.clone()
     }
 
     // Adds connector IDs to the active set and returns the merged selection.

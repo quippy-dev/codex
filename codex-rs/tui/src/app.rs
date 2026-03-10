@@ -34,7 +34,10 @@ use crate::model_migration::run_model_migration_prompt;
 use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
-use crate::multi_agents::sort_agent_picker_threads;
+use crate::multi_agents::next_agent_shortcut;
+use crate::multi_agents::next_agent_shortcut_matches;
+use crate::multi_agents::previous_agent_shortcut;
+use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
@@ -113,6 +116,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
@@ -1232,6 +1236,7 @@ pub(crate) struct App {
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_picker_threads: HashMap<ThreadId, AgentPickerThreadEntry>,
+    agent_picker_thread_order: Vec<ThreadId>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<Event>>,
     primary_thread_id: Option<ThreadId>,
@@ -1245,6 +1250,12 @@ struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
     // One-shot suppression of the next world-writable scan after user confirmation.
     skip_world_writable_scan_once: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AgentNavigationDirection {
+    Previous,
+    Next,
 }
 
 fn normalize_harness_overrides_for_cwd(
@@ -1453,8 +1464,10 @@ impl App {
         history_cell::SessionHeaderHistoryCell::new(
             self.chat_widget.current_model().to_string(),
             self.chat_widget.current_reasoning_effort(),
-            self.chat_widget
-                .should_show_fast_status(self.chat_widget.current_service_tier()),
+            self.chat_widget.should_show_fast_status(
+                self.chat_widget.current_model(),
+                self.chat_widget.current_service_tier(),
+            ),
             self.config.cwd.clone(),
             version,
         )
@@ -1653,6 +1666,77 @@ impl App {
         } else {
             fallback_label
         }
+    }
+
+    fn current_displayed_thread_id(&self) -> Option<ThreadId> {
+        self.active_thread_id.or(self.chat_widget.thread_id())
+    }
+
+    fn sync_active_agent_label(&mut self) {
+        let label = if self.agent_picker_threads.len() > 1 {
+            self.current_displayed_thread_id().map(|thread_id| {
+                let is_primary = self.primary_thread_id == Some(thread_id);
+                self.agent_picker_threads
+                    .get(&thread_id)
+                    .map(|entry| {
+                        format_agent_picker_item_name(
+                            entry.agent_nickname.as_deref(),
+                            entry.agent_role.as_deref(),
+                            is_primary,
+                        )
+                    })
+                    .unwrap_or_else(|| format_agent_picker_item_name(None, None, is_primary))
+            })
+        } else {
+            None
+        };
+        self.chat_widget.set_active_agent_label(label);
+    }
+
+    fn ordered_agent_picker_threads(&self) -> Vec<(ThreadId, &AgentPickerThreadEntry)> {
+        self.agent_picker_thread_order
+            .iter()
+            .filter_map(|thread_id| {
+                self.agent_picker_threads
+                    .get(thread_id)
+                    .map(|entry| (*thread_id, entry))
+            })
+            .collect()
+    }
+
+    fn adjacent_agent_picker_thread_id(
+        &self,
+        direction: AgentNavigationDirection,
+    ) -> Option<ThreadId> {
+        let agent_threads = self.ordered_agent_picker_threads();
+        if agent_threads.len() < 2 {
+            return None;
+        }
+
+        let current_thread_id = self.current_displayed_thread_id()?;
+        let current_idx = agent_threads
+            .iter()
+            .position(|(thread_id, _)| *thread_id == current_thread_id)?;
+        let next_idx = match direction {
+            AgentNavigationDirection::Next => (current_idx + 1) % agent_threads.len(),
+            AgentNavigationDirection::Previous => {
+                if current_idx == 0 {
+                    agent_threads.len() - 1
+                } else {
+                    current_idx - 1
+                }
+            }
+        };
+        Some(agent_threads[next_idx].0)
+    }
+
+    fn agent_picker_subtitle() -> String {
+        let previous: Span<'static> = previous_agent_shortcut().into();
+        let next: Span<'static> = next_agent_shortcut().into();
+        format!(
+            "Select an agent to watch. {} previous, {} next.",
+            previous.content, next.content
+        )
     }
 
     async fn thread_cwd(&self, thread_id: ThreadId) -> Option<PathBuf> {
@@ -1951,6 +2035,7 @@ impl App {
             let thread_id = session.session_id;
             self.primary_thread_id = Some(thread_id);
             self.primary_session_configured = Some(session.clone());
+            self.upsert_agent_picker_thread(thread_id, None, None, false);
             self.ensure_thread_channel(thread_id);
             self.activate_thread_channel(thread_id).await;
             self.enqueue_thread_event(thread_id, event).await?;
@@ -1999,15 +2084,9 @@ impl App {
             return;
         }
 
-        let mut agent_threads: Vec<(ThreadId, AgentPickerThreadEntry)> = self
-            .agent_picker_threads
-            .iter()
-            .map(|(thread_id, entry)| (*thread_id, entry.clone()))
-            .collect();
-        sort_agent_picker_threads(&mut agent_threads);
-
         let mut initial_selected_idx = None;
-        let items: Vec<SelectionItem> = agent_threads
+        let items: Vec<SelectionItem> = self
+            .ordered_agent_picker_threads()
             .iter()
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
@@ -2039,7 +2118,7 @@ impl App {
 
         self.chat_widget.show_selection_view(SelectionViewParams {
             title: Some("Multi-agents".to_string()),
-            subtitle: Some("Select an agent to watch".to_string()),
+            subtitle: Some(Self::agent_picker_subtitle()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             initial_selected_idx,
@@ -2054,6 +2133,9 @@ impl App {
         agent_role: Option<String>,
         is_closed: bool,
     ) {
+        if !self.agent_picker_threads.contains_key(&thread_id) {
+            self.agent_picker_thread_order.push(thread_id);
+        }
         self.agent_picker_threads.insert(
             thread_id,
             AgentPickerThreadEntry {
@@ -2062,11 +2144,13 @@ impl App {
                 is_closed,
             },
         );
+        self.sync_active_agent_label();
     }
 
     fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) {
         if let Some(entry) = self.agent_picker_threads.get_mut(&thread_id) {
             entry.is_closed = true;
+            self.sync_active_agent_label();
         } else {
             self.upsert_agent_picker_thread(thread_id, None, None, true);
         }
@@ -2116,6 +2200,7 @@ impl App {
             tx
         };
         self.chat_widget = ChatWidget::new_with_op_sender(init, codex_op_tx);
+        self.sync_active_agent_label();
 
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot, !is_replay_only);
@@ -2146,10 +2231,13 @@ impl App {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
         self.agent_picker_threads.clear();
+        self.agent_picker_thread_order.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
+        self.chat_widget.set_pending_thread_approvals(Vec::new());
+        self.sync_active_agent_label();
     }
 
     async fn start_fresh_session_with_summary_hint(&mut self, tui: &mut tui::Tui) {
@@ -2541,6 +2629,7 @@ impl App {
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_picker_threads: HashMap::new(),
+            agent_picker_thread_order: Vec::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -4335,6 +4424,31 @@ impl App {
     }
 
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
+        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
+            && self.chat_widget.composer_text_with_pending().is_empty();
+        if self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
+        {
+            if let Some(thread_id) =
+                self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous)
+            {
+                let _ = self.select_agent_thread(tui, thread_id).await;
+            }
+            return;
+        }
+        if self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
+        {
+            if let Some(thread_id) =
+                self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Next)
+            {
+                let _ = self.select_agent_thread(tui, thread_id).await;
+            }
+            return;
+        }
+
         match key_event {
             KeyEvent {
                 code: KeyCode::Char('t'),
@@ -4469,6 +4583,7 @@ mod tests {
     use crate::app_backtrack::BacktrackState;
     use crate::app_backtrack::user_count;
     use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
+    use crate::chatwidget::tests::set_chatgpt_auth;
     use crate::file_search::FileSearchManager;
     use crate::history_cell::AgentMessageCell;
     use crate::history_cell::HistoryCell;
@@ -5669,6 +5784,7 @@ mod tests {
                 is_closed: true,
             })
         );
+        assert_eq!(app.agent_picker_thread_order, vec![thread_id]);
         Ok(())
     }
 
@@ -5686,6 +5802,7 @@ mod tests {
                 is_closed: false,
             },
         );
+        app.agent_picker_thread_order.push(thread_id);
 
         app.open_agent_picker().await;
 
@@ -5883,6 +6000,7 @@ mod tests {
                 is_closed: false,
             },
         );
+        app.agent_picker_thread_order.push(agent_thread_id);
 
         app.refresh_pending_thread_approvals().await;
         assert_eq!(
@@ -5940,6 +6058,7 @@ mod tests {
                 is_closed: false,
             },
         );
+        app.agent_picker_thread_order.push(agent_thread_id);
 
         app.enqueue_thread_event(
             agent_thread_id,
@@ -6007,6 +6126,115 @@ mod tests {
         ]
         .join("\n");
         assert_snapshot!("agent_picker_item_name", snapshot);
+    }
+
+    #[tokio::test]
+    async fn agent_cycle_wraps_in_spawn_order() {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000101").expect("valid thread");
+        let first_agent_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000102").expect("valid thread");
+        let second_agent_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000103").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(second_agent_id);
+        app.agent_picker_threads.insert(
+            main_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(main_thread_id);
+        app.agent_picker_threads.insert(
+            first_agent_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(first_agent_id);
+        app.agent_picker_threads.insert(
+            second_agent_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Bob".to_string()),
+                agent_role: Some("worker".to_string()),
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(second_agent_id);
+
+        assert_eq!(
+            app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Next),
+            Some(main_thread_id),
+            "next should wrap to the first spawned thread"
+        );
+        assert_eq!(
+            app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous),
+            Some(first_agent_id),
+            "previous should move backward through spawn order"
+        );
+
+        app.active_thread_id = Some(main_thread_id);
+        assert_eq!(
+            app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous),
+            Some(second_agent_id),
+            "previous from the first spawned thread should wrap to the end"
+        );
+    }
+
+    #[test]
+    fn agent_picker_subtitle_mentions_shortcuts() {
+        let previous: Span<'static> = previous_agent_shortcut().into();
+        let next: Span<'static> = next_agent_shortcut().into();
+        let subtitle = App::agent_picker_subtitle();
+
+        assert!(subtitle.contains(previous.content.as_ref()));
+        assert!(subtitle.contains(next.content.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn sync_active_agent_label_tracks_selected_thread() {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000111").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000112").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(agent_thread_id);
+        app.agent_picker_threads.insert(
+            main_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(main_thread_id);
+        app.agent_picker_threads.insert(
+            agent_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(agent_thread_id);
+
+        app.sync_active_agent_label();
+        assert_eq!(
+            app.chat_widget.active_agent_label(),
+            Some("Robie [explorer]")
+        );
+
+        app.active_thread_id = Some(main_thread_id);
+        app.sync_active_agent_label();
+        assert_eq!(app.chat_widget.active_agent_label(), Some("Main [default]"));
     }
 
     #[tokio::test]
@@ -6200,6 +6428,32 @@ mod tests {
         assert_snapshot!("clear_ui_after_long_transcript_fresh_header_only", rendered);
     }
 
+    #[tokio::test]
+    async fn clear_ui_header_shows_fast_status_only_for_gpt54() {
+        let mut app = make_test_app().await;
+        app.config.cwd = PathBuf::from("/tmp/project");
+        app.chat_widget.set_model("gpt-5.4");
+        app.chat_widget
+            .set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+        app.chat_widget
+            .set_service_tier(Some(codex_protocol::config_types::ServiceTier::Fast));
+        set_chatgpt_auth(&mut app.chat_widget);
+
+        let rendered = app
+            .clear_ui_header_lines_with_version(80, "<VERSION>")
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_snapshot!("clear_ui_header_fast_status_gpt54_only", rendered);
+    }
+
     async fn make_test_app() -> App {
         let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
@@ -6248,6 +6502,7 @@ mod tests {
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_picker_threads: HashMap::new(),
+            agent_picker_thread_order: Vec::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -6310,6 +6565,7 @@ mod tests {
                 thread_event_channels: HashMap::new(),
                 thread_event_listener_tasks: HashMap::new(),
                 agent_picker_threads: HashMap::new(),
+                agent_picker_thread_order: Vec::new(),
                 active_thread_id: None,
                 active_thread_rx: None,
                 primary_thread_id: None,

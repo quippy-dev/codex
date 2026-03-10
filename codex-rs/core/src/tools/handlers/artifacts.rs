@@ -14,8 +14,9 @@ use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::protocol::ExecCommandSource;
 use crate::sandboxing::SandboxPermissions;
+use crate::tools::context::TextToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
+use crate::tools::context::ToolOutputBox;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
@@ -28,7 +29,6 @@ use crate::tools::runtimes::artifacts::ArtifactApprovalKey;
 use crate::tools::runtimes::artifacts::ArtifactExecRequest;
 use crate::tools::runtimes::artifacts::ArtifactRuntime;
 use crate::tools::sandboxing::ToolError;
-use codex_protocol::models::FunctionCallOutputBody;
 
 const ARTIFACTS_TOOL_NAME: &str = "artifacts";
 const ARTIFACTS_PRAGMA_PREFIXES: [&str; 2] = ["// codex-artifacts:", "// codex-artifact-tool:"];
@@ -81,7 +81,7 @@ impl ToolHandler for ArtifactsHandler {
         true
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutputBox, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -113,7 +113,6 @@ impl ToolHandler for ArtifactsHandler {
                 .unwrap_or(DEFAULT_EXECUTION_TIMEOUT.as_millis() as u64),
         )
         .await?;
-
         let emitter = ToolEmitter::shell(
             artifact_display_command(),
             prepared.request.cwd.clone(),
@@ -393,7 +392,7 @@ async fn finish_artifact_execution(
     emitter: &ToolEmitter,
     event_ctx: ToolEventCtx<'_>,
     result: Result<ExecToolCallOutput, ToolError>,
-) -> ToolOutput {
+) -> ToolOutputBox {
     let (body, success, stage) = match result {
         Ok(output) => {
             let success = output.exit_code == 0;
@@ -442,10 +441,10 @@ async fn finish_artifact_execution(
     };
     emitter.emit(event_ctx, stage).await;
 
-    ToolOutput::Function {
-        body: FunctionCallOutputBody::Text(body),
+    Box::new(TextToolOutput {
+        text: body,
         success: Some(success),
-    }
+    })
 }
 
 fn format_artifact_output(output: &ExecToolCallOutput) -> String {

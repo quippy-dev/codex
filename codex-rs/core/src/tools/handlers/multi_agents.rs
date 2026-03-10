@@ -7,8 +7,9 @@ use crate::config::Constrained;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::tools::context::TextToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
+use crate::tools::context::ToolOutputBox;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
@@ -16,7 +17,6 @@ use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
-use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -63,7 +63,7 @@ impl ToolHandler for MultiAgentHandler {
         matches!(payload, ToolPayload::Function { .. })
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutputBox, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -165,7 +165,7 @@ mod spawn {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         let args: SpawnAgentArgs = parse_arguments(&arguments)?;
         if let Some(model) = args.model.as_deref()
             && model.trim().is_empty()
@@ -343,10 +343,10 @@ mod spawn {
             FunctionCallError::Fatal(format!("failed to serialize spawn_agent result: {err}"))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: Some(true),
-        })
+        }))
     }
 
     fn watchdog_interval(
@@ -446,7 +446,7 @@ mod send_input {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = match args.id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() && !matches!(id, "parent" | "root") => agent_id(id)?,
@@ -532,10 +532,10 @@ mod send_input {
             FunctionCallError::Fatal(format!("failed to serialize send_input result: {err}"))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: Some(true),
-        })
+        }))
     }
 }
 
@@ -569,7 +569,7 @@ mod resume_agent {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         let args: ResumeAgentArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = agent_id(&args.id)?;
         let child_depth = next_thread_spawn_depth(&turn.session_source);
@@ -655,10 +655,10 @@ mod resume_agent {
             FunctionCallError::Fatal(format!("failed to serialize resume_agent result: {err}"))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: Some(true),
-        })
+        }))
     }
 
     async fn try_resume_closed_agent(
@@ -785,7 +785,7 @@ mod compact_parent_context {
         _turn: Arc<TurnContext>,
         _call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         let args: CompactParentContextArgs = parse_arguments(&arguments)?;
         let _reason = args.reason.and_then(|reason| {
             let trimmed = reason.trim();
@@ -837,10 +837,10 @@ mod compact_parent_context {
             ))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: Some(true),
-        })
+        }))
     }
 }
 
@@ -879,7 +879,7 @@ mod list_agents {
         _turn: Arc<TurnContext>,
         _call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
         let owner_thread_id = match args.id.as_deref().map(str::trim) {
             Some(id) if !id.is_empty() && id == "parent" => session
@@ -921,10 +921,10 @@ mod list_agents {
             FunctionCallError::Fatal(format!("failed to serialize list_agents result: {err}"))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: Some(true),
-        })
+        }))
     }
 }
 
@@ -960,7 +960,7 @@ pub(crate) mod wait {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         if let Some(owner_thread_id) = session
             .services
             .agent_control
@@ -971,7 +971,6 @@ pub(crate) mod wait {
                 "wait is not available to watchdog check-in agents. This thread is a one-shot watchdog check-in for owner {owner_thread_id}. Send the result to the parent/root agent with `send_input`. If you finish without `send_input`, runtime will forward your conclusory message to the owner as the mandatory fallback wake-up path. Exiting without either `send_input` or a final message is a bug; every watchdog check-in must wake the owner thread."
             )));
         }
-
         let args: WaitArgs = parse_arguments(&arguments)?;
         if args.ids.is_empty() {
             return Err(FunctionCallError::RespondToModel(
@@ -1171,13 +1170,14 @@ pub(crate) mod wait {
             FunctionCallError::Fatal(format!("failed to serialize wait result: {err}"))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: None,
-        })
+        }))
     }
 
-    async fn wait_for_final_status(
+    // Pub only for tests. Do not use.
+    pub(super) async fn wait_for_final_status(
         session: Arc<Session>,
         thread_id: ThreadId,
         mut status_rx: Receiver<AgentStatus>,
@@ -1379,7 +1379,7 @@ pub mod close_agent {
         turn: Arc<TurnContext>,
         call_id: String,
         arguments: String,
-    ) -> Result<ToolOutput, FunctionCallError> {
+    ) -> Result<ToolOutputBox, FunctionCallError> {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
         let agent_id = agent_id(&args.id)?;
         let status_before = session.services.agent_control.get_status(agent_id).await;
@@ -1469,10 +1469,10 @@ pub mod close_agent {
                     ))
                 })?;
 
-                Ok(ToolOutput::Function {
-                    body: FunctionCallOutputBody::Text(content),
+                Ok(Box::new(TextToolOutput {
+                    text: content,
                     success: Some(true),
-                })
+                }))
             } else {
                 Err(multi_agent_tool_error(agent_id, err))
             };
@@ -1529,10 +1529,10 @@ pub mod close_agent {
             FunctionCallError::Fatal(format!("failed to serialize close_agent result: {err}"))
         })?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
+        Ok(Box::new(TextToolOutput {
+            text: content,
             success: Some(true),
-        })
+        }))
     }
 }
 
@@ -1873,6 +1873,8 @@ mod tests {
     use crate::protocol::SandboxPolicy;
     use crate::protocol::SessionSource;
     use crate::protocol::SubAgentSource;
+    use crate::tools::context::TextToolOutput;
+    use crate::tools::context::ToolOutputBox;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
@@ -1890,6 +1892,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
+    use tokio::sync::watch;
     use tokio::time::timeout;
 
     fn invocation(
@@ -1977,6 +1980,13 @@ mod tests {
             .into_iter()
             .filter(|preset| preset.show_in_picker)
             .collect()
+    }
+
+    fn expect_text_output(output: ToolOutputBox) -> (String, Option<bool>) {
+        let output = (&*output as &dyn std::any::Any)
+            .downcast_ref::<TextToolOutput>()
+            .expect("expected text output");
+        (output.text.clone(), output.success)
     }
 
     #[tokio::test]
@@ -2097,13 +2107,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
@@ -2139,6 +2143,82 @@ mod tests {
             err,
             FunctionCallError::RespondToModel("multi-agent manager unavailable".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+        fn pick_allowed_sandbox_policy(
+            constraint: &crate::config::Constrained<SandboxPolicy>,
+            base: SandboxPolicy,
+        ) -> SandboxPolicy {
+            let candidates = [
+                SandboxPolicy::DangerFullAccess,
+                SandboxPolicy::new_workspace_write_policy(),
+                SandboxPolicy::new_read_only_policy(),
+            ];
+            candidates
+                .into_iter()
+                .find(|candidate| *candidate != base && constraint.can_set(candidate).is_ok())
+                .unwrap_or(base)
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+            nickname: Option<String>,
+        }
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let expected_sandbox = pick_allowed_sandbox_policy(
+            &turn.config.permissions.sandbox_policy,
+            turn.config.permissions.sandbox_policy.get().clone(),
+        );
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy should be set");
+        turn.sandbox_policy
+            .set(expected_sandbox.clone())
+            .expect("sandbox policy should be set");
+        assert_ne!(
+            expected_sandbox,
+            turn.config.permissions.sandbox_policy.get().clone(),
+            "test requires a runtime sandbox override that differs from base config"
+        );
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "await this command",
+                "agent_type": "awaiter"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let (content, _) = expect_text_output(output);
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        assert!(
+            result
+                .nickname
+                .as_deref()
+                .is_some_and(|nickname| !nickname.is_empty())
+        );
+
+        let snapshot = manager
+            .get_thread(agent_id)
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
+        assert_eq!(snapshot.sandbox_policy, expected_sandbox);
+        assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
     }
 
     #[tokio::test]
@@ -2203,14 +2283,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("spawn should succeed within configured depth");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
         assert!(!result.agent_id.is_empty());
@@ -3453,14 +3526,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("resume_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: resume_agent::ResumeAgentResult =
             serde_json::from_str(&content).expect("resume_agent result should be json");
         assert_eq!(result.status, status_before);
@@ -3522,14 +3588,7 @@ mod tests {
             .handle(resume_invocation)
             .await
             .expect("resume_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: resume_agent::ResumeAgentResult =
             serde_json::from_str(&content).expect("resume_agent result should be json");
         assert_ne!(result.status, AgentStatus::NotFound);
@@ -3545,14 +3604,7 @@ mod tests {
             .handle(send_invocation)
             .await
             .expect("send_input should succeed after resume");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: serde_json::Value =
             serde_json::from_str(&content).expect("send_input result should be json");
         let submission_id = result
@@ -3788,15 +3840,8 @@ mod tests {
             .handle(invocation)
             .await
             .expect("wait should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
-        let result: WaitResult =
+        let (content, success) = expect_text_output(output);
+        let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
@@ -3832,15 +3877,8 @@ mod tests {
             .handle(invocation)
             .await
             .expect("wait should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
-        let result: WaitResult =
+        let (content, success) = expect_text_output(output);
+        let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
@@ -4159,15 +4197,8 @@ mod tests {
             .handle(invocation)
             .await
             .expect("wait should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
-        let result: WaitResult =
+        let (content, success) = expect_text_output(output);
+        let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
@@ -4214,15 +4245,8 @@ mod tests {
             .handle(invocation)
             .await
             .expect("wait should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
-        let result: WaitResult =
+        let (content, success) = expect_text_output(output);
+        let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
         assert_eq!(
             result,
@@ -4238,6 +4262,26 @@ mod tests {
             .submit(Op::Shutdown {})
             .await
             .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn wait_for_final_status_ignores_interrupted_status() {
+        let (session, _turn) = make_session_and_context().await;
+        let agent_id = ThreadId::new();
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Interrupted);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status_tx.send_replace(AgentStatus::Shutdown);
+        });
+
+        let result = timeout(
+            Duration::from_secs(1),
+            wait::wait_for_final_status(Arc::new(session), agent_id, status_rx),
+        )
+        .await
+        .expect("wait should complete once a truly final status arrives");
+        assert_eq!(result, Some((agent_id, AgentStatus::Shutdown)));
     }
 
     #[tokio::test]
@@ -4260,14 +4304,7 @@ mod tests {
             .handle(invocation)
             .await
             .expect("close_agent should succeed");
-        let ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(content),
-            success,
-            ..
-        } = output
-        else {
-            panic!("expected function output");
-        };
+        let (content, success) = expect_text_output(output);
         let result: close_agent::CloseAgentResult =
             serde_json::from_str(&content).expect("close_agent result should be json");
         let status_after = manager.agent_control().get_status(agent_id).await;

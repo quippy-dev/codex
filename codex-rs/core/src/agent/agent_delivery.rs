@@ -96,6 +96,7 @@ pub(crate) fn completed_message_for_agent_fallback(
         | AgentStatus::Completed(Some(_))
         | AgentStatus::PendingInit
         | AgentStatus::Running
+        | AgentStatus::Interrupted
         | AgentStatus::Errored(_)
         | AgentStatus::Shutdown
         | AgentStatus::NotFound => None,

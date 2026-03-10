@@ -116,6 +116,7 @@ async fn run_compact_task_inner(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
+    let persisted_history_items = history.raw_items().to_vec();
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.truncation_policy,
@@ -205,15 +206,18 @@ async fn run_compact_task_inner(
         }
     }
 
-    let history_snapshot = sess.clone_history().await;
-    let history_items = history_snapshot.raw_items();
-    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+    let summary_suffix = {
+        let history_snapshot = sess.clone_history().await;
+        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default()
+    };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-    let user_messages = collect_user_messages(history_items);
+    // Build replacement history from persisted session history, not the retry-local
+    // prompt buffer. Retries may trim oldest prompt items to fit context limits, but
+    // replacement history must preserve prior real user messages and ghost snapshots.
+    let user_messages = collect_user_messages(&persisted_history_items);
     let retained_proposed_plan =
         retained_proposed_plan_for_manual_plan_compaction(&sess, &turn_context, compact_trigger)
             .await;
-
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
     new_history = insert_retained_plan_context_message(new_history, &retained_proposed_plan);
 
@@ -225,7 +229,7 @@ async fn run_compact_task_inner(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
-    let ghost_snapshots: Vec<ResponseItem> = history_items
+    let ghost_snapshots: Vec<ResponseItem> = persisted_history_items
         .iter()
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
         .cloned()
