@@ -27,6 +27,11 @@ Supported transports:
 - stdio (`--listen stdio://`, default): newline-delimited JSON (JSONL)
 - websocket (`--listen ws://IP:PORT`): one JSON-RPC message per websocket text frame (**experimental / unsupported**)
 
+When running with `--listen ws://IP:PORT`, the same listener also serves basic HTTP health probes:
+
+- `GET /readyz` returns `200 OK` once the listener is accepting new connections.
+- `GET /healthz` currently always returns `200 OK`.
+
 Websocket transport is currently experimental and unsupported. Do not rely on it for production workloads.
 
 Tracing/log output:
@@ -174,6 +179,7 @@ Example with notification opt-out:
 - `app/list` — list available apps.
 - `skills/config/write` — write user-level skill config by path.
 - `plugin/install` — install a plugin from a discovered marketplace entry and return any apps that still need auth (**under development; do not call from production clients yet**).
+- `plugin/uninstall` — uninstall a plugin by id by removing its cached files and clearing its user-level config entry (**under development; do not call from production clients yet**).
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; returns an `authorization_url` and later emits `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
@@ -919,12 +925,13 @@ The built-in `request_permissions` tool sends an `item/permissions/requestApprov
 }
 ```
 
-The client responds with `result.permissions`, which should be the granted subset of the requested permission profile:
+The client responds with `result.permissions`, which should be the granted subset of the requested permission profile. It may also set `result.scope` to `"session"` to make the grant persist for later turns in the same session; omitted or `"turn"` keeps the existing turn-scoped behavior:
 
 ```json
 {
   "id": 61,
   "result": {
+    "scope": "session",
     "permissions": {
       "fileSystem": {
         "write": [
@@ -939,6 +946,8 @@ The client responds with `result.permissions`, which should be the granted subse
 Only the granted subset matters on the wire. Any permissions omitted from `result.permissions` are treated as denied, including omitted nested keys inside `result.permissions.macos`, so a sparse response like `{ "permissions": { "macos": { "accessibility": true } } }` grants only accessibility. Any permissions not present in the original request are ignored by the server.
 
 Within the same turn, granted permissions are sticky: later shell-like tool calls can automatically reuse the granted subset without reissuing a separate permission request.
+
+If the session approval policy uses `Reject` with `request_permissions: true`, the server does not send `item/permissions/requestApproval` to the client. Instead, the tool is auto-denied and resolves with an empty granted-permissions payload.
 
 ### Dynamic tool calls (experimental)
 
