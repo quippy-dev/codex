@@ -984,6 +984,7 @@ async fn record_initial_history_resumed_compaction_reestablishes_latest_turn_con
         RolloutItem::TurnContext(earlier_context_item),
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
+            retained_proposed_plan: RetainedProposedPlan::None,
             replacement_history: Some(Vec::new()),
         }),
         RolloutItem::TurnContext(latest_context_item.clone()),
