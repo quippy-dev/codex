@@ -6533,7 +6533,13 @@ async fn built_tools(
             connectors::filter_codex_apps_tools_by_policy(selected_mcp_tools, &turn_context.config);
     }
 
-    Ok(Arc::new(ToolRouter::from_config(
+    let available_models = sess
+        .services
+        .models_manager
+        .list_models(crate::models_manager::manager::RefreshStrategy::Offline)
+        .await;
+
+    Ok(Arc::new(ToolRouter::from_config_with_available_models(
         &turn_context.tools_config,
         has_mcp_servers.then(|| {
             mcp_tools
@@ -6543,6 +6549,7 @@ async fn built_tools(
         }),
         app_tools,
         turn_context.dynamic_tools.as_slice(),
+        available_models.as_slice(),
     )))
 }
 

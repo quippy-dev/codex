@@ -27,6 +27,7 @@ use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -724,7 +725,15 @@ fn create_collab_input_items_schema() -> JsonSchema {
     }
 }
 
+#[cfg(test)]
 fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
+    create_spawn_agent_tool_with_available_models(config, &[])
+}
+
+fn create_spawn_agent_tool_with_available_models(
+    config: &ToolsConfig,
+    available_models: &[ModelPreset],
+) -> ToolSpec {
     let spawn_mode_description = if config.agent_watchdog {
         "Spawn behavior: fork, spawn (fresh context), or watchdog (idle-time check-ins). Roles may override the omitted-mode default. Watchdog mode returns a handle, not a conversational worker, and check-ins only happen after the current turn ends and the owner thread is idle."
             .to_string()
@@ -769,7 +778,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "model".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional model override for the spawned agent. When set, overrides the inherited turn model and any agent_type defaults."
+                    "Optional model slug for the spawned agent. Must match one of the visible models listed in this tool description."
                         .to_string(),
                 ),
             },
@@ -778,7 +787,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "reasoning_effort".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional reasoning effort override for the spawned agent (one of: \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\"). When set, overrides the inherited turn reasoning effort and any agent_type defaults."
+                    "Optional reasoning effort override for the spawned agent. If `model` is omitted, this is validated against the inherited parent model."
                         .to_string(),
                 ),
             },
@@ -807,6 +816,9 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
         description: format!(
             r#"{description_prefix} This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
 
+### Available models
+{}
+
 ### When to delegate vs. do the subtask yourself
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
 - Use the smaller subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
@@ -834,7 +846,8 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
 - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
 - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
 - Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
-- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#
+- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#,
+            format_spawn_agent_model_catalog(available_models),
         ),
         strict: false,
         parameters: JsonSchema::Object {
@@ -843,6 +856,42 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             additional_properties: Some(false.into()),
         },
     })
+}
+
+fn format_spawn_agent_model_catalog(available_models: &[ModelPreset]) -> String {
+    let visible_models = available_models
+        .iter()
+        .filter(|model| model.show_in_picker)
+        .collect::<Vec<_>>();
+    if visible_models.is_empty() {
+        return "No visible models are currently available.".to_string();
+    }
+
+    visible_models
+        .into_iter()
+        .map(format_spawn_agent_model_entry)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_spawn_agent_model_entry(model: &ModelPreset) -> String {
+    let reasoning_efforts = model
+        .supported_reasoning_efforts
+        .iter()
+        .map(|effort| {
+            let default_suffix = if effort.effort == model.default_reasoning_effort {
+                " (default)"
+            } else {
+                ""
+            };
+            format!(
+                "`{}`{}: {}",
+                effort.effort, default_suffix, effort.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("- `{}`: {reasoning_efforts}", model.model)
 }
 
 fn create_spawn_agents_on_csv_tool() -> ToolSpec {
@@ -1971,12 +2020,23 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
-/// Builds the tool registry builder while collecting tool specs for later serialization.
+#[cfg(test)]
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
     app_tools: Option<HashMap<String, ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
+) -> ToolRegistryBuilder {
+    build_specs_with_available_models(config, mcp_tools, app_tools, dynamic_tools, &[])
+}
+
+/// Builds the tool registry builder while collecting tool specs for later serialization.
+pub(crate) fn build_specs_with_available_models(
+    config: &ToolsConfig,
+    mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
+    app_tools: Option<HashMap<String, ToolInfo>>,
+    dynamic_tools: &[DynamicToolSpec],
+    available_models: &[ModelPreset],
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::ArtifactsHandler;
@@ -2195,7 +2255,10 @@ pub(crate) fn build_specs(
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
-        builder.push_spec(create_spawn_agent_tool(config));
+        builder.push_spec(create_spawn_agent_tool_with_available_models(
+            config,
+            available_models,
+        ));
         builder.push_spec(create_send_input_tool(config));
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_list_agents_tool(config.agent_watchdog));
@@ -2272,7 +2335,10 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_protocol::openai_models::InputModality;
     use codex_protocol::openai_models::ModelInfo;
+    use codex_protocol::openai_models::ModelPreset;
     use codex_protocol::openai_models::ModelsResponse;
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::openai_models::ReasoningEffortPreset;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -2430,6 +2496,33 @@ mod tests {
             .find(|candidate| candidate.slug == slug)
             .unwrap_or_else(|| panic!("model slug {slug} is missing from models.json"));
         with_config_overrides(model, &config)
+    }
+
+    fn visible_model_preset_for_tests() -> ModelPreset {
+        ModelPreset {
+            id: "preset-1".to_string(),
+            model: "gpt-5-codex-mini".to_string(),
+            display_name: "GPT-5 Codex Mini".to_string(),
+            description: "Test preset".to_string(),
+            default_reasoning_effort: ReasoningEffort::High,
+            supported_reasoning_efforts: vec![
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Minimal,
+                    description: "Fast".to_string(),
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::High,
+                    description: "Deep".to_string(),
+                },
+            ],
+            supports_personality: true,
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+            availability_nux: None,
+            supported_in_api: true,
+            input_modalities: vec![InputModality::Text],
+        }
     }
 
     #[test]
@@ -2691,6 +2784,32 @@ mod tests {
         assert!(properties.contains_key("reasoning_effort"));
         assert!(!spec.description.contains("watchdog_interval_s"));
         assert!(spawn_mode_description.contains("Roles may override the omitted-mode default"));
+    }
+
+    #[test]
+    fn spawn_agent_tool_lists_visible_models_and_reasoning_efforts() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Collab);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        });
+        let ToolSpec::Function(spec) = create_spawn_agent_tool_with_available_models(
+            &tools_config,
+            &[visible_model_preset_for_tests()],
+        ) else {
+            panic!("spawn_agent should use a function tool spec");
+        };
+
+        assert!(spec.description.contains("### Available models"));
+        assert!(spec.description.contains("`gpt-5-codex-mini`"));
+        assert!(spec.description.contains("`minimal`: Fast"));
+        assert!(spec.description.contains("`high` (default): Deep"));
     }
 
     #[test]
