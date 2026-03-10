@@ -22,7 +22,7 @@ Core terms:
 Watchdog-specific `spawn_agent` guidance:
 - `spawn_mode = "watchdog"` is available for long-running work that needs periodic oversight.
 - When using `spawn_mode = "watchdog"`, keep `agent_type` at the default.
-- The watchdog cadence comes from config `watchdog_interval_s`.
+- `interval_s` sets the watchdog interval in seconds when provided; otherwise the configured default is used.
 - Put the user goal in `message` (verbatim plus needed clarifications).
 - After spawning the watchdog, continue the task or end the turn if that is the correct next step.
 
@@ -37,7 +37,7 @@ Watchdog-specific `wait` guidance:
 - If every id passed to `wait` is a watchdog handle, `wait` returns an immediate correction; this does not mean a new watchdog check-in happened.
 
 Operational notes:
-- Do not call `send_input` on watchdog handles.
+- `send_input` may reach a watchdog handle thread, but it does not update the registered watchdog prompt or active helper, and it does not confirm or force a new check-in. Do not treat it as a watchdog-update mechanism.
 - The tool returns a watchdog handle ID. When you no longer need the watchdog, stop it by calling `close_agent` on that handle ID.
 
 Treat watchdog guidance as high-priority execution feedback. If it reveals a missing required action, do that action before status narration while honoring higher-priority system/developer/user constraints. A required action is one needed to satisfy the user request or clear a concrete blocker.

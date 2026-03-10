@@ -39,7 +39,6 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
 use std::collections::HashMap;
 
 pub struct MultiAgentHandler;
@@ -114,6 +113,8 @@ mod spawn {
     use crate::agent::next_thread_spawn_depth;
     use crate::agent::role::DEFAULT_ROLE_NAME;
     use crate::agent::role::apply_role_to_config;
+    use crate::agent::role::default_spawn_mode_for_role;
+    use crate::config::AgentRoleSpawnMode;
     use crate::config::Config;
     use codex_protocol::protocol::SessionSource;
     use std::collections::HashSet;
@@ -136,8 +137,11 @@ mod spawn {
         agent_type: Option<String>,
         model: Option<String>,
         reasoning_effort: Option<ReasoningEffort>,
-        #[serde(default, alias = "mode")]
-        spawn_mode: SpawnMode,
+        interval_s: Option<i64>,
+        #[serde(default)]
+        fork_context: bool,
+        #[serde(alias = "mode")]
+        spawn_mode: Option<SpawnMode>,
     }
 
     #[derive(Debug, Serialize)]
@@ -162,16 +166,7 @@ mod spawn {
         call_id: String,
         arguments: String,
     ) -> Result<ToolOutput, FunctionCallError> {
-        let raw_args: Value = parse_arguments(&arguments)?;
-        if raw_args.get("interval_s").is_some() {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent no longer accepts interval_s; configure watchdog_interval_s instead"
-                    .to_string(),
-            ));
-        }
-        let args: SpawnAgentArgs = serde_json::from_value(raw_args).map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
-        })?;
+        let args: SpawnAgentArgs = parse_arguments(&arguments)?;
         if let Some(model) = args.model.as_deref()
             && model.trim().is_empty()
         {
@@ -184,7 +179,16 @@ mod spawn {
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
-        let spawn_mode = args.spawn_mode;
+        let role_name_owned = role_name.map(str::to_string);
+        let default_spawn_mode = match default_spawn_mode_for_role(turn.config.as_ref(), role_name)
+        {
+            AgentRoleSpawnMode::Spawn => SpawnMode::Spawn,
+            AgentRoleSpawnMode::Fork => SpawnMode::Fork,
+        };
+        let spawn_mode = args
+            .spawn_mode
+            .or_else(|| args.fork_context.then_some(SpawnMode::Fork))
+            .unwrap_or(default_spawn_mode);
         let input_items = parse_multi_agent_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
         let session_source = turn.session_source.clone();
@@ -245,25 +249,36 @@ mod spawn {
             session.conversation_id,
             child_depth,
             None,
-            role_name.map(str::to_string),
+            role_name_owned,
         );
         let agent_control = &session.services.agent_control;
         let result = match spawn_mode {
-            SpawnMode::Spawn | SpawnMode::Fork => {
+            SpawnMode::Spawn => {
                 agent_control
                     .spawn_agent_with_options(
                         config,
                         input_items,
                         Some(spawn_source),
                         SpawnAgentOptions {
-                            fork_parent_spawn_call_id: matches!(spawn_mode, SpawnMode::Fork)
-                                .then(|| call_id.clone()),
+                            fork_parent_spawn_call_id: None,
+                        },
+                    )
+                    .await
+            }
+            SpawnMode::Fork => {
+                agent_control
+                    .spawn_agent_with_options(
+                        config,
+                        input_items,
+                        Some(spawn_source),
+                        SpawnAgentOptions {
+                            fork_parent_spawn_call_id: Some(call_id.clone()),
                         },
                     )
                     .await
             }
             SpawnMode::Watchdog => {
-                let interval_s = watchdog_interval(&config)?;
+                let interval_s = watchdog_interval(&config, args.interval_s)?;
                 spawn_watchdog(
                     agent_control,
                     config,
@@ -329,11 +344,14 @@ mod spawn {
         })
     }
 
-    fn watchdog_interval(config: &Config) -> Result<i64, FunctionCallError> {
-        let interval = config.watchdog_interval_s;
+    fn watchdog_interval(
+        config: &Config,
+        interval_override_s: Option<i64>,
+    ) -> Result<i64, FunctionCallError> {
+        let interval = interval_override_s.unwrap_or(config.watchdog_interval_s);
         if interval <= 0 {
             return Err(FunctionCallError::RespondToModel(
-                "watchdog_interval_s must be greater than zero".to_string(),
+                "interval_s must be greater than zero".to_string(),
             ));
         }
         Ok(interval)
@@ -434,17 +452,6 @@ mod send_input {
             })?,
         };
         let input_items = parse_multi_agent_input(args.message, args.items)?;
-        if session
-            .services
-            .agent_control
-            .watchdog_targets(&[receiver_thread_id])
-            .await
-            .contains(&receiver_thread_id)
-        {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "send_input cannot target watchdog handle {receiver_thread_id}; target the watchdog owner agent instead"
-            )));
-        }
         let prompt = input_preview(&input_items);
         let (receiver_agent_nickname, receiver_agent_role) = session
             .services
@@ -1050,7 +1057,7 @@ pub(crate) mod wait {
             })?;
 
             return Err(FunctionCallError::RespondToModel(format!(
-                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins only happen after the current turn ends and the owner thread is idle for at least watchdog_interval_s. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
+                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins only happen after the current turn ends and the owner thread is idle for at least the watchdog interval. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
             )));
         }
 
@@ -1755,7 +1762,9 @@ mod tests {
     use crate::ThreadManager;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
+    use crate::codex::make_session_and_context_with_rx;
     use crate::config::AgentRoleConfig;
+    use crate::config::AgentRoleSpawnMode;
     use crate::config::types::ShellEnvironmentPolicy;
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
@@ -1772,6 +1781,7 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::AgentSpawnMode;
     use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::TurnContextItem;
@@ -2106,8 +2116,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_rejects_interval_override() {
-        let (session, turn) = make_session_and_context().await;
+    async fn spawn_agent_accepts_watchdog_interval_override() {
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let mut config = (*turn.config).clone();
+        let _ = config.features.enable(Feature::AgentWatchdog);
+        turn.config = Arc::new(config);
+
         let invocation = invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -2118,16 +2134,14 @@ mod tests {
                 "interval_s": 5
             })),
         );
-        let Err(err) = MultiAgentHandler.handle(invocation).await else {
-            panic!("interval override should be rejected");
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("interval override should be accepted");
+        let ToolOutput::Function { success, .. } = output else {
+            panic!("expected function output");
         };
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "spawn_agent no longer accepts interval_s; configure watchdog_interval_s instead"
-                    .to_string(),
-            )
-        );
+        assert_eq!(success, Some(true));
     }
 
     #[tokio::test]
@@ -2236,6 +2250,7 @@ mod tests {
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -2274,6 +2289,156 @@ mod tests {
             .await;
         assert_eq!(snapshot.model, "explicit-model");
         assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_omitted_spawn_mode_uses_role_default() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, mut turn, rx) = make_session_and_context_with_rx().await;
+        let manager = thread_manager();
+        let owner_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start owner thread");
+        Arc::get_mut(&mut session)
+            .expect("no extra session refs")
+            .services
+            .agent_control = manager.agent_control();
+        Arc::get_mut(&mut session)
+            .expect("no extra session refs")
+            .conversation_id = owner_thread.thread_id;
+
+        let mut config = (*turn.config).clone();
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: Some("Fork by default".to_string()),
+                config_file: None,
+                spawn_mode: Some(AgentRoleSpawnMode::Fork),
+                nickname_candidates: None,
+            },
+        );
+        Arc::get_mut(&mut turn).expect("no extra turn refs").config = Arc::new(config);
+
+        let invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "agent_type": "custom"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        let spawn_event = timeout(Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("collab event");
+                if let EventMsg::CollabAgentSpawnEnd(event) = event.msg {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("spawn end event should arrive");
+
+        assert_eq!(spawn_event.spawn_mode, AgentSpawnMode::Fork);
+
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown spawned agent");
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(owner_thread.thread_id)
+            .await
+            .expect("shutdown owner thread");
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_fork_context_defaults_spawn_mode_to_fork() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+        let manager = thread_manager();
+        let owner_thread = manager
+            .start_thread(turn.config.as_ref().clone())
+            .await
+            .expect("start owner thread");
+        Arc::get_mut(&mut session)
+            .expect("no extra session refs")
+            .services
+            .agent_control = manager.agent_control();
+        Arc::get_mut(&mut session)
+            .expect("no extra session refs")
+            .conversation_id = owner_thread.thread_id;
+
+        let invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "fork_context": true
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+        let spawn_event = timeout(Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("collab event");
+                if let EventMsg::CollabAgentSpawnEnd(event) = event.msg {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("spawn end event should arrive");
+
+        assert_eq!(spawn_event.spawn_mode, AgentSpawnMode::Fork);
+
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown spawned agent");
+        let _ = manager
+            .agent_control()
+            .shutdown_agent(owner_thread.thread_id)
+            .await
+            .expect("shutdown owner thread");
     }
 
     #[tokio::test]
@@ -2803,7 +2968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_input_rejects_watchdog_handle_target() {
+    async fn send_input_targets_watchdog_handle() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
@@ -2827,15 +2992,15 @@ mod tests {
                 "message": "hi"
             })),
         );
-        let Err(err) = MultiAgentHandler.handle(invocation).await else {
-            panic!("send_input should reject watchdog handles");
-        };
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(format!(
-                "send_input cannot target watchdog handle {watchdog_id}; target the watchdog owner agent instead"
-            ))
-        );
+        MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("send_input should target watchdog handles");
+        let sent_prompt_to_watchdog = manager
+            .captured_ops()
+            .iter()
+            .any(|(id, op)| *id == watchdog_id && matches!(op, Op::UserInput { .. }));
+        assert!(sent_prompt_to_watchdog);
 
         let _ = session
             .services
@@ -2850,7 +3015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_input_interrupt_rejects_watchdog_handle_target() {
+    async fn send_input_interrupt_targets_watchdog_handle() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
@@ -2875,20 +3040,20 @@ mod tests {
                 "interrupt": true
             })),
         );
-        let Err(err) = MultiAgentHandler.handle(invocation).await else {
-            panic!("send_input should reject watchdog handles");
-        };
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(format!(
-                "send_input cannot target watchdog handle {watchdog_id}; target the watchdog owner agent instead"
-            ))
-        );
+        MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("send_input should target watchdog handles");
         let interrupted_watchdog = manager
             .captured_ops()
             .iter()
             .any(|(id, op)| *id == watchdog_id && matches!(op, Op::Interrupt));
-        assert_eq!(interrupted_watchdog, false);
+        assert!(interrupted_watchdog);
+        let sent_prompt_to_watchdog = manager
+            .captured_ops()
+            .iter()
+            .any(|(id, op)| *id == watchdog_id && matches!(op, Op::UserInput { .. }));
+        assert!(sent_prompt_to_watchdog);
 
         let _ = session
             .services
@@ -3456,7 +3621,7 @@ mod tests {
             panic!("expected respond-to-model error");
         };
         assert!(message.contains("wait cannot be used to wait for watchdog check-ins"));
-        assert!(message.contains("watchdog_interval_s"));
+        assert!(message.contains("watchdog interval"));
         assert!(message.contains("Continue the task now or end the turn"));
         assert!(message.contains(&watchdog_id.to_string()));
 

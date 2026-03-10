@@ -7,6 +7,7 @@
 //! which role to use; the multi-agent tool handler owns that orchestration.
 
 use crate::config::AgentRoleConfig;
+use crate::config::AgentRoleSpawnMode;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::deserialize_config_toml_with_base;
@@ -24,6 +25,16 @@ use toml::Value as TomlValue;
 /// The role name used when a caller omits `agent_type`.
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
+
+pub(crate) fn default_spawn_mode_for_role(
+    config: &Config,
+    role_name: Option<&str>,
+) -> AgentRoleSpawnMode {
+    let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    resolve_role_config(config, role_name)
+        .and_then(|role| role.spawn_mode)
+        .unwrap_or_default()
+}
 
 /// Applies a named role layer to `config` while preserving caller-owned model selection.
 ///
@@ -180,10 +191,20 @@ Available roles:
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
-        if let Some(description) = &declaration.description {
-            format!("{name}: {{\n{description}\n}}")
-        } else {
+        let has_inline_metadata = declaration.spawn_mode.is_some();
+        if declaration.description.is_none() && !has_inline_metadata {
             format!("{name}: no description")
+        } else {
+            let mut body = Vec::new();
+            if let Some(description) = &declaration.description {
+                body.push(description.clone());
+            }
+            let default_spawn_mode = match declaration.spawn_mode.unwrap_or_default() {
+                AgentRoleSpawnMode::Spawn => "spawn",
+                AgentRoleSpawnMode::Fork => "fork",
+            };
+            body.push(format!("Default spawn mode: {default_spawn_mode}"));
+            format!("{name}: {{\n{}\n}}", body.join("\n"))
         }
     }
 }
@@ -200,6 +221,7 @@ mod built_in {
                     AgentRoleConfig {
                         description: Some("Default agent.".to_string()),
                         config_file: None,
+                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 ),
@@ -214,6 +236,7 @@ Rules:
 - You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.
 - Reuse existing explorers for related questions."#.to_string()),
                         config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
+                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 ),
@@ -229,6 +252,7 @@ Rules:
 - Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
 - Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
                         config_file: None,
+                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 ),
@@ -247,6 +271,7 @@ Rules:
                         - Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
                         - Close the awaiter when you're done with it."#.to_string()),
                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
+                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 )
@@ -353,6 +378,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_spawn_mode_for_role_defaults_to_spawn_and_honors_role_overrides() {
+        let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+        config.agent_roles.insert(
+            "researcher".to_string(),
+            AgentRoleConfig {
+                description: Some("Research role".to_string()),
+                spawn_mode: Some(AgentRoleSpawnMode::Fork),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            default_spawn_mode_for_role(&config, None),
+            AgentRoleSpawnMode::Spawn
+        );
+        assert_eq!(
+            default_spawn_mode_for_role(&config, Some("worker")),
+            AgentRoleSpawnMode::Spawn
+        );
+        assert_eq!(
+            default_spawn_mode_for_role(&config, Some("explorer")),
+            AgentRoleSpawnMode::Spawn
+        );
+        assert_eq!(
+            default_spawn_mode_for_role(&config, Some("researcher")),
+            AgentRoleSpawnMode::Fork
+        );
+    }
+
+    #[tokio::test]
     async fn apply_role_returns_unavailable_for_missing_user_role_file() {
         let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
         config.agent_roles.insert(
@@ -360,6 +415,7 @@ mod tests {
             AgentRoleConfig {
                 description: None,
                 config_file: Some(PathBuf::from("/path/does/not/exist.toml")),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -380,6 +436,7 @@ mod tests {
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -411,6 +468,7 @@ mod tests {
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -465,6 +523,7 @@ model_provider = "test-provider"
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -522,6 +581,7 @@ model_provider = "role-provider"
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -580,6 +640,7 @@ model_provider = "base-provider"
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -642,6 +703,7 @@ model_reasoning_effort = "high"
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -684,6 +746,7 @@ writable_roots = ["./sandbox-root"]
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -738,6 +801,7 @@ writable_roots = ["./sandbox-root"]
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -779,6 +843,7 @@ enabled = false
             AgentRoleConfig {
                 description: None,
                 config_file: Some(role_path),
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         );
@@ -807,6 +872,7 @@ enabled = false
                 AgentRoleConfig {
                     description: Some("user override".to_string()),
                     config_file: None,
+                    spawn_mode: None,
                     nickname_candidates: None,
                 },
             ),
@@ -816,9 +882,9 @@ enabled = false
         let spec = spawn_tool_spec::build(&user_defined_roles);
 
         assert!(spec.contains("researcher: no description"));
-        assert!(spec.contains("explorer: {\nuser override\n}"));
+        assert!(spec.contains("explorer: {\nuser override\nDefault spawn mode: spawn\n}"));
         assert!(spec.contains("awaiter: {"));
-        assert!(spec.contains("default: {\nDefault agent.\n}"));
+        assert!(spec.contains("default: {\nDefault agent.\nDefault spawn mode: spawn\n}"));
         assert!(!spec.contains("Explorers are fast and authoritative."));
     }
 
@@ -829,14 +895,17 @@ enabled = false
             AgentRoleConfig {
                 description: Some("first".to_string()),
                 config_file: None,
+                spawn_mode: None,
                 nickname_candidates: None,
             },
         )]);
 
         let spec = spawn_tool_spec::build(&user_defined_roles);
-        let user_index = spec.find("aaa: {\nfirst\n}").expect("find user role");
+        let user_index = spec
+            .find("aaa: {\nfirst\nDefault spawn mode: spawn\n}")
+            .expect("find user role");
         let built_in_index = spec
-            .find("default: {\nDefault agent.\n}")
+            .find("default: {\nDefault agent.\nDefault spawn mode: spawn\n}")
             .expect("find built-in role");
 
         assert!(user_index < built_in_index);

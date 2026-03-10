@@ -1550,6 +1550,19 @@ async fn set_rate_limits_retains_previous_credits() {
     );
 }
 
+#[test]
+fn normalize_reasoning_effort_for_model_clears_inherited_effort_for_fallback_metadata() {
+    let fallback_model = model_info::model_info_from_slug("custom-model");
+
+    assert_eq!(
+        normalize_reasoning_effort_for_model(
+            &fallback_model,
+            Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+        ),
+        None
+    );
+}
+
 #[tokio::test]
 async fn set_rate_limits_updates_plan_type_when_present() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
@@ -3366,6 +3379,50 @@ async fn abort_gracefully_emits_turn_aborted_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_user_prompt_skips_synthetic_blank_bootstrap_input() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+    while rx.try_recv().is_ok() {}
+
+    let response_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: String::new(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+    let input = vec![UserInput::Text {
+        text: String::new(),
+        text_elements: Vec::new(),
+    }];
+
+    sess.record_user_prompt_and_emit_turn_item(tc.as_ref(), &input, response_item.clone())
+        .await;
+    sess.flush_rollout().await;
+
+    let history = sess.clone_history().await;
+    assert!(
+        !history
+            .raw_items()
+            .iter()
+            .any(|item| item == &response_item)
+    );
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert!(!resumed.history.iter().any(
+        |item| matches!(item, RolloutItem::ResponseItem(candidate) if candidate == &response_item)
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let input = vec![UserInput::Text {
@@ -4263,7 +4320,7 @@ async fn load_root_agent_prompt_excludes_watchdog_fragment_when_disabled() {
     let prompt = load_root_agent_prompt(codex_home.path(), false).await;
 
     assert!(!prompt.contains("## Watchdogs"));
-    assert!(!prompt.contains("watchdog_interval_s"));
+    assert!(!prompt.contains("interval_s` sets the watchdog interval"));
 }
 
 #[tokio::test]
@@ -4273,7 +4330,9 @@ async fn load_root_agent_prompt_includes_watchdog_fragment_when_enabled() {
     let prompt = load_root_agent_prompt(codex_home.path(), true).await;
 
     assert!(prompt.contains("## Watchdogs"));
-    assert!(prompt.contains("watchdog_interval_s"));
+    assert!(prompt.contains("`interval_s` sets the watchdog interval in seconds"));
+    assert!(prompt.contains("does not update the registered watchdog prompt or active helper"));
+    assert!(prompt.contains("Do not treat it as a watchdog-update mechanism"));
 }
 
 #[tokio::test]

@@ -726,18 +726,18 @@ fn create_collab_input_items_schema() -> JsonSchema {
 
 fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
     let spawn_mode_description = if config.agent_watchdog {
-        "Spawn behavior: use `spawn` for a fresh thread (default), `fork` to inherit parent history, or `watchdog` to create an idle watchdog handle. Watchdog mode returns a handle, not a conversational worker, and check-ins only happen after the current turn ends and the owner thread becomes idle."
+        "Spawn behavior: fork, spawn (fresh context), or watchdog (idle-time check-ins). Roles may override the omitted-mode default. Watchdog mode returns a handle, not a conversational worker, and check-ins only happen after the current turn ends and the owner thread is idle."
             .to_string()
     } else {
-        "Spawn behavior: use `spawn` for a fresh thread (default) or `fork` to inherit parent history."
+        "Spawn behavior: fork or spawn (fresh context). Roles may override the omitted-mode default."
             .to_string()
     };
     let description_prefix = if config.agent_watchdog {
-        "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. Watchdog mode returns a control handle, not a conversational worker; watchdog check-ins are asynchronous and cannot arrive until the current turn ends and the owner thread becomes idle. Watchdog cadence is controlled by config `watchdog_interval_s`."
+        "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. Watchdog mode returns a control handle, not a conversational worker; watchdog check-ins are asynchronous and cannot arrive until the current turn ends and the owner thread becomes idle."
     } else {
         "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent."
     };
-    let properties = BTreeMap::from([
+    let mut properties = BTreeMap::from([
         (
             "message".to_string(),
             JsonSchema::String {
@@ -754,6 +754,15 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
                 description: Some(crate::agent::role::spawn_tool_spec::build(
                     &config.agent_roles,
                 )),
+            },
+        ),
+        (
+            "fork_context".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "When true, fork the current thread history into the new agent before sending the initial prompt. If `spawn_mode` is omitted, this defaults the spawn to `fork`."
+                        .to_string(),
+                ),
             },
         ),
         (
@@ -781,6 +790,17 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             },
         ),
     ]);
+    if config.agent_watchdog {
+        properties.insert(
+            "interval_s".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Watchdog interval in seconds when `spawn_mode = \"watchdog\"`. When omitted, the configured default is used."
+                        .to_string(),
+                ),
+            },
+        );
+    }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
@@ -2640,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_tool_omits_interval_s_and_mentions_watchdog_interval_config() {
+    fn spawn_agent_tool_exposes_fork_context_and_interval_override() {
         let config = test_config();
         let model_info =
             ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
@@ -2658,11 +2678,19 @@ mod tests {
         let JsonSchema::Object { properties, .. } = &spec.parameters else {
             panic!("spawn_agent should use object parameters");
         };
+        let JsonSchema::String {
+            description: Some(spawn_mode_description),
+        } = properties.get("spawn_mode").expect("spawn_mode property")
+        else {
+            panic!("spawn_mode should be a described string");
+        };
 
-        assert!(!properties.contains_key("interval_s"));
+        assert!(properties.contains_key("fork_context"));
+        assert!(properties.contains_key("interval_s"));
         assert!(properties.contains_key("model"));
         assert!(properties.contains_key("reasoning_effort"));
-        assert!(spec.description.contains("watchdog_interval_s"));
+        assert!(!spec.description.contains("watchdog_interval_s"));
+        assert!(spawn_mode_description.contains("Roles may override the omitted-mode default"));
     }
 
     #[test]
@@ -2695,8 +2723,10 @@ mod tests {
             panic!("spawn_mode should be a described string");
         };
 
+        assert!(properties.contains_key("fork_context"));
         assert!(properties.contains_key("model"));
         assert!(properties.contains_key("reasoning_effort"));
+        assert!(!properties.contains_key("interval_s"));
         assert!(!spawn_mode_description.contains("watchdog"));
         assert!(!spawn_spec.description.contains("watchdog_interval_s"));
         assert!(!wait_spec.description.contains("Watchdog handles"));

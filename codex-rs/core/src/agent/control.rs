@@ -3853,6 +3853,7 @@ mod tests {
             AgentRoleConfig {
                 description: Some("Research role".to_string()),
                 config_file: None,
+                spawn_mode: None,
                 nickname_candidates: Some(vec!["Atlas".to_string()]),
             },
         );

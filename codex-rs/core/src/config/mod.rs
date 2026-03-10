@@ -1433,12 +1433,22 @@ pub struct AgentsToml {
     pub roles: BTreeMap<String, AgentRoleToml>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRoleSpawnMode {
+    #[default]
+    Spawn,
+    Fork,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRoleConfig {
     /// Human-facing role documentation used in spawn tool guidance.
     pub description: Option<String>,
     /// Path to a role-specific config layer.
     pub config_file: Option<PathBuf>,
+    /// Optional default spawn mode when `spawn_agent` omits `spawn_mode`.
+    pub spawn_mode: Option<AgentRoleSpawnMode>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
 }
@@ -1452,6 +1462,9 @@ pub struct AgentRoleToml {
     /// Path to a role-specific config layer.
     /// Relative paths are resolved relative to the `config.toml` that defines them.
     pub config_file: Option<AbsolutePathBuf>,
+
+    /// Optional default spawn mode when `spawn_agent` omits `spawn_mode`.
+    pub spawn_mode: Option<AgentRoleSpawnMode>,
 
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
@@ -2128,6 +2141,7 @@ impl Config {
                             AgentRoleConfig {
                                 description: role.description.clone(),
                                 config_file,
+                                spawn_mode: role.spawn_mode,
                                 nickname_candidates,
                             },
                         ))

@@ -992,7 +992,7 @@ pub(crate) fn normalize_reasoning_effort_for_model(
         .map(|preset| preset.effort)
         .collect::<Vec<_>>();
     if supported_reasoning_levels.is_empty() && model_info.default_reasoning_level.is_none() {
-        return reasoning_effort;
+        return None;
     }
     if let Some(reasoning_effort) = reasoning_effort
         && supported_reasoning_levels.contains(&reasoning_effort)
@@ -3820,6 +3820,19 @@ impl Session {
         input: &[UserInput],
         response_item: ResponseItem,
     ) {
+        if matches!(
+            input,
+            [UserInput::Text {
+                text,
+                text_elements,
+            }] if text.is_empty() && text_elements.is_empty()
+        ) {
+            // Idle collab inbox delivery may bootstrap a turn with a synthetic blank user input
+            // only to create an execution context for injected response items. That bootstrap
+            // must not create a persisted blank user turn in history or rollout.
+            self.ensure_rollout_materialized().await;
+            return;
+        }
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
