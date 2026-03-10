@@ -1,4 +1,5 @@
 pub mod account;
+pub mod agent_inbox;
 mod thread_id;
 pub use thread_id::ThreadId;
 pub mod approvals;

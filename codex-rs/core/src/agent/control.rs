@@ -1,6 +1,7 @@
 use super::agent_delivery::completed_message_for_agent_fallback;
 use super::agent_delivery::log_deferred_agent_enqueue_error;
 use super::agent_delivery::should_defer_agent_delivery;
+use super::inbox_delivery::build_agent_inbox_items;
 use super::watchdog::RemovedWatchdog;
 use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
@@ -12,6 +13,7 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
 use crate::config::Config;
+#[cfg(test)]
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -23,13 +25,15 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
+#[cfg(test)]
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
+#[cfg(test)]
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+#[cfg(test)]
 use codex_protocol::protocol::AGENT_INBOX_KIND;
-use codex_protocol::protocol::AGENT_INBOX_MESSAGE_PREFIX;
+#[cfg(test)]
 use codex_protocol::protocol::AgentInboxPayload;
 use codex_protocol::protocol::ForkReferenceItem;
 use codex_protocol::protocol::InitialHistory;
@@ -1225,65 +1229,6 @@ impl AgentControl {
             Err(_) => state.default_auth_manager(),
         }
     }
-}
-
-fn build_agent_inbox_items(
-    role: CollabInboxDeliveryRole,
-    sender_thread_id: ThreadId,
-    message: String,
-    prepend_turn_start_user_message: bool,
-) -> CodexResult<Vec<ResponseInputItem>> {
-    let mut items = Vec::new();
-    if prepend_turn_start_user_message {
-        items.push(ResponseInputItem::Message {
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: String::new(),
-            }],
-        });
-    }
-    let role_items = match role {
-        CollabInboxDeliveryRole::Tool => {
-            let call_id = format!("agent_inbox_{}", Uuid::new_v4());
-            let payload = AgentInboxPayload::new(sender_thread_id, message);
-            let output = serde_json::to_string(&payload).map_err(|err| {
-                CodexErr::UnsupportedOperation(format!(
-                    "failed to serialize collab inbox payload: {err}"
-                ))
-            })?;
-
-            vec![
-                ResponseInputItem::FunctionCall {
-                    name: AGENT_INBOX_KIND.to_string(),
-                    arguments: "{}".to_string(),
-                    call_id: call_id.clone(),
-                },
-                ResponseInputItem::FunctionCallOutput {
-                    call_id,
-                    output: FunctionCallOutputPayload {
-                        body: FunctionCallOutputBody::Text(output),
-                        ..Default::default()
-                    },
-                },
-            ]
-        }
-        CollabInboxDeliveryRole::Assistant => {
-            let text = format!("{AGENT_INBOX_MESSAGE_PREFIX}{sender_thread_id}] {message}");
-            vec![ResponseInputItem::Message {
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText { text }],
-            }]
-        }
-        CollabInboxDeliveryRole::Developer => {
-            let text = format!("{AGENT_INBOX_MESSAGE_PREFIX}{sender_thread_id}] {message}");
-            vec![ResponseInputItem::Message {
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText { text }],
-            }]
-        }
-    };
-    items.extend(role_items);
-    Ok(items)
 }
 
 #[cfg(test)]

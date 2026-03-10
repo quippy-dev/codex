@@ -13,7 +13,6 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
-use crate::chatwidget::ThreadInputState;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -21,13 +20,10 @@ use crate::external_editor;
 use crate::file_search::FileSearchManager;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
-use crate::history_cell::SubagentPanelAgent;
-use crate::history_cell::SubagentPanelState;
-use crate::history_cell::SubagentStatusCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
+#[cfg(test)]
 use crate::history_cell::new_subagent_spawned_cell;
-use crate::history_cell::new_subagent_update_cell;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
@@ -42,16 +38,17 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
-use crate::subagent_identity::format_subagent_label;
-use crate::subagent_identity::merge_subagent_identity;
+#[cfg(test)]
+use crate::subagent_panel::SubagentInfo;
+use crate::subagent_panel::SubagentRegistry;
+#[cfg(test)]
 use crate::subagent_transcript::SUBAGENT_UPDATE_PREVIEW_BUDGET;
-use crate::subagent_transcript::SubagentUpdateLevel;
-use crate::subagent_transcript::prompt_first_line;
-use crate::subagent_transcript::prompt_preview;
-use crate::subagent_transcript::running_preview;
-use crate::subagent_transcript::terminal_summary;
-use crate::text_formatting::extract_first_bold;
+#[cfg(test)]
 use crate::text_formatting::truncate_text;
+use crate::thread_switch_replay;
+use crate::thread_switch_replay::ThreadEventChannel;
+use crate::thread_switch_replay::ThreadEventSnapshot;
+use crate::thread_switch_replay::ThreadEventStore;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -81,20 +78,13 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::AgentMessageDeltaEvent;
-use codex_protocol::protocol::AgentMessageEvent;
+#[cfg(test)]
 use codex_protocol::protocol::AgentSpawnMode;
-use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::CollabAgentSpawnEndEvent;
-use codex_protocol::protocol::CollabCloseEndEvent;
-use codex_protocol::protocol::CollabWaitingEndEvent;
-use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
@@ -105,9 +95,6 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillErrorInfo;
 use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::TurnAbortedEvent;
-use codex_protocol::protocol::TurnCompleteEvent;
-use codex_protocol::protocol::TurnStartedEvent;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -126,7 +113,6 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -136,15 +122,10 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
-
-mod pending_interactive_replay;
-
-use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -288,672 +269,7 @@ struct SessionSummary {
     resume_command: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ThreadEventSnapshot {
-    session_configured: Option<Event>,
-    events: Vec<Event>,
-    input_state: Option<ThreadInputState>,
-}
-
-#[derive(Debug)]
-struct ThreadEventStore {
-    session_configured: Option<Event>,
-    buffer: VecDeque<Event>,
-    user_message_ids: HashSet<String>,
-    pending_interactive_replay: PendingInteractiveReplayState,
-    input_state: Option<ThreadInputState>,
-    capacity: usize,
-    active: bool,
-}
-
-impl ThreadEventStore {
-    fn new(capacity: usize) -> Self {
-        Self {
-            session_configured: None,
-            buffer: VecDeque::new(),
-            user_message_ids: HashSet::new(),
-            pending_interactive_replay: PendingInteractiveReplayState::default(),
-            input_state: None,
-            capacity,
-            active: false,
-        }
-    }
-
-    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
-        let mut store = Self::new(capacity);
-        store.session_configured = Some(event);
-        store
-    }
-
-    fn push_event(&mut self, event: Event) {
-        self.pending_interactive_replay.note_event(&event);
-        match &event.msg {
-            EventMsg::SessionConfigured(_) => {
-                self.session_configured = Some(event);
-                return;
-            }
-            EventMsg::ItemCompleted(completed) => {
-                if let TurnItem::UserMessage(item) = &completed.item {
-                    if !event.id.is_empty() && self.user_message_ids.contains(&event.id) {
-                        return;
-                    }
-                    let legacy = Event {
-                        id: event.id,
-                        msg: item.as_legacy_event(),
-                    };
-                    self.push_legacy_event(legacy);
-                    return;
-                }
-            }
-            _ => {}
-        }
-
-        self.push_legacy_event(event);
-    }
-
-    fn push_legacy_event(&mut self, event: Event) {
-        if let EventMsg::UserMessage(_) = &event.msg
-            && !event.id.is_empty()
-            && !self.user_message_ids.insert(event.id.clone())
-        {
-            return;
-        }
-        self.buffer.push_back(event);
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-        {
-            self.pending_interactive_replay.note_evicted_event(&removed);
-            if matches!(removed.msg, EventMsg::UserMessage(_)) && !removed.id.is_empty() {
-                self.user_message_ids.remove(&removed.id);
-            }
-        }
-    }
-
-    fn snapshot(&self) -> ThreadEventSnapshot {
-        ThreadEventSnapshot {
-            session_configured: self.session_configured.clone(),
-            events: self
-                .buffer
-                .iter()
-                .filter(|event| {
-                    self.pending_interactive_replay
-                        .should_replay_snapshot_event(event)
-                })
-                .cloned()
-                .collect(),
-            input_state: self.input_state.clone(),
-        }
-    }
-
-    fn note_outbound_op(&mut self, op: &Op) {
-        self.pending_interactive_replay.note_outbound_op(op);
-    }
-
-    fn op_can_change_pending_replay_state(op: &Op) -> bool {
-        PendingInteractiveReplayState::op_can_change_state(op)
-    }
-
-    fn event_can_change_pending_thread_approvals(event: &Event) -> bool {
-        PendingInteractiveReplayState::event_can_change_pending_thread_approvals(event)
-    }
-
-    fn has_pending_thread_approvals(&self) -> bool {
-        self.pending_interactive_replay
-            .has_pending_thread_approvals()
-    }
-}
-
-#[derive(Debug)]
-struct ThreadEventChannel {
-    sender: mpsc::Sender<Event>,
-    receiver: Option<mpsc::Receiver<Event>>,
-    store: Arc<Mutex<ThreadEventStore>>,
-}
-
-impl ThreadEventChannel {
-    fn new(capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::channel(capacity);
-        Self {
-            sender,
-            receiver: Some(receiver),
-            store: Arc::new(Mutex::new(ThreadEventStore::new(capacity))),
-        }
-    }
-
-    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
-        let (sender, receiver) = mpsc::channel(capacity);
-        Self {
-            sender,
-            receiver: Some(receiver),
-            store: Arc::new(Mutex::new(ThreadEventStore::new_with_session_configured(
-                capacity, event,
-            ))),
-        }
-    }
-}
-
-const SUBAGENT_PENDING_EVENT_CAPACITY: usize = 12;
 const SUBAGENT_ANIMATION_TICK: Duration = Duration::from_millis(100);
-const SUBAGENT_SHIMMER_WINDOW: Duration = Duration::from_secs(1);
-
-#[derive(Debug, Clone)]
-struct SubagentInfo {
-    ordinal: i32,
-    nickname: Option<String>,
-    agent_role: Option<String>,
-    prompt_preview: String,
-    spawn_mode: AgentSpawnMode,
-    status: AgentStatus,
-    is_root_level: bool,
-    spawned_at: Instant,
-    started_at: Option<Instant>,
-    latest_summary: String,
-    latest_preview: String,
-    latest_update_at: Instant,
-    inflight_message: String,
-    reasoning_buffer: String,
-    notified_terminal: bool,
-}
-
-impl SubagentInfo {
-    fn new(
-        ordinal: i32,
-        nickname: Option<String>,
-        agent_role: Option<String>,
-        prompt_preview: String,
-        spawn_mode: AgentSpawnMode,
-        is_root_level: bool,
-    ) -> Self {
-        let now = Instant::now();
-        Self {
-            ordinal,
-            nickname,
-            agent_role,
-            prompt_preview: prompt_preview.clone(),
-            spawn_mode,
-            status: AgentStatus::PendingInit,
-            is_root_level,
-            spawned_at: now,
-            started_at: None,
-            latest_summary: String::new(),
-            latest_preview: prompt_preview,
-            latest_update_at: now,
-            inflight_message: String::new(),
-            reasoning_buffer: String::new(),
-            notified_terminal: false,
-        }
-    }
-
-    fn merge_identity(&mut self, nickname: Option<&str>, agent_role: Option<&str>) {
-        merge_subagent_identity(
-            &mut self.nickname,
-            &mut self.agent_role,
-            nickname,
-            agent_role,
-        );
-    }
-
-    fn label(&self) -> String {
-        format_subagent_label(
-            self.ordinal,
-            self.nickname.as_deref(),
-            self.agent_role.as_deref(),
-            self.spawn_mode,
-        )
-    }
-
-    fn is_running(&self) -> bool {
-        matches!(self.status, AgentStatus::PendingInit | AgentStatus::Running)
-    }
-
-    fn is_watchdog(&self) -> bool {
-        self.spawn_mode == AgentSpawnMode::Watchdog
-    }
-
-    fn is_visible_in_panel(&self) -> bool {
-        if self.is_watchdog() {
-            return matches!(self.status, AgentStatus::PendingInit | AgentStatus::Running);
-        }
-        self.is_running()
-    }
-
-    fn is_running_for_panel(&self) -> bool {
-        if self.is_watchdog() {
-            return matches!(self.status, AgentStatus::Running);
-        }
-        self.is_running()
-    }
-
-    fn running_started_at(&self) -> Instant {
-        self.started_at.unwrap_or(self.spawned_at)
-    }
-
-    fn update_level(&self) -> SubagentUpdateLevel {
-        if self.is_root_level {
-            SubagentUpdateLevel::Root
-        } else {
-            SubagentUpdateLevel::Nested
-        }
-    }
-
-    fn update_preview(&mut self, preview: String) {
-        self.latest_preview = preview;
-        self.latest_update_at = Instant::now();
-    }
-
-    fn update_reasoning_summary(&mut self, delta: &str) {
-        self.reasoning_buffer.push_str(delta);
-        if let Some(summary) = extract_first_bold(&self.reasoning_buffer) {
-            self.latest_summary = truncate_text(summary.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
-            self.latest_update_at = Instant::now();
-        }
-    }
-
-    fn clear_turn_buffers(&mut self) {
-        self.inflight_message.clear();
-        self.reasoning_buffer.clear();
-        self.latest_summary.clear();
-    }
-
-    fn should_shimmer(&self, now: Instant) -> bool {
-        if self.is_watchdog() && matches!(self.status, AgentStatus::PendingInit) {
-            return false;
-        }
-        if !self.is_running() {
-            return false;
-        }
-        now.saturating_duration_since(self.latest_update_at) <= SUBAGENT_SHIMMER_WINDOW
-    }
-}
-
-#[derive(Debug, Default)]
-struct SubagentRegistry {
-    root_thread_id: Option<ThreadId>,
-    agents: HashMap<ThreadId, SubagentInfo>,
-    order: Vec<ThreadId>,
-    pending_events: HashMap<ThreadId, Vec<EventMsg>>,
-    pending_history: Vec<Box<dyn HistoryCell>>,
-    panel_state: Option<Arc<StdMutex<SubagentPanelState>>>,
-    panel_cell: Option<Arc<SubagentStatusCell>>,
-    animations_enabled: bool,
-}
-
-impl SubagentRegistry {
-    fn new(animations_enabled: bool) -> Self {
-        Self {
-            animations_enabled,
-            ..Self::default()
-        }
-    }
-
-    fn clear(&mut self) {
-        self.root_thread_id = None;
-        self.agents.clear();
-        self.order.clear();
-        self.pending_events.clear();
-        self.pending_history.clear();
-        self.panel_state = None;
-        self.panel_cell = None;
-    }
-
-    fn set_root_thread(&mut self, thread_id: ThreadId) {
-        if self
-            .root_thread_id
-            .is_some_and(|current| current != thread_id)
-        {
-            self.clear();
-        }
-        self.root_thread_id = Some(thread_id);
-    }
-
-    fn is_root_thread(&self, thread_id: ThreadId) -> bool {
-        self.root_thread_id == Some(thread_id)
-    }
-
-    fn contains(&self, thread_id: ThreadId) -> bool {
-        self.agents.contains_key(&thread_id)
-    }
-
-    fn on_spawn_end(&mut self, event: &CollabAgentSpawnEndEvent) -> Option<Box<dyn HistoryCell>> {
-        let new_thread_id = event.new_thread_id?;
-        if event.spawn_mode == AgentSpawnMode::Watchdog {
-            self.prune_superseded_watchdogs(new_thread_id);
-        }
-        if self.contains(new_thread_id) {
-            return None;
-        }
-        let ordinal = i32::try_from(self.order.len())
-            .unwrap_or(i32::MAX - 1)
-            .saturating_add(1);
-        let prompt_preview = prompt_preview(&event.prompt);
-        let is_root_level = self.is_root_thread(event.sender_thread_id);
-        let mut info = SubagentInfo::new(
-            ordinal,
-            event.new_agent_nickname.clone(),
-            event.new_agent_role.clone(),
-            prompt_preview,
-            event.spawn_mode,
-            is_root_level,
-        );
-        info.status = event.status.clone();
-        info.latest_preview = info.prompt_preview.clone();
-        info.latest_update_at = Instant::now();
-        let label = info.label();
-
-        self.order.push(new_thread_id);
-        self.agents.insert(new_thread_id, info);
-
-        let early_events = self
-            .pending_events
-            .remove(&new_thread_id)
-            .unwrap_or_default();
-        let mut follow_up = Vec::new();
-        for msg in early_events {
-            follow_up.extend(self.on_agent_event(new_thread_id, &msg));
-        }
-        for cell in follow_up {
-            self.queue_history(cell);
-        }
-
-        let prompt_line = prompt_first_line(&event.prompt);
-        Some(Box::new(new_subagent_spawned_cell(&label, &prompt_line)))
-    }
-
-    fn prune_superseded_watchdogs(&mut self, keep_thread_id: ThreadId) {
-        let superseded: HashSet<ThreadId> = self
-            .agents
-            .iter()
-            .filter_map(|(thread_id, info)| {
-                (info.spawn_mode == AgentSpawnMode::Watchdog && *thread_id != keep_thread_id)
-                    .then_some(*thread_id)
-            })
-            .collect();
-        if superseded.is_empty() {
-            return;
-        }
-
-        self.order
-            .retain(|thread_id| !superseded.contains(thread_id));
-        self.agents
-            .retain(|thread_id, _| !superseded.contains(thread_id));
-        self.pending_events
-            .retain(|thread_id, _| !superseded.contains(thread_id));
-    }
-
-    fn on_close_end(&mut self, event: &CollabCloseEndEvent) -> Option<Box<dyn HistoryCell>> {
-        let receiver_id = event.receiver_thread_id;
-        let info = self.agents.get_mut(&receiver_id)?;
-        info.merge_identity(
-            event.receiver_agent_nickname.as_deref(),
-            event.receiver_agent_role.as_deref(),
-        );
-        info.status = event.status.clone();
-        info.latest_update_at = Instant::now();
-
-        if is_terminal_status(&info.status) && !info.notified_terminal {
-            info.notified_terminal = true;
-            let summary = terminal_summary(&info.status);
-            let label = info.label();
-            return Some(Box::new(new_subagent_update_cell(
-                &label,
-                &info.status,
-                summary.as_str(),
-                info.update_level(),
-            )));
-        }
-        None
-    }
-
-    fn on_wait_end(&mut self, event: &CollabWaitingEndEvent) {
-        for entry in &event.agent_statuses {
-            let Some(info) = self.agents.get_mut(&entry.thread_id) else {
-                continue;
-            };
-            info.merge_identity(entry.agent_nickname.as_deref(), entry.agent_role.as_deref());
-        }
-
-        for (thread_id, status) in &event.statuses {
-            let Some(info) = self.agents.get_mut(thread_id) else {
-                continue;
-            };
-            info.status = status.clone();
-            info.latest_update_at = Instant::now();
-        }
-    }
-
-    fn on_agent_event(&mut self, thread_id: ThreadId, msg: &EventMsg) -> Vec<Box<dyn HistoryCell>> {
-        let Some(info) = self.agents.get_mut(&thread_id) else {
-            self.buffer_pending_event(thread_id, msg.clone());
-            return Vec::new();
-        };
-
-        let mut history = Vec::new();
-        match msg {
-            EventMsg::TurnStarted(TurnStartedEvent { .. }) => {
-                info.clear_turn_buffers();
-                info.status = AgentStatus::Running;
-                if info.started_at.is_none() {
-                    info.started_at = Some(Instant::now());
-                }
-            }
-            EventMsg::AgentReasoningDelta(ev) => {
-                info.update_reasoning_summary(ev.delta.as_str());
-            }
-            EventMsg::AgentReasoningRawContentDelta(ev) => {
-                info.update_reasoning_summary(ev.delta.as_str());
-            }
-            EventMsg::AgentReasoningRawContent(ev) => {
-                info.update_reasoning_summary(ev.text.as_str());
-                info.reasoning_buffer.clear();
-            }
-            EventMsg::AgentReasoning(_) => {
-                info.reasoning_buffer.clear();
-            }
-            EventMsg::AgentReasoningSectionBreak(_) => {
-                info.reasoning_buffer.clear();
-            }
-            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
-                info.inflight_message.push_str(delta);
-                let preview =
-                    truncate_text(info.inflight_message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
-                info.update_preview(preview);
-            }
-            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
-                info.inflight_message.clear();
-                let preview = truncate_text(message.trim(), SUBAGENT_UPDATE_PREVIEW_BUDGET);
-                info.update_preview(preview);
-            }
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                last_agent_message, ..
-            }) => {
-                info.inflight_message.clear();
-                info.status = AgentStatus::Completed(last_agent_message.clone());
-                if !info.notified_terminal {
-                    info.notified_terminal = true;
-                    let summary = last_agent_message
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|message| !message.is_empty())
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "completed".to_string());
-                    let label = info.label();
-                    history.push(Box::new(new_subagent_update_cell(
-                        &label,
-                        &info.status,
-                        summary.as_str(),
-                        info.update_level(),
-                    )) as Box<dyn HistoryCell>);
-                }
-            }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, .. }) => {
-                info.inflight_message.clear();
-                let reason_text = format!("{reason:?}").to_lowercase();
-                info.status = AgentStatus::Errored(reason_text.clone());
-                if !info.notified_terminal {
-                    info.notified_terminal = true;
-                    let label = info.label();
-                    history.push(Box::new(new_subagent_update_cell(
-                        &label,
-                        &info.status,
-                        reason_text.as_str(),
-                        info.update_level(),
-                    )) as Box<dyn HistoryCell>);
-                }
-            }
-            EventMsg::Error(ErrorEvent { message, .. }) => {
-                info.inflight_message.clear();
-                let summary = message.trim();
-                let summary = if summary.is_empty() {
-                    "errored".to_string()
-                } else {
-                    summary.to_string()
-                };
-                info.status = AgentStatus::Errored(summary.clone());
-                if !info.notified_terminal {
-                    info.notified_terminal = true;
-                    let label = info.label();
-                    history.push(Box::new(new_subagent_update_cell(
-                        &label,
-                        &info.status,
-                        summary.as_str(),
-                        info.update_level(),
-                    )) as Box<dyn HistoryCell>);
-                }
-            }
-            EventMsg::ShutdownComplete => {
-                info.inflight_message.clear();
-                info.status = AgentStatus::Shutdown;
-                if !info.notified_terminal {
-                    info.notified_terminal = true;
-                    let label = info.label();
-                    history.push(Box::new(new_subagent_update_cell(
-                        &label,
-                        &info.status,
-                        "shutdown",
-                        info.update_level(),
-                    )) as Box<dyn HistoryCell>);
-                }
-            }
-            _ => {}
-        }
-
-        if history.is_empty() && matches!(msg, EventMsg::TurnStarted(_)) {
-            info.latest_update_at = Instant::now();
-        }
-
-        history
-    }
-
-    fn buffer_pending_event(&mut self, thread_id: ThreadId, msg: EventMsg) {
-        if self.is_root_thread(thread_id) {
-            return;
-        }
-        let entry = self.pending_events.entry(thread_id).or_default();
-        entry.push(msg);
-        if entry.len() > SUBAGENT_PENDING_EVENT_CAPACITY {
-            let excess = entry.len() - SUBAGENT_PENDING_EVENT_CAPACITY;
-            entry.drain(0..excess);
-        }
-    }
-
-    fn queue_history(&mut self, cell: Box<dyn HistoryCell>) {
-        self.pending_history.push(cell);
-    }
-
-    fn take_pending_history(&mut self) -> Vec<Box<dyn HistoryCell>> {
-        std::mem::take(&mut self.pending_history)
-    }
-
-    fn has_animating_agents(&self) -> bool {
-        let now = Instant::now();
-        self.agents.values().any(|info| info.should_shimmer(now))
-    }
-
-    fn rebuild_panel_state(&mut self) {
-        let mut running_infos: Vec<&SubagentInfo> = self
-            .agents
-            .values()
-            .filter(|info| info.is_visible_in_panel())
-            .collect();
-        running_infos.sort_by_key(|info| info.ordinal);
-
-        if running_infos.is_empty() {
-            self.panel_state = None;
-            self.panel_cell = None;
-            return;
-        }
-
-        let started_at = running_infos
-            .iter()
-            .map(|info| info.running_started_at())
-            .min()
-            .unwrap_or_else(Instant::now);
-        let running_count = i32::try_from(
-            running_infos
-                .iter()
-                .filter(|info| info.is_running_for_panel())
-                .count(),
-        )
-        .unwrap_or(i32::MAX);
-        let total_agents = i32::try_from(running_infos.len()).unwrap_or(i32::MAX);
-        let running_agents = running_infos
-            .into_iter()
-            .map(|info| SubagentPanelAgent {
-                ordinal: info.ordinal,
-                name: info.label(),
-                status: info.status.clone(),
-                is_watchdog: info.is_watchdog(),
-                preview: running_preview(
-                    info.latest_summary.as_str(),
-                    info.inflight_message.as_str(),
-                    info.latest_preview.as_str(),
-                    info.prompt_preview.as_str(),
-                ),
-                latest_update_at: info.latest_update_at,
-            })
-            .collect();
-
-        let state = SubagentPanelState {
-            started_at,
-            total_agents,
-            running_count,
-            running_agents,
-        };
-
-        match &self.panel_state {
-            Some(existing) => {
-                let mut guard = existing
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *guard = state;
-            }
-            None => {
-                self.panel_state = Some(Arc::new(StdMutex::new(state)));
-            }
-        }
-
-        if let Some(panel_state) = &self.panel_state {
-            self.panel_cell = Some(Arc::new(SubagentStatusCell::new(
-                Arc::clone(panel_state),
-                self.animations_enabled,
-            )));
-        }
-    }
-
-    fn panel_cell(&self) -> Option<Arc<SubagentStatusCell>> {
-        self.panel_cell.clone()
-    }
-}
-
-fn is_terminal_status(status: &AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::Completed(_)
-            | AgentStatus::Errored(_)
-            | AgentStatus::Shutdown
-            | AgentStatus::NotFound
-    )
-}
 
 fn should_show_model_migration_prompt(
     current_model: &str,
@@ -1579,62 +895,52 @@ impl App {
             .or_insert_with(|| ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn set_thread_active(&mut self, thread_id: ThreadId, active: bool) {
-        if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
-            let mut store = channel.store.lock().await;
-            store.active = active;
-        }
+        thread_switch_replay::set_thread_active(&mut self.thread_event_channels, thread_id, active)
+            .await;
     }
 
     async fn activate_thread_channel(&mut self, thread_id: ThreadId) {
         if self.active_thread_id.is_some() {
             return;
         }
-        self.set_thread_active(thread_id, true).await;
-        let receiver = if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
-            channel.receiver.take()
-        } else {
-            None
-        };
-        self.active_thread_id = Some(thread_id);
-        self.active_thread_rx = receiver;
+        thread_switch_replay::activate_thread_channel(
+            &mut self.thread_event_channels,
+            &mut self.active_thread_id,
+            &mut self.active_thread_rx,
+            thread_id,
+        )
+        .await;
         self.sync_subagent_panel_state();
         self.refresh_pending_thread_approvals().await;
     }
 
     async fn store_active_thread_receiver(&mut self) {
-        let Some(active_id) = self.active_thread_id else {
-            return;
-        };
-        let input_state = self.chat_widget.capture_thread_input_state();
-        if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
-            let receiver = self.active_thread_rx.take();
-            let mut store = channel.store.lock().await;
-            store.active = false;
-            store.input_state = input_state;
-            if let Some(receiver) = receiver {
-                channel.receiver = Some(receiver);
-            }
-        }
+        thread_switch_replay::store_active_thread_receiver(
+            &mut self.thread_event_channels,
+            self.active_thread_id,
+            &mut self.active_thread_rx,
+            &self.chat_widget,
+        )
+        .await;
     }
 
     async fn activate_thread_for_replay(
         &mut self,
         thread_id: ThreadId,
     ) -> Option<(mpsc::Receiver<Event>, ThreadEventSnapshot)> {
-        let channel = self.thread_event_channels.get_mut(&thread_id)?;
-        let receiver = channel.receiver.take()?;
-        let mut store = channel.store.lock().await;
-        store.active = true;
-        let snapshot = store.snapshot();
-        Some((receiver, snapshot))
+        thread_switch_replay::activate_thread_for_replay(&mut self.thread_event_channels, thread_id)
+            .await
     }
 
     async fn clear_active_thread(&mut self) {
-        if let Some(active_id) = self.active_thread_id.take() {
-            self.set_thread_active(active_id, false).await;
-        }
-        self.active_thread_rx = None;
+        thread_switch_replay::clear_active_thread(
+            &mut self.thread_event_channels,
+            &mut self.active_thread_id,
+            &mut self.active_thread_rx,
+        )
+        .await;
         self.sync_subagent_panel_state();
         self.refresh_pending_thread_approvals().await;
     }
@@ -1959,38 +1265,11 @@ impl App {
     }
 
     fn process_subagent_side_effects(&mut self, thread_id: ThreadId, event: &Event) {
-        if self.primary_thread_id == Some(thread_id) {
-            self.subagents.set_root_thread(thread_id);
-        }
-
-        match &event.msg {
-            EventMsg::CollabAgentSpawnEnd(ev) => {
-                // Keep registry/panel state in sync for both root and nested spawns, but let
-                // chatwidget own lifecycle transcript cells for root-thread collab events.
-                let _ = self.subagents.on_spawn_end(ev);
-            }
-            EventMsg::CollabWaitingEnd(ev) => {
-                self.subagents.on_wait_end(ev);
-            }
-            EventMsg::CollabCloseEnd(ev) => {
-                let is_nested_receiver = self
-                    .subagents
-                    .agents
-                    .get(&ev.receiver_thread_id)
-                    .is_some_and(|info| info.update_level() == SubagentUpdateLevel::Nested);
-                if let Some(cell) = self.subagents.on_close_end(ev)
-                    && is_nested_receiver
-                {
-                    self.emit_or_queue_subagent_history(cell);
-                }
-            }
-            _ if !self.subagents.is_root_thread(thread_id) => {
-                let updates = self.subagents.on_agent_event(thread_id, &event.msg);
-                for cell in updates {
-                    self.emit_or_queue_subagent_history(cell);
-                }
-            }
-            _ => {}
+        for cell in self
+            .subagents
+            .process_event(thread_id, self.primary_thread_id, event)
+        {
+            self.emit_or_queue_subagent_history(cell);
         }
 
         self.sync_subagent_panel_state();
@@ -2333,25 +1612,15 @@ impl App {
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        let Some(mut rx) = self.active_thread_rx.take() else {
-            return Ok(());
-        };
-
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(event) => self.handle_codex_event_now(event),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
+        let mut active_thread_rx = self.active_thread_rx.take();
+        let disconnected =
+            thread_switch_replay::drain_active_thread_events(&mut active_thread_rx, |event| {
+                self.handle_codex_event_now(event)
+            });
         if !disconnected {
-            self.active_thread_rx = Some(rx);
-        } else {
+            self.active_thread_rx = active_thread_rx;
+        }
+        if disconnected {
             self.clear_active_thread().await;
         }
 
@@ -2389,19 +1658,15 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) {
-        if let Some(event) = snapshot.session_configured {
+        let events =
+            thread_switch_replay::prepare_thread_snapshot_replay(&mut self.chat_widget, snapshot);
+        for event in events {
             self.handle_codex_event_replay(event);
         }
-        self.chat_widget.set_queue_autosend_suppressed(true);
-        self.chat_widget
-            .restore_thread_input_state(snapshot.input_state);
-        for event in snapshot.events {
-            self.handle_codex_event_replay(event);
-        }
-        self.chat_widget.set_queue_autosend_suppressed(false);
-        if resume_restored_queue {
-            self.chat_widget.maybe_send_next_queued_input();
-        }
+        thread_switch_replay::finish_thread_snapshot_replay(
+            &mut self.chat_widget,
+            resume_restored_queue,
+        );
         self.refresh_status_line();
     }
 

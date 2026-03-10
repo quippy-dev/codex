@@ -1,6 +1,7 @@
 mod agent_delivery;
 pub(crate) mod control;
 mod guards;
+mod inbox_delivery;
 pub(crate) mod role;
 pub(crate) mod status;
 mod watchdog;

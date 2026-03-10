@@ -72,8 +72,10 @@ mod models;
 mod outgoing_message;
 mod runtime_bootstrap;
 mod server_request_error;
+mod thread_history_loader;
 mod thread_state;
 mod thread_status;
+mod thread_summary;
 mod transport;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;

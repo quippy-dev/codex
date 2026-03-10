@@ -25,10 +25,14 @@ use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
 use crate::render::line_utils::push_owned_lines;
 use crate::render::renderable::Renderable;
-use crate::shimmer::shimmer_spans;
-use crate::status_indicator_widget::fmt_elapsed_compact;
 use crate::style::proposed_plan_style;
 use crate::style::user_message_style;
+#[allow(unused_imports)]
+pub(crate) use crate::subagent_panel::SubagentPanelAgent;
+#[allow(unused_imports)]
+pub(crate) use crate::subagent_panel::SubagentPanelState;
+#[allow(unused_imports)]
+pub(crate) use crate::subagent_panel::SubagentStatusCell;
 use crate::subagent_transcript::SubagentUpdateLevel;
 use crate::subagent_transcript::subagent_spawned_lines;
 use crate::subagent_transcript::subagent_update_lines;
@@ -83,7 +87,6 @@ use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
@@ -488,122 +491,6 @@ impl HistoryCell for PlainHistoryCell {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SubagentPanelAgent {
-    pub(crate) ordinal: i32,
-    pub(crate) name: String,
-    pub(crate) status: AgentStatus,
-    pub(crate) is_watchdog: bool,
-    pub(crate) preview: String,
-    pub(crate) latest_update_at: Instant,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SubagentPanelState {
-    pub(crate) started_at: Instant,
-    pub(crate) total_agents: i32,
-    pub(crate) running_count: i32,
-    pub(crate) running_agents: Vec<SubagentPanelAgent>,
-}
-
-impl SubagentPanelState {
-    pub(crate) fn running_count(&self) -> i32 {
-        self.running_count
-    }
-
-    pub(crate) fn has_animating_agents(&self, now: Instant) -> bool {
-        self.running_agents
-            .iter()
-            .any(|agent| should_shimmer(agent, now))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SubagentStatusCell {
-    state: Arc<Mutex<SubagentPanelState>>,
-    animations_enabled: bool,
-}
-
-impl SubagentStatusCell {
-    pub(crate) fn new(
-        state: Arc<Mutex<SubagentPanelState>>,
-        animations_enabled: bool,
-    ) -> SubagentStatusCell {
-        SubagentStatusCell {
-            state,
-            animations_enabled,
-        }
-    }
-
-    pub(crate) fn state_handle(&self) -> Arc<Mutex<SubagentPanelState>> {
-        Arc::clone(&self.state)
-    }
-
-    pub(crate) fn matches_state(&self, other: &Arc<Mutex<SubagentPanelState>>) -> bool {
-        Arc::ptr_eq(&self.state, other)
-    }
-}
-
-impl HistoryCell for SubagentStatusCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let state = {
-            let guard = self.state.lock().expect("subagent panel state lock");
-            guard.clone()
-        };
-        if state.running_agents.is_empty() {
-            return Vec::new();
-        }
-
-        let elapsed = fmt_elapsed_compact(state.started_at.elapsed().as_secs());
-        let running_count = state.running_count();
-        let total_agents = state.total_agents.max(running_count);
-        let count_label = subagent_count_label(total_agents, running_count);
-        let header_suffix = format!("({elapsed} • {count_label} • esc to interrupt)");
-
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![
-            "• ".dim(),
-            "Subagents".bold(),
-            " ".into(),
-            header_suffix.dim(),
-        ]));
-
-        let mut running_agents = state.running_agents;
-        running_agents.sort_by(|left, right| left.ordinal.cmp(&right.ordinal));
-        let preview_budget = running_preview_budget(width);
-        let now = Instant::now();
-        lines.extend(running_agents.into_iter().map(|agent| {
-            let preview = truncate_text(agent.preview.trim(), preview_budget);
-            let mut spans: Vec<Span<'static>> =
-                vec!["• ".dim(), format!("[#{}] ", agent.ordinal).dim()];
-            spans.push(Span::from(agent.name.clone()));
-            spans.push(" ".into());
-            spans.push(status_span_for_panel(&agent));
-            spans.push(" — ".dim());
-            if self.animations_enabled && should_shimmer(&agent, now) {
-                spans.extend(shimmer_spans(&preview));
-            } else {
-                spans.push(Span::from(preview));
-            }
-            Line::from(spans)
-        }));
-
-        lines
-    }
-
-    fn transcript_animation_tick(&self) -> Option<u64> {
-        if !self.animations_enabled {
-            return None;
-        }
-        let guard = self.state.lock().expect("subagent panel state lock");
-        let now = Instant::now();
-        if !guard.has_animating_agents(now) {
-            return None;
-        }
-        Some((now.duration_since(guard.started_at).as_millis() / 100) as u64)
-    }
-}
-
 pub(crate) fn new_subagent_spawned_cell(name: &str, prompt_preview: &str) -> PlainHistoryCell {
     PlainHistoryCell::new(subagent_spawned_lines(name, prompt_preview))
 }
@@ -615,56 +502,6 @@ pub(crate) fn new_subagent_update_cell(
     update_level: SubagentUpdateLevel,
 ) -> PlainHistoryCell {
     PlainHistoryCell::new(subagent_update_lines(name, status, summary, update_level))
-}
-
-fn running_preview_budget(width: u16) -> usize {
-    let width = width as usize;
-    width.saturating_sub(24).clamp(60, 160)
-}
-
-fn is_running_status(status: &AgentStatus) -> bool {
-    matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
-}
-
-fn status_span_for_panel(agent: &SubagentPanelAgent) -> Span<'static> {
-    match &agent.status {
-        AgentStatus::PendingInit if agent.is_watchdog => "idle".dim(),
-        AgentStatus::PendingInit | AgentStatus::Running => "running".cyan().bold(),
-        AgentStatus::Interrupted => "interrupted".yellow(),
-        AgentStatus::Completed(_) => "completed".green(),
-        AgentStatus::Errored(_) => "errored".red(),
-        AgentStatus::Shutdown => "shutdown".dim(),
-        AgentStatus::NotFound => "not found".red(),
-    }
-}
-
-const SUBAGENT_SHIMMER_WINDOW: Duration = Duration::from_secs(1);
-
-fn should_shimmer(agent: &SubagentPanelAgent, now: Instant) -> bool {
-    if agent.is_watchdog && matches!(agent.status, AgentStatus::PendingInit) {
-        return false;
-    }
-    is_running_status(&agent.status)
-        && now.saturating_duration_since(agent.latest_update_at) <= SUBAGENT_SHIMMER_WINDOW
-}
-
-fn subagent_count_label(total: i32, running: i32) -> String {
-    if total <= 0 || running <= 0 {
-        return "no subagents running".to_string();
-    }
-    let total_label = subagent_pluralize(total, "subagent");
-    if running >= total {
-        return format!("{total_label} running");
-    }
-    format!("{total_label}, {running} running")
-}
-
-fn subagent_pluralize(count: i32, singular: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {singular}s")
-    }
 }
 
 #[cfg_attr(debug_assertions, allow(dead_code))]
@@ -1922,7 +1759,7 @@ pub(crate) fn new_mcp_tools_output(
     let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
     let effective_servers = mcp_manager.effective_servers(config, None);
     let mut servers: Vec<_> = effective_servers.iter().collect();
-    servers.sort_by(|(a, _), (b, _)| a.cmp(b));
+    servers.sort_by_key(|(a, _)| *a);
 
     for (server, cfg) in servers {
         let prefix = format!("mcp__{server}__");
@@ -1988,7 +1825,7 @@ pub(crate) fn new_mcp_tools_output(
                     && !headers.is_empty()
                 {
                     let mut pairs: Vec<_> = headers.iter().collect();
-                    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    pairs.sort_by_key(|(a, _)| *a);
                     let display = pairs
                         .into_iter()
                         .map(|(name, _)| format!("{name}=*****"))
@@ -2000,7 +1837,7 @@ pub(crate) fn new_mcp_tools_output(
                     && !headers.is_empty()
                 {
                     let mut pairs: Vec<_> = headers.iter().collect();
-                    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    pairs.sort_by_key(|(a, _)| *a);
                     let display = pairs
                         .into_iter()
                         .map(|(name, var)| format!("{name}={var}"))

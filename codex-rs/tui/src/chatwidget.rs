@@ -78,6 +78,8 @@ use codex_otel::RuntimeMetricsSummary;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
+use codex_protocol::agent_inbox::AgentInboxMessage;
+use codex_protocol::agent_inbox::parse_agent_inbox_message_from_item;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
@@ -89,14 +91,9 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::parse_command::ParsedCommand;
-use codex_protocol::protocol::AGENT_INBOX_KIND;
-use codex_protocol::protocol::AGENT_INBOX_MESSAGE_PREFIX;
-use codex_protocol::protocol::AgentInboxPayload;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
@@ -249,7 +246,6 @@ use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
-use crate::history_cell::SubagentStatusCell;
 use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -265,6 +261,7 @@ use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
 use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
 use crate::status_indicator_widget::StatusDetailsCapitalization;
+use crate::subagent_panel::SubagentStatusCell;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod interrupts;
@@ -372,89 +369,6 @@ fn is_unified_exec_source(source: ExecCommandSource) -> bool {
         source,
         ExecCommandSource::UnifiedExecStartup | ExecCommandSource::UnifiedExecInteraction
     )
-}
-
-fn agent_inbox_message_from_item(item: &ResponseItem) -> Option<(Option<String>, String)> {
-    match item {
-        ResponseItem::FunctionCallOutput { output, .. } => {
-            let text = output.body.to_text()?;
-            let payload: AgentInboxPayload = serde_json::from_str(&text).ok()?;
-            if !payload.injected || payload.kind != AGENT_INBOX_KIND {
-                return None;
-            }
-            Some((Some(payload.sender_thread_id.to_string()), payload.message))
-        }
-        ResponseItem::Message { content, .. } => {
-            let text = content.iter().find_map(|item| match item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })?;
-            let rest = text.strip_prefix(AGENT_INBOX_MESSAGE_PREFIX)?;
-            let (sender, message) = rest.split_once(']')?;
-            let message = message.trim_start().to_string();
-            let sender = sender.trim().to_string();
-            if sender.is_empty() {
-                Some((None, message))
-            } else {
-                Some((Some(sender), message))
-            }
-        }
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplayAgentInboxEncoding {
-    FunctionCallOutput,
-    LegacyMessage,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReplayAgentInboxMessage {
-    sender: Option<String>,
-    message: String,
-    encoding: ReplayAgentInboxEncoding,
-}
-
-fn replay_agent_inbox_message_from_item(item: &ResponseItem) -> Option<ReplayAgentInboxMessage> {
-    match item {
-        ResponseItem::FunctionCallOutput { output, .. } => {
-            let text = output.body.to_text()?;
-            let payload: AgentInboxPayload = serde_json::from_str(&text).ok()?;
-            if !payload.injected || payload.kind != AGENT_INBOX_KIND {
-                return None;
-            }
-            Some(ReplayAgentInboxMessage {
-                sender: Some(payload.sender_thread_id.to_string()),
-                message: payload.message,
-                encoding: ReplayAgentInboxEncoding::FunctionCallOutput,
-            })
-        }
-        ResponseItem::Message { content, .. } => {
-            let text = content.iter().find_map(|item| match item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })?;
-            let rest = text.strip_prefix(AGENT_INBOX_MESSAGE_PREFIX)?;
-            let (sender, message) = rest.split_once(']')?;
-            let message = message.trim_start().to_string();
-            let sender = sender.trim().to_string();
-            Some(ReplayAgentInboxMessage {
-                sender: if sender.is_empty() {
-                    None
-                } else {
-                    Some(sender)
-                },
-                message,
-                encoding: ReplayAgentInboxEncoding::LegacyMessage,
-            })
-        }
-        _ => None,
-    }
 }
 
 fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
@@ -797,7 +711,7 @@ pub(crate) struct ChatWidget {
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
-    last_replayed_agent_inbox_message: Option<ReplayAgentInboxMessage>,
+    last_replayed_agent_inbox_message: Option<AgentInboxMessage>,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
 }
 
@@ -2601,7 +2515,7 @@ impl ChatWidget {
         event: codex_protocol::protocol::RawResponseItemEvent,
         from_replay: bool,
     ) {
-        let Some(replay_message) = replay_agent_inbox_message_from_item(&event.item) else {
+        let Some(replay_message) = parse_agent_inbox_message_from_item(&event.item) else {
             if from_replay {
                 self.last_replayed_agent_inbox_message = None;
             }
@@ -2617,21 +2531,21 @@ impl ChatWidget {
                 self.last_replayed_agent_inbox_message = None;
                 return;
             }
-            self.last_replayed_agent_inbox_message = Some(replay_message);
+            self.last_replayed_agent_inbox_message = Some(replay_message.clone());
         } else {
             self.last_replayed_agent_inbox_message = None;
         }
 
-        let Some((sender, message)) = agent_inbox_message_from_item(&event.item) else {
-            return;
-        };
-        let hint = sender.map(|sender| format!("from {sender}"));
+        let hint = replay_message
+            .sender
+            .clone()
+            .map(|sender| format!("from {sender}"));
         self.add_to_history(history_cell::new_info_event(
             "Agent message:".to_string(),
             hint,
         ));
         let mut rendered: Vec<Line<'static>> = Vec::new();
-        append_markdown(&message, None, &mut rendered);
+        append_markdown(&replay_message.message, None, &mut rendered);
         if !rendered.is_empty() {
             self.add_boxed_history(Box::new(AgentMessageCell::new(rendered, false)));
         }
