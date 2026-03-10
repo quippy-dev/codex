@@ -335,6 +335,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::InitialHistory;
@@ -885,6 +886,7 @@ impl TurnContext {
         })
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
+        .with_available_models(models_manager.try_list_models().unwrap_or_default())
         .with_agent_roles(config.agent_roles.clone());
 
         Self {
@@ -1265,6 +1267,7 @@ impl Session {
         provider: ModelProviderInfo,
         session_configuration: &SessionConfiguration,
         per_turn_config: Config,
+        available_models: Vec<ModelPreset>,
         model_info: ModelInfo,
         network: Option<NetworkProxy>,
         sub_id: String,
@@ -1293,6 +1296,7 @@ impl Session {
         })
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
+        .with_available_models(available_models)
         .with_agent_roles(per_turn_config.agent_roles.clone());
 
         let cwd = session_configuration.cwd.clone();
@@ -2505,6 +2509,10 @@ impl Session {
             session_configuration.provider.clone(),
             &session_configuration,
             per_turn_config,
+            self.services
+                .models_manager
+                .try_list_models()
+                .unwrap_or_default(),
             model_info,
             self.services
                 .network_proxy
@@ -5484,6 +5492,12 @@ async fn spawn_review_thread(
     })
     .with_web_search_config(None)
     .with_allow_login_shell(config.permissions.allow_login_shell)
+    .with_available_models(
+        sess.services
+            .models_manager
+            .try_list_models()
+            .unwrap_or_default(),
+    )
     .with_agent_roles(config.agent_roles.clone());
 
     let review_prompt = resolved.prompt.clone();
@@ -6533,13 +6547,7 @@ async fn built_tools(
             connectors::filter_codex_apps_tools_by_policy(selected_mcp_tools, &turn_context.config);
     }
 
-    let available_models = sess
-        .services
-        .models_manager
-        .list_models(crate::models_manager::manager::RefreshStrategy::Offline)
-        .await;
-
-    Ok(Arc::new(ToolRouter::from_config_with_available_models(
+    Ok(Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
         has_mcp_servers.then(|| {
             mcp_tools
@@ -6549,7 +6557,6 @@ async fn built_tools(
         }),
         app_tools,
         turn_context.dynamic_tools.as_slice(),
-        available_models.as_slice(),
     )))
 }
 

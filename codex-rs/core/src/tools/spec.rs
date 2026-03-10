@@ -79,6 +79,7 @@ pub(crate) struct ToolsConfig {
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
+    pub available_models: Vec<ModelPreset>,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -190,6 +191,7 @@ impl ToolsConfig {
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
+            available_models: Vec::new(),
         }
     }
 
@@ -205,6 +207,11 @@ impl ToolsConfig {
 
     pub fn with_web_search_config(mut self, web_search_config: Option<WebSearchConfig>) -> Self {
         self.web_search_config = web_search_config;
+        self
+    }
+
+    pub fn with_available_models(mut self, available_models: Vec<ModelPreset>) -> Self {
+        self.available_models = available_models;
         self
     }
 }
@@ -725,15 +732,7 @@ fn create_collab_input_items_schema() -> JsonSchema {
     }
 }
 
-#[cfg(test)]
 fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
-    create_spawn_agent_tool_with_available_models(config, &[])
-}
-
-fn create_spawn_agent_tool_with_available_models(
-    config: &ToolsConfig,
-    available_models: &[ModelPreset],
-) -> ToolSpec {
     let spawn_mode_description = if config.agent_watchdog {
         "Spawn behavior: fork, spawn (fresh context), or watchdog (idle-time check-ins). Roles may override the omitted-mode default. Watchdog mode returns a handle, not a conversational worker, and check-ins only happen after the current turn ends and the owner thread is idle."
             .to_string()
@@ -847,7 +846,7 @@ fn create_spawn_agent_tool_with_available_models(
 - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
 - Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
 - The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#,
-            format_spawn_agent_model_catalog(available_models),
+            format_spawn_agent_model_catalog(&config.available_models),
         ),
         strict: false,
         parameters: JsonSchema::Object {
@@ -2020,23 +2019,12 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
-#[cfg(test)]
+/// Builds the tool registry builder while collecting tool specs for later serialization.
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
     app_tools: Option<HashMap<String, ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
-) -> ToolRegistryBuilder {
-    build_specs_with_available_models(config, mcp_tools, app_tools, dynamic_tools, &[])
-}
-
-/// Builds the tool registry builder while collecting tool specs for later serialization.
-pub(crate) fn build_specs_with_available_models(
-    config: &ToolsConfig,
-    mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
-    app_tools: Option<HashMap<String, ToolInfo>>,
-    dynamic_tools: &[DynamicToolSpec],
-    available_models: &[ModelPreset],
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::ArtifactsHandler;
@@ -2255,10 +2243,7 @@ pub(crate) fn build_specs_with_available_models(
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
-        builder.push_spec(create_spawn_agent_tool_with_available_models(
-            config,
-            available_models,
-        ));
+        builder.push_spec(create_spawn_agent_tool(config));
         builder.push_spec(create_send_input_tool(config));
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_list_agents_tool(config.agent_watchdog));
@@ -2798,11 +2783,9 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
             session_source: SessionSource::Cli,
-        });
-        let ToolSpec::Function(spec) = create_spawn_agent_tool_with_available_models(
-            &tools_config,
-            &[visible_model_preset_for_tests()],
-        ) else {
+        })
+        .with_available_models(vec![visible_model_preset_for_tests()]);
+        let ToolSpec::Function(spec) = create_spawn_agent_tool(&tools_config) else {
             panic!("spawn_agent should use a function tool spec");
         };
 
