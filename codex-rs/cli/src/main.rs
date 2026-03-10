@@ -738,8 +738,12 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 &mut cloud_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            codex_cloud_tasks::run_main(cloud_cli, arg0_paths.codex_linux_sandbox_exe.clone())
-                .await?;
+            codex_cloud_tasks::run_main(
+                cloud_cli,
+                arg0_paths.codex_linux_sandbox_exe.clone(),
+                auth_file.clone(),
+            )
+            .await?;
         }
         Some(Subcommand::Sandbox(sandbox_args)) => match sandbox_args.cmd {
             SandboxCommand::Macos(mut seatbelt_cli) => {
@@ -1593,6 +1597,17 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/auth.json"))
         );
         assert_matches!(cli.subcommand, Some(Subcommand::Exec(_)));
+    }
+
+    #[test]
+    fn cloud_auth_file_parses_as_global_flag() {
+        let cli = MultitoolCli::try_parse_from(["codex", "cloud", "--auth-file", "/tmp/auth.json"])
+            .expect("parse");
+        assert_eq!(
+            cli.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
+        assert_matches!(cli.subcommand, Some(Subcommand::Cloud(_)));
     }
 
     #[test]

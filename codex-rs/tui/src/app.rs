@@ -1746,6 +1746,25 @@ impl App {
         Some(agent_threads[next_idx].0)
     }
 
+    fn agent_navigation_shortcut_target(&self, key_event: KeyEvent) -> Option<ThreadId> {
+        if self.overlay.is_some() || !self.chat_widget.no_modal_or_popup_active() {
+            return None;
+        }
+
+        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
+            && self.chat_widget.composer_text_with_pending().is_empty();
+
+        if previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
+            return self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous);
+        }
+
+        if next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
+            return self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Next);
+        }
+
+        None
+    }
+
     fn agent_picker_subtitle() -> String {
         let previous: Span<'static> = previous_agent_shortcut().into();
         let next: Span<'static> = next_agent_shortcut().into();
@@ -4442,28 +4461,8 @@ impl App {
     }
 
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
-        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
-            && self.chat_widget.composer_text_with_pending().is_empty();
-        if self.overlay.is_none()
-            && self.chat_widget.no_modal_or_popup_active()
-            && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
-        {
-            if let Some(thread_id) =
-                self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous)
-            {
-                let _ = self.select_agent_thread(tui, thread_id).await;
-            }
-            return;
-        }
-        if self.overlay.is_none()
-            && self.chat_widget.no_modal_or_popup_active()
-            && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
-        {
-            if let Some(thread_id) =
-                self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Next)
-            {
-                let _ = self.select_agent_thread(tui, thread_id).await;
-            }
+        if let Some(thread_id) = self.agent_navigation_shortcut_target(key_event) {
+            let _ = self.select_agent_thread(tui, thread_id).await;
             return;
         }
 
@@ -4642,6 +4641,8 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -6202,6 +6203,32 @@ mod tests {
             app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous),
             Some(second_agent_id),
             "previous from the first spawned thread should wrap to the end"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_navigation_shortcut_target_is_none_without_adjacent_thread() {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000121").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(main_thread_id);
+        app.agent_picker_threads.insert(
+            main_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(main_thread_id);
+        app.chat_widget
+            .set_composer_text("foo bar".to_string(), Vec::new(), Vec::new());
+
+        assert_eq!(
+            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            None
         );
     }
 

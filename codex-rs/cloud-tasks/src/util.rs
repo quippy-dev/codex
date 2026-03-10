@@ -3,9 +3,13 @@ use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
 use reqwest::header::HeaderMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use codex_core::auth::resolve_auth_storage_home;
 use codex_core::config::Config;
 use codex_login::AuthManager;
+use codex_utils_cli::CliConfigOverrides;
 
 pub fn set_user_agent_suffix(suffix: &str) {
     if let Ok(mut guard) = codex_core::default_client::USER_AGENT_SUFFIX.lock() {
@@ -59,19 +63,34 @@ pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub async fn load_auth_manager() -> Option<AuthManager> {
-    // TODO: pass in cli overrides once cloud tasks properly support them.
-    let config = Config::load_with_cli_overrides(Vec::new()).await.ok()?;
-    Some(AuthManager::new(
+pub async fn load_auth_manager(
+    cli_overrides: &CliConfigOverrides,
+    auth_file: Option<PathBuf>,
+) -> Option<Arc<AuthManager>> {
+    let config = Config::load_with_cli_overrides(cli_overrides.parse_overrides().ok()?)
+        .await
+        .ok()?;
+    let auth_storage_home = resolve_auth_storage_home(
         config.codex_home,
+        auth_file.as_deref(),
+        config.cli_auth_credentials_store_mode,
+    )
+    .ok()?;
+    AuthManager::shared_with_auth_file(
+        auth_storage_home,
         false,
         config.cli_auth_credentials_store_mode,
-    ))
+        auth_file,
+    )
+    .ok()
 }
 
 /// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
 /// and optional `ChatGPT-Account-Id`.
-pub async fn build_chatgpt_headers() -> HeaderMap {
+pub async fn build_chatgpt_headers(
+    cli_overrides: &CliConfigOverrides,
+    auth_file: Option<PathBuf>,
+) -> HeaderMap {
     use reqwest::header::AUTHORIZATION;
     use reqwest::header::HeaderName;
     use reqwest::header::HeaderValue;
@@ -84,7 +103,7 @@ pub async fn build_chatgpt_headers() -> HeaderMap {
         USER_AGENT,
         HeaderValue::from_str(&ua).unwrap_or(HeaderValue::from_static("codex-cli")),
     );
-    if let Some(am) = load_auth_manager().await
+    if let Some(am) = load_auth_manager(cli_overrides, auth_file).await
         && let Some(auth) = am.auth().await
         && let Ok(tok) = auth.get_token()
         && !tok.is_empty()
@@ -142,4 +161,67 @@ pub fn format_relative_time(reference: DateTime<Utc>, ts: DateTime<Utc>) -> Stri
 
 pub fn format_relative_time_now(ts: DateTime<Utc>) -> String {
     format_relative_time(Utc::now(), ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use codex_core::auth::AuthMode;
+    use codex_core::auth::save_auth_with_auth_file;
+    use codex_login::AuthDotJson;
+    use pretty_assertions::assert_eq;
+    use reqwest::header::AUTHORIZATION;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    #[tokio::test]
+    async fn auth_file_override_loads_cloud_auth_manager_and_headers() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-cloud-tasks-auth-override-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("custom").join("auth.json");
+        let auth_dot_json = AuthDotJson {
+            auth_mode: None,
+            openai_api_key: Some("sk-cloud-override".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+        save_auth_with_auth_file(
+            &dir,
+            &auth_dot_json,
+            AuthCredentialsStoreMode::File,
+            Some(auth_file.clone()),
+        )
+        .expect("save auth override");
+
+        let cli_overrides = vec![
+            format!("codex_home={}", dir.display()),
+            "cli_auth_credentials_store=file".to_string(),
+        ];
+        let cli_overrides = CliConfigOverrides {
+            raw_overrides: cli_overrides,
+        };
+
+        let auth_manager = load_auth_manager(&cli_overrides, Some(auth_file.clone()))
+            .await
+            .expect("auth manager");
+        assert_eq!(auth_manager.auth_mode(), Some(AuthMode::ApiKey));
+
+        let headers = build_chatgpt_headers(&cli_overrides, Some(auth_file)).await;
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-cloud-override")
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
 }
