@@ -1030,14 +1030,14 @@ pub(crate) async fn apply_bespoke_event_handling(
             } else {
                 V2CollabToolCallStatus::Completed
             };
-            let receiver_thread_ids = end_event.statuses.keys().map(ToString::to_string).collect();
             let agents_states = end_event
                 .statuses
                 .iter()
                 .map(|(id, status)| (id.to_string(), V2CollabAgentStatus::from(status.clone())))
                 .collect();
-            let receiver_agents = wait_end_receiver_agents(&end_event);
             let agent_statuses = wait_end_agent_statuses(&end_event);
+            let receiver_thread_ids = wait_end_receiver_thread_ids(&agent_statuses);
+            let receiver_agents = wait_end_receiver_agents(&agent_statuses);
             let item = ThreadItem::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::Wait,
@@ -2636,31 +2636,21 @@ fn wait_receiver_agents(
         .collect()
 }
 
-fn wait_end_receiver_agents(
-    end_event: &codex_protocol::protocol::CollabWaitingEndEvent,
-) -> Vec<CollabAgentRef> {
-    if end_event.agent_statuses.is_empty() {
-        let mut receiver_thread_ids: Vec<String> =
-            end_event.statuses.keys().map(ToString::to_string).collect();
-        receiver_thread_ids.sort();
-        return receiver_thread_ids
-            .into_iter()
-            .map(|thread_id| CollabAgentRef {
-                thread_id,
-                agent_nickname: None,
-                agent_role: None,
-            })
-            .collect();
-    }
-
-    end_event
-        .agent_statuses
+fn wait_end_receiver_agents(agent_statuses: &[CollabAgentStatusEntry]) -> Vec<CollabAgentRef> {
+    agent_statuses
         .iter()
         .map(|entry| CollabAgentRef {
             thread_id: entry.thread_id.to_string(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
         })
+        .collect()
+}
+
+fn wait_end_receiver_thread_ids(agent_statuses: &[CollabAgentStatusEntry]) -> Vec<String> {
+    agent_statuses
+        .iter()
+        .map(|entry| entry.thread_id.to_string())
         .collect()
 }
 
@@ -3064,6 +3054,105 @@ mod tests {
     fn collab_send_input_status_maps_not_found_to_failed() {
         let status = collab_send_input_status(&codex_protocol::protocol::AgentStatus::NotFound);
         assert_eq!(status, V2CollabToolCallStatus::Failed);
+    }
+
+    #[test]
+    fn wait_end_outputs_follow_agent_status_order_when_metadata_is_present() {
+        let thread_a =
+            ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").expect("valid thread id");
+        let thread_b =
+            ThreadId::from_string("123e4567-e89b-12d3-a456-426614174001").expect("valid thread id");
+        let end_event = codex_protocol::protocol::CollabWaitingEndEvent {
+            sender_thread_id: ThreadId::new(),
+            call_id: "wait-1".to_string(),
+            agent_statuses: vec![
+                codex_protocol::protocol::CollabAgentStatusEntry {
+                    thread_id: thread_b,
+                    agent_nickname: Some("B".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    status: codex_protocol::protocol::AgentStatus::Running,
+                },
+                codex_protocol::protocol::CollabAgentStatusEntry {
+                    thread_id: thread_a,
+                    agent_nickname: Some("A".to_string()),
+                    agent_role: Some("default".to_string()),
+                    status: codex_protocol::protocol::AgentStatus::Completed(None),
+                },
+            ],
+            statuses: [
+                (
+                    thread_a,
+                    codex_protocol::protocol::AgentStatus::Completed(None),
+                ),
+                (thread_b, codex_protocol::protocol::AgentStatus::Running),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let agent_statuses = wait_end_agent_statuses(&end_event);
+        assert_eq!(
+            wait_end_receiver_thread_ids(&agent_statuses),
+            vec![thread_b.to_string(), thread_a.to_string()]
+        );
+        assert_eq!(
+            wait_end_receiver_agents(&agent_statuses),
+            vec![
+                CollabAgentRef {
+                    thread_id: thread_b.to_string(),
+                    agent_nickname: Some("B".to_string()),
+                    agent_role: Some("worker".to_string()),
+                },
+                CollabAgentRef {
+                    thread_id: thread_a.to_string(),
+                    agent_nickname: Some("A".to_string()),
+                    agent_role: Some("default".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_end_outputs_sort_consistently_when_metadata_is_absent() {
+        let thread_b =
+            ThreadId::from_string("123e4567-e89b-12d3-a456-426614174001").expect("valid thread id");
+        let thread_a =
+            ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").expect("valid thread id");
+        let end_event = codex_protocol::protocol::CollabWaitingEndEvent {
+            sender_thread_id: ThreadId::new(),
+            call_id: "wait-2".to_string(),
+            agent_statuses: Vec::new(),
+            statuses: [
+                (thread_b, codex_protocol::protocol::AgentStatus::Running),
+                (
+                    thread_a,
+                    codex_protocol::protocol::AgentStatus::Completed(None),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let agent_statuses = wait_end_agent_statuses(&end_event);
+        assert_eq!(
+            wait_end_receiver_thread_ids(&agent_statuses),
+            vec![thread_a.to_string(), thread_b.to_string()]
+        );
+        assert_eq!(
+            wait_end_receiver_agents(&agent_statuses),
+            vec![
+                CollabAgentRef {
+                    thread_id: thread_a.to_string(),
+                    agent_nickname: None,
+                    agent_role: None,
+                },
+                CollabAgentRef {
+                    thread_id: thread_b.to_string(),
+                    agent_nickname: None,
+                    agent_role: None,
+                },
+            ]
+        );
     }
 
     #[tokio::test]

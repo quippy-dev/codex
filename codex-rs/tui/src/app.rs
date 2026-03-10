@@ -586,7 +586,23 @@ impl SubagentRegistry {
         }
     }
 
+    fn clear(&mut self) {
+        self.root_thread_id = None;
+        self.agents.clear();
+        self.order.clear();
+        self.pending_events.clear();
+        self.pending_history.clear();
+        self.panel_state = None;
+        self.panel_cell = None;
+    }
+
     fn set_root_thread(&mut self, thread_id: ThreadId) {
+        if self
+            .root_thread_id
+            .is_some_and(|current| current != thread_id)
+        {
+            self.clear();
+        }
         self.root_thread_id = Some(thread_id);
     }
 
@@ -1926,9 +1942,9 @@ impl App {
         }
 
         match &event.msg {
-            EventMsg::CollabAgentSpawnEnd(ev) if self.subagents.is_root_thread(thread_id) => {
-                // Keep registry/panel state in sync, but let chatwidget own
-                // lifecycle transcript cells for root-thread collab events.
+            EventMsg::CollabAgentSpawnEnd(ev) => {
+                // Keep registry/panel state in sync for both root and nested spawns, but let
+                // chatwidget own lifecycle transcript cells for root-thread collab events.
                 let _ = self.subagents.on_spawn_end(ev);
             }
             EventMsg::CollabWaitingEnd(ev) => {
@@ -2236,8 +2252,10 @@ impl App {
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
+        self.subagents.clear();
         self.chat_widget.set_pending_thread_approvals(Vec::new());
         self.sync_active_agent_label();
+        self.sync_subagent_panel_state();
     }
 
     async fn start_fresh_session_with_summary_hint(&mut self, tui: &mut tui::Tui) {
@@ -8100,6 +8118,50 @@ mod tests {
         assert!(guard.running_agents[0].preview.contains("watchdog B"));
     }
 
+    #[test]
+    fn subagent_registry_clears_state_when_root_thread_changes() {
+        let mut registry = SubagentRegistry::new(false);
+        let first_root_thread_id = ThreadId::new();
+        let second_root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        let buffered_thread_id = ThreadId::new();
+        registry.set_root_thread(first_root_thread_id);
+
+        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-1".to_string(),
+            sender_thread_id: first_root_thread_id,
+            new_thread_id: Some(subagent_thread_id),
+            new_agent_nickname: Some("Nested".to_string()),
+            new_agent_role: Some("worker".to_string()),
+            prompt: "nested prompt".to_string(),
+            spawn_mode: AgentSpawnMode::Spawn,
+            status: AgentStatus::Running,
+        });
+        assert!(spawned.is_some(), "expected spawn cell for new subagent");
+        registry.buffer_pending_event(buffered_thread_id, EventMsg::ShutdownComplete);
+        registry.queue_history(Box::new(new_subagent_spawned_cell(
+            "Nested [worker]",
+            "nested prompt",
+        )));
+        registry.rebuild_panel_state();
+
+        assert!(!registry.agents.is_empty());
+        assert!(!registry.pending_events.is_empty());
+        assert!(!registry.pending_history.is_empty());
+        assert!(registry.panel_state.is_some());
+        assert!(registry.panel_cell.is_some());
+
+        registry.set_root_thread(second_root_thread_id);
+
+        assert_eq!(registry.root_thread_id, Some(second_root_thread_id));
+        assert!(registry.agents.is_empty());
+        assert!(registry.order.is_empty());
+        assert!(registry.pending_events.is_empty());
+        assert!(registry.pending_history.is_empty());
+        assert!(registry.panel_state.is_none());
+        assert!(registry.panel_cell.is_none());
+    }
+
     #[tokio::test]
     async fn root_subagent_side_effects_do_not_emit_lifecycle_cells() {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -8280,6 +8342,73 @@ mod tests {
         );
         let duplicate_close_cells = drain_insert_history_text(&mut app_event_rx);
         assert!(duplicate_close_cells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_on_parent_channel_registers_nested_subagent() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let parent_thread_id = ThreadId::new();
+        let nested_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn-root".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-root".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(parent_thread_id),
+                    new_agent_nickname: Some("RootChild".to_string()),
+                    new_agent_role: Some("default".to_string()),
+                    prompt: "root child prompt".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+
+        app.process_subagent_side_effects(
+            parent_thread_id,
+            &Event {
+                id: "spawn-nested".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-nested".to_string(),
+                    sender_thread_id: parent_thread_id,
+                    new_thread_id: Some(nested_thread_id),
+                    new_agent_nickname: Some("NestedWorker".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "nested worker prompt".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(
+            app.subagents.contains(nested_thread_id),
+            "nested subagent should be registered from the parent channel"
+        );
+
+        let nested_summary = "nested completed summary";
+        app.process_subagent_side_effects(
+            nested_thread_id,
+            &Event {
+                id: "turn-complete-nested".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: Some(nested_summary.to_string()),
+                }),
+            },
+        );
+
+        let nested_cells = drain_insert_history_text(&mut app_event_rx);
+        assert_eq!(nested_cells.len(), 1);
+        assert!(nested_cells[0].contains("Subagent update: NestedWorker [worker] completed"));
+        assert!(nested_cells[0].contains(nested_summary));
     }
 
     #[test]
