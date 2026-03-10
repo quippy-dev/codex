@@ -47,7 +47,7 @@ use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
-use crate::tools::context::TextToolOutput;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellHandler;
@@ -91,11 +91,10 @@ use std::time::Duration as StdDuration;
 #[path = "codex_tests_guardian.rs"]
 mod guardian_tests;
 
-fn expect_text_tool_output(output: &dyn std::any::Any) -> String {
-    let Some(output) = output.downcast_ref::<TextToolOutput>() else {
-        panic!("unexpected tool output");
-    };
-    output.text.clone()
+use codex_protocol::models::function_call_output_content_items_to_text;
+
+fn expect_text_tool_output(output: &FunctionToolOutput) -> String {
+    function_call_output_content_items_to_text(&output.body).unwrap_or_default()
 }
 
 struct InstructionsTestCase {
@@ -2218,6 +2217,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     let skills_manager = Arc::new(SkillsManager::new(
         config.codex_home.clone(),
         Arc::clone(&plugins_manager),
+        true,
     ));
     let result = Session::new(
         session_configuration,
@@ -2320,6 +2320,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let skills_manager = Arc::new(SkillsManager::new(
         config.codex_home.clone(),
         Arc::clone(&plugins_manager),
+        true,
     ));
     let network_approval = Arc::new(NetworkApprovalService::default());
 
@@ -2342,6 +2343,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         ),
         hooks: Hooks::new(HooksConfig {
             legacy_notify_argv: config.notify.clone(),
+            ..HooksConfig::default()
         }),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
@@ -2396,6 +2398,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation_id,
         tx_event,
         agent_status: agent_status_tx,
+        out_of_band_elicitation_paused: watch::channel(false).0,
         state: Mutex::new(state),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -2460,7 +2463,7 @@ async fn request_permissions_emits_event_when_reject_policy_allows_requests() {
             }),
             ..Default::default()
         },
-        scope: codex_protocol::request_permissions::PermissionGrantScope::Turn,
+        scope: PermissionGrantScope::Turn,
     };
 
     let handle = tokio::spawn({
@@ -2545,7 +2548,7 @@ async fn request_permissions_returns_empty_grant_when_reject_policy_blocks_reque
         Some(
             codex_protocol::request_permissions::RequestPermissionsResponse {
                 permissions: codex_protocol::models::PermissionProfile::default(),
-                scope: codex_protocol::request_permissions::PermissionGrantScope::Turn,
+                scope: PermissionGrantScope::Turn,
             }
         )
     );
@@ -2875,6 +2878,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let skills_manager = Arc::new(SkillsManager::new(
         config.codex_home.clone(),
         Arc::clone(&plugins_manager),
+        true,
     ));
     let network_approval = Arc::new(NetworkApprovalService::default());
 
@@ -2897,6 +2901,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         ),
         hooks: Hooks::new(HooksConfig {
             legacy_notify_argv: config.notify.clone(),
+            ..HooksConfig::default()
         }),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
@@ -2951,6 +2956,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         conversation_id,
         tx_event,
         agent_status: agent_status_tx,
+        out_of_band_elicitation_paused: watch::channel(false).0,
         state: Mutex::new(state),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -4305,7 +4311,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
         })
         .await;
 
-    let output = expect_text_tool_output(&*resp2.expect("expected Ok result"));
+    let output = expect_text_tool_output(&resp2.expect("expected Ok result"));
 
     #[derive(Deserialize, PartialEq, Eq, Debug)]
     struct ResponseExecMetadata {
