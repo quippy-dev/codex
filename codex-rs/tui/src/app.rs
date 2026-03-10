@@ -1193,8 +1193,11 @@ impl App {
             return None;
         }
 
-        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
-            && self.chat_widget.composer_text_with_pending().is_empty();
+        if !self.chat_widget.composer_text_with_pending().is_empty() {
+            return None;
+        }
+
+        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported;
 
         if previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
             return self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous);
@@ -5464,6 +5467,86 @@ mod tests {
         assert_eq!(
             app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_navigation_shortcut_target_is_none_with_draft_and_adjacent_thread() {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000131").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000132").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(main_thread_id);
+        app.agent_picker_threads.insert(
+            main_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(main_thread_id);
+        app.agent_picker_threads.insert(
+            agent_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(agent_thread_id);
+        app.chat_widget
+            .set_composer_text("foo bar".to_string(), Vec::new(), Vec::new());
+
+        assert_eq!(
+            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
+            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_navigation_shortcut_target_switches_threads_when_composer_is_empty() {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000141").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000142").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(main_thread_id);
+        app.agent_picker_threads.insert(
+            main_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: None,
+                agent_role: None,
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(main_thread_id);
+        app.agent_picker_threads.insert(
+            agent_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(agent_thread_id);
+
+        assert_eq!(
+            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            Some(agent_thread_id)
+        );
+        assert_eq!(
+            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            Some(agent_thread_id)
         );
     }
 

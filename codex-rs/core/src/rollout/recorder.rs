@@ -105,6 +105,27 @@ enum RolloutCmd {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RolloutParseSummary {
+    parse_errors: usize,
+    trailing_parse_errors: usize,
+}
+
+impl RolloutParseSummary {
+    fn record_parse_error(&mut self) {
+        self.parse_errors = self.parse_errors.saturating_add(1);
+        self.trailing_parse_errors = self.trailing_parse_errors.saturating_add(1);
+    }
+
+    fn record_success(&mut self) {
+        self.trailing_parse_errors = 0;
+    }
+
+    fn has_non_trailing_parse_errors(self) -> bool {
+        self.parse_errors > self.trailing_parse_errors
+    }
+}
+
 impl RolloutRecorderParams {
     pub fn new(
         conversation_id: ThreadId,
@@ -527,9 +548,9 @@ impl RolloutRecorder {
             .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))
     }
 
-    pub(crate) async fn load_rollout_items(
+    async fn load_rollout_items_with_parse_summary(
         path: &Path,
-    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, RolloutParseSummary)> {
         trace!("Resuming rollout from {path:?}");
         let text = tokio::fs::read_to_string(path).await?;
         if text.trim().is_empty() {
@@ -538,7 +559,7 @@ impl RolloutRecorder {
 
         let mut items: Vec<RolloutItem> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
-        let mut parse_errors = 0usize;
+        let mut parse_summary = RolloutParseSummary::default();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -547,41 +568,44 @@ impl RolloutRecorder {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("failed to parse line as JSON: {line:?}, error: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
+                    parse_summary.record_parse_error();
                     continue;
                 }
             };
 
             // Parse the rollout line structure
             match serde_json::from_value::<RolloutLine>(v.clone()) {
-                Ok(rollout_line) => match rollout_line.item {
-                    RolloutItem::SessionMeta(session_meta_line) => {
-                        // Use the FIRST SessionMeta encountered in the file as the canonical
-                        // thread id and main session information. Keep all items intact.
-                        if thread_id.is_none() {
-                            thread_id = Some(session_meta_line.meta.id);
+                Ok(rollout_line) => {
+                    parse_summary.record_success();
+                    match rollout_line.item {
+                        RolloutItem::SessionMeta(session_meta_line) => {
+                            // Use the FIRST SessionMeta encountered in the file as the canonical
+                            // thread id and main session information. Keep all items intact.
+                            if thread_id.is_none() {
+                                thread_id = Some(session_meta_line.meta.id);
+                            }
+                            items.push(RolloutItem::SessionMeta(session_meta_line));
                         }
-                        items.push(RolloutItem::SessionMeta(session_meta_line));
+                        RolloutItem::ResponseItem(item) => {
+                            items.push(RolloutItem::ResponseItem(item));
+                        }
+                        RolloutItem::ForkReference(item) => {
+                            items.push(RolloutItem::ForkReference(item));
+                        }
+                        RolloutItem::Compacted(item) => {
+                            items.push(RolloutItem::Compacted(item));
+                        }
+                        RolloutItem::TurnContext(item) => {
+                            items.push(RolloutItem::TurnContext(item));
+                        }
+                        RolloutItem::EventMsg(_ev) => {
+                            items.push(RolloutItem::EventMsg(_ev));
+                        }
                     }
-                    RolloutItem::ResponseItem(item) => {
-                        items.push(RolloutItem::ResponseItem(item));
-                    }
-                    RolloutItem::ForkReference(item) => {
-                        items.push(RolloutItem::ForkReference(item));
-                    }
-                    RolloutItem::Compacted(item) => {
-                        items.push(RolloutItem::Compacted(item));
-                    }
-                    RolloutItem::TurnContext(item) => {
-                        items.push(RolloutItem::TurnContext(item));
-                    }
-                    RolloutItem::EventMsg(_ev) => {
-                        items.push(RolloutItem::EventMsg(_ev));
-                    }
-                },
+                }
                 Err(e) => {
                     trace!("failed to parse rollout line: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
+                    parse_summary.record_parse_error();
                 }
             }
         }
@@ -590,16 +614,28 @@ impl RolloutRecorder {
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),
             thread_id,
-            parse_errors,
+            parse_summary.parse_errors,
         );
-        Ok((items, thread_id, parse_errors))
+        Ok((items, thread_id, parse_summary))
+    }
+
+    pub(crate) async fn load_rollout_items(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let (items, thread_id, parse_summary) =
+            Self::load_rollout_items_with_parse_summary(path).await?;
+        Ok((items, thread_id, parse_summary.parse_errors))
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
-        let (items, thread_id, parse_errors) = Self::load_rollout_items(path).await?;
-        if parse_errors > 0 {
+        let (items, thread_id, parse_summary) =
+            Self::load_rollout_items_with_parse_summary(path).await?;
+        if parse_summary.has_non_trailing_parse_errors()
+            || (parse_summary.parse_errors > 0 && items.is_empty())
+        {
             return Err(IoError::other(format!(
-                "failed to parse {parse_errors} rollout line(s) from {path:?}; legacy or invalid rollout files are unsupported"
+                "failed to parse {} rollout line(s) from {path:?}; legacy or invalid rollout files are unsupported",
+                parse_summary.parse_errors,
             )));
         }
         let conversation_id = thread_id

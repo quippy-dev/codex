@@ -7,18 +7,21 @@ pub fn validate_auth_file_override(
     if auth_file.is_some()
         && matches!(
             auth_credentials_store_mode,
-            AuthCredentialsStoreMode::Auto | AuthCredentialsStoreMode::Keyring
+            AuthCredentialsStoreMode::Auto
+                | AuthCredentialsStoreMode::Ephemeral
+                | AuthCredentialsStoreMode::Keyring
         )
     {
         let mode = match auth_credentials_store_mode {
             AuthCredentialsStoreMode::Auto => "auto",
+            AuthCredentialsStoreMode::Ephemeral => "ephemeral",
             AuthCredentialsStoreMode::Keyring => "keyring",
             _ => unreachable!(),
         };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "--auth-file cannot be used when `cli_auth_credentials_store` is `{mode}`. Set `-c cli_auth_credentials_store=file` (or `ephemeral`) and retry."
+                "--auth-file cannot be used when `cli_auth_credentials_store` is `{mode}`. Set `-c cli_auth_credentials_store=file` and retry."
             ),
         ));
     }

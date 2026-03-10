@@ -1428,6 +1428,99 @@ async fn get_rollout_history_accepts_compacted_lines_without_retained_plan() {
 }
 
 #[tokio::test]
+async fn get_rollout_history_recovers_from_malformed_trailing_line() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let rollout_path = attach_rollout_recorder(&session).await;
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    session
+        .record_into_history(&initial_context, &turn_context)
+        .await;
+    session.flush_rollout().await;
+
+    let valid_line = RolloutLine {
+        timestamp: "2026-03-10T00:00:00Z".to_string(),
+        item: RolloutItem::ResponseItem(user_message("line before malformed tail")),
+    };
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout path");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&valid_line).expect("serialize valid rollout line")
+    )
+    .expect("append valid rollout line");
+    writeln!(file, "{{\"timestamp\":\"2026-03-10T00:00:00Z\",\"item\":")
+        .expect("append malformed rollout line");
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("recover rollout history from malformed trailing line")
+    else {
+        panic!("expected resumed rollout history");
+    };
+
+    let resumed_response_items: Vec<_> = resumed
+        .history
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        resumed_response_items.contains(&user_message("line before malformed tail")),
+        "expected recovered rollout history to keep the valid prefix before the malformed tail",
+    );
+}
+
+#[tokio::test]
+async fn get_rollout_history_rejects_interleaved_malformed_line() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let rollout_path = attach_rollout_recorder(&session).await;
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    session
+        .record_into_history(&initial_context, &turn_context)
+        .await;
+    session.flush_rollout().await;
+
+    let valid_line = RolloutLine {
+        timestamp: "2026-03-10T00:00:01Z".to_string(),
+        item: RolloutItem::ResponseItem(user_message("line after malformed entry")),
+    };
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout path");
+    writeln!(file, "{{\"timestamp\":\"2026-03-10T00:00:00Z\",\"item\":")
+        .expect("append malformed rollout line");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&valid_line).expect("serialize valid rollout line")
+    )
+    .expect("append valid rollout line after malformed line");
+
+    let err = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect_err("interleaved malformed rollout line should still fail closed");
+    assert!(
+        err.to_string()
+            .contains("failed to parse 1 rollout line(s)"),
+        "unexpected error: {err}",
+    );
+}
+
+#[tokio::test]
 async fn thread_rollback_fails_when_turn_in_progress() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 

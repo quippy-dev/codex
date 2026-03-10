@@ -53,7 +53,7 @@ Use `--auth-file` to point app-server auth flows (login/logout/status) at a spec
 codex app-server --auth-file /tmp/codex-auth/auth.json
 ```
 
-When `--auth-file` is set, `cli_auth_credentials_store` must be `file` (or `ephemeral`). `keyring` and `auto` are rejected. If needed, set:
+When `--auth-file` is set, `cli_auth_credentials_store` must be `file`. `ephemeral`, `keyring`, and `auto` are rejected. If needed, set:
 
 ```bash
 codex app-server --auth-file /tmp/codex-auth/auth.json -c cli_auth_credentials_store=file

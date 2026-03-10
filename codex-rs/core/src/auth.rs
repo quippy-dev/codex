@@ -1641,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_file_override_validation_disallows_keyring_and_auto() {
+    fn auth_file_override_validation_disallows_keyring_auto_and_ephemeral() {
         let auth_file = PathBuf::from("/tmp/auth-override.json");
         let keyring_error = validate_auth_file_override(
             AuthCredentialsStoreMode::Keyring,
@@ -1666,17 +1666,27 @@ mod tests {
                 .contains("cli_auth_credentials_store")
         );
         assert!(auto_error.to_string().contains("auto"));
+
+        let ephemeral_error = validate_auth_file_override(
+            AuthCredentialsStoreMode::Ephemeral,
+            Some(auth_file.as_path()),
+        )
+        .expect_err("ephemeral mode should reject auth file override");
+        assert_eq!(ephemeral_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            ephemeral_error
+                .to_string()
+                .contains("cli_auth_credentials_store")
+        );
+        assert!(ephemeral_error.to_string().contains("ephemeral"));
     }
 
     #[test]
-    fn auth_file_override_validation_allows_file_and_ephemeral() -> std::io::Result<()> {
+    fn auth_file_override_validation_allows_file_without_override_modes() -> std::io::Result<()> {
         let auth_file = PathBuf::from("/tmp/auth-override.json");
         validate_auth_file_override(AuthCredentialsStoreMode::File, Some(auth_file.as_path()))?;
-        validate_auth_file_override(
-            AuthCredentialsStoreMode::Ephemeral,
-            Some(auth_file.as_path()),
-        )?;
         validate_auth_file_override(AuthCredentialsStoreMode::Auto, None)?;
+        validate_auth_file_override(AuthCredentialsStoreMode::Ephemeral, None)?;
         Ok(())
     }
 
@@ -1825,6 +1835,20 @@ mod tests {
         assert!(removed);
         assert!(!auth_file.exists());
         Ok(())
+    }
+
+    #[test]
+    fn auth_manager_new_with_auth_file_rejects_ephemeral_override() {
+        let auth_file = PathBuf::from("/tmp/custom/auth.json");
+        let err = AuthManager::new_with_auth_file(
+            PathBuf::from("/tmp/codex-home"),
+            false,
+            AuthCredentialsStoreMode::Ephemeral,
+            Some(auth_file),
+        )
+        .expect_err("ephemeral mode should reject auth file override");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("ephemeral"));
     }
 
     struct AuthFileParams {
