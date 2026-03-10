@@ -2714,9 +2714,15 @@ mod tests {
             ThreadItem::CollabAgentToolCall {
                 id: "send-1".into(),
                 tool: CollabAgentTool::SendInput,
+                spawn_mode: None,
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender.to_string(),
                 receiver_thread_ids: vec![receiver.to_string()],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: None,
+                    agent_role: None,
+                }],
                 prompt: Some("new task".into()),
                 agents_states: [(
                     receiver.to_string(),
@@ -2727,6 +2733,15 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                agent_statuses: vec![CollabAgentStatusEntry {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: None,
+                    agent_role: None,
+                    status: CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Interrupted,
+                        message: None,
+                    },
+                }],
             }
         );
     }
