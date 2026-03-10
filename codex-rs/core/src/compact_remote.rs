@@ -19,6 +19,8 @@ use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnStartedEvent;
+use crate::tools::spec::create_tools_json_for_responses_api;
+use crate::truncate::approx_token_count;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
@@ -96,10 +98,22 @@ async fn run_remote_compact_task_inner_impl(
         .await;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
+    let prompt_input = history
+        .clone()
+        .for_prompt(&turn_context.model_info.input_modalities);
+    let compact_tools = build_compact_tools(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &prompt_input,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let compact_tool_token_count = estimate_tool_token_count(&compact_tools)?;
     let deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,
         turn_context.as_ref(),
         &base_instructions,
+        compact_tool_token_count,
     );
     if deleted_items > 0 {
         info!(
@@ -117,18 +131,9 @@ async fn run_remote_compact_task_inner_impl(
         .collect();
 
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
-    let tool_router = built_tools(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        &prompt_input,
-        &HashSet::new(),
-        None,
-        &CancellationToken::new(),
-    )
-    .await?;
     let prompt = Prompt {
         input: prompt_input,
-        tools: tool_router.specs(),
+        tools: compact_tools,
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         personality: turn_context.personality,
@@ -163,6 +168,7 @@ async fn run_remote_compact_task_inner_impl(
                 let compact_request_log_data = build_compact_request_log_data(
                     &compact_prompt.input,
                     &compact_prompt.base_instructions.text,
+                    &compact_prompt.tools,
                 );
                 log_remote_compact_failure(
                     turn_context,
@@ -282,14 +288,17 @@ struct CompactRequestLogData {
 fn build_compact_request_log_data(
     input: &[ResponseItem],
     instructions: &str,
+    tools: &[crate::client_common::tools::ToolSpec],
 ) -> CompactRequestLogData {
+    let tool_tokens = estimate_tool_token_count(tools).unwrap_or_default();
     let failing_compaction_request_model_visible_bytes = input
         .iter()
         .map(estimate_response_item_model_visible_bytes)
         .fold(
             i64::try_from(instructions.len()).unwrap_or(i64::MAX),
             i64::saturating_add,
-        );
+        )
+        .saturating_add(tool_tokens);
 
     CompactRequestLogData {
         failing_compaction_request_model_visible_bytes,
@@ -319,15 +328,33 @@ fn trim_function_call_history_to_fit_context_window(
     history: &mut ContextManager,
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
+    extra_token_budget: i64,
+) -> usize {
+    let Some(context_window) = turn_context.model_context_window() else {
+        return 0;
+    };
+
+    trim_function_call_history_to_fit_token_budget(
+        history,
+        context_window,
+        base_instructions,
+        extra_token_budget,
+    )
+}
+
+fn trim_function_call_history_to_fit_token_budget(
+    history: &mut ContextManager,
+    context_window: i64,
+    base_instructions: &BaseInstructions,
+    extra_token_budget: i64,
 ) -> usize {
     let mut deleted_items = 0usize;
-    let Some(context_window) = turn_context.model_context_window() else {
-        return deleted_items;
-    };
 
     while history
         .estimate_token_count_with_base_instructions(base_instructions)
-        .is_some_and(|estimated_tokens| estimated_tokens > context_window)
+        .is_some_and(|estimated_tokens| {
+            estimated_tokens.saturating_add(extra_token_budget) > context_window
+        })
     {
         let Some(last_item) = history.raw_items().last() else {
             break;
@@ -342,4 +369,87 @@ fn trim_function_call_history_to_fit_context_window(
     }
 
     deleted_items
+}
+
+async fn build_compact_tools(
+    sess: &Session,
+    turn_context: &TurnContext,
+    prompt_input: &[ResponseItem],
+    cancellation_token: &CancellationToken,
+) -> CodexResult<Vec<crate::client_common::tools::ToolSpec>> {
+    let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
+    let tool_router = built_tools(
+        sess,
+        turn_context,
+        prompt_input,
+        &HashSet::new(),
+        skills_outcome,
+        cancellation_token,
+    )
+    .await?;
+    Ok(tool_router.specs())
+}
+
+fn estimate_tool_token_count(tools: &[crate::client_common::tools::ToolSpec]) -> CodexResult<i64> {
+    let tools_json = create_tools_json_for_responses_api(tools)?;
+    let serialized = serde_json::to_string(&tools_json)?;
+    Ok(i64::try_from(approx_token_count(&serialized)).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_function_call_history_to_fit_token_budget;
+    use crate::context_manager::ContextManager;
+    use crate::truncate::TruncationPolicy;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
+
+    #[test]
+    fn trim_function_call_history_accounts_for_tool_budget() {
+        let mut history = ContextManager::new();
+        let user_message = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello compact".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let tool_output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("tool output".to_string()),
+                ..Default::default()
+            },
+        };
+        history.record_items(
+            [&user_message, &tool_output],
+            TruncationPolicy::Tokens(10_000),
+        );
+
+        let base_instructions = BaseInstructions {
+            text: String::new(),
+        };
+        let history_tokens = history
+            .estimate_token_count_with_base_instructions(&base_instructions)
+            .expect("history should estimate");
+        let extra_tool_budget = 64;
+        let context_window = history_tokens
+            .saturating_add(extra_tool_budget)
+            .saturating_sub(1);
+
+        let deleted_items = trim_function_call_history_to_fit_token_budget(
+            &mut history,
+            context_window,
+            &base_instructions,
+            extra_tool_budget,
+        );
+
+        assert_eq!(deleted_items, 1);
+        assert_eq!(history.raw_items(), &[user_message]);
+    }
 }
