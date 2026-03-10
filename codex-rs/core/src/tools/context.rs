@@ -264,7 +264,6 @@ fn response_input_to_code_mode_result(response: ResponseInputItem) -> JsonValue 
                 })
                 .collect::<Vec<_>>(),
         ),
-        ResponseInputItem::FunctionCall { arguments, .. } => JsonValue::String(arguments),
         ResponseInputItem::FunctionCallOutput { output, .. }
         | ResponseInputItem::CustomToolCallOutput { output, .. } => match output.body {
             FunctionCallOutputBody::Text(text) => JsonValue::String(text),

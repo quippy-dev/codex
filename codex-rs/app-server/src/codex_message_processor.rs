@@ -3125,7 +3125,6 @@ impl CodexMessageProcessor {
                 return;
             };
             let config_snapshot = thread.config_snapshot().await;
-            let loaded_rollout_path = thread.rollout_path();
             if include_turns && loaded_rollout_path.is_none() {
                 self.send_invalid_request_error(
                     request_id,

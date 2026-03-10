@@ -17,18 +17,18 @@ Core terms:
 - A **watchdog handle** is the id returned by that spawn call; it is a control id, not a conversational agent.
 - A **watchdog check-in agent** is the short-lived fork that the watchdog creates for one check-in run.
 - **`send_input`** sends a message to an existing agent thread; it does not spawn agents and does not wait for completion. Delivery is asynchronous.
-- A **multi-agent inbox message** is a runtime-forwarded fallback message shown through the collab inbox flow.
+- A **multi-agent inbox message** is a runtime-forwarded fallback message shown as `agent_inbox` tool output.
 
 Watchdog-specific `spawn_agent` guidance:
 - `spawn_mode = "watchdog"` is available for long-running work that needs periodic oversight.
 - When using `spawn_mode = "watchdog"`, keep `agent_type` at the default.
 - `interval_s` sets the watchdog interval in seconds when provided; otherwise the configured default is used.
 - Put the user goal in `message` (verbatim plus needed clarifications).
-- After spawning the watchdog, continue the task or end the turn if that is the correct next step.
+- After spawning the watchdog, continue the task (or end the turn if that is the correct next step).
 
 Delivery and user-facing behavior:
-Primary delivery path: the watchdog check-in agent calls `send_input` to the owner thread.
-Fallback delivery path: if a watchdog check-in agent exits without any `send_input`, runtime may forward one final multi-agent inbox message. This fallback is best-effort and not guaranteed.
+Primary delivery path: the watchdog check-in agent calls `send_input` to the owner thread (its direct parent thread for this run).
+Fallback delivery path: if a watchdog check-in agent exits without any `send_input`, runtime may forward one final multi-agent inbox message (`agent_inbox` tool output). This fallback is best-effort and not guaranteed.
 - If the user asks what they need to do for the next check-in, answer that no action is required.
 - Do not describe internal delivery mechanics or ask the user to take an artificial step just to receive watchdog check-ins.
 
@@ -37,7 +37,7 @@ Watchdog-specific `wait` guidance:
 - If every id passed to `wait` is a watchdog handle, `wait` returns an immediate correction; this does not mean a new watchdog check-in happened.
 
 Operational notes:
-- `send_input` may reach a watchdog handle thread, but it does not update the registered watchdog prompt or active helper, and it does not confirm or force a new check-in. Do not treat it as a watchdog-update mechanism.
+- Do not call `send_input` on watchdog handles.
 - The tool returns a watchdog handle ID. When you no longer need the watchdog, stop it by calling `close_agent` on that handle ID.
 
 Treat watchdog guidance as high-priority execution feedback. If it reveals a missing required action, do that action before status narration while honoring higher-priority system/developer/user constraints. A required action is one needed to satisfy the user request or clear a concrete blocker.

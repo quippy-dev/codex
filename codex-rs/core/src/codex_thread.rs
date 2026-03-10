@@ -104,16 +104,18 @@ impl CodexThread {
         self.codex.agent_status.clone()
     }
 
+    pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
+        self.codex.session.total_token_usage().await
+    }
+
     pub(crate) async fn has_active_turn(&self) -> bool {
-        self.codex.has_active_turn().await
+        self.codex.session.has_active_turn().await
     }
 
     pub(crate) fn last_completed_turn_used_agent_send_input(&self) -> bool {
-        self.codex.last_completed_turn_used_agent_send_input()
-    }
-
-    pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
-        self.codex.session.total_token_usage().await
+        self.codex
+            .session
+            .last_completed_turn_used_agent_send_input()
     }
 
     /// Records a user-role session-prefix message without creating a new user turn boundary.

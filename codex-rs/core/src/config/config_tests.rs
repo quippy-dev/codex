@@ -2782,6 +2782,7 @@ fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result<()> {
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    model: None,
                     config_file: Some(AbsolutePathBuf::from_absolute_path(missing_path)?),
                     spawn_mode: None,
                     nickname_candidates: None,
@@ -2863,6 +2864,7 @@ fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Result<()
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    model: None,
                     config_file: None,
                     spawn_mode: None,
                     nickname_candidates: Some(vec![
@@ -2906,6 +2908,7 @@ fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::Result
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    model: None,
                     config_file: None,
                     spawn_mode: None,
                     nickname_candidates: Some(Vec::new()),
@@ -2943,6 +2946,7 @@ fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::io::Re
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    model: None,
                     config_file: None,
                     spawn_mode: None,
                     nickname_candidates: Some(vec!["Hypatia".to_string(), " Hypatia ".to_string()]),
@@ -2980,6 +2984,7 @@ fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io::Resul
                 "researcher".to_string(),
                 AgentRoleToml {
                     description: Some("Research role".to_string()),
+                    model: None,
                     config_file: None,
                     spawn_mode: None,
                     nickname_candidates: Some(vec!["Agent <One>".to_string()]),

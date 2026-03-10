@@ -35,12 +35,13 @@ Create a subagent and give it an initial task.
 
 Parameters:
 - `message` (required): the task description.
-- `agent_type` (optional): the role to assign (`default`, `orchestrator`, or `worker`).
-- `spawn_mode` (optional): one of `spawn` or `fork`.
+- `agent_type` (optional): the role to assign (`default`, `explorer`, `fast-worker`, or `worker`).
+- `spawn_mode` (optional): one of `spawn`, `fork`, or `watchdog`.
 
 Guidance:
 - Use `spawn_mode = "fork"` when the child should preserve your current conversation history.
 - Use `spawn_mode = "spawn"` for a fresh context with a tight prompt.
+- Use `spawn_mode = "watchdog"` for long-running work that needs periodic oversight.
 
 ### 2) `send_input`
 
@@ -90,6 +91,10 @@ Close an agent that is complete, stuck, or no longer relevant.
 Guidance:
 - Keep the set of active agents small and purposeful.
 - Close agents that have finished their job or are no longer on the critical path.
+
+### 7) `compact_parent_context`
+
+Watchdog-only: request compaction for the watchdog helper's parent thread when it is idle and appears stuck.
 
 ## Operating Principles
 

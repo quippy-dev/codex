@@ -1449,6 +1449,8 @@ pub enum AgentRoleSpawnMode {
 pub struct AgentRoleConfig {
     /// Human-facing role documentation used in spawn tool guidance.
     pub description: Option<String>,
+    /// Optional model override applied by this role.
+    pub model: Option<String>,
     /// Path to a role-specific config layer.
     pub config_file: Option<PathBuf>,
     /// Optional default spawn mode when `spawn_agent` omits `spawn_mode`.
@@ -1462,6 +1464,9 @@ pub struct AgentRoleConfig {
 pub struct AgentRoleToml {
     /// Human-facing role documentation used in spawn tool guidance.
     pub description: Option<String>,
+
+    /// Optional model override applied by this role.
+    pub model: Option<String>,
 
     /// Path to a role-specific config layer.
     /// Relative paths are resolved relative to the `config.toml` that defines them.
@@ -2149,6 +2154,7 @@ impl Config {
                             name.clone(),
                             AgentRoleConfig {
                                 description: role.description.clone(),
+                                model: role.model.clone(),
                                 config_file,
                                 spawn_mode: role.spawn_mode,
                                 nickname_candidates,

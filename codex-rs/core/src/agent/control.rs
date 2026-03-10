@@ -604,6 +604,22 @@ impl AgentControl {
             .await
     }
 
+    /// Deliver a watchdog wake-up to an owner thread.
+    ///
+    /// Watchdog helpers must wake the owner exactly once when they finish without
+    /// explicitly using `send_input`. The existing collab inbox path already
+    /// injects response items for root owners, preserves helper identity, and
+    /// bypasses deferral for active watchdog helpers.
+    pub(crate) async fn send_watchdog_wakeup(
+        &self,
+        agent_id: ThreadId,
+        sender_thread_id: ThreadId,
+        message: String,
+    ) -> CodexResult<String> {
+        self.send_agent_message(agent_id, sender_thread_id, message)
+            .await
+    }
+
     /// Interrupt the current task for an existing agent thread.
     pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;

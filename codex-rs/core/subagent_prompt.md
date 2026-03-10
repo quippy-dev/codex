@@ -21,7 +21,7 @@ Term definitions in this file:
 
 The multi-agent tools available in this environment are `spawn_agent`, `send_input`, `resume_agent`, `list_agents`, `wait`, and `close_agent`.
 
-Important: to coordinate with parent/root, use `send_input`. A plain assistant message in your own thread does not notify the parent.
+Important: to coordinate with parent/root, use `send_input`. A plain assistant message in your own thread does not reliably notify the parent.
 
 You can call `send_input` without an `id` (or with `id = "parent"` / `id = "root"`); these forms target the immediate parent thread in this runtime.
 

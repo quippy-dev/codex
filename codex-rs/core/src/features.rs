@@ -138,6 +138,10 @@ pub enum Feature {
     EnableRequestCompression,
     /// Enable collab tools.
     Collab,
+    /// Deliver inbound agent messages via a synthetic function-call inbox envelope.
+    AgentFunctionCallInbox,
+    /// Enable prepending agent-specific developer instructions for agent sessions.
+    AgentPromptInjection,
     /// Enable watchdog spawning and watchdog-only agent tools.
     AgentWatchdog,
     /// Enable apps.
@@ -696,6 +700,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::AgentFunctionCallInbox,
+        key: "agent_function_call_inbox",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AgentPromptInjection,
+        key: "agent_prompt_injection",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::AgentWatchdog,
         key: "agent_watchdog",
         stage: Stage::UnderDevelopment,
@@ -1010,6 +1026,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_function_call_inbox_is_under_development() {
+        assert_eq!(
+            Feature::AgentFunctionCallInbox.stage(),
+            Stage::UnderDevelopment
+        );
+        assert!(!Feature::AgentFunctionCallInbox.default_enabled());
+        assert_eq!(
+            feature_for_key("agent_function_call_inbox"),
+            Some(Feature::AgentFunctionCallInbox)
+        );
+    }
+
+    #[test]
     fn agent_watchdog_uses_canonical_key_and_defaults_enabled() {
         assert_eq!(
             canonical_feature_for_key("agent_watchdog"),
@@ -1017,6 +1046,14 @@ mod tests {
         );
         assert_eq!(Feature::AgentWatchdog.stage(), Stage::UnderDevelopment);
         assert!(Feature::AgentWatchdog.default_enabled());
+    }
+
+    #[test]
+    fn agent_prompt_injection_uses_canonical_key() {
+        assert_eq!(
+            feature_for_key("agent_prompt_injection"),
+            Some(Feature::AgentPromptInjection)
+        );
     }
 
     #[test]

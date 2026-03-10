@@ -453,6 +453,17 @@ mod send_input {
                 )
             })?,
         };
+        let watchdog_targets = session
+            .services
+            .agent_control
+            .watchdog_targets(&[receiver_thread_id])
+            .await;
+        if watchdog_targets.contains(&receiver_thread_id) {
+            return Err(FunctionCallError::RespondToModel(
+                "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
+                    .to_string(),
+            ));
+        }
         let input_items = parse_multi_agent_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
         let (receiver_agent_nickname, receiver_agent_role) = session
@@ -3250,7 +3261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_input_targets_watchdog_handle() {
+    async fn send_input_rejects_watchdog_handle() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
@@ -3274,15 +3285,17 @@ mod tests {
                 "message": "hi"
             })),
         );
-        MultiAgentHandler
+        let err = MultiAgentHandler
             .handle(invocation)
             .await
-            .expect("send_input should target watchdog handles");
-        let sent_prompt_to_watchdog = manager
-            .captured_ops()
-            .iter()
-            .any(|(id, op)| *id == watchdog_id && matches!(op, Op::UserInput { .. }));
-        assert!(sent_prompt_to_watchdog);
+            .expect_err("send_input should reject watchdog handles");
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
+                    .to_string()
+            )
+        );
 
         let _ = session
             .services
@@ -3297,7 +3310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_input_interrupt_targets_watchdog_handle() {
+    async fn send_input_interrupt_rejects_watchdog_handle() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
@@ -3322,20 +3335,17 @@ mod tests {
                 "interrupt": true
             })),
         );
-        MultiAgentHandler
+        let err = MultiAgentHandler
             .handle(invocation)
             .await
-            .expect("send_input should target watchdog handles");
-        let interrupted_watchdog = manager
-            .captured_ops()
-            .iter()
-            .any(|(id, op)| *id == watchdog_id && matches!(op, Op::Interrupt));
-        assert!(interrupted_watchdog);
-        let sent_prompt_to_watchdog = manager
-            .captured_ops()
-            .iter()
-            .any(|(id, op)| *id == watchdog_id && matches!(op, Op::UserInput { .. }));
-        assert!(sent_prompt_to_watchdog);
+            .expect_err("send_input should reject watchdog handles");
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
+                    .to_string()
+            )
+        );
 
         let _ = session
             .services

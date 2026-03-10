@@ -552,7 +552,9 @@ impl Codex {
             .get_default_model(&config.model, refresh_strategy)
             .await;
 
-        let role_prompt = if config.features.enabled(Feature::Collab) {
+        let role_prompt = if config.features.enabled(Feature::Collab)
+            && config.features.enabled(Feature::AgentPromptInjection)
+        {
             if let SessionSource::SubAgent(_) = session_source {
                 Some(
                     load_subagent_prompt(
@@ -774,13 +776,6 @@ impl Codex {
         self.session.enabled(feature)
     }
 
-    pub(crate) async fn has_active_turn(&self) -> bool {
-        self.session.has_active_turn().await
-    }
-
-    pub(crate) fn last_completed_turn_used_agent_send_input(&self) -> bool {
-        self.session.last_completed_turn_used_agent_send_input()
-    }
 }
 
 /// Context for an initialized model agent
@@ -5219,73 +5214,6 @@ mod handlers {
         let first_item = items.first().cloned()?;
         let response_item: ResponseItem = first_item.into();
         let TurnItem::UserMessage(user_message) = parse_turn_item(&response_item)? else {
-            return None;
-        };
-        let _ = items.remove(0);
-        Some(user_message.content)
-    }
-
-    pub async fn inject_response_items(
-        sess: &Arc<Session>,
-        sub_id: String,
-        items: Vec<ResponseInputItem>,
-    ) {
-        const MAX_TURN_RESTART_ATTEMPTS: usize = 3;
-
-        let mut pending_items = items;
-        let mut attempts = 0usize;
-        loop {
-            match sess.inject_response_items(pending_items).await {
-                Ok(()) => return,
-                Err(items_without_active_turn) => {
-                    pending_items = items_without_active_turn;
-                }
-            }
-
-            if attempts >= MAX_TURN_RESTART_ATTEMPTS {
-                warn!(
-                    attempts,
-                    remaining_items = pending_items.len(),
-                    "dropping response items after repeated turn restart failures"
-                );
-                return;
-            }
-            attempts += 1;
-
-            let turn_input =
-                pop_leading_user_message_input(&mut pending_items).unwrap_or_else(|| {
-                    vec![UserInput::Text {
-                        text: String::new(),
-                        text_elements: Vec::new(),
-                    }]
-                });
-            let turn_sub_id = if attempts == 1 {
-                sub_id.clone()
-            } else {
-                format!("{sub_id}-retry-{attempts}")
-            };
-            let current_context = sess.new_default_turn_with_sub_id(turn_sub_id).await;
-            // Keep injected inbox wakeups visible to telemetry after the TurnContext field rename.
-            current_context.session_telemetry.user_prompt(&turn_input);
-
-            sess.refresh_mcp_servers_if_requested(&current_context)
-                .await;
-            let regular_task = sess.take_startup_regular_task().await.unwrap_or_default();
-            sess.spawn_task(Arc::clone(&current_context), turn_input, regular_task)
-                .await;
-
-            if pending_items.is_empty() {
-                return;
-            }
-        }
-    }
-
-    fn pop_leading_user_message_input(
-        items: &mut Vec<ResponseInputItem>,
-    ) -> Option<Vec<UserInput>> {
-        let first_item = items.first().cloned()?;
-        let response_item = ResponseItem::from(first_item);
-        let TurnItem::UserMessage(user_message) = crate::parse_turn_item(&response_item)? else {
             return None;
         };
         let _ = items.remove(0);
