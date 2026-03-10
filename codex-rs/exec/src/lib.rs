@@ -45,6 +45,7 @@ use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
+use codex_core::auth::AuthFileRuntime;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
@@ -431,12 +432,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             range: None,
         })
         .collect();
-    let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
-        config.codex_home.clone(),
-        auth_file.as_deref(),
-        config.cli_auth_credentials_store_mode,
-    )
-    .map_err(|err| anyhow::anyhow!("Error resolving auth storage path: {err}"))?;
+    let auth_storage_home = AuthFileRuntime::from_config(&config, auth_file)
+        .map(AuthFileRuntime::into_auth_storage_home)
+        .map_err(|err| anyhow::anyhow!("Error resolving auth storage path: {err}"))?;
     let in_process_start_args = InProcessClientStartArgs {
         arg0_paths,
         config: std::sync::Arc::new(config.clone()),

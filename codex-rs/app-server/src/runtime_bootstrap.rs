@@ -1,4 +1,5 @@
 use super::*;
+use codex_core::auth::AuthFileRuntime;
 
 pub(crate) struct RuntimeBootstrap {
     pub(crate) cli_kv_overrides: Vec<(String, TomlValue)>,
@@ -45,16 +46,8 @@ pub(crate) async fn prepare_runtime_bootstrap(
                 }
             }
 
-            let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
-                config.codex_home.clone(),
-                auth_file.as_deref(),
-                config.cli_auth_credentials_store_mode,
-            )?;
-            let auth_manager = AuthManager::shared(
-                auth_storage_home,
-                false,
-                config.cli_auth_credentials_store_mode,
-            );
+            let auth_runtime = AuthFileRuntime::from_config(&config, auth_file.clone())?;
+            let auth_manager = auth_runtime.shared_auth_manager(false)?;
             cloud_requirements_loader(
                 auth_manager,
                 config.chatgpt_base_url,
@@ -89,11 +82,8 @@ pub(crate) async fn prepare_runtime_bootstrap(
         }
     };
 
-    let auth_storage_home = codex_core::auth::resolve_auth_storage_home(
-        config.codex_home.clone(),
-        auth_file.as_deref(),
-        config.cli_auth_credentials_store_mode,
-    )?;
+    let auth_storage_home =
+        AuthFileRuntime::from_config(&config, auth_file)?.into_auth_storage_home();
 
     Ok(RuntimeBootstrap {
         cli_kv_overrides,

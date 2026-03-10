@@ -24,6 +24,7 @@ pub use codex_thread::CodexThread;
 pub use codex_thread::ThreadConfigSnapshot;
 mod agent;
 mod codex_delegate;
+pub mod collaboration_mode_policy;
 mod command_canonicalization;
 mod commit_attribution;
 pub mod config;

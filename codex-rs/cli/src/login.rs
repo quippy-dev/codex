@@ -9,6 +9,7 @@
 
 use codex_core::CodexAuth;
 use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::auth::AuthFileRuntime;
 use codex_core::auth::AuthMode;
 use codex_core::auth::CLIENT_ID;
 use codex_core::auth::login_with_api_key;
@@ -408,15 +409,12 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
 }
 
 fn resolve_auth_storage_home_or_exit(config: &Config, auth_file: Option<PathBuf>) -> PathBuf {
-    codex_core::auth::resolve_auth_storage_home(
-        config.codex_home.clone(),
-        auth_file.as_deref(),
-        config.cli_auth_credentials_store_mode,
-    )
-    .unwrap_or_else(|err| {
-        eprintln!("Error resolving auth storage path: {err}");
-        std::process::exit(1);
-    })
+    AuthFileRuntime::from_config(config, auth_file)
+        .map(AuthFileRuntime::into_auth_storage_home)
+        .unwrap_or_else(|err| {
+            eprintln!("Error resolving auth storage path: {err}");
+            std::process::exit(1);
+        })
 }
 
 fn safe_format_key(key: &str) -> String {

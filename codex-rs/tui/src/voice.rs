@@ -17,9 +17,7 @@ use hound::WavSpec;
 use hound::WavWriter;
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
@@ -31,14 +29,12 @@ use tracing::trace;
 const AUDIO_MODEL: &str = "gpt-4o-mini-transcribe";
 const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 const MODEL_AUDIO_CHANNELS: u16 = 1;
-static TRANSCRIPTION_SESSION_CONTEXT: LazyLock<Mutex<Option<TranscriptionSessionContext>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TranscriptionSessionContext {
-    auth_storage_home: PathBuf,
-    chatgpt_base_url: String,
-}
+#[path = "voice/session_context.rs"]
+mod session_context;
+#[cfg(test)]
+use session_context::TranscriptionSessionContext;
+pub(crate) use session_context::set_transcription_session_context;
+use session_context::transcription_auth_input;
 
 struct TranscriptionAuthContext {
     mode: AuthMode,
@@ -60,18 +56,6 @@ pub struct VoiceCapture {
     data: Arc<Mutex<Vec<i16>>>,
     stopped: Arc<AtomicBool>,
     last_peak: Arc<AtomicU16>,
-}
-
-pub(crate) fn set_transcription_session_context(
-    auth_storage_home: PathBuf,
-    chatgpt_base_url: String,
-) {
-    if let Ok(mut stored) = TRANSCRIPTION_SESSION_CONTEXT.lock() {
-        *stored = Some(TranscriptionSessionContext {
-            auth_storage_home,
-            chatgpt_base_url,
-        });
-    }
 }
 
 impl VoiceCapture {
@@ -785,13 +769,9 @@ fn normalize_chatgpt_base_url(input: &str) -> String {
 }
 
 async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
-    let session_context = TRANSCRIPTION_SESSION_CONTEXT
-        .lock()
-        .map_err(|_| "failed to access transcription session context".to_string())?
-        .clone()
-        .ok_or_else(|| "transcription session context was not initialized".to_string())?;
+    let auth_input = transcription_auth_input()?;
     let auth = CodexAuth::from_auth_storage(
-        &session_context.auth_storage_home,
+        &auth_input.auth_storage_home,
         AuthCredentialsStoreMode::Auto,
     )
     .map_err(|e| format!("failed to read auth.json: {e}"))?
@@ -806,7 +786,7 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
         mode: auth.api_auth_mode(),
         bearer_token: token,
         chatgpt_account_id,
-        chatgpt_base_url: normalize_chatgpt_base_url(&session_context.chatgpt_base_url),
+        chatgpt_base_url: normalize_chatgpt_base_url(&auth_input.chatgpt_base_url),
     })
 }
 
@@ -898,9 +878,10 @@ async fn transcribe_bytes(
 #[cfg(test)]
 mod tests {
     use super::RecordedAudio;
-    use super::TRANSCRIPTION_SESSION_CONTEXT;
+    use super::TranscriptionSessionContext;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
+    use super::session_context::current_transcription_session_context;
     use super::set_transcription_session_context;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
@@ -943,13 +924,11 @@ mod tests {
             expected_chatgpt_base_url.clone(),
         );
 
-        let stored = TRANSCRIPTION_SESSION_CONTEXT
-            .lock()
-            .expect("lock transcription session context")
-            .clone();
+        let stored =
+            current_transcription_session_context().expect("read transcription session context");
         assert_eq!(
             stored,
-            Some(super::TranscriptionSessionContext {
+            Some(TranscriptionSessionContext {
                 auth_storage_home: expected_auth_storage_home,
                 chatgpt_base_url: expected_chatgpt_base_url,
             })
