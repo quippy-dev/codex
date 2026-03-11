@@ -4,10 +4,9 @@ use codex_protocol::protocol::AgentStatus;
 use tracing::warn;
 
 pub(crate) fn should_queue_agent_delivery_until_turn_end(
-    receiver_has_active_turn: bool,
     post_turn_agent_flush_pending: bool,
 ) -> bool {
-    receiver_has_active_turn || post_turn_agent_flush_pending
+    post_turn_agent_flush_pending
 }
 
 pub(crate) fn should_defer_agent_delivery(

@@ -72,13 +72,14 @@ pub fn build_legacy_message_text(sender_thread_id: ThreadId, message: &str) -> S
 }
 
 pub fn parse_agent_inbox_message_from_item(item: &ResponseItem) -> Option<AgentInboxMessage> {
+    if !is_agent_inbox_response_item(item) {
+        return None;
+    }
+
     match item {
         ResponseItem::FunctionCallOutput { output, .. } => {
             let text = output.body.to_text()?;
             let payload: AgentInboxPayload = serde_json::from_str(&text).ok()?;
-            if !payload.injected || payload.kind != AGENT_INBOX_KIND {
-                return None;
-            }
             Some(AgentInboxMessage {
                 sender: Some(payload.sender_thread_id.to_string()),
                 message: payload.message,
@@ -100,6 +101,40 @@ pub fn parse_agent_inbox_message_from_item(item: &ResponseItem) -> Option<AgentI
                 encoding: AgentInboxEncoding::LegacyMessage,
             })
         }
+        _ => None,
+    }
+}
+
+pub fn is_agent_inbox_response_item(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::FunctionCall { name, .. } => name == AGENT_INBOX_KIND,
+        ResponseItem::FunctionCallOutput { output, .. } => {
+            let Some(text) = output.body.to_text() else {
+                return false;
+            };
+            let Ok(payload) = serde_json::from_str::<AgentInboxPayload>(&text) else {
+                return false;
+            };
+            payload.injected && payload.kind == AGENT_INBOX_KIND
+        }
+        ResponseItem::Message { content, .. } => {
+            content.iter().filter_map(message_text).any(|text| {
+                let Some(rest) = text.strip_prefix(AGENT_INBOX_MESSAGE_PREFIX) else {
+                    return false;
+                };
+                let Some((sender, _message)) = rest.split_once(']') else {
+                    return false;
+                };
+                ThreadId::from_string(sender.trim()).is_ok()
+            })
+        }
+        _ => false,
+    }
+}
+
+fn message_text(item: &ContentItem) -> Option<&str> {
+    match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()),
         _ => None,
     }
 }

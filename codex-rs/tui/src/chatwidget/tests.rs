@@ -10602,6 +10602,7 @@ async fn deltas_then_same_final_message_are_rendered_snapshot() {
 #[tokio::test]
 async fn raw_agent_inbox_agent_message_renders_header_and_markdown_body_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender = ThreadId::new();
     let tail_marker = "TAIL_END_0123456789";
     let padding = "x".repeat(220);
     let markdown_body = format!(
@@ -10615,7 +10616,7 @@ async fn raw_agent_inbox_agent_message_renders_header_and_markdown_body_snapshot
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: format!("[agent_inbox:agent-7] {markdown_body}"),
+                    text: format!("[agent_inbox:{sender}] {markdown_body}"),
                 }],
                 end_turn: None,
                 phase: None,
@@ -10631,7 +10632,7 @@ async fn raw_agent_inbox_agent_message_renders_header_and_markdown_body_snapshot
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert!(combined.contains("Agent message:"));
-    assert!(combined.contains("from agent-7"));
+    assert!(combined.contains(&format!("from {sender}")));
     assert!(combined.contains("Bold line"));
     assert!(!combined.contains("**Bold line**"));
     assert!(combined.contains(tail_marker));

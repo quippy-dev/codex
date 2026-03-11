@@ -48,6 +48,10 @@ use codex_protocol::user_input::UserInput;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::future::Future;
+#[cfg(test)]
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
@@ -553,6 +557,23 @@ impl AgentControl {
         sender_thread_id: ThreadId,
         message: String,
     ) -> CodexResult<String> {
+        self.send_agent_message_inner(
+            agent_id,
+            sender_thread_id,
+            message,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn send_agent_message_inner(
+        &self,
+        agent_id: ThreadId,
+        sender_thread_id: ThreadId,
+        message: String,
+        #[cfg(test)] before_live_inject: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+    ) -> CodexResult<String> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         let snapshot = thread.config_snapshot().await;
@@ -573,10 +594,7 @@ impl AgentControl {
             .watchdog_owner_for_active_helper(sender_thread_id)
             .await
             == Some(agent_id);
-        if should_queue_agent_delivery_until_turn_end(
-            receiver_has_active_turn,
-            post_turn_agent_flush_pending,
-        ) {
+        if should_queue_agent_delivery_until_turn_end(post_turn_agent_flush_pending) {
             let queued_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
                 sender_thread_id,
@@ -593,6 +611,58 @@ impl AgentControl {
                     return Ok(Uuid::now_v7().to_string());
                 }
                 Err(err) => log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err),
+            }
+        }
+        if receiver_has_active_turn {
+            #[cfg(test)]
+            if let Some(before_live_inject) = before_live_inject {
+                before_live_inject.await;
+            }
+            let live_items = build_agent_inbox_items(
+                snapshot.collab_inbox_delivery_role,
+                sender_thread_id,
+                message.clone(),
+                false,
+            )?;
+            match thread.codex.session.inject_response_items(live_items).await {
+                Ok(()) => {
+                    return Ok(Uuid::now_v7().to_string());
+                }
+                Err(late_items) => {
+                    match thread
+                        .codex
+                        .session
+                        .enqueue_post_turn_agent_items(late_items)
+                        .await
+                    {
+                        Ok(()) => {
+                            if thread
+                                .codex
+                                .session
+                                .arm_post_turn_agent_flush_if_items()
+                                .await
+                                && let Err(err) = state
+                                    .send_op(
+                                        agent_id,
+                                        Op::InjectResponseItems { items: Vec::new() },
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    receiver_thread_id = %agent_id,
+                                    sender_thread_id = %sender_thread_id,
+                                    "failed to submit post-turn agent items after late active-turn inject miss: {err}"
+                                );
+                                thread.codex.session.clear_post_turn_agent_items().await;
+                            } else {
+                                return Ok(Uuid::now_v7().to_string());
+                            }
+                        }
+                        Err(err) => {
+                            log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err)
+                        }
+                    }
+                }
             }
         }
         if should_defer_agent_delivery(
@@ -634,8 +704,8 @@ impl AgentControl {
     ///
     /// Watchdog helpers must wake the owner exactly once when they finish without
     /// explicitly using `send_input`. Reuse the normal collab inbox delivery
-    /// path so helper identity stays intact in history and active roots still
-    /// respect the branch-local next-boundary delivery policy.
+    /// path so helper identity stays intact in history while post-interrupt and
+    /// true next-boundary delivery policy remains centralized in `send_agent_message`.
     pub(crate) async fn send_watchdog_wakeup(
         &self,
         agent_id: ThreadId,
@@ -1877,7 +1947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_agent_message_to_active_root_thread_queues_until_turn_completion() {
+    async fn send_agent_message_to_active_root_thread_injects_immediately() {
         let harness = AgentControlHarness::new().await;
         let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
         let sender_thread_id = ThreadId::new();
@@ -1903,26 +1973,28 @@ mod tests {
             .send_agent_message(
                 receiver_thread_id,
                 sender_thread_id,
-                "queued update".to_string(),
+                "same-turn update".to_string(),
             )
             .await
-            .expect("send_agent_message should queue while the root turn is active");
+            .expect("send_agent_message should inject into the active root turn");
         assert!(!submission_id.is_empty());
 
         let (queued_items, queued_bytes, flush_pending) =
             receiver_thread.codex.session.post_turn_agent_stats().await;
-        assert_eq!(queued_items, 2);
-        assert!(queued_bytes > 0);
+        assert_eq!(queued_items, 0);
+        assert_eq!(queued_bytes, 0);
         assert_eq!(flush_pending, false);
-
-        let injected = harness
-            .manager
-            .captured_ops()
-            .into_iter()
-            .any(|(thread_id, op)| {
-                thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
-            });
-        assert_eq!(injected, false);
+        let injected_items = receiver_thread.codex.session.get_pending_input().await;
+        assert_eq!(injected_items.len(), 2);
+        assert!(
+            harness
+                .manager
+                .captured_ops()
+                .into_iter()
+                .all(|(thread_id, op)| {
+                    thread_id != receiver_thread_id || !matches!(op, Op::InjectResponseItems { .. })
+                })
+        );
 
         receiver_thread
             .codex
@@ -1942,16 +2014,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_agent_message_keeps_turn_boundary_replies_in_same_post_turn_queue() {
+    async fn send_agent_message_late_active_turn_miss_queues_post_turn_flush() {
         let harness = AgentControlHarness::new().await;
         let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
-        let first_sender = ThreadId::new();
-        let second_sender = ThreadId::new();
+        let sender_thread_id = ThreadId::new();
 
         let turn_context = receiver_thread
             .codex
             .session
-            .new_default_turn_with_sub_id("boundary-race-turn".to_string())
+            .new_default_turn_with_sub_id("late-active-root-turn".to_string())
             .await;
         receiver_thread
             .codex
@@ -1964,29 +2035,65 @@ mod tests {
             .await;
         assert!(receiver_thread.has_active_turn().await);
 
-        harness
+        let receiver_session = Arc::clone(&receiver_thread.codex.session);
+        let submission_id = harness
             .control
-            .send_agent_message(
+            .send_agent_message_inner(
                 receiver_thread_id,
-                first_sender,
-                "queued before boundary".to_string(),
+                sender_thread_id,
+                "late same-turn update".to_string(),
+                Some(Box::pin(async move {
+                    receiver_session
+                        .abort_all_tasks(TurnAbortReason::Replaced)
+                        .await;
+                })),
             )
             .await
-            .expect("first send should queue");
-        assert_eq!(
-            receiver_thread
-                .codex
-                .session
-                .post_turn_agent_stats()
-                .await
-                .0,
-            2
-        );
+            .expect("send_agent_message should recover a late active-turn miss");
+        assert!(!submission_id.is_empty());
 
-        {
-            let mut active = receiver_thread.codex.session.active_turn.lock().await;
-            *active = None;
+        let inject_ops: Vec<Op> = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .filter_map(|(thread_id, op)| (thread_id == receiver_thread_id).then_some(op))
+            .filter(|op| matches!(op, Op::InjectResponseItems { .. }))
+            .collect();
+        assert_eq!(inject_ops.len(), 1);
+        match &inject_ops[0] {
+            Op::InjectResponseItems { items } => {
+                assert!(items.is_empty(), "late miss should arm an empty flush op");
+            }
+            other => panic!("expected inject response items op, got {other:?}"),
         }
+
+        receiver_thread
+            .codex
+            .session
+            .clear_post_turn_agent_items()
+            .await;
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_keeps_turn_boundary_replies_in_same_post_turn_queue() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        let first_sender = ThreadId::new();
+        let second_sender = ThreadId::new();
+        let queued_items = build_agent_inbox_items(
+            CollabInboxDeliveryRole::Tool,
+            first_sender,
+            "queued before boundary".to_string(),
+            false,
+        )
+        .expect("build queued items");
+        receiver_thread
+            .codex
+            .session
+            .enqueue_post_turn_agent_items(queued_items)
+            .await
+            .expect("seed boundary queue");
         assert!(
             receiver_thread
                 .codex

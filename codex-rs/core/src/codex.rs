@@ -74,6 +74,7 @@ use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::ThreadId;
+use codex_protocol::agent_inbox::is_agent_inbox_response_item;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::approvals::ExecApprovalRequestSkillMetadata;
 use codex_protocol::approvals::ExecPolicyAmendment;
@@ -3831,7 +3832,14 @@ impl Session {
         items: &[ResponseItem],
     ) {
         self.record_into_history(items, turn_context).await;
-        self.persist_rollout_response_items(items).await;
+        let persisted_items: Vec<ResponseItem> = items
+            .iter()
+            .filter(|item| !is_agent_inbox_response_item(item))
+            .cloned()
+            .collect();
+        if !persisted_items.is_empty() {
+            self.persist_rollout_response_items(&persisted_items).await;
+        }
         self.send_raw_response_items(turn_context, items).await;
     }
 

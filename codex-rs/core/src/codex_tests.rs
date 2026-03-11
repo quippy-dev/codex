@@ -3791,6 +3791,89 @@ async fn record_user_prompt_skips_synthetic_blank_bootstrap_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_conversation_items_keeps_agent_inbox_live_only() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+    while rx.try_recv().is_ok() {}
+
+    let response_items: Vec<ResponseItem> = build_tool_response_input_items(
+        ThreadId::new(),
+        "live only subagent body".to_string(),
+        "agent-inbox-call".to_string(),
+    )
+    .expect("build agent inbox response items")
+    .into_iter()
+    .map(ResponseItem::from)
+    .collect();
+
+    sess.record_conversation_items(tc.as_ref(), &response_items)
+        .await;
+    sess.flush_rollout().await;
+
+    let history = sess.clone_history().await;
+    for response_item in &response_items {
+        assert!(
+            history.raw_items().iter().any(|item| item == response_item),
+            "expected agent inbox item in in-memory history"
+        );
+    }
+
+    let mut raw_response_events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let EventMsg::RawResponseItem(raw) = event.msg {
+            raw_response_events.push(raw.item);
+        }
+    }
+    assert_eq!(raw_response_events, response_items);
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    for response_item in &response_items {
+        assert!(
+            !resumed.history.iter().any(
+                |item| matches!(item, RolloutItem::ResponseItem(candidate) if candidate == response_item)
+            ),
+            "agent inbox items should not persist to rollout history"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_conversation_items_persists_literal_agent_inbox_prefix_messages() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+    while rx.try_recv().is_ok() {}
+
+    let response_item = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "[agent_inbox:not-a-thread-id] literal content".to_string(),
+        }],
+        end_turn: None,
+        phase: None,
+    };
+
+    sess.record_conversation_items(tc.as_ref(), std::slice::from_ref(&response_item))
+        .await;
+    sess.flush_rollout().await;
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert!(resumed.history.iter().any(
+        |item| matches!(item, RolloutItem::ResponseItem(candidate) if candidate == &response_item)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let input = vec![UserInput::Text {
