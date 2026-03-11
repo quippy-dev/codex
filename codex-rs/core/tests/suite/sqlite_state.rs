@@ -142,6 +142,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     agent_nickname: None,
                     agent_role: None,
                     model_provider: None,
+                    auth_file: None,
                     base_instructions: None,
                     dynamic_tools: Some(dynamic_tools_for_hook),
                     memory_mode: None,

@@ -1099,11 +1099,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .remove_thread(&end_event.receiver_thread_id.to_string())
                     .await;
             }
-            let status = match &end_event.status {
-                codex_protocol::protocol::AgentStatus::Errored(_)
-                | codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Failed,
-                _ => V2CollabToolCallStatus::Completed,
-            };
+            let status = collab_close_status(&end_event.status);
             let receiver_id = end_event.receiver_thread_id.to_string();
             let received_status = V2CollabAgentStatus::from(end_event.status.clone());
             let agents_states = [(receiver_id.clone(), received_status.clone())]
@@ -2604,6 +2600,18 @@ fn collab_send_input_status(
     }
 }
 
+fn collab_close_status(status: &codex_protocol::protocol::AgentStatus) -> V2CollabToolCallStatus {
+    match status {
+        codex_protocol::protocol::AgentStatus::Errored(_) => V2CollabToolCallStatus::Failed,
+        codex_protocol::protocol::AgentStatus::PendingInit
+        | codex_protocol::protocol::AgentStatus::Running
+        | codex_protocol::protocol::AgentStatus::Interrupted
+        | codex_protocol::protocol::AgentStatus::Completed(_)
+        | codex_protocol::protocol::AgentStatus::Shutdown
+        | codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Completed,
+    }
+}
+
 fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEvent) -> ThreadItem {
     let status = match &end_event.status {
         codex_protocol::protocol::AgentStatus::Errored(_)
@@ -3082,6 +3090,12 @@ mod tests {
     fn collab_send_input_status_maps_not_found_to_failed() {
         let status = collab_send_input_status(&codex_protocol::protocol::AgentStatus::NotFound);
         assert_eq!(status, V2CollabToolCallStatus::Failed);
+    }
+
+    #[test]
+    fn collab_close_status_maps_not_found_to_completed() {
+        let status = collab_close_status(&codex_protocol::protocol::AgentStatus::NotFound);
+        assert_eq!(status, V2CollabToolCallStatus::Completed);
     }
 
     #[test]

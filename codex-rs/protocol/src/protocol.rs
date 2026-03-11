@@ -2344,6 +2344,8 @@ pub struct SessionMeta {
     #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
     pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_file: Option<PathBuf>,
     /// base_instructions for the session. This *should* always be present when creating a new session,
     /// but may be missing for older sessions. If not present, fall back to rendering the base_instructions
     /// from ModelsManager.
@@ -2367,6 +2369,7 @@ impl Default for SessionMeta {
             agent_nickname: None,
             agent_role: None,
             model_provider: None,
+            auth_file: None,
             base_instructions: None,
             dynamic_tools: None,
             memory_mode: None,

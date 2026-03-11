@@ -175,6 +175,7 @@ mod tests {
                 agent_nickname: None,
                 agent_role: None,
                 model_provider: None,
+                auth_file: None,
                 base_instructions: None,
                 dynamic_tools: None,
                 memory_mode: None,

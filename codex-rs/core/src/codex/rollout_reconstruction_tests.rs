@@ -70,6 +70,7 @@ fn write_rollout_items(
                 agent_nickname: None,
                 agent_role: None,
                 model_provider: Some("openai".to_string()),
+                auth_file: None,
                 base_instructions: None,
                 dynamic_tools: None,
                 memory_mode: None,

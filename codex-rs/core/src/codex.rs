@@ -1511,6 +1511,7 @@ impl Session {
                         conversation_id,
                         forked_from_id,
                         session_source,
+                        auth_manager.auth_file_override().map(Path::to_path_buf),
                         BaseInstructions {
                             text: session_configuration.base_instructions.clone(),
                         },

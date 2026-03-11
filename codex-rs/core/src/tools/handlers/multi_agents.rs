@@ -1494,7 +1494,13 @@ pub mod close_agent {
             }
             Err(err) => Err(multi_agent_tool_error(agent_id, err)),
         };
-        let status = session.services.agent_control.get_status(agent_id).await;
+        let status = match close_result {
+            Ok(CloseAgentOutcome::Closed) => status_before,
+            Ok(CloseAgentOutcome::AlreadyClosed) | Ok(CloseAgentOutcome::NotFound) => {
+                session.services.agent_control.get_status(agent_id).await
+            }
+            Err(_) => session.services.agent_control.get_status(agent_id).await,
+        };
         session
             .send_event(
                 &turn,
@@ -4225,9 +4231,8 @@ mod tests {
         let result: close_agent::CloseAgentResult =
             serde_json::from_str(&content).expect("close_agent result should be json");
         let status_after = manager.agent_control().get_status(agent_id).await;
-        assert_eq!(result.status, status_after);
+        assert_eq!(result.status, status_before);
         assert_eq!(result.close_result, close_agent::CloseAgentOutcome::Closed);
-        assert_ne!(result.status, status_before);
         assert_eq!(success, Some(true));
 
         let ops = manager.captured_ops();

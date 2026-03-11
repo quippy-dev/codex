@@ -1104,6 +1104,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
                 agent_nickname: None,
                 agent_role: None,
                 model_provider: Some("test-provider".into()),
+                auth_file: None,
                 base_instructions: None,
                 dynamic_tools: None,
                 memory_mode: None,

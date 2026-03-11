@@ -752,10 +752,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_collab_close_end(&mut self, payload: &codex_protocol::protocol::CollabCloseEndEvent) {
-        let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
-            _ => CollabAgentToolCallStatus::Completed,
-        };
+        let status = collab_close_status(&payload.status);
         let receiver_id = payload.receiver_thread_id.to_string();
         let agents_states = [(
             receiver_id.clone(),
@@ -1066,6 +1063,18 @@ impl ThreadHistoryBuilder {
             content.push(UserInput::LocalImage { path: path.clone() });
         }
         content
+    }
+}
+
+fn collab_close_status(status: &AgentStatus) -> CollabAgentToolCallStatus {
+    match status {
+        AgentStatus::Errored(_) => CollabAgentToolCallStatus::Failed,
+        AgentStatus::PendingInit
+        | AgentStatus::Running
+        | AgentStatus::Interrupted
+        | AgentStatus::Completed(_)
+        | AgentStatus::Shutdown
+        | AgentStatus::NotFound => CollabAgentToolCallStatus::Completed,
     }
 }
 
@@ -2739,6 +2748,78 @@ mod tests {
                     agent_role: None,
                     status: CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Interrupted,
+                        message: None,
+                    },
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_close_agent_not_found_as_completed_collab_call() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "close it".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::CollabCloseBegin(
+                codex_protocol::protocol::CollabCloseBeginEvent {
+                    call_id: "close-1".into(),
+                    sender_thread_id: sender,
+                    receiver_thread_id: receiver,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::CollabCloseEnd(
+                codex_protocol::protocol::CollabCloseEndEvent {
+                    call_id: "close-1".into(),
+                    sender_thread_id: sender,
+                    receiver_thread_id: receiver,
+                    receiver_agent_nickname: Some("Atlas".into()),
+                    receiver_agent_role: Some("explorer".into()),
+                    status: AgentStatus::NotFound,
+                },
+            )),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "close-1".into(),
+                tool: CollabAgentTool::CloseAgent,
+                spawn_mode: None,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender.to_string(),
+                receiver_thread_ids: vec![receiver.to_string()],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: Some("Atlas".into()),
+                    agent_role: Some("explorer".into()),
+                }],
+                prompt: None,
+                agents_states: [(
+                    receiver.to_string(),
+                    CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::NotFound,
+                        message: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                agent_statuses: vec![CollabAgentStatusEntry {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: Some("Atlas".into()),
+                    agent_role: Some("explorer".into()),
+                    status: CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::NotFound,
                         message: None,
                     },
                 }],

@@ -1225,6 +1225,10 @@ impl AuthManager {
         )?))
     }
 
+    pub(crate) fn auth_file_override(&self) -> Option<&Path> {
+        self.auth_file.as_deref()
+    }
+
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
