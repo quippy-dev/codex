@@ -3870,6 +3870,8 @@ pub enum ThreadItem {
         receiver_agents: Vec<CollabAgentRef>,
         /// Prompt text sent as part of the collab tool call, when available.
         prompt: Option<String>,
+        /// Optional close result when `tool` is `CloseAgent`.
+        close_result: Option<CollabCloseResult>,
         /// Last known status of the target agents, when available.
         agents_states: HashMap<String, CollabAgentState>,
         /// Optional receiver metadata paired with final statuses.
@@ -4056,6 +4058,14 @@ v2_enum_from_core! {
     }
 }
 
+v2_enum_from_core! {
+    pub enum CollabCloseResult from codex_protocol::protocol::CollabCloseResult {
+        Closed,
+        AlreadyClosed,
+        NotFound
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -4063,6 +4073,7 @@ pub struct CollabAgentRef {
     pub thread_id: String,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    pub spawn_mode: Option<CollabAgentSpawnMode>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -4072,6 +4083,7 @@ pub struct CollabAgentStatusEntry {
     pub thread_id: String,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    pub spawn_mode: Option<CollabAgentSpawnMode>,
     pub status: CollabAgentState,
 }
 

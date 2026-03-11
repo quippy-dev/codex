@@ -1,3 +1,4 @@
+use crate::CollabCloseResult;
 use crate::protocol::v2::CollabAgentRef;
 use crate::protocol::v2::CollabAgentSpawnMode;
 use crate::protocol::v2::CollabAgentState;
@@ -560,6 +561,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: Vec::new(),
             receiver_agents: Vec::new(),
             prompt: Some(payload.prompt.clone()),
+            close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
         };
@@ -587,12 +589,14 @@ impl ThreadHistoryBuilder {
                             thread_id: receiver_id.clone(),
                             agent_nickname: payload.new_agent_nickname.clone(),
                             agent_role: payload.new_agent_role.clone(),
+                            spawn_mode: Some(CollabAgentSpawnMode::from(payload.spawn_mode)),
                         }],
                         [(receiver_id, received_status)].into_iter().collect(),
                         vec![CollabAgentStatusEntry {
                             thread_id: id.to_string(),
                             agent_nickname: payload.new_agent_nickname.clone(),
                             agent_role: payload.new_agent_role.clone(),
+                            spawn_mode: Some(CollabAgentSpawnMode::from(payload.spawn_mode)),
                             status: CollabAgentState::from(payload.status.clone()),
                         }],
                     )
@@ -608,6 +612,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             receiver_agents,
             prompt: Some(payload.prompt.clone()),
+            close_result: None,
             agents_states,
             agent_statuses,
         });
@@ -628,8 +633,10 @@ impl ThreadHistoryBuilder {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             }],
             prompt: Some(payload.prompt.clone()),
+            close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
         };
@@ -657,13 +664,16 @@ impl ThreadHistoryBuilder {
                 thread_id: receiver_id.clone(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: None,
             }],
             prompt: Some(payload.prompt.clone()),
+            close_result: None,
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
             agent_statuses: vec![CollabAgentStatusEntry {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: None,
                 status: CollabAgentState::from(payload.status.clone()),
             }],
         });
@@ -686,6 +696,7 @@ impl ThreadHistoryBuilder {
                 .collect(),
             receiver_agents: wait_receiver_agents(payload),
             prompt: None,
+            close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
         };
@@ -705,10 +716,18 @@ impl ThreadHistoryBuilder {
         } else {
             CollabAgentToolCallStatus::Completed
         };
-        let mut receiver_thread_ids: Vec<String> =
-            payload.statuses.keys().map(ToString::to_string).collect();
-        receiver_thread_ids.sort();
         let agent_statuses = wait_end_agent_statuses(payload);
+        let receiver_thread_ids = if agent_statuses.is_empty() {
+            let mut receiver_thread_ids: Vec<String> =
+                payload.statuses.keys().map(ToString::to_string).collect();
+            receiver_thread_ids.sort();
+            receiver_thread_ids
+        } else {
+            agent_statuses
+                .iter()
+                .map(|entry| entry.thread_id.clone())
+                .collect()
+        };
         let agents_states = payload
             .statuses
             .iter()
@@ -723,6 +742,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             receiver_agents: wait_end_receiver_agents(payload, &agent_statuses),
             prompt: None,
+            close_result: None,
             agents_states,
             agent_statuses,
         });
@@ -743,8 +763,10 @@ impl ThreadHistoryBuilder {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             }],
             prompt: None,
+            close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
         };
@@ -771,13 +793,16 @@ impl ThreadHistoryBuilder {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
             }],
             prompt: None,
+            close_result: Some(CollabCloseResult::from(payload.close_result)),
             agents_states,
             agent_statuses: vec![CollabAgentStatusEntry {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
                 status: CollabAgentState::from(payload.status.clone()),
             }],
         });
@@ -798,8 +823,10 @@ impl ThreadHistoryBuilder {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
             }],
             prompt: None,
+            close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
         };
@@ -832,13 +859,16 @@ impl ThreadHistoryBuilder {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
             }],
             prompt: None,
+            close_result: None,
             agents_states,
             agent_statuses: vec![CollabAgentStatusEntry {
                 thread_id: payload.receiver_thread_id.to_string(),
                 agent_nickname: payload.receiver_agent_nickname.clone(),
                 agent_role: payload.receiver_agent_role.clone(),
+                spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
                 status: CollabAgentState::from(payload.status.clone()),
             }],
         });
@@ -1089,6 +1119,7 @@ fn wait_receiver_agents(
                 thread_id: thread_id.to_string(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             })
             .collect();
     }
@@ -1099,6 +1130,7 @@ fn wait_receiver_agents(
             thread_id: agent.thread_id.to_string(),
             agent_nickname: agent.agent_nickname.clone(),
             agent_role: agent.agent_role.clone(),
+            spawn_mode: agent.spawn_mode.map(CollabAgentSpawnMode::from),
         })
         .collect()
 }
@@ -1117,6 +1149,7 @@ fn wait_end_receiver_agents(
                 thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             })
             .collect();
     }
@@ -1127,6 +1160,7 @@ fn wait_end_receiver_agents(
             thread_id: entry.thread_id.clone(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
+            spawn_mode: entry.spawn_mode.clone(),
         })
         .collect()
 }
@@ -1134,17 +1168,17 @@ fn wait_end_receiver_agents(
 fn wait_end_agent_statuses(
     payload: &codex_protocol::protocol::CollabWaitingEndEvent,
 ) -> Vec<CollabAgentStatusEntry> {
-    let mut agent_statuses: Vec<CollabAgentStatusEntry> = payload
+    let agent_statuses: Vec<CollabAgentStatusEntry> = payload
         .agent_statuses
         .iter()
         .map(|entry| CollabAgentStatusEntry {
             thread_id: entry.thread_id.to_string(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
+            spawn_mode: entry.spawn_mode.map(CollabAgentSpawnMode::from),
             status: CollabAgentState::from(entry.status.clone()),
         })
         .collect();
-    agent_statuses.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
     agent_statuses
 }
 
@@ -2472,6 +2506,7 @@ mod tests {
                     .expect("valid receiver thread id"),
                 receiver_agent_nickname: None,
                 receiver_agent_role: None,
+                receiver_spawn_mode: None,
                 status: AgentStatus::Completed(None),
             }),
         ];
@@ -2496,8 +2531,10 @@ mod tests {
                     thread_id: "00000000-0000-0000-0000-000000000002".into(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                 }],
                 prompt: None,
+                close_result: None,
                 agents_states: [(
                     "00000000-0000-0000-0000-000000000002".into(),
                     CollabAgentState {
@@ -2511,6 +2548,7 @@ mod tests {
                     thread_id: "00000000-0000-0000-0000-000000000002".into(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                     status: CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
                         message: None,
@@ -2521,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn collab_waiting_end_sorts_receiver_outputs_by_thread_id() {
+    fn collab_waiting_end_preserves_receiver_output_order() {
         let events = vec![
             EventMsg::UserMessage(UserMessageEvent {
                 message: "wait".into(),
@@ -2539,6 +2577,7 @@ mod tests {
                             .expect("valid receiver thread id"),
                         agent_nickname: Some("charlie".into()),
                         agent_role: Some("researcher".into()),
+                        spawn_mode: Some(codex_protocol::protocol::AgentSpawnMode::Watchdog),
                         status: AgentStatus::Completed(None),
                     },
                     codex_protocol::protocol::CollabAgentStatusEntry {
@@ -2546,6 +2585,7 @@ mod tests {
                             .expect("valid receiver thread id"),
                         agent_nickname: Some("alpha".into()),
                         agent_role: Some("planner".into()),
+                        spawn_mode: None,
                         status: AgentStatus::Completed(None),
                     },
                     codex_protocol::protocol::CollabAgentStatusEntry {
@@ -2553,6 +2593,7 @@ mod tests {
                             .expect("valid receiver thread id"),
                         agent_nickname: Some("bravo".into()),
                         agent_role: Some("reviewer".into()),
+                        spawn_mode: None,
                         status: AgentStatus::Completed(None),
                     },
                 ],
@@ -2594,28 +2635,32 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: "00000000-0000-0000-0000-000000000010".into(),
                 receiver_thread_ids: vec![
+                    "00000000-0000-0000-0000-000000000003".into(),
                     "00000000-0000-0000-0000-000000000001".into(),
                     "00000000-0000-0000-0000-000000000002".into(),
-                    "00000000-0000-0000-0000-000000000003".into(),
                 ],
                 receiver_agents: vec![
+                    CollabAgentRef {
+                        thread_id: "00000000-0000-0000-0000-000000000003".into(),
+                        agent_nickname: Some("charlie".into()),
+                        agent_role: Some("researcher".into()),
+                        spawn_mode: Some(CollabAgentSpawnMode::Watchdog),
+                    },
                     CollabAgentRef {
                         thread_id: "00000000-0000-0000-0000-000000000001".into(),
                         agent_nickname: Some("alpha".into()),
                         agent_role: Some("planner".into()),
+                        spawn_mode: None,
                     },
                     CollabAgentRef {
                         thread_id: "00000000-0000-0000-0000-000000000002".into(),
                         agent_nickname: Some("bravo".into()),
                         agent_role: Some("reviewer".into()),
-                    },
-                    CollabAgentRef {
-                        thread_id: "00000000-0000-0000-0000-000000000003".into(),
-                        agent_nickname: Some("charlie".into()),
-                        agent_role: Some("researcher".into()),
+                        spawn_mode: None,
                     },
                 ],
                 prompt: None,
+                close_result: None,
                 agents_states: [
                     (
                         "00000000-0000-0000-0000-000000000001".into(),
@@ -2643,9 +2688,20 @@ mod tests {
                 .collect(),
                 agent_statuses: vec![
                     CollabAgentStatusEntry {
+                        thread_id: "00000000-0000-0000-0000-000000000003".into(),
+                        agent_nickname: Some("charlie".into()),
+                        agent_role: Some("researcher".into()),
+                        spawn_mode: Some(CollabAgentSpawnMode::Watchdog),
+                        status: CollabAgentState {
+                            status: crate::protocol::v2::CollabAgentStatus::Completed,
+                            message: None,
+                        },
+                    },
+                    CollabAgentStatusEntry {
                         thread_id: "00000000-0000-0000-0000-000000000001".into(),
                         agent_nickname: Some("alpha".into()),
                         agent_role: Some("planner".into()),
+                        spawn_mode: None,
                         status: CollabAgentState {
                             status: crate::protocol::v2::CollabAgentStatus::Completed,
                             message: None,
@@ -2655,15 +2711,7 @@ mod tests {
                         thread_id: "00000000-0000-0000-0000-000000000002".into(),
                         agent_nickname: Some("bravo".into()),
                         agent_role: Some("reviewer".into()),
-                        status: CollabAgentState {
-                            status: crate::protocol::v2::CollabAgentStatus::Completed,
-                            message: None,
-                        },
-                    },
-                    CollabAgentStatusEntry {
-                        thread_id: "00000000-0000-0000-0000-000000000003".into(),
-                        agent_nickname: Some("charlie".into()),
-                        agent_role: Some("researcher".into()),
+                        spawn_mode: None,
                         status: CollabAgentState {
                             status: crate::protocol::v2::CollabAgentStatus::Completed,
                             message: None,
@@ -2731,8 +2779,10 @@ mod tests {
                     thread_id: receiver.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                 }],
                 prompt: Some("new task".into()),
+                close_result: None,
                 agents_states: [(
                     receiver.to_string(),
                     CollabAgentState {
@@ -2746,6 +2796,7 @@ mod tests {
                     thread_id: receiver.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                     status: CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Interrupted,
                         message: None,
@@ -2782,7 +2833,9 @@ mod tests {
                     receiver_thread_id: receiver,
                     receiver_agent_nickname: Some("Atlas".into()),
                     receiver_agent_role: Some("explorer".into()),
+                    receiver_spawn_mode: Some(codex_protocol::protocol::AgentSpawnMode::Watchdog),
                     status: AgentStatus::NotFound,
+                    close_result: codex_protocol::protocol::CollabCloseResult::NotFound,
                 },
             )),
         ];
@@ -2803,8 +2856,10 @@ mod tests {
                     thread_id: receiver.to_string(),
                     agent_nickname: Some("Atlas".into()),
                     agent_role: Some("explorer".into()),
+                    spawn_mode: Some(CollabAgentSpawnMode::Watchdog),
                 }],
                 prompt: None,
+                close_result: Some(CollabCloseResult::NotFound),
                 agents_states: [(
                     receiver.to_string(),
                     CollabAgentState {
@@ -2818,6 +2873,7 @@ mod tests {
                     thread_id: receiver.to_string(),
                     agent_nickname: Some("Atlas".into()),
                     agent_role: Some("explorer".into()),
+                    spawn_mode: Some(CollabAgentSpawnMode::Watchdog),
                     status: CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::NotFound,
                         message: None,

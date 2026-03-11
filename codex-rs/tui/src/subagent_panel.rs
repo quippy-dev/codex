@@ -523,9 +523,19 @@ impl SubagentRegistry {
             EventMsg::TurnAborted(TurnAbortedEvent { reason, .. }) => {
                 info.inflight_message.clear();
                 let reason_text = format!("{reason:?}").to_lowercase();
-                info.status = AgentStatus::Errored(reason_text.clone());
-                if !info.notified_terminal {
-                    info.notified_terminal = true;
+                let interrupted = matches!(
+                    reason,
+                    codex_protocol::protocol::TurnAbortReason::Interrupted
+                );
+                info.status = if interrupted {
+                    AgentStatus::Interrupted
+                } else {
+                    AgentStatus::Errored(reason_text.clone())
+                };
+                if interrupted || !info.notified_terminal {
+                    if !interrupted {
+                        info.notified_terminal = true;
+                    }
                     let label = info.label();
                     history.push(Box::new(new_subagent_update_cell(
                         &label,
@@ -778,5 +788,161 @@ fn subagent_pluralize(count: i32, singular: &str) -> String {
         format!("1 {singular}")
     } else {
         format!("{count} {singular}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn cell_to_text(cell: &dyn HistoryCell) -> String {
+        cell.display_lines(200)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn interrupted_abort_marks_subagent_interrupted_and_emits_history() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let spawned = registry.process_event(
+            root_thread_id,
+            Some(root_thread_id),
+            &Event {
+                id: "spawn".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: Some("Closer".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "interrupt me".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(spawned.is_empty());
+
+        let history = registry.process_event(
+            subagent_thread_id,
+            Some(root_thread_id),
+            &Event {
+                id: "aborted".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: None,
+                    reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                }),
+            },
+        );
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            registry
+                .agents
+                .get(&subagent_thread_id)
+                .expect("subagent should still be tracked")
+                .status,
+            AgentStatus::Interrupted
+        );
+        assert!(
+            cell_to_text(history[0].as_ref())
+                .contains("Subagent update: Closer [worker] interrupted"),
+            "interrupted abort should render interrupted summary"
+        );
+        assert!(
+            !registry
+                .agents
+                .get(&subagent_thread_id)
+                .expect("subagent should still be tracked")
+                .notified_terminal,
+            "interrupted abort should not mark the agent terminal"
+        );
+    }
+
+    #[test]
+    fn interrupted_abort_can_resume_and_emit_terminal_history() {
+        let mut registry = SubagentRegistry::new(false);
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        registry.set_root_thread(root_thread_id);
+
+        let spawned = registry.process_event(
+            root_thread_id,
+            Some(root_thread_id),
+            &Event {
+                id: "spawn".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: Some("Closer".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "interrupt me".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(spawned.is_empty());
+
+        let interrupted = registry.process_event(
+            subagent_thread_id,
+            Some(root_thread_id),
+            &Event {
+                id: "aborted".to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: None,
+                    reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                }),
+            },
+        );
+        assert_eq!(interrupted.len(), 1);
+
+        let restarted = registry.process_event(
+            subagent_thread_id,
+            Some(root_thread_id),
+            &Event {
+                id: "started".to_string(),
+                msg: EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: "turn-2".to_string(),
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+            },
+        );
+        assert!(restarted.is_empty());
+
+        let completed = registry.process_event(
+            subagent_thread_id,
+            Some(root_thread_id),
+            &Event {
+                id: "completed".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-2".to_string(),
+                    last_agent_message: Some("finished after resume".to_string()),
+                }),
+            },
+        );
+        assert_eq!(completed.len(), 1);
+        assert!(
+            cell_to_text(completed[0].as_ref())
+                .contains("Subagent update: Closer [worker] completed"),
+            "resumed completion should still emit its terminal completion cell"
+        );
+        let info = registry
+            .agents
+            .get(&subagent_thread_id)
+            .expect("subagent should still be tracked");
+        assert_eq!(
+            info.status,
+            AgentStatus::Completed(Some("finished after resume".to_string()))
+        );
+        assert!(info.notified_terminal);
     }
 }

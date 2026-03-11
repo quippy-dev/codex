@@ -82,8 +82,6 @@ use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-#[cfg(test)]
-use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -3880,13 +3878,17 @@ mod tests {
     use codex_core::config::types::ModelAvailabilityNuxConfig;
     use codex_otel::SessionTelemetry;
     use codex_protocol::ThreadId;
+    use codex_protocol::agent_inbox::AgentInboxPayload;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::CollaborationModeMask;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ModelAvailabilityNux;
     use codex_protocol::protocol::AgentMessageDeltaEvent;
     use codex_protocol::protocol::AgentReasoningDeltaEvent;
+    use codex_protocol::protocol::AgentSpawnMode;
     use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CollabAgentSpawnEndEvent;
@@ -3897,6 +3899,7 @@ mod tests {
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RawResponseItemEvent;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
     use codex_protocol::protocol::SessionSource;
@@ -5970,6 +5973,20 @@ mod tests {
         )
     }
 
+    fn agent_inbox_function_call_output_event(sender: ThreadId, message: &str) -> Event {
+        let payload = serde_json::to_string(&AgentInboxPayload::new(sender, message.to_string()))
+            .expect("collab inbox payload should serialize");
+        Event {
+            id: "agent-inbox".to_string(),
+            msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+                item: ResponseItem::FunctionCallOutput {
+                    call_id: "call-collab-inbox".to_string(),
+                    output: FunctionCallOutputPayload::from_text(payload),
+                },
+            }),
+        }
+    }
+
     fn drain_insert_history_text(
         app_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     ) -> Vec<String> {
@@ -7329,6 +7346,7 @@ mod tests {
                 thread_id: subagent_thread_id,
                 agent_nickname: Some("Wisteria".to_string()),
                 agent_role: Some("git_ops".to_string()),
+                spawn_mode: None,
                 status: AgentStatus::Running,
             }],
             statuses,
@@ -7620,7 +7638,9 @@ mod tests {
                     receiver_thread_id: subagent_thread_id,
                     receiver_agent_nickname: None,
                     receiver_agent_role: None,
+                    receiver_spawn_mode: None,
                     status: AgentStatus::Completed(Some("3.1415926535".to_string())),
+                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
                 }),
             },
         );
@@ -7629,6 +7649,199 @@ mod tests {
             close_cells.is_empty(),
             "app should not emit duplicate close lifecycle cells"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_keeps_root_agent_inbox_after_completion() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        app.thread_event_channels
+            .insert(root_thread_id, ThreadEventChannel::new(8));
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: Some("Closer".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "close with a summary".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+
+        app.process_subagent_side_effects(
+            subagent_thread_id,
+            &Event {
+                id: "turn-complete".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: Some("late final summary".to_string()),
+                }),
+            },
+        );
+        let terminal_cells = drain_insert_history_text(&mut app_event_rx);
+        assert_eq!(terminal_cells.len(), 1);
+        assert!(terminal_cells[0].contains("Subagent update:"));
+
+        app.enqueue_thread_event(
+            root_thread_id,
+            agent_inbox_function_call_output_event(subagent_thread_id, "late final summary"),
+        )
+        .await
+        .expect("late duplicate inbox event should not fail");
+
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&root_thread_id)
+                .expect("root thread channel should exist");
+            let store = channel.store.lock().await;
+            store.snapshot()
+        };
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(matches!(
+            snapshot.events[0].msg,
+            EventMsg::RawResponseItem(RawResponseItemEvent { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_keeps_distinct_root_agent_inbox_after_completion() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        app.thread_event_channels
+            .insert(root_thread_id, ThreadEventChannel::new(8));
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: Some("Closer".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "close with a summary".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+
+        app.process_subagent_side_effects(
+            subagent_thread_id,
+            &Event {
+                id: "turn-complete".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: Some("late final summary".to_string()),
+                }),
+            },
+        );
+        drain_insert_history_text(&mut app_event_rx);
+
+        let distinct_event =
+            agent_inbox_function_call_output_event(subagent_thread_id, "different follow-up");
+        app.enqueue_thread_event(root_thread_id, distinct_event.clone())
+            .await
+            .expect("distinct inbox event should not fail");
+
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&root_thread_id)
+                .expect("root thread channel should exist");
+            let store = channel.store.lock().await;
+            store.snapshot()
+        };
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(matches!(
+            snapshot.events[0].msg,
+            EventMsg::RawResponseItem(RawResponseItemEvent { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_keeps_root_agent_inbox_after_error() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        app.thread_event_channels
+            .insert(root_thread_id, ThreadEventChannel::new(8));
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: Some("Closer".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "fail with a summary".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+
+        app.process_subagent_side_effects(
+            subagent_thread_id,
+            &Event {
+                id: "error".to_string(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "late error summary".to_string(),
+                    codex_error_info: None,
+                }),
+            },
+        );
+        let terminal_cells = drain_insert_history_text(&mut app_event_rx);
+        assert_eq!(terminal_cells.len(), 1);
+        assert!(terminal_cells[0].contains("late error summary"));
+
+        app.enqueue_thread_event(
+            root_thread_id,
+            agent_inbox_function_call_output_event(subagent_thread_id, "late error summary"),
+        )
+        .await
+        .expect("late duplicate inbox event should not fail");
+
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&root_thread_id)
+                .expect("root thread channel should exist");
+            let store = channel.store.lock().await;
+            store.snapshot()
+        };
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(matches!(
+            snapshot.events[0].msg,
+            EventMsg::RawResponseItem(RawResponseItemEvent { .. })
+        ));
     }
 
     #[tokio::test]
@@ -7690,7 +7903,9 @@ mod tests {
                     receiver_thread_id: nested_thread_id,
                     receiver_agent_nickname: Some("NestedWorker".to_string()),
                     receiver_agent_role: Some("worker".to_string()),
+                    receiver_spawn_mode: None,
                     status: AgentStatus::Completed(Some(nested_summary.to_string())),
+                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
                 }),
             },
         );
@@ -7710,7 +7925,9 @@ mod tests {
                     receiver_thread_id: nested_thread_id,
                     receiver_agent_nickname: Some("NestedWorker".to_string()),
                     receiver_agent_role: Some("worker".to_string()),
+                    receiver_spawn_mode: None,
                     status: AgentStatus::Completed(Some(nested_summary.to_string())),
+                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
                 }),
             },
         );
@@ -7774,7 +7991,9 @@ mod tests {
                     receiver_thread_id: nested_thread_id,
                     receiver_agent_nickname: Some("Closer".to_string()),
                     receiver_agent_role: Some("worker".to_string()),
+                    receiver_spawn_mode: None,
                     status: AgentStatus::Running,
+                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
                 }),
             },
         );

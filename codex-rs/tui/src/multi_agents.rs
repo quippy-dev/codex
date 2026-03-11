@@ -2,12 +2,14 @@ use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabCloseResult;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
@@ -40,6 +42,7 @@ struct AgentLabel<'a> {
     thread_id: Option<ThreadId>,
     nickname: Option<&'a str>,
     role: Option<&'a str>,
+    spawn_mode: Option<AgentSpawnMode>,
 }
 
 pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>> {
@@ -151,7 +154,7 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
         new_agent_nickname,
         new_agent_role,
         prompt,
-        spawn_mode: _,
+        spawn_mode,
         status: _,
         ..
     } = ev;
@@ -163,6 +166,7 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
                 thread_id: Some(thread_id),
                 nickname: new_agent_nickname.as_deref(),
                 role: new_agent_role.as_deref(),
+                spawn_mode: Some(spawn_mode),
             },
         ),
         None => title_text("Agent spawn failed"),
@@ -192,6 +196,7 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
             thread_id: Some(receiver_thread_id),
             nickname: receiver_agent_nickname.as_deref(),
             role: receiver_agent_role.as_deref(),
+            spawn_mode: None,
         },
     );
 
@@ -247,7 +252,9 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_spawn_mode,
         status: _,
+        close_result,
     } = ev;
 
     agent_event(
@@ -257,9 +264,10 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
+                spawn_mode: receiver_spawn_mode,
             },
         ),
-        Vec::new(),
+        vec![Line::from(close_result_text(close_result))],
     )
 }
 
@@ -270,6 +278,7 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_spawn_mode,
     } = ev;
 
     agent_event(
@@ -279,6 +288,7 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
+                spawn_mode: receiver_spawn_mode,
             },
         ),
         Vec::new(),
@@ -292,6 +302,7 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_spawn_mode,
         status,
     } = ev;
 
@@ -302,9 +313,13 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
+                spawn_mode: receiver_spawn_mode,
             },
         ),
-        vec![status_summary_line(&status)],
+        vec![status_summary_line(
+            &status,
+            receiver_spawn_mode == Some(AgentSpawnMode::Watchdog),
+        )],
     )
 }
 
@@ -338,6 +353,7 @@ fn agent_label_from_ref(agent: &CollabAgentRef) -> AgentLabel<'_> {
         thread_id: Some(agent.thread_id),
         nickname: agent.agent_nickname.as_deref(),
         role: agent.agent_role.as_deref(),
+        spawn_mode: agent.spawn_mode,
     }
 }
 
@@ -361,7 +377,10 @@ fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>> {
         spans.push(Span::from("agent").cyan());
     }
 
-    if let Some(role) = role {
+    if agent.spawn_mode == Some(AgentSpawnMode::Watchdog) {
+        spans.push(Span::from(" ").dim());
+        spans.push(Span::from("[watchdog]"));
+    } else if let Some(role) = role {
         spans.push(Span::from(" ").dim());
         spans.push(Span::from(format!("[{role}]")));
     }
@@ -392,6 +411,7 @@ fn merge_wait_receivers(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             })
             .collect();
     }
@@ -406,6 +426,7 @@ fn merge_wait_receivers(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             });
         }
     }
@@ -427,6 +448,7 @@ fn wait_complete_lines(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
                 status: status.clone(),
             })
             .collect::<Vec<_>>();
@@ -445,6 +467,7 @@ fn wait_complete_lines(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
                 status: status.clone(),
             })
             .collect::<Vec<_>>();
@@ -460,28 +483,32 @@ fn wait_complete_lines(
                 thread_id,
                 agent_nickname,
                 agent_role,
+                spawn_mode,
                 status,
             } = entry;
+            let is_watchdog = spawn_mode == Some(AgentSpawnMode::Watchdog);
             let mut spans = agent_label_spans(AgentLabel {
                 thread_id: Some(thread_id),
                 nickname: agent_nickname.as_deref(),
                 role: agent_role.as_deref(),
+                spawn_mode,
             });
             spans.push(Span::from(": ").dim());
-            spans.extend(status_summary_spans(&status));
+            spans.extend(status_summary_spans(&status, is_watchdog));
             spans.into()
         })
         .collect()
 }
 
-fn status_summary_line(status: &AgentStatus) -> Line<'static> {
-    status_summary_spans(status).into()
+fn status_summary_line(status: &AgentStatus, is_watchdog: bool) -> Line<'static> {
+    status_summary_spans(status, is_watchdog).into()
 }
 
 // Allow `.yellow()`
 #[allow(clippy::disallowed_methods)]
-fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
+fn status_summary_spans(status: &AgentStatus, is_watchdog: bool) -> Vec<Span<'static>> {
     match status {
+        AgentStatus::PendingInit if is_watchdog => vec![Span::from("Idle").cyan()],
         AgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
         AgentStatus::Running => vec![Span::from("Running").cyan().bold()],
         AgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
@@ -513,6 +540,14 @@ fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
         }
         AgentStatus::Shutdown => vec![Span::from("Shutdown")],
         AgentStatus::NotFound => vec![Span::from("Not found").red()],
+    }
+}
+
+fn close_result_text(close_result: CollabCloseResult) -> &'static str {
+    match close_result {
+        CollabCloseResult::Closed => "Closed",
+        CollabCloseResult::AlreadyClosed => "Already closed",
+        CollabCloseResult::NotFound => "Not found",
     }
 }
 
@@ -566,6 +601,7 @@ mod tests {
                 thread_id: robie_id,
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
+                spawn_mode: None,
             }],
             call_id: "call-wait".to_string(),
         });
@@ -584,12 +620,14 @@ mod tests {
                     thread_id: robie_id,
                     agent_nickname: Some("Robie".to_string()),
                     agent_role: Some("explorer".to_string()),
+                    spawn_mode: None,
                     status: AgentStatus::Completed(Some("39916800".to_string())),
                 },
                 CollabAgentStatusEntry {
                     thread_id: bob_id,
                     agent_nickname: Some("Bob".to_string()),
                     agent_role: Some("worker".to_string()),
+                    spawn_mode: None,
                     status: AgentStatus::Errored("tool timeout".to_string()),
                 },
             ],
@@ -602,7 +640,9 @@ mod tests {
             receiver_thread_id: robie_id,
             receiver_agent_nickname: Some("Robie".to_string()),
             receiver_agent_role: Some("explorer".to_string()),
+            receiver_spawn_mode: None,
             status: AgentStatus::Completed(Some("39916800".to_string())),
+            close_result: CollabCloseResult::Closed,
         });
 
         let snapshot = [spawn, send, waiting, finished, close]
@@ -674,10 +714,52 @@ mod tests {
             receiver_thread_id: robie_id,
             receiver_agent_nickname: Some("Robie".to_string()),
             receiver_agent_role: Some("explorer".to_string()),
+            receiver_spawn_mode: None,
             status: AgentStatus::Interrupted,
         });
 
         assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
+    }
+
+    #[test]
+    fn collab_resume_watchdog_idle_snapshot() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let watchdog_id = ThreadId::from_string("00000000-0000-0000-0000-0000000000aa")
+            .expect("valid watchdog thread id");
+
+        let cell = resume_end(CollabResumeEndEvent {
+            call_id: "call-resume".to_string(),
+            sender_thread_id,
+            receiver_thread_id: watchdog_id,
+            receiver_agent_nickname: Some("Watchful".to_string()),
+            receiver_agent_role: Some("worker".to_string()),
+            receiver_spawn_mode: Some(AgentSpawnMode::Watchdog),
+            status: AgentStatus::PendingInit,
+        });
+
+        assert_snapshot!("collab_resume_watchdog_idle", cell_to_text(&cell));
+    }
+
+    #[test]
+    fn collab_close_watchdog_already_closed_snapshot() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let watchdog_id = ThreadId::from_string("00000000-0000-0000-0000-0000000000aa")
+            .expect("valid watchdog thread id");
+
+        let cell = close_end(CollabCloseEndEvent {
+            call_id: "call-close".to_string(),
+            sender_thread_id,
+            receiver_thread_id: watchdog_id,
+            receiver_agent_nickname: Some("Watchful".to_string()),
+            receiver_agent_role: Some("worker".to_string()),
+            receiver_spawn_mode: Some(AgentSpawnMode::Watchdog),
+            status: AgentStatus::Completed(None),
+            close_result: CollabCloseResult::AlreadyClosed,
+        });
+
+        assert_snapshot!("collab_close_watchdog_already_closed", cell_to_text(&cell));
     }
 
     fn cell_to_text(cell: &PlainHistoryCell) -> String {

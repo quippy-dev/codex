@@ -3207,6 +3207,16 @@ pub enum AgentSpawnMode {
     Watchdog,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CollabCloseResult {
+    #[default]
+    Closed,
+    AlreadyClosed,
+    NotFound,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct CollabAgentRef {
     /// Thread ID of the receiver/new agent.
@@ -3217,6 +3227,9 @@ pub struct CollabAgentRef {
     /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
     #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    /// Optional spawn mode for the receiver/new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_mode: Option<AgentSpawnMode>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3229,6 +3242,9 @@ pub struct CollabAgentStatusEntry {
     /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
     #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    /// Optional spawn mode for the receiver/new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_mode: Option<AgentSpawnMode>,
     /// Last known status of the agent.
     pub status: AgentStatus,
 }
@@ -3341,9 +3357,15 @@ pub struct CollabCloseEndEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional spawn mode assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_spawn_mode: Option<AgentSpawnMode>,
     /// Last known status of the receiver agent reported to the sender agent before
     /// the close.
     pub status: AgentStatus,
+    /// Close outcome reported by the close_agent tool.
+    #[serde(default)]
+    pub close_result: CollabCloseResult,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3360,6 +3382,9 @@ pub struct CollabResumeBeginEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional spawn mode assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_spawn_mode: Option<AgentSpawnMode>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3376,6 +3401,9 @@ pub struct CollabResumeEndEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional spawn mode assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_spawn_mode: Option<AgentSpawnMode>,
     /// Last known status of the receiver agent reported to the sender agent after
     /// resume.
     pub status: AgentStatus,
@@ -4403,5 +4431,27 @@ mod tests {
             .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(258_400));
+    }
+
+    #[test]
+    fn collab_close_end_event_defaults_close_result_for_legacy_rollouts() -> Result<()> {
+        let mut serialized = serde_json::to_value(CollabCloseEndEvent {
+            call_id: "call-close".to_string(),
+            sender_thread_id: ThreadId::new(),
+            receiver_thread_id: ThreadId::new(),
+            receiver_agent_nickname: Some("Closer".to_string()),
+            receiver_agent_role: Some("worker".to_string()),
+            receiver_spawn_mode: None,
+            status: AgentStatus::Running,
+            close_result: CollabCloseResult::AlreadyClosed,
+        })?;
+        serialized
+            .as_object_mut()
+            .expect("event should serialize as an object")
+            .remove("close_result");
+
+        let deserialized: CollabCloseEndEvent = serde_json::from_value(serialized)?;
+        assert_eq!(deserialized.close_result, CollabCloseResult::Closed);
+        Ok(())
     }
 }

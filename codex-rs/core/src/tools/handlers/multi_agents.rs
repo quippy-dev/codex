@@ -27,6 +27,7 @@ use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabCloseResult;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
@@ -37,6 +38,7 @@ use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub struct MultiAgentHandler;
 
@@ -591,6 +593,14 @@ mod resume_agent {
             .get_agent_nickname_and_role(receiver_thread_id)
             .await
             .unwrap_or((None, None));
+        let receiver_spawn_mode = watchdog_ref_spawn_mode(
+            &session
+                .services
+                .agent_control
+                .watchdog_targets(&[receiver_thread_id])
+                .await,
+            receiver_thread_id,
+        );
         session
             .send_event(
                 &turn,
@@ -600,6 +610,7 @@ mod resume_agent {
                     receiver_thread_id,
                     receiver_agent_nickname: receiver_agent_nickname.clone(),
                     receiver_agent_role: receiver_agent_role.clone(),
+                    receiver_spawn_mode,
                 }
                 .into(),
             )
@@ -644,6 +655,7 @@ mod resume_agent {
                     receiver_thread_id,
                     receiver_agent_nickname,
                     receiver_agent_role,
+                    receiver_spawn_mode,
                     status: status.clone(),
                 }
                 .into(),
@@ -978,6 +990,11 @@ pub(crate) mod wait {
             .iter()
             .map(|id| agent_id(id))
             .collect::<Result<Vec<_>, _>>()?;
+        let watchdog_target_ids = session
+            .services
+            .agent_control
+            .watchdog_targets(&requested_thread_ids)
+            .await;
         let event_receiver_thread_ids = requested_thread_ids.clone();
         let mut receiver_agents = Vec::with_capacity(event_receiver_thread_ids.len());
         for receiver_thread_id in &event_receiver_thread_ids {
@@ -991,13 +1008,9 @@ pub(crate) mod wait {
                 thread_id: *receiver_thread_id,
                 agent_nickname,
                 agent_role,
+                spawn_mode: watchdog_ref_spawn_mode(&watchdog_target_ids, *receiver_thread_id),
             });
         }
-        let watchdog_target_ids = session
-            .services
-            .agent_control
-            .watchdog_targets(&requested_thread_ids)
-            .await;
         let mut receiver_thread_ids = Vec::new();
         let mut watchdog_statuses = Vec::new();
         split_wait_ids(
@@ -1320,6 +1333,7 @@ fn build_wait_agent_statuses(
                 thread_id: receiver_agent.thread_id,
                 agent_nickname: receiver_agent.agent_nickname.clone(),
                 agent_role: receiver_agent.agent_role.clone(),
+                spawn_mode: receiver_agent.spawn_mode,
                 status: status.clone(),
             });
         }
@@ -1332,12 +1346,22 @@ fn build_wait_agent_statuses(
             thread_id: *thread_id,
             agent_nickname: None,
             agent_role: None,
+            spawn_mode: None,
             status: status.clone(),
         })
         .collect::<Vec<_>>();
     extras.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
     entries.extend(extras);
     entries
+}
+
+fn watchdog_ref_spawn_mode(
+    watchdog_target_ids: &HashSet<ThreadId>,
+    receiver_thread_id: ThreadId,
+) -> Option<AgentSpawnMode> {
+    watchdog_target_ids
+        .contains(&receiver_thread_id)
+        .then_some(AgentSpawnMode::Watchdog)
 }
 
 pub mod close_agent {
@@ -1367,6 +1391,14 @@ pub mod close_agent {
         }
     }
 
+    fn event_close_result(outcome: CloseAgentOutcome) -> CollabCloseResult {
+        match outcome {
+            CloseAgentOutcome::Closed => CollabCloseResult::Closed,
+            CloseAgentOutcome::AlreadyClosed => CollabCloseResult::AlreadyClosed,
+            CloseAgentOutcome::NotFound => CollabCloseResult::NotFound,
+        }
+    }
+
     pub async fn handle(
         session: Arc<Session>,
         turn: Arc<TurnContext>,
@@ -1382,6 +1414,14 @@ pub mod close_agent {
             .get_agent_nickname_and_role(agent_id)
             .await
             .unwrap_or((None, None));
+        let receiver_spawn_mode = watchdog_ref_spawn_mode(
+            &session
+                .services
+                .agent_control
+                .watchdog_targets(&[agent_id])
+                .await,
+            agent_id,
+        );
         let mut was_known = if matches!(status_before, AgentStatus::NotFound) {
             let listed = session
                 .services
@@ -1446,7 +1486,9 @@ pub mod close_agent {
                         receiver_thread_id: agent_id,
                         receiver_agent_nickname: receiver_agent_nickname.clone(),
                         receiver_agent_role: receiver_agent_role.clone(),
+                        receiver_spawn_mode,
                         status: status.clone(),
+                        close_result: event_close_result(not_found_outcome(was_known)),
                     }
                     .into(),
                 )
@@ -1501,6 +1543,7 @@ pub mod close_agent {
             }
             Err(_) => session.services.agent_control.get_status(agent_id).await,
         };
+        let close_result = close_result?;
         session
             .send_event(
                 &turn,
@@ -1510,12 +1553,13 @@ pub mod close_agent {
                     receiver_thread_id: agent_id,
                     receiver_agent_nickname,
                     receiver_agent_role,
+                    receiver_spawn_mode,
                     status: status.clone(),
+                    close_result: event_close_result(close_result),
                 }
                 .into(),
             )
             .await;
-        let close_result = close_result?;
 
         let content = serde_json::to_string(&CloseAgentResult {
             status,

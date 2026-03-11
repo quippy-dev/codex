@@ -24,6 +24,7 @@ use codex_app_server_protocol::CollabAgentState as V2CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentStatusEntry;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus as V2CollabToolCallStatus;
+use codex_app_server_protocol::CollabCloseResult as V2CollabCloseResult;
 use codex_app_server_protocol::CommandAction as V2ParsedCommand;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
@@ -867,6 +868,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: Vec::new(),
                 receiver_agents: Vec::new(),
                 prompt: Some(begin_event.prompt),
+                close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
             };
@@ -898,12 +900,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                                 thread_id: receiver_id.clone(),
                                 agent_nickname: end_event.new_agent_nickname.clone(),
                                 agent_role: end_event.new_agent_role.clone(),
+                                spawn_mode: Some(V2CollabAgentSpawnMode::from(
+                                    end_event.spawn_mode,
+                                )),
                             }],
                             [(receiver_id, received_status)].into_iter().collect(),
                             vec![CollabAgentStatusEntry {
                                 thread_id: id.to_string(),
                                 agent_nickname: end_event.new_agent_nickname.clone(),
                                 agent_role: end_event.new_agent_role.clone(),
+                                spawn_mode: Some(V2CollabAgentSpawnMode::from(
+                                    end_event.spawn_mode,
+                                )),
                                 status: V2CollabAgentStatus::from(end_event.status.clone()),
                             }],
                         )
@@ -919,6 +927,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 receiver_agents,
                 prompt: Some(end_event.prompt),
+                close_result: None,
                 agents_states,
                 agent_statuses,
             };
@@ -944,8 +953,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: begin_event.receiver_thread_id.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                 }],
                 prompt: Some(begin_event.prompt),
+                close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
             };
@@ -973,8 +984,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: receiver_id.clone(),
                     agent_nickname: end_event.receiver_agent_nickname.clone(),
                     agent_role: end_event.receiver_agent_role.clone(),
+                    spawn_mode: None,
                 }],
                 prompt: Some(end_event.prompt),
+                close_result: None,
                 agents_states: [(receiver_id, received_status.clone())]
                     .into_iter()
                     .collect(),
@@ -982,6 +995,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: end_event.receiver_thread_id.to_string(),
                     agent_nickname: end_event.receiver_agent_nickname.clone(),
                     agent_role: end_event.receiver_agent_role.clone(),
+                    spawn_mode: None,
                     status: received_status,
                 }],
             };
@@ -1010,6 +1024,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 receiver_agents,
                 prompt: None,
+                close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
             };
@@ -1051,6 +1066,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 receiver_agents,
                 prompt: None,
+                close_result: None,
                 agents_states,
                 agent_statuses,
             };
@@ -1075,8 +1091,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: begin_event.receiver_thread_id.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                 }],
                 prompt: None,
+                close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
             };
@@ -1116,13 +1134,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: end_event.receiver_thread_id.to_string(),
                     agent_nickname: end_event.receiver_agent_nickname.clone(),
                     agent_role: end_event.receiver_agent_role.clone(),
+                    spawn_mode: end_event
+                        .receiver_spawn_mode
+                        .map(V2CollabAgentSpawnMode::from),
                 }],
                 prompt: None,
+                close_result: Some(V2CollabCloseResult::from(end_event.close_result)),
                 agents_states,
                 agent_statuses: vec![CollabAgentStatusEntry {
                     thread_id: end_event.receiver_thread_id.to_string(),
                     agent_nickname: end_event.receiver_agent_nickname.clone(),
                     agent_role: end_event.receiver_agent_role.clone(),
+                    spawn_mode: end_event
+                        .receiver_spawn_mode
+                        .map(V2CollabAgentSpawnMode::from),
                     status: received_status,
                 }],
             };
@@ -2579,8 +2604,12 @@ fn collab_resume_begin_item(
             thread_id: begin_event.receiver_thread_id.to_string(),
             agent_nickname: begin_event.receiver_agent_nickname,
             agent_role: begin_event.receiver_agent_role,
+            spawn_mode: begin_event
+                .receiver_spawn_mode
+                .map(V2CollabAgentSpawnMode::from),
         }],
         prompt: None,
+        close_result: None,
         agents_states: HashMap::new(),
         agent_statuses: Vec::new(),
     }
@@ -2634,13 +2663,20 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
             thread_id: end_event.receiver_thread_id.to_string(),
             agent_nickname: end_event.receiver_agent_nickname.clone(),
             agent_role: end_event.receiver_agent_role.clone(),
+            spawn_mode: end_event
+                .receiver_spawn_mode
+                .map(V2CollabAgentSpawnMode::from),
         }],
         prompt: None,
+        close_result: None,
         agents_states,
         agent_statuses: vec![CollabAgentStatusEntry {
             thread_id: end_event.receiver_thread_id.to_string(),
             agent_nickname: end_event.receiver_agent_nickname,
             agent_role: end_event.receiver_agent_role,
+            spawn_mode: end_event
+                .receiver_spawn_mode
+                .map(V2CollabAgentSpawnMode::from),
             status: received_status,
         }],
     }
@@ -2657,6 +2693,7 @@ fn wait_receiver_agents(
                 thread_id: thread_id.to_string(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             })
             .collect();
     }
@@ -2668,6 +2705,7 @@ fn wait_receiver_agents(
             thread_id: agent.thread_id.to_string(),
             agent_nickname: agent.agent_nickname.clone(),
             agent_role: agent.agent_role.clone(),
+            spawn_mode: agent.spawn_mode.map(V2CollabAgentSpawnMode::from),
         })
         .collect()
 }
@@ -2679,6 +2717,7 @@ fn wait_end_receiver_agents(agent_statuses: &[CollabAgentStatusEntry]) -> Vec<Co
             thread_id: entry.thread_id.to_string(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
+            spawn_mode: entry.spawn_mode.map(V2CollabAgentSpawnMode::from),
         })
         .collect()
 }
@@ -2706,6 +2745,7 @@ fn wait_end_agent_statuses(
                 thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
                 status,
             })
             .collect();
@@ -2718,6 +2758,7 @@ fn wait_end_agent_statuses(
             thread_id: entry.thread_id.to_string(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
+            spawn_mode: entry.spawn_mode.map(V2CollabAgentSpawnMode::from),
             status: V2CollabAgentStatus::from(entry.status.clone()),
         })
         .collect()

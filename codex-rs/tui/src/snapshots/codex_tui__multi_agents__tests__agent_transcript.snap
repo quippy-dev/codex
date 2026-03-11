@@ -1,6 +1,5 @@
 ---
 source: tui/src/multi_agents.rs
-assertion_line: 536
 expression: snapshot
 ---
 • Spawned Robie [explorer]
@@ -16,3 +15,4 @@ expression: snapshot
     Bob [worker]: Error - tool timeout
 
 • Closed Robie [explorer]
+  └ Closed
