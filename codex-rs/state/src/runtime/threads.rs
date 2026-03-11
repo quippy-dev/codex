@@ -561,7 +561,6 @@ pub(super) fn extract_dynamic_tools(items: &[RolloutItem]) -> Option<Option<Vec<
         RolloutItem::ResponseItem(_)
         | RolloutItem::ForkReference(_)
         | RolloutItem::Compacted(_)
-        | RolloutItem::ForkReference(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_) => None,
     })
@@ -573,7 +572,6 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         RolloutItem::ResponseItem(_)
         | RolloutItem::ForkReference(_)
         | RolloutItem::Compacted(_)
-        | RolloutItem::ForkReference(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_) => None,
     })

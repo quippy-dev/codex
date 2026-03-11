@@ -161,6 +161,7 @@ use codex_app_server_protocol::ThreadSourceKind;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
+use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_app_server_protocol::ThreadUnarchivedNotification;
@@ -3064,7 +3065,7 @@ impl CodexMessageProcessor {
 
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
-        } else if let Some(thread) = loaded_thread {
+        } else if let Some(ref thread) = loaded_thread {
             let config_snapshot = thread.config_snapshot().await;
             if include_turns && loaded_rollout_path.is_none() {
                 self.send_invalid_request_error(

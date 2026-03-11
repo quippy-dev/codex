@@ -2444,6 +2444,7 @@ mod tests {
             "custom".to_string(),
             AgentRoleConfig {
                 description: None,
+                model: None,
                 config_file: Some(role_path),
                 spawn_mode: None,
                 nickname_candidates: None,
@@ -2506,6 +2507,7 @@ mod tests {
             "custom".to_string(),
             AgentRoleConfig {
                 description: Some("Fork by default".to_string()),
+                model: None,
                 config_file: None,
                 spawn_mode: Some(AgentRoleSpawnMode::Fork),
                 nickname_candidates: None,
@@ -3285,17 +3287,13 @@ mod tests {
                 "message": "hi"
             })),
         );
-        let err = MultiAgentHandler
-            .handle(invocation)
-            .await
-            .expect_err("send_input should reject watchdog handles");
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
-                    .to_string()
-            )
-        );
+        let result = MultiAgentHandler.handle(invocation).await;
+        assert!(matches!(
+            result,
+            Err(FunctionCallError::RespondToModel(message))
+                if message
+                    == "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
+        ));
 
         let _ = session
             .services
@@ -3335,17 +3333,13 @@ mod tests {
                 "interrupt": true
             })),
         );
-        let err = MultiAgentHandler
-            .handle(invocation)
-            .await
-            .expect_err("send_input should reject watchdog handles");
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
-                    .to_string()
-            )
-        );
+        let result = MultiAgentHandler.handle(invocation).await;
+        assert!(matches!(
+            result,
+            Err(FunctionCallError::RespondToModel(message))
+                if message
+                    == "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
+        ));
 
         let _ = session
             .services

@@ -125,7 +125,6 @@ pub(crate) async fn extract_metadata_from_rollout(
             RolloutItem::ResponseItem(_)
             | RolloutItem::ForkReference(_)
             | RolloutItem::Compacted(_)
-            | RolloutItem::ForkReference(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::EventMsg(_) => None,
         }),

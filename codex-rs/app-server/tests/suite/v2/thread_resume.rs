@@ -69,36 +69,6 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 
-async fn wait_for_responses_request_count(
-    server: &wiremock::MockServer,
-    expected_count: usize,
-) -> Result<()> {
-    timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let Some(requests) = server.received_requests().await else {
-                anyhow::bail!("wiremock did not record requests");
-            };
-            let responses_request_count = requests
-                .iter()
-                .filter(|request| {
-                    request.method == "POST" && request.url.path().ends_with("/responses")
-                })
-                .count();
-            if responses_request_count == expected_count {
-                return Ok::<(), anyhow::Error>(());
-            }
-            if responses_request_count > expected_count {
-                anyhow::bail!(
-                    "expected exactly {expected_count} /responses requests, got {responses_request_count}"
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    Ok(())
-}
-
 #[tokio::test]
 async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;

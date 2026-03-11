@@ -3818,6 +3818,7 @@ mod tests {
             "researcher".to_string(),
             AgentRoleConfig {
                 description: Some("Research role".to_string()),
+                model: None,
                 config_file: None,
                 spawn_mode: None,
                 nickname_candidates: Some(vec!["Atlas".to_string()]),

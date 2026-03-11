@@ -775,7 +775,6 @@ impl Codex {
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
-
 }
 
 /// Context for an initialized model agent
