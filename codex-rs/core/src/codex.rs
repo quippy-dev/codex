@@ -4420,6 +4420,9 @@ impl Session {
         match active.as_mut() {
             Some(at) => {
                 let mut ts = at.turn_state.lock().await;
+                if ts.sampling_completed() {
+                    return Err(input);
+                }
                 for item in input {
                     ts.push_pending_input(item);
                 }
@@ -4449,6 +4452,15 @@ impl Session {
             }
             None => false,
         }
+    }
+
+    pub(crate) async fn mark_active_turn_sampling_completed(&self) {
+        let active = self.active_turn.lock().await;
+        let Some(at) = active.as_ref() else {
+            return;
+        };
+        let mut ts = at.turn_state.lock().await;
+        ts.mark_sampling_completed();
     }
 
     pub async fn drop_pending_input(&self) -> bool {
@@ -8010,6 +8022,7 @@ async fn try_run_sampling_request(
                     .await;
                 should_emit_turn_diff = true;
 
+                sess.mark_active_turn_sampling_completed().await;
                 needs_follow_up |= sess.has_pending_input().await;
 
                 break Ok(SamplingRequestResult {

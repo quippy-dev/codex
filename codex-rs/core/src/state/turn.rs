@@ -84,6 +84,7 @@ pub(crate) struct TurnState {
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pending_input: Vec<ResponseInputItem>,
+    sampling_completed: bool,
     granted_permissions: Option<PermissionProfile>,
     pub(crate) tool_calls: u64,
     pub(crate) token_usage_at_turn_start: TokenUsage,
@@ -180,6 +181,14 @@ impl TurnState {
 
     pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {
         self.pending_input.push(input);
+    }
+
+    pub(crate) fn mark_sampling_completed(&mut self) {
+        self.sampling_completed = true;
+    }
+
+    pub(crate) fn sampling_completed(&self) -> bool {
+        self.sampling_completed
     }
 
     pub(crate) fn take_pending_input(&mut self) -> Vec<ResponseInputItem> {

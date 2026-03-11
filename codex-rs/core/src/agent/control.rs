@@ -629,37 +629,63 @@ impl AgentControl {
                     return Ok(Uuid::now_v7().to_string());
                 }
                 Err(late_items) => {
-                    match thread
+                    let post_interrupt_collab_hold_armed = thread
                         .codex
                         .session
-                        .enqueue_post_turn_agent_items(late_items)
-                        .await
-                    {
-                        Ok(()) => {
-                            if thread
-                                .codex
-                                .session
-                                .arm_post_turn_agent_flush_if_items()
-                                .await
-                                && let Err(err) = state
-                                    .send_op(
-                                        agent_id,
-                                        Op::InjectResponseItems { items: Vec::new() },
-                                    )
-                                    .await
-                            {
-                                warn!(
-                                    receiver_thread_id = %agent_id,
-                                    sender_thread_id = %sender_thread_id,
-                                    "failed to submit post-turn agent items after late active-turn inject miss: {err}"
-                                );
-                                thread.codex.session.clear_post_turn_agent_items().await;
-                            } else {
+                        .post_interrupt_collab_hold_armed()
+                        .await;
+                    let should_defer_late_items = should_defer_agent_delivery(
+                        false,
+                        post_interrupt_collab_hold_armed,
+                        sender_is_watchdog_helper_for_receiver,
+                    );
+                    if should_defer_late_items {
+                        match thread
+                            .codex
+                            .session
+                            .enqueue_deferred_collab_items(late_items)
+                            .await
+                        {
+                            Ok(()) => {
                                 return Ok(Uuid::now_v7().to_string());
                             }
+                            Err(err) => {
+                                log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err)
+                            }
                         }
-                        Err(err) => {
-                            log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err)
+                    } else {
+                        match thread
+                            .codex
+                            .session
+                            .enqueue_post_turn_agent_items(late_items)
+                            .await
+                        {
+                            Ok(()) => {
+                                if thread
+                                    .codex
+                                    .session
+                                    .arm_post_turn_agent_flush_if_items()
+                                    .await
+                                    && let Err(err) = state
+                                        .send_op(
+                                            agent_id,
+                                            Op::InjectResponseItems { items: Vec::new() },
+                                        )
+                                        .await
+                                {
+                                    warn!(
+                                        receiver_thread_id = %agent_id,
+                                        sender_thread_id = %sender_thread_id,
+                                        "failed to submit post-turn agent items after late active-turn inject miss: {err}"
+                                    );
+                                    thread.codex.session.clear_post_turn_agent_items().await;
+                                } else {
+                                    return Ok(Uuid::now_v7().to_string());
+                                }
+                            }
+                            Err(err) => {
+                                log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err)
+                            }
                         }
                     }
                 }
@@ -2071,6 +2097,146 @@ mod tests {
             .codex
             .session
             .clear_post_turn_agent_items()
+            .await;
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_after_sampling_completed_queues_post_turn_flush() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        let sender_thread_id = ThreadId::new();
+
+        let turn_context = receiver_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("sampling-completed-turn".to_string())
+            .await;
+        receiver_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&turn_context),
+                text_input("active root turn"),
+                WaitForCancellationTask,
+            )
+            .await;
+        assert!(receiver_thread.has_active_turn().await);
+
+        let receiver_session = Arc::clone(&receiver_thread.codex.session);
+        let submission_id = harness
+            .control
+            .send_agent_message_inner(
+                receiver_thread_id,
+                sender_thread_id,
+                "late completed update".to_string(),
+                Some(Box::pin(async move {
+                    receiver_session.mark_active_turn_sampling_completed().await;
+                })),
+            )
+            .await
+            .expect("send_agent_message should queue after sampling completed");
+        assert!(!submission_id.is_empty());
+
+        let (queued_items, queued_bytes, flush_pending) =
+            receiver_thread.codex.session.post_turn_agent_stats().await;
+        assert_eq!(queued_items, 2);
+        assert!(queued_bytes > 0);
+        assert!(flush_pending);
+        assert!(
+            receiver_thread
+                .codex
+                .session
+                .get_pending_input()
+                .await
+                .is_empty()
+        );
+
+        let inject_ops: Vec<Op> = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .filter_map(|(thread_id, op)| (thread_id == receiver_thread_id).then_some(op))
+            .filter(|op| matches!(op, Op::InjectResponseItems { .. }))
+            .collect();
+        assert_eq!(inject_ops.len(), 1);
+        match &inject_ops[0] {
+            Op::InjectResponseItems { items } => assert!(items.is_empty()),
+            other => panic!("expected inject response items op, got {other:?}"),
+        }
+
+        receiver_thread
+            .codex
+            .session
+            .clear_post_turn_agent_items()
+            .await;
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_late_interrupt_miss_preserves_post_interrupt_hold() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        let sender_thread_id = ThreadId::new();
+
+        let turn_context = receiver_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("late-interrupt-turn".to_string())
+            .await;
+        receiver_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&turn_context),
+                text_input("active root turn"),
+                WaitForCancellationTask,
+            )
+            .await;
+        assert!(receiver_thread.has_active_turn().await);
+
+        let receiver_session = Arc::clone(&receiver_thread.codex.session);
+        let submission_id = harness
+            .control
+            .send_agent_message_inner(
+                receiver_thread_id,
+                sender_thread_id,
+                "late interrupt update".to_string(),
+                Some(Box::pin(async move {
+                    receiver_session.interrupt_task().await;
+                })),
+            )
+            .await
+            .expect("send_agent_message should defer after late interrupt miss");
+        assert!(!submission_id.is_empty());
+
+        let (deferred_items, deferred_bytes) =
+            receiver_thread.codex.session.deferred_collab_stats().await;
+        assert_eq!(deferred_items, 2);
+        assert!(deferred_bytes > 0);
+        let (queued_items, queued_bytes, flush_pending) =
+            receiver_thread.codex.session.post_turn_agent_stats().await;
+        assert_eq!((queued_items, queued_bytes, flush_pending), (0, 0, false));
+        assert!(
+            receiver_thread
+                .codex
+                .session
+                .post_interrupt_collab_hold_armed()
+                .await
+        );
+        let injected = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            });
+        assert!(!injected);
+
+        let _ = receiver_thread
+            .codex
+            .session
+            .take_deferred_collab_items()
             .await;
         let _ = harness.control.shutdown_agent(receiver_thread_id).await;
     }
