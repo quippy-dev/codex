@@ -186,7 +186,7 @@ pub enum SteerInputError {
     EmptyInput,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeferredCollabEnqueueError {
     TooManyItems {
         existing_items: usize,
@@ -667,6 +667,7 @@ impl Codex {
             auth_manager.clone(),
             models_manager.clone(),
             exec_policy,
+            tx_sub.clone(),
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
@@ -782,6 +783,7 @@ impl Codex {
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) conversation_id: ThreadId,
+    tx_sub: Sender<Submission>,
     tx_event: Sender<Event>,
     agent_status: watch::Sender<AgentStatus>,
     out_of_band_elicitation_paused: watch::Sender<bool>,
@@ -1444,6 +1446,7 @@ impl Session {
         auth_manager: Arc<AuthManager>,
         models_manager: Arc<ModelsManager>,
         exec_policy: ExecPolicyManager,
+        tx_sub: Sender<Submission>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         initial_history: InitialHistory,
@@ -1880,6 +1883,7 @@ impl Session {
 
         let sess = Arc::new(Session {
             conversation_id,
+            tx_sub,
             tx_event: tx_event.clone(),
             agent_status,
             out_of_band_elicitation_paused,
@@ -2117,6 +2121,19 @@ impl Session {
             },
         )
         .await;
+    }
+
+    pub(crate) async fn submit_op(&self, op: Op) -> CodexResult<String> {
+        let id = Uuid::now_v7().to_string();
+        self.tx_sub
+            .send(Submission {
+                id: id.clone(),
+                op,
+                trace: current_span_w3c_trace_context(),
+            })
+            .await
+            .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(id)
     }
 
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
@@ -4463,6 +4480,25 @@ impl Session {
     pub(crate) async fn deferred_collab_stats(&self) -> (usize, usize) {
         let state = self.state.lock().await;
         state.deferred_collab_stats()
+    }
+
+    pub(crate) async fn enqueue_post_turn_agent_items(
+        &self,
+        items: Vec<ResponseInputItem>,
+    ) -> Result<(), DeferredCollabEnqueueError> {
+        let mut state = self.state.lock().await;
+        state.enqueue_post_turn_agent_items(items)
+    }
+
+    pub(crate) async fn take_post_turn_agent_items(&self) -> Vec<ResponseInputItem> {
+        let mut state = self.state.lock().await;
+        state.take_post_turn_agent_items()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn post_turn_agent_stats(&self) -> (usize, usize) {
+        let state = self.state.lock().await;
+        state.post_turn_agent_stats()
     }
 
     pub(crate) async fn clear_post_interrupt_collab_hold_if_no_deferred_items(&self) -> bool {

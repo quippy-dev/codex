@@ -58,6 +58,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_app_server_protocol::AppInfo;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::RetainedProposedPlan;
+use codex_protocol::agent_inbox::build_tool_response_input_items;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::McpToolOutput;
@@ -2225,6 +2226,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     };
 
     let (tx_event, _rx_event) = async_channel::unbounded();
+    let (tx_sub, _rx_sub) = async_channel::bounded(1);
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
@@ -2239,6 +2241,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         auth_manager,
         models_manager,
         ExecPolicyManager::default(),
+        tx_sub,
         tx_event,
         agent_status_tx,
         InitialHistory::New,
@@ -2411,6 +2414,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
 
     let session = Session {
         conversation_id,
+        tx_sub: async_channel::bounded(1).0,
         tx_event,
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
@@ -2973,6 +2977,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
 
     let session = Arc::new(Session {
         conversation_id,
+        tx_sub: async_channel::bounded(1).0,
         tx_event,
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
@@ -4601,6 +4606,67 @@ async fn user_input_or_turn_replacement_turn_spawn_path_flushes_deferred_collab_
     assert_eq!(sess.deferred_collab_stats().await.0, 0);
     assert_eq!(sess.post_interrupt_collab_hold_armed().await, false);
 
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_task_finished_flushes_post_turn_agent_items_on_follow_up_turn_path() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let agent_items = build_tool_response_input_items(
+        ThreadId::new(),
+        "post-turn agent inbox".to_string(),
+        "post-turn-agent-call".to_string(),
+    )
+    .expect("build agent inbox items");
+    let expected_response_items = agent_items
+        .iter()
+        .cloned()
+        .map(ResponseItem::from)
+        .collect::<Vec<_>>();
+
+    spawn_never_ending_regular_task(&sess, &tc, "post-turn-agent-turn").await;
+    sess.enqueue_post_turn_agent_items(agent_items)
+        .await
+        .expect("enqueue post-turn agent items");
+    assert_eq!(sess.post_turn_agent_stats().await.0, 2);
+
+    while rx.try_recv().is_ok() {}
+
+    sess.on_task_finished(Arc::clone(&tc), None).await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event")
+        .expect("channel open");
+    assert!(matches!(
+        first.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id,
+            last_agent_message: None,
+        }) if turn_id == tc.sub_id
+    ));
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let queue_empty = sess.post_turn_agent_stats().await.0 == 0;
+            let has_active_turn = sess.has_active_turn().await;
+            let history = sess.clone_history().await;
+            let history_has_agent_items = expected_response_items.iter().all(|expected| {
+                history
+                    .raw_items()
+                    .iter()
+                    .any(|recorded| recorded == expected)
+            });
+            if queue_empty && (has_active_turn || history_has_agent_items) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-turn agent items should be flushed onto a follow-up turn path");
+
+    assert_eq!(sess.post_turn_agent_stats().await.0, 0);
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 

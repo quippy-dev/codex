@@ -1,6 +1,8 @@
 use super::agent_delivery::completed_message_for_agent_fallback;
 use super::agent_delivery::log_deferred_agent_enqueue_error;
+use super::agent_delivery::log_post_turn_agent_enqueue_error;
 use super::agent_delivery::should_defer_agent_delivery;
+use super::agent_delivery::should_queue_agent_delivery_until_turn_end;
 use super::inbox_delivery::build_agent_inbox_items;
 use super::watchdog::RemovedWatchdog;
 use super::watchdog::WatchdogManager;
@@ -569,6 +571,25 @@ impl AgentControl {
             .watchdog_owner_for_active_helper(sender_thread_id)
             .await
             == Some(agent_id);
+        if should_queue_agent_delivery_until_turn_end(receiver_has_active_turn) {
+            let queued_items = build_agent_inbox_items(
+                snapshot.collab_inbox_delivery_role,
+                sender_thread_id,
+                message.clone(),
+                false,
+            )?;
+            match thread
+                .codex
+                .session
+                .enqueue_post_turn_agent_items(queued_items)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(Uuid::now_v7().to_string());
+                }
+                Err(err) => log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err),
+            }
+        }
         if should_defer_agent_delivery(
             receiver_has_active_turn,
             post_interrupt_collab_hold_armed,
@@ -607,9 +628,9 @@ impl AgentControl {
     /// Deliver a watchdog wake-up to an owner thread.
     ///
     /// Watchdog helpers must wake the owner exactly once when they finish without
-    /// explicitly using `send_input`. The existing collab inbox path already
-    /// injects response items for root owners, preserves helper identity, and
-    /// bypasses deferral for active watchdog helpers.
+    /// explicitly using `send_input`. Reuse the normal collab inbox delivery
+    /// path so helper identity stays intact in history and active roots still
+    /// respect the branch-local next-boundary delivery policy.
     pub(crate) async fn send_watchdog_wakeup(
         &self,
         agent_id: ThreadId,
@@ -1305,6 +1326,31 @@ mod tests {
     use tokio::time::timeout;
     use toml::Value as TomlValue;
 
+    #[derive(Clone, Copy)]
+    struct WaitForCancellationTask;
+
+    #[async_trait::async_trait]
+    impl SessionTask for WaitForCancellationTask {
+        fn kind(&self) -> crate::state::TaskKind {
+            crate::state::TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "session_task.wait_for_cancellation"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<SessionTaskContext>,
+            _ctx: Arc<crate::codex::TurnContext>,
+            _input: Vec<UserInput>,
+            cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> Option<String> {
+            cancellation_token.cancelled().await;
+            None
+        }
+    }
+
     async fn test_config_with_cli_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
     ) -> (TempDir, Config) {
@@ -1779,6 +1825,66 @@ mod tests {
             }
             other => panic!("expected collab function call output, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_to_active_root_thread_queues_until_turn_completion() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        let sender_thread_id = ThreadId::new();
+
+        let turn_context = receiver_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("active-root-turn".to_string())
+            .await;
+        receiver_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&turn_context),
+                text_input("active root turn"),
+                WaitForCancellationTask,
+            )
+            .await;
+        assert!(receiver_thread.has_active_turn().await);
+
+        let submission_id = harness
+            .control
+            .send_agent_message(
+                receiver_thread_id,
+                sender_thread_id,
+                "queued update".to_string(),
+            )
+            .await
+            .expect("send_agent_message should queue while the root turn is active");
+        assert!(!submission_id.is_empty());
+
+        let (queued_items, queued_bytes) =
+            receiver_thread.codex.session.post_turn_agent_stats().await;
+        assert_eq!(queued_items, 2);
+        assert!(queued_bytes > 0);
+
+        let injected = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            });
+        assert_eq!(injected, false);
+
+        receiver_thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+        let _ = receiver_thread
+            .codex
+            .session
+            .take_post_turn_agent_items()
+            .await;
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
     }
 
     #[tokio::test]

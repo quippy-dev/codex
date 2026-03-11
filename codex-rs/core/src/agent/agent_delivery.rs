@@ -3,6 +3,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use tracing::warn;
 
+pub(crate) fn should_queue_agent_delivery_until_turn_end(receiver_has_active_turn: bool) -> bool {
+    receiver_has_active_turn
+}
+
 pub(crate) fn should_defer_agent_delivery(
     receiver_has_active_turn: bool,
     post_interrupt_agent_hold_armed: bool,
@@ -11,6 +15,51 @@ pub(crate) fn should_defer_agent_delivery(
     !receiver_has_active_turn
         && post_interrupt_agent_hold_armed
         && !sender_is_watchdog_helper_for_receiver
+}
+
+pub(crate) fn log_post_turn_agent_enqueue_error(
+    agent_id: ThreadId,
+    sender_thread_id: ThreadId,
+    err: DeferredCollabEnqueueError,
+) {
+    match err {
+        DeferredCollabEnqueueError::TooManyItems {
+            existing_items,
+            incoming_items,
+            max_items,
+        } => {
+            warn!(
+                receiver_thread_id = %agent_id,
+                sender_thread_id = %sender_thread_id,
+                existing_items,
+                incoming_items,
+                max_items,
+                "post-turn agent queue item limit exceeded; injecting immediately and relaxing ordering guarantee"
+            );
+        }
+        DeferredCollabEnqueueError::TooManyBytes {
+            existing_bytes,
+            incoming_bytes,
+            max_bytes,
+        } => {
+            warn!(
+                receiver_thread_id = %agent_id,
+                sender_thread_id = %sender_thread_id,
+                existing_bytes,
+                incoming_bytes,
+                max_bytes,
+                "post-turn agent queue byte limit exceeded; injecting immediately and relaxing ordering guarantee"
+            );
+        }
+        DeferredCollabEnqueueError::Serialization { message } => {
+            warn!(
+                receiver_thread_id = %agent_id,
+                sender_thread_id = %sender_thread_id,
+                error = message,
+                "failed to serialize post-turn agent payload; injecting immediately and relaxing ordering guarantee"
+            );
+        }
+    }
 }
 
 pub(crate) fn log_deferred_agent_enqueue_error(

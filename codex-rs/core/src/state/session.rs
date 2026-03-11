@@ -46,6 +46,8 @@ pub(crate) struct SessionState {
     post_interrupt_collab_hold_armed: bool,
     deferred_collab_items: Vec<ResponseInputItem>,
     deferred_collab_items_bytes: usize,
+    post_turn_agent_items: Vec<ResponseInputItem>,
+    post_turn_agent_items_bytes: usize,
 }
 
 impl SessionState {
@@ -69,6 +71,8 @@ impl SessionState {
             post_interrupt_collab_hold_armed: false,
             deferred_collab_items: Vec::new(),
             deferred_collab_items_bytes: 0,
+            post_turn_agent_items: Vec::new(),
+            post_turn_agent_items_bytes: 0,
         }
     }
 
@@ -410,6 +414,66 @@ impl SessionState {
         )
     }
 
+    pub(crate) fn enqueue_post_turn_agent_items(
+        &mut self,
+        items: Vec<ResponseInputItem>,
+    ) -> Result<(), DeferredCollabEnqueueError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let existing_items = self.post_turn_agent_items.len();
+        let incoming_items = items.len();
+        if existing_items.saturating_add(incoming_items) > DEFERRED_COLLAB_ITEMS_MAX {
+            return Err(DeferredCollabEnqueueError::TooManyItems {
+                existing_items,
+                incoming_items,
+                max_items: DEFERRED_COLLAB_ITEMS_MAX,
+            });
+        }
+
+        let incoming_bytes = match serialized_response_input_items_bytes(&items) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err(DeferredCollabEnqueueError::Serialization {
+                    message: err.to_string(),
+                });
+            }
+        };
+        if self
+            .post_turn_agent_items_bytes
+            .saturating_add(incoming_bytes)
+            > DEFERRED_COLLAB_BYTES_MAX
+        {
+            return Err(DeferredCollabEnqueueError::TooManyBytes {
+                existing_bytes: self.post_turn_agent_items_bytes,
+                incoming_bytes,
+                max_bytes: DEFERRED_COLLAB_BYTES_MAX,
+            });
+        }
+
+        self.post_turn_agent_items.extend(items);
+        self.post_turn_agent_items_bytes += incoming_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn take_post_turn_agent_items(&mut self) -> Vec<ResponseInputItem> {
+        if self.post_turn_agent_items.is_empty() {
+            return Vec::with_capacity(0);
+        }
+
+        self.post_turn_agent_items_bytes = 0;
+        std::mem::take(&mut self.post_turn_agent_items)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_turn_agent_stats(&self) -> (usize, usize) {
+        (
+            self.post_turn_agent_items.len(),
+            self.post_turn_agent_items_bytes,
+        )
+    }
+
     pub(crate) fn set_pending_session_start_source(
         &mut self,
         value: Option<codex_hooks::SessionStartSource>,
@@ -656,6 +720,48 @@ mod tests {
                 .expect("serialize restored deferred item");
         assert_eq!(total_bytes, expected_bytes);
         assert_eq!(state.take_deferred_collab_items(), vec![restored_item]);
+    }
+
+    #[tokio::test]
+    async fn enqueue_post_turn_agent_items_tracks_stats_and_take_clears_queue() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        let items = vec![
+            deferred_collab_message("post-turn-agent-1".to_string()),
+            deferred_collab_message("post-turn-agent-2".to_string()),
+        ];
+        let expected_bytes =
+            serialized_response_input_items_bytes(&items).expect("serialize post-turn items");
+
+        state
+            .enqueue_post_turn_agent_items(items.clone())
+            .expect("enqueue post-turn agent items");
+
+        assert_eq!(state.post_turn_agent_stats(), (2, expected_bytes));
+        assert_eq!(state.take_post_turn_agent_items(), items);
+        assert_eq!(state.post_turn_agent_stats(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn enqueue_post_turn_agent_items_enforces_item_cap() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        let items = (0..=DEFERRED_COLLAB_ITEMS_MAX)
+            .map(|idx| deferred_collab_message(format!("post-turn-item-{idx}")))
+            .collect::<Vec<_>>();
+
+        let err = state
+            .enqueue_post_turn_agent_items(items)
+            .expect_err("item cap should be enforced");
+
+        assert_eq!(
+            err,
+            DeferredCollabEnqueueError::TooManyItems {
+                existing_items: 0,
+                incoming_items: DEFERRED_COLLAB_ITEMS_MAX + 1,
+                max_items: DEFERRED_COLLAB_ITEMS_MAX,
+            }
+        );
     }
 
     #[tokio::test]
