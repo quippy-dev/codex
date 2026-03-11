@@ -562,6 +562,8 @@ impl AgentControl {
         }
 
         let receiver_has_active_turn = thread.has_active_turn().await;
+        let post_turn_agent_flush_pending =
+            thread.codex.session.post_turn_agent_flush_pending().await;
         let post_interrupt_collab_hold_armed = thread
             .codex
             .session
@@ -571,7 +573,10 @@ impl AgentControl {
             .watchdog_owner_for_active_helper(sender_thread_id)
             .await
             == Some(agent_id);
-        if should_queue_agent_delivery_until_turn_end(receiver_has_active_turn) {
+        if should_queue_agent_delivery_until_turn_end(
+            receiver_has_active_turn,
+            post_turn_agent_flush_pending,
+        ) {
             let queued_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
                 sender_thread_id,
@@ -1263,12 +1268,17 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         parent_thread_id: ThreadId,
     ) -> Arc<AuthManager> {
+        let default_auth_manager = state.default_auth_manager();
         match state.get_thread(parent_thread_id).await {
             Ok(parent_thread) => Arc::clone(&parent_thread.codex.session.services.auth_manager),
             Err(_) => self
-                .auth_manager_from_parent_rollout(config, parent_thread_id)
+                .auth_manager_from_parent_rollout(
+                    config,
+                    parent_thread_id,
+                    default_auth_manager.enable_codex_api_key_env(),
+                )
                 .await
-                .unwrap_or_else(|| state.default_auth_manager()),
+                .unwrap_or(default_auth_manager),
         }
     }
 
@@ -1276,6 +1286,7 @@ impl AgentControl {
         &self,
         config: &Config,
         parent_thread_id: ThreadId,
+        enable_codex_api_key_env: bool,
     ) -> Option<Arc<AuthManager>> {
         let rollout_path =
             find_thread_path_by_id_str(config.codex_home.as_path(), &parent_thread_id.to_string())
@@ -1284,14 +1295,26 @@ impl AgentControl {
         let session_meta = crate::rollout::list::read_session_meta_line(&rollout_path)
             .await
             .ok()?;
+        let auth_file = replayed_parent_auth_file(&session_meta.meta)?;
         AuthManager::shared_with_auth_file(
             config.codex_home.clone(),
-            false,
+            enable_codex_api_key_env,
             config.cli_auth_credentials_store_mode,
-            session_meta.meta.auth_file,
+            Some(auth_file),
         )
         .ok()
     }
+}
+
+fn replayed_parent_auth_file(
+    session_meta: &codex_protocol::protocol::SessionMeta,
+) -> Option<std::path::PathBuf> {
+    let auth_file = session_meta.auth_file.as_ref()?;
+    Some(if auth_file.is_absolute() {
+        auth_file.clone()
+    } else {
+        session_meta.cwd.join(auth_file)
+    })
 }
 
 #[cfg(test)]
@@ -1321,6 +1344,9 @@ mod tests {
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnStartedEvent;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
+    use std::env;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::time::timeout;
@@ -1348,6 +1374,29 @@ mod tests {
         ) -> Option<String> {
             cancellation_token.cancelled().await;
             None
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var(key).ok();
+            unsafe { env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                unsafe { env::set_var(self.key, original) };
+            } else {
+                unsafe { env::remove_var(self.key) };
+            }
         }
     }
 
@@ -1860,10 +1909,11 @@ mod tests {
             .expect("send_agent_message should queue while the root turn is active");
         assert!(!submission_id.is_empty());
 
-        let (queued_items, queued_bytes) =
+        let (queued_items, queued_bytes, flush_pending) =
             receiver_thread.codex.session.post_turn_agent_stats().await;
         assert_eq!(queued_items, 2);
         assert!(queued_bytes > 0);
+        assert_eq!(flush_pending, false);
 
         let injected = harness
             .manager
@@ -1879,10 +1929,101 @@ mod tests {
             .session
             .abort_all_tasks(TurnAbortReason::Interrupted)
             .await;
-        let _ = receiver_thread
+        assert_eq!(
+            receiver_thread
+                .codex
+                .session
+                .post_turn_agent_stats()
+                .await
+                .0,
+            0
+        );
+        let _ = harness.control.shutdown_agent(receiver_thread_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_agent_message_keeps_turn_boundary_replies_in_same_post_turn_queue() {
+        let harness = AgentControlHarness::new().await;
+        let (receiver_thread_id, receiver_thread) = harness.start_thread().await;
+        let first_sender = ThreadId::new();
+        let second_sender = ThreadId::new();
+
+        let turn_context = receiver_thread
             .codex
             .session
-            .take_post_turn_agent_items()
+            .new_default_turn_with_sub_id("boundary-race-turn".to_string())
+            .await;
+        receiver_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&turn_context),
+                text_input("active root turn"),
+                WaitForCancellationTask,
+            )
+            .await;
+        assert!(receiver_thread.has_active_turn().await);
+
+        harness
+            .control
+            .send_agent_message(
+                receiver_thread_id,
+                first_sender,
+                "queued before boundary".to_string(),
+            )
+            .await
+            .expect("first send should queue");
+        assert_eq!(
+            receiver_thread
+                .codex
+                .session
+                .post_turn_agent_stats()
+                .await
+                .0,
+            2
+        );
+
+        {
+            let mut active = receiver_thread.codex.session.active_turn.lock().await;
+            *active = None;
+        }
+        assert!(
+            receiver_thread
+                .codex
+                .session
+                .arm_post_turn_agent_flush_if_items()
+                .await
+        );
+
+        harness
+            .control
+            .send_agent_message(
+                receiver_thread_id,
+                second_sender,
+                "queued during boundary flush".to_string(),
+            )
+            .await
+            .expect("second send should join the same queue");
+
+        let (queued_items, queued_bytes, flush_pending) =
+            receiver_thread.codex.session.post_turn_agent_stats().await;
+        assert_eq!(queued_items, 4);
+        assert!(queued_bytes > 0);
+        assert_eq!(flush_pending, true);
+
+        let injected = harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == receiver_thread_id && matches!(op, Op::InjectResponseItems { .. })
+            });
+        assert_eq!(injected, false);
+
+        receiver_thread
+            .codex
+            .session
+            .clear_post_turn_agent_items()
             .await;
         let _ = harness.control.shutdown_agent(receiver_thread_id).await;
     }
@@ -3999,6 +4140,76 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(codex_api_key)]
+    async fn fork_agent_uses_manager_default_auth_when_parent_rollout_has_no_auth_file() {
+        let _guard = EnvVarGuard::set(crate::auth::CODEX_API_KEY_ENV_VAR, "sk-env-parent");
+        let (home, config) = test_config().await;
+        let default_auth_manager = AuthManager::shared(
+            config.codex_home.clone(),
+            true,
+            AuthCredentialsStoreMode::File,
+        );
+        let manager = ThreadManager::new(
+            &config,
+            default_auth_manager.clone(),
+            SessionSource::default(),
+            crate::models_manager::collaboration_mode_presets::CollaborationModesConfig::default(),
+        );
+        let control = manager.agent_control();
+
+        let parent_thread = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start parent thread");
+        parent_thread
+            .thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.thread.codex.session.flush_rollout().await;
+        let _ = manager.remove_thread(&parent_thread.thread_id).await;
+
+        let child_thread_id = control
+            .fork_agent(
+                config.clone(),
+                text_input("forked"),
+                parent_thread.thread_id,
+                usize::MAX,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: parent_thread.thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: Some("explorer".to_string()),
+                }),
+            )
+            .await
+            .expect("fork_agent should succeed");
+
+        let child_thread = manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        assert!(Arc::ptr_eq(
+            &default_auth_manager,
+            &child_thread.codex.session.services.auth_manager,
+        ));
+        assert!(
+            child_thread
+                .codex
+                .session
+                .services
+                .auth_manager
+                .auth_cached()
+                .is_some(),
+            "child should retain env-backed auth through the default manager fallback"
+        );
+
+        let _ = control.shutdown_agent(child_thread_id).await;
+        drop(home);
+    }
+
+    #[tokio::test]
     async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
         let mut harness = AgentControlHarness::new().await;
         harness.config.agent_roles.insert(
@@ -4318,6 +4529,77 @@ mod tests {
                 .auth_file_override()
                 .map(std::path::Path::to_path_buf),
         );
+    }
+
+    #[tokio::test]
+    async fn fork_agent_rebases_relative_parent_auth_file_to_parent_session_cwd() {
+        let (_home, mut config) = test_config().await;
+        let parent_cwd = tempfile::tempdir().expect("parent cwd");
+        config.cwd = parent_cwd.path().to_path_buf();
+        let relative_auth_file = PathBuf::from("relative/auth.json");
+        let parent_auth_manager = AuthManager::shared_with_auth_file(
+            config.codex_home.clone(),
+            false,
+            AuthCredentialsStoreMode::File,
+            Some(relative_auth_file.clone()),
+        )
+        .expect("relative auth manager");
+        let manager = ThreadManager::with_models_provider_and_home_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.clone(),
+        );
+        let control = manager.agent_control();
+        let parent_thread = manager
+            .resume_thread_with_history(
+                config.clone(),
+                InitialHistory::New,
+                parent_auth_manager,
+                false,
+            )
+            .await
+            .expect("start parent thread");
+        parent_thread
+            .thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.thread.codex.session.flush_rollout().await;
+        let _ = manager.remove_thread(&parent_thread.thread_id).await;
+
+        let child_thread_id = control
+            .fork_agent(
+                config.clone(),
+                text_input("forked"),
+                parent_thread.thread_id,
+                usize::MAX,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: parent_thread.thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: Some("explorer".to_string()),
+                }),
+            )
+            .await
+            .expect("fork_agent should succeed");
+
+        let child_thread = manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        assert_eq!(
+            child_thread
+                .codex
+                .session
+                .services
+                .auth_manager
+                .auth_file_override()
+                .map(std::path::Path::to_path_buf),
+            Some(parent_cwd.path().join(relative_auth_file)),
+        );
+
+        let _ = control.shutdown_agent(child_thread_id).await;
     }
 
     #[test]

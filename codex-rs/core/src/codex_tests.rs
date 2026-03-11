@@ -2820,12 +2820,13 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
     );
 }
 
-pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
+pub(crate) async fn make_session_and_context_with_dynamic_tools_and_channels(
     dynamic_tools: Vec<DynamicToolSpec>,
 ) -> (
     Arc<Session>,
     Arc<TurnContext>,
     async_channel::Receiver<Event>,
+    async_channel::Receiver<Submission>,
 ) {
     let (tx_event, rx_event) = async_channel::unbounded();
     let codex_home = tempfile::tempdir().expect("create temp dir");
@@ -2975,9 +2976,10 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         skills_outcome,
     ));
 
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
     let session = Arc::new(Session {
         conversation_id,
-        tx_sub: async_channel::bounded(1).0,
+        tx_sub,
         tx_event,
         agent_status: agent_status_tx,
         out_of_band_elicitation_paused: watch::channel(false).0,
@@ -2995,6 +2997,18 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         next_internal_sub_id: AtomicU64::new(0),
     });
 
+    (session, turn_context, rx_event, rx_sub)
+}
+
+pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
+    dynamic_tools: Vec<DynamicToolSpec>,
+) -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+) {
+    let (session, turn_context, rx_event, _rx_sub) =
+        make_session_and_context_with_dynamic_tools_and_channels(dynamic_tools).await;
     (session, turn_context, rx_event)
 }
 
@@ -3006,6 +3020,15 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+pub(crate) async fn make_session_and_context_with_submission_rx() -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+    async_channel::Receiver<Submission>,
+) {
+    make_session_and_context_with_dynamic_tools_and_channels(Vec::new()).await
 }
 
 #[tokio::test]
@@ -4611,7 +4634,7 @@ async fn user_input_or_turn_replacement_turn_spawn_path_flushes_deferred_collab_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_task_finished_flushes_post_turn_agent_items_on_follow_up_turn_path() {
-    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let (sess, tc, rx, rx_sub) = make_session_and_context_with_submission_rx().await;
     let agent_items = build_tool_response_input_items(
         ThreadId::new(),
         "post-turn agent inbox".to_string(),
@@ -4646,28 +4669,56 @@ async fn on_task_finished_flushes_post_turn_agent_items_on_follow_up_turn_path()
         }) if turn_id == tc.sub_id
     ));
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let queue_empty = sess.post_turn_agent_stats().await.0 == 0;
-            let has_active_turn = sess.has_active_turn().await;
-            let history = sess.clone_history().await;
-            let history_has_agent_items = expected_response_items.iter().all(|expected| {
-                history
-                    .raw_items()
-                    .iter()
-                    .any(|recorded| recorded == expected)
-            });
-            if queue_empty && (has_active_turn || history_has_agent_items) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("post-turn agent items should be flushed onto a follow-up turn path");
+    let submitted = tokio::time::timeout(Duration::from_secs(2), rx_sub.recv())
+        .await
+        .expect("post-turn agent flush should submit a follow-up inject op")
+        .expect("submission channel open");
+    assert!(matches!(
+        submitted.op,
+        Op::InjectResponseItems { ref items } if items.is_empty()
+    ));
+    let (queued_items, queued_bytes, flush_pending) = sess.post_turn_agent_stats().await;
+    assert_eq!(queued_items, 2);
+    assert!(queued_bytes > 0);
+    assert_eq!(flush_pending, true);
 
-    assert_eq!(sess.post_turn_agent_stats().await.0, 0);
+    handlers::inject_response_items(&sess, submitted.id, Vec::new()).await;
+    let queue_empty = sess.post_turn_agent_stats().await.0 == 0;
+    let history = sess.clone_history().await;
+    let history_has_agent_items = expected_response_items.iter().all(|expected| {
+        history
+            .raw_items()
+            .iter()
+            .any(|recorded| recorded == expected)
+    });
+    assert_eq!(queue_empty, true);
+    assert_eq!(
+        history_has_agent_items || sess.has_active_turn().await,
+        true
+    );
+
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_all_tasks_clears_post_turn_agent_items() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let agent_items = build_tool_response_input_items(
+        ThreadId::new(),
+        "stale post-turn agent inbox".to_string(),
+        "post-turn-agent-abort".to_string(),
+    )
+    .expect("build agent inbox items");
+
+    spawn_never_ending_regular_task(&sess, &tc, "post-turn-agent-abort-turn").await;
+    sess.enqueue_post_turn_agent_items(agent_items)
+        .await
+        .expect("enqueue post-turn agent items");
+    assert_eq!(sess.post_turn_agent_stats().await.0, 2);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert_eq!(sess.post_turn_agent_stats().await, (0, 0, false));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

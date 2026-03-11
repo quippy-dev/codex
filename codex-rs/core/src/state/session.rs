@@ -48,6 +48,7 @@ pub(crate) struct SessionState {
     deferred_collab_items_bytes: usize,
     post_turn_agent_items: Vec<ResponseInputItem>,
     post_turn_agent_items_bytes: usize,
+    post_turn_agent_flush_pending: bool,
 }
 
 impl SessionState {
@@ -73,6 +74,7 @@ impl SessionState {
             deferred_collab_items_bytes: 0,
             post_turn_agent_items: Vec::new(),
             post_turn_agent_items_bytes: 0,
+            post_turn_agent_flush_pending: false,
         }
     }
 
@@ -459,18 +461,36 @@ impl SessionState {
 
     pub(crate) fn take_post_turn_agent_items(&mut self) -> Vec<ResponseInputItem> {
         if self.post_turn_agent_items.is_empty() {
+            self.post_turn_agent_flush_pending = false;
             return Vec::with_capacity(0);
         }
 
         self.post_turn_agent_items_bytes = 0;
+        self.post_turn_agent_flush_pending = false;
         std::mem::take(&mut self.post_turn_agent_items)
     }
 
+    pub(crate) fn arm_post_turn_agent_flush_if_items(&mut self) -> bool {
+        self.post_turn_agent_flush_pending = !self.post_turn_agent_items.is_empty();
+        self.post_turn_agent_flush_pending
+    }
+
+    pub(crate) fn post_turn_agent_flush_pending(&self) -> bool {
+        self.post_turn_agent_flush_pending
+    }
+
+    pub(crate) fn clear_post_turn_agent_items(&mut self) {
+        self.post_turn_agent_items.clear();
+        self.post_turn_agent_items_bytes = 0;
+        self.post_turn_agent_flush_pending = false;
+    }
+
     #[cfg(test)]
-    pub(crate) fn post_turn_agent_stats(&self) -> (usize, usize) {
+    pub(crate) fn post_turn_agent_stats(&self) -> (usize, usize, bool) {
         (
             self.post_turn_agent_items.len(),
             self.post_turn_agent_items_bytes,
+            self.post_turn_agent_flush_pending,
         )
     }
 
@@ -737,9 +757,9 @@ mod tests {
             .enqueue_post_turn_agent_items(items.clone())
             .expect("enqueue post-turn agent items");
 
-        assert_eq!(state.post_turn_agent_stats(), (2, expected_bytes));
+        assert_eq!(state.post_turn_agent_stats(), (2, expected_bytes, false));
         assert_eq!(state.take_post_turn_agent_items(), items);
-        assert_eq!(state.post_turn_agent_stats(), (0, 0));
+        assert_eq!(state.post_turn_agent_stats(), (0, 0, false));
     }
 
     #[tokio::test]

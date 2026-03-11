@@ -1229,6 +1229,10 @@ impl AuthManager {
         self.auth_file.as_deref()
     }
 
+    pub(crate) fn enable_codex_api_key_env(&self) -> bool {
+        self.enable_codex_api_key_env
+    }
+
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
     }

@@ -4495,8 +4495,23 @@ impl Session {
         state.take_post_turn_agent_items()
     }
 
+    pub(crate) async fn arm_post_turn_agent_flush_if_items(&self) -> bool {
+        let mut state = self.state.lock().await;
+        state.arm_post_turn_agent_flush_if_items()
+    }
+
+    pub(crate) async fn post_turn_agent_flush_pending(&self) -> bool {
+        let state = self.state.lock().await;
+        state.post_turn_agent_flush_pending()
+    }
+
+    pub(crate) async fn clear_post_turn_agent_items(&self) {
+        let mut state = self.state.lock().await;
+        state.clear_post_turn_agent_items();
+    }
+
     #[cfg(test)]
-    pub(crate) async fn post_turn_agent_stats(&self) -> (usize, usize) {
+    pub(crate) async fn post_turn_agent_stats(&self) -> (usize, usize, bool) {
         let state = self.state.lock().await;
         state.post_turn_agent_stats()
     }
@@ -5196,7 +5211,16 @@ mod handlers {
     ) {
         const MAX_TURN_RESTART_ATTEMPTS: usize = 3;
 
-        let mut pending_items = items;
+        let mut pending_items = if sess.post_turn_agent_flush_pending().await {
+            let mut queued_items = sess.take_post_turn_agent_items().await;
+            queued_items.extend(items);
+            queued_items
+        } else {
+            items
+        };
+        if pending_items.is_empty() {
+            return;
+        }
         let mut attempts = 0usize;
         loop {
             match sess.inject_response_items(pending_items).await {

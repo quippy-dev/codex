@@ -217,6 +217,7 @@ impl Session {
             // Let interrupted tasks observe cancellation before dropping pending approvals, or an
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             active_turn.clear_pending().await;
+            self.clear_post_turn_agent_items().await;
         }
         if reason == TurnAbortReason::Interrupted {
             self.close_unified_exec_processes().await;
@@ -349,15 +350,13 @@ impl Session {
         });
         self.send_event(initial_turn_context.as_ref(), event).await;
 
-        let post_turn_agent_items = self.take_post_turn_agent_items().await;
-        if !post_turn_agent_items.is_empty()
+        if self.arm_post_turn_agent_flush_if_items().await
             && let Err(err) = self
-                .submit_op(crate::protocol::Op::InjectResponseItems {
-                    items: post_turn_agent_items,
-                })
+                .submit_op(crate::protocol::Op::InjectResponseItems { items: Vec::new() })
                 .await
         {
             warn!("failed to submit post-turn agent items: {err}");
+            self.clear_post_turn_agent_items().await;
         }
     }
 

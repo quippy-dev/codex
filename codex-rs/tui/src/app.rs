@@ -7719,6 +7719,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_subagent_close_end_treats_running_status_as_terminal_shutdown() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let parent_thread_id = ThreadId::new();
+        let nested_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn-running".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-running".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(parent_thread_id),
+                    new_agent_nickname: Some("Parent".to_string()),
+                    new_agent_role: Some("default".to_string()),
+                    prompt: "spawn nested closer".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn-nested-running".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-nested-running".to_string(),
+                    sender_thread_id: parent_thread_id,
+                    new_thread_id: Some(nested_thread_id),
+                    new_agent_nickname: Some("Closer".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "close this thread".to_string(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "close-running".to_string(),
+                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                    call_id: "call-close".to_string(),
+                    sender_thread_id: parent_thread_id,
+                    receiver_thread_id: nested_thread_id,
+                    receiver_agent_nickname: Some("Closer".to_string()),
+                    receiver_agent_role: Some("worker".to_string()),
+                    status: AgentStatus::Running,
+                }),
+            },
+        );
+
+        let close_cells = drain_insert_history_text(&mut app_event_rx);
+        assert_eq!(close_cells.len(), 1);
+        assert!(close_cells[0].contains("Subagent update: Closer [worker] shutdown"));
+    }
+
+    #[tokio::test]
     async fn nested_spawn_on_parent_channel_registers_nested_subagent() {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let root_thread_id = ThreadId::new();

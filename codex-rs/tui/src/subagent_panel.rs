@@ -435,7 +435,7 @@ impl SubagentRegistry {
             event.receiver_agent_nickname.as_deref(),
             event.receiver_agent_role.as_deref(),
         );
-        info.status = event.status.clone();
+        info.status = terminal_close_status(&event.status);
         info.latest_update_at = Instant::now();
 
         if is_terminal_status(&info.status) && !info.notified_terminal {
@@ -589,6 +589,15 @@ impl SubagentRegistry {
             let excess = entry.len() - SUBAGENT_PENDING_EVENT_CAPACITY;
             entry.drain(0..excess);
         }
+    }
+}
+
+fn terminal_close_status(status: &AgentStatus) -> AgentStatus {
+    match status {
+        AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => {
+            AgentStatus::Shutdown
+        }
+        other => other.clone(),
     }
 }
 
