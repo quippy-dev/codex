@@ -745,22 +745,6 @@ impl AgentControl {
             .await
     }
 
-    /// Deliver a watchdog wake-up to an owner thread.
-    ///
-    /// Watchdog helpers must wake the owner exactly once when they finish without
-    /// explicitly using `send_input`. Reuse the normal collab inbox delivery
-    /// path so helper identity stays intact in history while post-interrupt and
-    /// true next-boundary delivery policy remains centralized in `send_agent_message`.
-    pub(crate) async fn send_watchdog_wakeup(
-        &self,
-        agent_id: ThreadId,
-        sender_thread_id: ThreadId,
-        message: String,
-    ) -> CodexResult<String> {
-        self.send_agent_message(agent_id, sender_thread_id, message)
-            .await
-    }
-
     /// Interrupt the current task for an existing agent thread.
     pub(crate) async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
@@ -1587,6 +1571,26 @@ mod tests {
                 .is_some_and(|text| text.contains(needle)),
             _ => false,
         })
+    }
+
+    fn count_history_text(history_items: &[ResponseItem], needle: &str) -> usize {
+        history_items
+            .iter()
+            .filter(|item| match item {
+                ResponseItem::Message { content, .. } => {
+                    content.iter().any(|content_item| match content_item {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            text.contains(needle)
+                        }
+                        ContentItem::InputImage { .. } => false,
+                    })
+                }
+                ResponseItem::FunctionCallOutput { output, .. } => output
+                    .text_content()
+                    .is_some_and(|text| text.contains(needle)),
+                _ => false,
+            })
+            .count()
     }
 
     fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
@@ -2501,6 +2505,23 @@ mod tests {
         assert_eq!(
             wait_for_history_text(&owner_thread, "before calling send_input").await,
             true
+        );
+        harness
+            .control
+            .force_watchdog_due_for_tests(watchdog_handle_id)
+            .await;
+        harness.control.run_watchdogs_once_for_tests().await;
+        tokio::task::yield_now().await;
+        let owner_history = owner_thread
+            .codex
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .to_vec();
+        assert_eq!(
+            count_history_text(&owner_history, "before calling send_input"),
+            1
         );
     }
 
