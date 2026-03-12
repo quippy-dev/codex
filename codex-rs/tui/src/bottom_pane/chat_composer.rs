@@ -410,6 +410,7 @@ pub(crate) struct ChatComposer {
     windows_degraded_sandbox_active: bool,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
+    // Agent label injected into the footer's contextual row when multi-agent mode is active.
     active_agent_label: Option<String>,
 }
 
@@ -497,7 +498,7 @@ impl ChatComposer {
             frame_requester: None,
             attached_images: Vec::new(),
             placeholder_text,
-            voice_state: VoiceState::new(false),
+            voice_state: VoiceState::new(enhanced_keys_supported),
             spinner_stop_flags: HashMap::new(),
             is_task_running: false,
             input_enabled: true,
@@ -1292,9 +1293,9 @@ impl ChatComposer {
         }
 
         // Timer-based conversion is handled in the pre-draw tick.
-        // If recording, stop on Space release once we've observed a key release in this session.
-        // Until then, Space repeat events are handled as "still held" and stop is driven by
-        // timeout in `process_space_hold_trigger`.
+        // If recording, stop on Space release when supported. On terminals without key-release
+        // events, Space repeat events are handled as "still held" and stop is driven by timeout
+        // in `process_space_hold_trigger`.
         if let Some(result) = self.handle_key_event_while_recording(key_event) {
             return result;
         }
@@ -3766,6 +3767,11 @@ impl ChatComposer {
         true
     }
 
+    /// Replaces the contextual footer label for the currently viewed agent.
+    ///
+    /// Returning `false` means the value was unchanged, so callers can skip redraw work. This
+    /// field is intentionally just cached presentation state; `ChatComposer` does not infer which
+    /// thread is active on its own.
     pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) -> bool {
         if self.active_agent_label == active_agent_label {
             return false;
@@ -3775,6 +3781,7 @@ impl ChatComposer {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn active_agent_label(&self) -> Option<&str> {
         self.active_agent_label.as_deref()
     }
@@ -4487,13 +4494,6 @@ impl Drop for ChatComposer {
         for (_id, flag) in self.spinner_stop_flags.drain() {
             flag.store(true, Ordering::Relaxed);
         }
-    }
-}
-
-#[cfg(test)]
-impl super::BottomPane {
-    pub fn set_steer_enabled(&mut self, enabled: bool) {
-        self.composer.set_steer_enabled(enabled);
     }
 }
 
@@ -6750,49 +6750,6 @@ mod tests {
         assert_eq!("x ", composer.textarea.text());
         assert!(composer.voice_state.space_hold_started_at.is_none());
         assert!(!composer.voice_state.space_hold_repeat_seen);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn first_space_hold_without_repeat_uses_release_path_after_any_release() {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyEventKind;
-        use crossterm::event::KeyModifiers;
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            true,
-            sender,
-            false,
-            "Ask Codex to do anything".to_string(),
-            false,
-        );
-        composer.set_voice_transcription_enabled(true);
-
-        composer.set_text_content("x ".to_string(), Vec::new(), Vec::new());
-        composer.move_cursor_to_end();
-
-        let _ = composer.handle_key_event(KeyEvent::new_with_kind(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        ));
-        assert!(composer.voice_state.key_release_supported);
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        assert!(composer.voice_state.space_hold_started_at.is_some());
-        assert!(!composer.voice_state.space_hold_repeat_seen);
-
-        let _ = composer.on_space_hold_timeout();
-
-        assert_eq!("x ", composer.textarea.text());
-        assert!(composer.voice_state.space_hold_started_at.is_none());
-        assert!(!composer.voice_state.space_hold_repeat_seen);
-        if composer.is_recording() {
-            let _ = composer.stop_recording_and_start_transcription();
-        }
     }
 
     #[cfg(not(target_os = "linux"))]

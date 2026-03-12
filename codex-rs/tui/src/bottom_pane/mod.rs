@@ -424,7 +424,7 @@ impl BottomPane {
                 .lines()
                 .next()
                 .and_then(parse_slash_name)
-                .is_some_and(|(name, _, _)| name == "agent" || name == "multi-agents");
+                .is_some_and(|(name, _, _)| name == "agent");
 
             // If a task is running and a status line is visible, allow Esc to
             // send an interrupt even while the composer has focus.
@@ -833,11 +833,6 @@ impl BottomPane {
         self.pending_thread_approvals.threads()
     }
 
-    #[cfg(test)]
-    pub(crate) fn active_agent_label(&self) -> Option<&str> {
-        self.composer.active_agent_label()
-    }
-
     /// Update the unified-exec process set and refresh whichever summary surface is active.
     ///
     /// The summary may be displayed inline in the status row or as a dedicated
@@ -862,6 +857,12 @@ impl BottomPane {
     /// Update custom prompts available for the slash popup.
     pub(crate) fn set_custom_prompts(&mut self, prompts: Vec<CustomPrompt>) {
         self.composer.set_custom_prompts(prompts);
+        self.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_steer_enabled(&mut self, enabled: bool) {
+        self.composer.set_steer_enabled(enabled);
         self.request_redraw();
     }
 
@@ -1131,10 +1132,20 @@ impl BottomPane {
         }
     }
 
+    /// Updates the contextual footer label and requests a redraw only when it changed.
+    ///
+    /// This keeps the footer plumbing cheap during thread transitions where `App` may recompute
+    /// the label several times while the visible thread settles.
     pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) {
         if self.composer.set_active_agent_label(active_agent_label) {
             self.request_redraw();
         }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn active_agent_label(&self) -> Option<&str> {
+        self.composer.active_agent_label()
     }
 }
 
@@ -1725,42 +1736,6 @@ mod tests {
             );
         }
         assert_eq!(pane.composer_text(), "/agent ");
-    }
-
-    #[test]
-    fn esc_with_multi_agents_command_without_popup_does_not_interrupt_task() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut pane = BottomPane::new(BottomPaneParams {
-            app_event_tx: tx,
-            frame_requester: FrameRequester::test_dummy(),
-            has_input_focus: true,
-            enhanced_keys_supported: false,
-            placeholder_text: "Ask Codex to do anything".to_string(),
-            disable_paste_burst: false,
-            animations_enabled: true,
-            skills: Some(Vec::new()),
-        });
-
-        pane.set_task_running(true);
-
-        // Repro: `/multi-agents ` hides the popup. Esc should keep editing command
-        // text instead of interrupting the running task.
-        pane.insert_str("/multi-agents ");
-        assert!(
-            !pane.composer.popup_active(),
-            "expected command popup to be hidden after entering `/multi-agents `"
-        );
-
-        pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-        while let Ok(ev) = rx.try_recv() {
-            assert!(
-                !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
-                "expected Esc to not send Op::Interrupt while typing `/multi-agents`"
-            );
-        }
-        assert_eq!(pane.composer_text(), "/multi-agents ");
     }
 
     #[test]

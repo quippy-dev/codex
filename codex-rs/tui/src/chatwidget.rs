@@ -101,6 +101,7 @@ use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::ErrorEvent;
@@ -581,6 +582,7 @@ pub(crate) struct ChatWidget {
     // Latest completed user-visible Codex output that `/copy` should place on the clipboard.
     last_copyable_output: CopyState,
     running_commands: HashMap<String, RunningCommand>,
+    pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<PathBuf, bool>>,
@@ -1084,6 +1086,10 @@ impl ChatWidget {
         self.bottom_pane.set_status_line(status_line);
     }
 
+    /// Forwards the contextual active-agent label into the bottom-pane footer pipeline.
+    ///
+    /// `ChatWidget` stays a pass-through here so `App` remains the owner of "which thread is the
+    /// user actually looking at?" and the footer stack remains a pure renderer of that decision.
     pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) {
         self.bottom_pane.set_active_agent_label(active_agent_label);
     }
@@ -1472,6 +1478,7 @@ impl ChatWidget {
         if self.plan_stream_controller.is_none() {
             self.plan_stream_controller = Some(PlanStreamController::new(
                 self.last_rendered_width.get().map(|w| w.saturating_sub(4)),
+                &self.config.cwd,
             ));
         }
         if let Some(controller) = self.plan_stream_controller.as_mut()
@@ -1508,7 +1515,7 @@ impl ChatWidget {
             // TODO: Replace streamed output with the final plan item text if plan streaming is
             // removed or if we need to reconcile mismatches between streamed and final content.
         } else if !plan_text.is_empty() {
-            self.add_to_history(history_cell::new_proposed_plan(plan_text));
+            self.add_to_history(history_cell::new_proposed_plan(plan_text, &self.config.cwd));
         }
         if should_restore_after_stream {
             self.pending_status_indicator_restore = true;
@@ -1541,8 +1548,10 @@ impl ChatWidget {
         // At the end of a reasoning block, record transcript-only content.
         self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
         if !self.full_reasoning_buffer.is_empty() {
-            let cell =
-                history_cell::new_reasoning_summary_block(self.full_reasoning_buffer.clone());
+            let cell = history_cell::new_reasoning_summary_block(
+                self.full_reasoning_buffer.clone(),
+                &self.config.cwd,
+            );
             self.add_boxed_history(cell);
         }
         self.reasoning_buffer.clear();
@@ -2741,6 +2750,7 @@ impl ChatWidget {
             }
             self.stream_controller = Some(StreamController::new(
                 self.last_rendered_width.get().map(|w| w.saturating_sub(2)),
+                &self.config.cwd,
             ));
         }
         if let Some(controller) = self.stream_controller.as_mut()
@@ -3206,6 +3216,7 @@ impl ChatWidget {
             plan_stream_controller: None,
             last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
+            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -3390,6 +3401,7 @@ impl ChatWidget {
             plan_stream_controller: None,
             last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
+            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -3566,6 +3578,7 @@ impl ChatWidget {
             plan_stream_controller: None,
             last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
+            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -4961,8 +4974,24 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::CollabAgentSpawnBegin(_) => {}
-            EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
+            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                call_id,
+                model,
+                reasoning_effort,
+                ..
+            }) => {
+                self.pending_collab_spawn_requests.insert(
+                    call_id,
+                    multi_agents::SpawnRequestSummary {
+                        model,
+                        reasoning_effort,
+                    },
+                );
+            }
+            EventMsg::CollabAgentSpawnEnd(ev) => {
+                let spawn_request = self.pending_collab_spawn_requests.remove(&ev.call_id);
+                self.on_collab_event(multi_agents::spawn_end(ev, spawn_request.as_ref()));
+            }
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
                 self.on_collab_event(multi_agents::interaction_end(ev))
@@ -5098,7 +5127,12 @@ impl ChatWidget {
                 } else {
                     // Show explanation when there are no structured findings.
                     let mut rendered: Vec<ratatui::text::Line<'static>> = vec!["".into()];
-                    append_markdown(&explanation, None, &mut rendered);
+                    append_markdown(
+                        &explanation,
+                        None,
+                        Some(self.config.cwd.as_path()),
+                        &mut rendered,
+                    );
                     let body_cell = AgentMessageCell::new(rendered, false);
                     self.app_event_tx
                         .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
@@ -8256,6 +8290,7 @@ impl ChatWidget {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn active_agent_label(&self) -> Option<&str> {
         self.bottom_pane.active_agent_label()
     }

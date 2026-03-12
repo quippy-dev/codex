@@ -1314,11 +1314,6 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     // Ensure we do NOT receive a CommandExecutionRequestApproval request before task completes
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
-    )
-    .await??;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
@@ -1622,7 +1617,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
 
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+        mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
@@ -1811,7 +1806,7 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
 
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+        mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
@@ -1942,7 +1937,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     .await??;
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+        mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
@@ -2000,7 +1995,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
     .await??;
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+        mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
@@ -2151,7 +2146,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+        mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 

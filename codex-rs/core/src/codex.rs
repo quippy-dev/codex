@@ -33,6 +33,7 @@ use crate::features::maybe_push_unstable_features_warning;
 #[cfg(test)]
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
+use crate::models_manager::manager::RefreshStrategy;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
@@ -208,8 +209,6 @@ use crate::mcp::maybe_prompt_and_install_mcp_dependencies;
 use crate::mcp::with_codex_apps_mcp;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::mcp_connection_manager::codex_apps_tools_cache_key;
-use crate::mcp_connection_manager::filter_codex_apps_mcp_tools_only;
-use crate::mcp_connection_manager::filter_mcp_tools_by_name;
 use crate::mcp_connection_manager::filter_non_codex_apps_mcp_tools_only;
 use crate::memories;
 use crate::mentions::build_connector_slug_counts;
@@ -288,7 +287,6 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::js_repl::JsReplHandle;
 use crate::tools::js_repl::resolve_compatible_node;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -387,6 +385,7 @@ impl Codex {
         if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = session_source
             && depth >= config.agent_max_depth
         {
+            let _ = config.features.disable(Feature::SpawnCsv);
             let _ = config.features.disable(Feature::Collab);
         }
 
@@ -411,7 +410,7 @@ impl Codex {
             && let Err(err) = resolve_compatible_node(config.js_repl_node_path.as_deref()).await
         {
             let message = format!(
-                "Disabled `code_mode` for this session because the configured Node runtime is unavailable or incompatible. {err}"
+                "Disabled `exec` for this session because the configured Node runtime is unavailable or incompatible. {err}"
             );
             warn!("{message}");
             let _ = config.features.disable(Feature::CodeMode);
@@ -778,6 +777,9 @@ impl TurnContext {
         let features = self.features.clone();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &models_manager
+                .list_models(RefreshStrategy::OnlineIfUncached)
+                .await,
             features: &features,
             web_search_mode: self.tools_config.web_search_mode,
             session_source: self.session_source.clone(),
@@ -1209,6 +1211,7 @@ impl Session {
         session_configuration: &SessionConfiguration,
         per_turn_config: Config,
         model_info: ModelInfo,
+        models_manager: &ModelsManager,
         network: Option<NetworkProxy>,
         sub_id: String,
         js_repl: Arc<JsReplHandle>,
@@ -1230,6 +1233,7 @@ impl Session {
 
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &models_manager.try_list_models().unwrap_or_default(),
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
             session_source: session_source.clone(),
@@ -1691,6 +1695,7 @@ impl Session {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
             ),
+            code_mode_store: Default::default(),
         };
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
@@ -1920,26 +1925,6 @@ impl Session {
         }
     }
 
-    pub(crate) async fn merge_mcp_tool_selection(&self, tool_names: Vec<String>) -> Vec<String> {
-        let mut state = self.state.lock().await;
-        state.merge_mcp_tool_selection(tool_names)
-    }
-
-    pub(crate) async fn set_mcp_tool_selection(&self, tool_names: Vec<String>) {
-        let mut state = self.state.lock().await;
-        state.set_mcp_tool_selection(tool_names);
-    }
-
-    pub(crate) async fn get_mcp_tool_selection(&self) -> Option<Vec<String>> {
-        let state = self.state.lock().await;
-        state.get_mcp_tool_selection()
-    }
-
-    pub(crate) async fn clear_mcp_tool_selection(&self) {
-        let mut state = self.state.lock().await;
-        state.clear_mcp_tool_selection();
-    }
-
     // Merges connector IDs into the session-level explicit connector selection.
     pub(crate) async fn merge_connector_selection(
         &self,
@@ -1972,7 +1957,6 @@ impl Session {
     }
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
         let turn_context = self.new_default_turn().await;
-        self.clear_mcp_tool_selection().await;
         let is_subagent = {
             let state = self.state.lock().await;
             matches!(
@@ -1982,16 +1966,8 @@ impl Session {
         };
         match conversation_history {
             InitialHistory::New => {
-                // Build and record initial items (user instructions + environment context)
-                // TODO(ccunningham): Defer initial context insertion until the first real turn
-                // starts so it reflects the actual first-turn settings (permissions, etc.) and
-                // we do not emit model-visible "diff" updates before the first user message.
-                let items = self.build_initial_context(&turn_context).await;
-                self.record_conversation_items(&turn_context, &items).await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
-                }
+                // Defer initial context insertion until the first real turn starts so
+                // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(None).await;
                 plan_retention_cache::clear_latest_proposed_plan_text(self).await;
                 // Ensure initial items are visible to immediate readers (e.g., tests, forks).
@@ -2001,8 +1977,6 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
-                let restored_tool_selection =
-                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
 
                 let reconstructed_rollout = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
@@ -2055,9 +2029,6 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
-                if let Some(selected_tools) = restored_tool_selection {
-                    self.set_mcp_tool_selection(selected_tools).await;
-                }
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
@@ -2066,9 +2037,6 @@ impl Session {
                 }
             }
             InitialHistory::Forked(rollout_items) => {
-                let restored_tool_selection =
-                    Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
-
                 let reconstructed_rollout = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
@@ -2101,9 +2069,6 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
-                if let Some(selected_tools) = restored_tool_selection {
-                    self.set_mcp_tool_selection(selected_tools).await;
-                }
 
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if !rollout_items.is_empty() {
@@ -2135,54 +2100,6 @@ impl Session {
             RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
             _ => None,
         })
-    }
-
-    fn extract_mcp_tool_selection_from_rollout(
-        rollout_items: &[RolloutItem],
-    ) -> Option<Vec<String>> {
-        let mut search_call_ids = HashSet::new();
-        let mut active_selected_tools: Option<Vec<String>> = None;
-
-        for item in rollout_items {
-            let RolloutItem::ResponseItem(response_item) = item else {
-                continue;
-            };
-            match response_item {
-                ResponseItem::FunctionCall { name, call_id, .. } => {
-                    if name == SEARCH_TOOL_BM25_TOOL_NAME {
-                        search_call_ids.insert(call_id.clone());
-                    }
-                }
-                ResponseItem::FunctionCallOutput { call_id, output } => {
-                    if !search_call_ids.contains(call_id) {
-                        continue;
-                    }
-                    let Some(content) = output.body.to_text() else {
-                        continue;
-                    };
-                    let Ok(payload) = serde_json::from_str::<Value>(&content) else {
-                        continue;
-                    };
-                    let Some(selected_tools) = payload
-                        .get("active_selected_tools")
-                        .and_then(Value::as_array)
-                    else {
-                        continue;
-                    };
-                    let Some(selected_tools) = selected_tools
-                        .iter()
-                        .map(|value| value.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        continue;
-                    };
-                    active_selected_tools = Some(selected_tools);
-                }
-                _ => {}
-            }
-        }
-
-        active_selected_tools
     }
 
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -2443,6 +2360,7 @@ impl Session {
             &session_configuration,
             per_turn_config,
             model_info,
+            &self.services.models_manager,
             self.services
                 .network_proxy
                 .as_ref()
@@ -2481,6 +2399,11 @@ impl Session {
             .unwrap_or(model_info.default_reasoning_summary);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &self
+                .services
+                .models_manager
+                .try_list_models()
+                .unwrap_or_default(),
             features: &per_turn_config.features,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
             session_source: current_turn_context.session_source.clone(),
@@ -4212,7 +4135,20 @@ impl Session {
             .await
     }
 
-    pub(crate) async fn parse_mcp_tool_name(&self, tool_name: &str) -> Option<(String, String)> {
+    pub(crate) async fn parse_mcp_tool_name(
+        &self,
+        name: &str,
+        namespace: &Option<String>,
+    ) -> Option<(String, String)> {
+        let tool_name = if let Some(namespace) = namespace {
+            if name.starts_with(namespace.as_str()) {
+                name
+            } else {
+                &format!("{namespace}{name}")
+            }
+        } else {
+            name
+        };
         self.services
             .mcp_connection_manager
             .read()
@@ -5512,6 +5448,11 @@ async fn spawn_review_thread(
     let review_web_search_mode = WebSearchMode::Disabled;
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
+        available_models: &sess
+            .services
+            .models_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await,
         features: &review_features,
         web_search_mode: Some(review_web_search_mode),
         session_source: parent_turn_context.session_source.clone(),
@@ -6460,7 +6401,7 @@ fn filter_codex_apps_mcp_tools(
         .iter()
         .filter(|(_, tool)| {
             if tool.server_name != CODEX_APPS_MCP_SERVER_NAME {
-                return true;
+                return false;
             }
             let Some(connector_id) = codex_apps_connector_id(tool) else {
                 return false;
@@ -6686,18 +6627,13 @@ pub(crate) async fn built_tools(
         );
 
         let mut selected_mcp_tools = filter_non_codex_apps_mcp_tools_only(&mcp_tools);
-
-        if let Some(selected_tools) = sess.get_mcp_tool_selection().await {
-            selected_mcp_tools.extend(filter_mcp_tools_by_name(&mcp_tools, &selected_tools));
-        }
-
-        selected_mcp_tools.extend(filter_codex_apps_mcp_tools_only(
+        selected_mcp_tools.extend(filter_codex_apps_mcp_tools(
             &mcp_tools,
             explicitly_enabled.as_ref(),
+            &turn_context.config,
         ));
 
-        mcp_tools =
-            connectors::filter_codex_apps_tools_by_policy(selected_mcp_tools, &turn_context.config);
+        mcp_tools = selected_mcp_tools;
     }
 
     Ok(Arc::new(ToolRouter::from_config(
@@ -7217,8 +7153,7 @@ async fn handle_assistant_item_done_in_plan_mode(
     {
         maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
 
-        if let Some(turn_item) =
-            handle_non_tool_response_item(item, true, Some(&turn_context.cwd)).await
+        if let Some(turn_item) = handle_non_tool_response_item(sess, turn_context, item, true).await
         {
             emit_turn_item_in_plan_mode(
                 sess,
@@ -7399,8 +7334,13 @@ async fn try_run_sampling_request(
                 needs_follow_up |= output_result.needs_follow_up;
             }
             ResponseEvent::OutputItemAdded(item) => {
-                if let Some(turn_item) =
-                    handle_non_tool_response_item(&item, plan_mode, Some(&turn_context.cwd)).await
+                if let Some(turn_item) = handle_non_tool_response_item(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &item,
+                    plan_mode,
+                )
+                .await
                 {
                     let mut turn_item = turn_item;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
