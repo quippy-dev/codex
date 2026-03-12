@@ -2202,19 +2202,11 @@ impl Session {
         };
         match conversation_history {
             InitialHistory::New => {
-                // Build and record initial items (user instructions + environment context)
-                // TODO(ccunningham): Defer initial context insertion until the first real turn
-                // starts so it reflects the actual first-turn settings (permissions, etc.) and
-                // we do not emit model-visible "diff" updates before the first user message.
-                let items = self.build_initial_context(&turn_context).await;
-                self.record_conversation_items(&turn_context, &items).await;
-                {
-                    let mut state = self.state.lock().await;
-                    state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
-                }
+                // Defer initial context insertion until the first real turn starts so it reflects
+                // the actual first-turn settings and does not emit model-visible diffs before the
+                // first user message.
                 self.set_previous_turn_settings(None).await;
                 plan_retention_cache::clear_latest_proposed_plan_text(self).await;
-                // Ensure initial items are visible to immediate readers (e.g., tests, forks).
                 if !is_subagent {
                     self.flush_rollout().await;
                 }
@@ -3336,7 +3328,13 @@ impl Session {
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
+                    ts.insert_pending_approval(
+                        effective_approval_id.clone(),
+                        crate::state::PendingApproval {
+                            tx: tx_approve,
+                            turn_id: turn_context.sub_id.clone(),
+                        },
+                    )
                 }
                 None => None,
             }
@@ -3401,7 +3399,13 @@ impl Session {
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(approval_id.clone(), tx_approve)
+                    ts.insert_pending_approval(
+                        approval_id.clone(),
+                        crate::state::PendingApproval {
+                            tx: tx_approve,
+                            turn_id: turn_context.sub_id.clone(),
+                        },
+                    )
                 }
                 None => None,
             }
@@ -3695,13 +3699,21 @@ impl Session {
             }
         };
         match entry {
-            Some(tx_approve) => {
-                tx_approve.send(decision).ok();
+            Some(pending_approval) => {
+                pending_approval.tx.send(decision).ok();
             }
             None => {
                 warn!("No pending approval found for call_id: {approval_id}");
             }
         }
+    }
+
+    pub(crate) async fn pending_approval_turn_id(&self, approval_id: &str) -> Option<String> {
+        let active = self.active_turn.lock().await;
+        let active = active.as_ref()?;
+        let ts = active.turn_state.lock().await;
+        ts.pending_approval_turn_id(approval_id)
+            .map(ToOwned::to_owned)
     }
 
     pub async fn resolve_elicitation(
@@ -5299,7 +5311,13 @@ mod handlers {
         turn_id: Option<String>,
         decision: ReviewDecision,
     ) {
-        let event_turn_id = turn_id.unwrap_or_else(|| approval_id.clone());
+        let event_turn_id = match turn_id {
+            Some(turn_id) => turn_id,
+            None => sess
+                .pending_approval_turn_id(&approval_id)
+                .await
+                .unwrap_or_else(|| approval_id.clone()),
+        };
         if let ReviewDecision::ApprovedExecpolicyAmendment {
             proposed_execpolicy_amendment,
         } = &decision

@@ -13,7 +13,6 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
-use crate::chatwidget::ThreadInputState;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -34,6 +33,11 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
+use crate::subagent_panel::SubagentRegistry;
+use crate::thread_switch_replay;
+use crate::thread_switch_replay::ThreadEventChannel;
+use crate::thread_switch_replay::ThreadEventSnapshot;
+use crate::thread_switch_replay::ThreadEventStore;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -63,12 +67,14 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CollabAgentRef;
+use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
@@ -91,7 +97,6 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -105,18 +110,15 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
 
 mod agent_navigation;
-mod pending_interactive_replay;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
-use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -259,152 +261,6 @@ fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) 
 struct SessionSummary {
     usage_line: String,
     resume_command: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ThreadEventSnapshot {
-    session_configured: Option<Event>,
-    events: Vec<Event>,
-    input_state: Option<ThreadInputState>,
-}
-
-#[derive(Debug)]
-struct ThreadEventStore {
-    session_configured: Option<Event>,
-    buffer: VecDeque<Event>,
-    user_message_ids: HashSet<String>,
-    pending_interactive_replay: PendingInteractiveReplayState,
-    input_state: Option<ThreadInputState>,
-    capacity: usize,
-    active: bool,
-}
-
-impl ThreadEventStore {
-    fn new(capacity: usize) -> Self {
-        Self {
-            session_configured: None,
-            buffer: VecDeque::new(),
-            user_message_ids: HashSet::new(),
-            pending_interactive_replay: PendingInteractiveReplayState::default(),
-            input_state: None,
-            capacity,
-            active: false,
-        }
-    }
-
-    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
-        let mut store = Self::new(capacity);
-        store.session_configured = Some(event);
-        store
-    }
-
-    fn push_event(&mut self, event: Event) {
-        self.pending_interactive_replay.note_event(&event);
-        match &event.msg {
-            EventMsg::SessionConfigured(_) => {
-                self.session_configured = Some(event);
-                return;
-            }
-            EventMsg::ItemCompleted(completed) => {
-                if let TurnItem::UserMessage(item) = &completed.item {
-                    if !event.id.is_empty() && self.user_message_ids.contains(&event.id) {
-                        return;
-                    }
-                    let legacy = Event {
-                        id: event.id,
-                        msg: item.as_legacy_event(),
-                    };
-                    self.push_legacy_event(legacy);
-                    return;
-                }
-            }
-            _ => {}
-        }
-
-        self.push_legacy_event(event);
-    }
-
-    fn push_legacy_event(&mut self, event: Event) {
-        if let EventMsg::UserMessage(_) = &event.msg
-            && !event.id.is_empty()
-            && !self.user_message_ids.insert(event.id.clone())
-        {
-            return;
-        }
-        self.buffer.push_back(event);
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-        {
-            self.pending_interactive_replay.note_evicted_event(&removed);
-            if matches!(removed.msg, EventMsg::UserMessage(_)) && !removed.id.is_empty() {
-                self.user_message_ids.remove(&removed.id);
-            }
-        }
-    }
-
-    fn snapshot(&self) -> ThreadEventSnapshot {
-        ThreadEventSnapshot {
-            session_configured: self.session_configured.clone(),
-            // Thread switches replay buffered events into a rebuilt ChatWidget. Only replay
-            // interactive prompts that are still pending, or answered approvals/input will reappear.
-            events: self
-                .buffer
-                .iter()
-                .filter(|event| {
-                    self.pending_interactive_replay
-                        .should_replay_snapshot_event(event)
-                })
-                .cloned()
-                .collect(),
-            input_state: self.input_state.clone(),
-        }
-    }
-
-    fn note_outbound_op(&mut self, op: &Op) {
-        self.pending_interactive_replay.note_outbound_op(op);
-    }
-
-    fn op_can_change_pending_replay_state(op: &Op) -> bool {
-        PendingInteractiveReplayState::op_can_change_state(op)
-    }
-
-    fn event_can_change_pending_thread_approvals(event: &Event) -> bool {
-        PendingInteractiveReplayState::event_can_change_pending_thread_approvals(event)
-    }
-
-    fn has_pending_thread_approvals(&self) -> bool {
-        self.pending_interactive_replay
-            .has_pending_thread_approvals()
-    }
-}
-
-#[derive(Debug)]
-struct ThreadEventChannel {
-    sender: mpsc::Sender<Event>,
-    receiver: Option<mpsc::Receiver<Event>>,
-    store: Arc<Mutex<ThreadEventStore>>,
-}
-
-impl ThreadEventChannel {
-    fn new(capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::channel(capacity);
-        Self {
-            sender,
-            receiver: Some(receiver),
-            store: Arc::new(Mutex::new(ThreadEventStore::new(capacity))),
-        }
-    }
-
-    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
-        let (sender, receiver) = mpsc::channel(capacity);
-        Self {
-            sender,
-            receiver: Some(receiver),
-            store: Arc::new(Mutex::new(ThreadEventStore::new_with_session_configured(
-                capacity, event,
-            ))),
-        }
-    }
 }
 
 fn should_show_model_migration_prompt(
@@ -709,6 +565,7 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
+    subagents: SubagentRegistry,
 }
 
 #[derive(Default)]
@@ -1018,61 +875,53 @@ impl App {
             .or_insert_with(|| ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY))
     }
 
+    #[cfg(test)]
     async fn set_thread_active(&mut self, thread_id: ThreadId, active: bool) {
-        if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
-            let mut store = channel.store.lock().await;
-            store.active = active;
-        }
+        thread_switch_replay::set_thread_active(&mut self.thread_event_channels, thread_id, active)
+            .await;
     }
 
     async fn activate_thread_channel(&mut self, thread_id: ThreadId) {
         if self.active_thread_id.is_some() {
             return;
         }
-        self.set_thread_active(thread_id, true).await;
-        let receiver = if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
-            channel.receiver.take()
-        } else {
-            None
-        };
-        self.active_thread_id = Some(thread_id);
-        self.active_thread_rx = receiver;
+        thread_switch_replay::activate_thread_channel(
+            &mut self.thread_event_channels,
+            &mut self.active_thread_id,
+            &mut self.active_thread_rx,
+            thread_id,
+        )
+        .await;
+        self.sync_subagent_panel_state();
         self.refresh_pending_thread_approvals().await;
     }
 
     async fn store_active_thread_receiver(&mut self) {
-        let Some(active_id) = self.active_thread_id else {
-            return;
-        };
-        let input_state = self.chat_widget.capture_thread_input_state();
-        if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
-            let receiver = self.active_thread_rx.take();
-            let mut store = channel.store.lock().await;
-            store.active = false;
-            store.input_state = input_state;
-            if let Some(receiver) = receiver {
-                channel.receiver = Some(receiver);
-            }
-        }
+        thread_switch_replay::store_active_thread_receiver(
+            &mut self.thread_event_channels,
+            self.active_thread_id,
+            &mut self.active_thread_rx,
+            &self.chat_widget,
+        )
+        .await;
     }
 
     async fn activate_thread_for_replay(
         &mut self,
         thread_id: ThreadId,
     ) -> Option<(mpsc::Receiver<Event>, ThreadEventSnapshot)> {
-        let channel = self.thread_event_channels.get_mut(&thread_id)?;
-        let receiver = channel.receiver.take()?;
-        let mut store = channel.store.lock().await;
-        store.active = true;
-        let snapshot = store.snapshot();
-        Some((receiver, snapshot))
+        thread_switch_replay::activate_thread_for_replay(&mut self.thread_event_channels, thread_id)
+            .await
     }
 
     async fn clear_active_thread(&mut self) {
-        if let Some(active_id) = self.active_thread_id.take() {
-            self.set_thread_active(active_id, false).await;
-        }
-        self.active_thread_rx = None;
+        thread_switch_replay::clear_active_thread(
+            &mut self.thread_event_channels,
+            &mut self.active_thread_id,
+            &mut self.active_thread_rx,
+        )
+        .await;
+        self.sync_subagent_panel_state();
         self.refresh_pending_thread_approvals().await;
     }
 
@@ -1092,6 +941,166 @@ impl App {
             return;
         };
         self.note_thread_outbound_op(thread_id, op).await;
+    }
+
+    fn subagents_root_active(&self) -> bool {
+        self.primary_thread_id.is_some() && self.active_thread_id == self.primary_thread_id
+    }
+
+    fn emit_or_queue_subagent_history(&mut self, cell: Box<dyn HistoryCell>) {
+        if self.subagents_root_active() {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        } else {
+            self.subagents.queue_history(cell);
+        }
+    }
+
+    fn flush_subagent_history_if_root_active(&mut self) {
+        if !self.subagents_root_active() {
+            return;
+        }
+        let pending = self.subagents.take_pending_history();
+        for cell in pending {
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        }
+    }
+
+    fn update_subagent_animation(&mut self, root_active: bool) {
+        let should_run = root_active && self.subagents.has_animating_agents();
+        let is_running = self.subagent_anim_running.load(Ordering::Relaxed);
+        if should_run && !is_running {
+            self.app_event_tx.send(AppEvent::StartSubagentAnimation);
+        } else if !should_run && is_running {
+            self.app_event_tx.send(AppEvent::StopSubagentAnimation);
+        }
+    }
+
+    fn sync_subagent_panel_state(&mut self) {
+        let root_active = self.subagents_root_active();
+        self.subagents.rebuild_panel_state();
+
+        if root_active {
+            self.flush_subagent_history_if_root_active();
+            if let Some(panel) = self.subagents.panel_cell() {
+                self.app_event_tx.send(AppEvent::UpdateSubagentPanel(panel));
+            } else {
+                self.app_event_tx.send(AppEvent::ClearSubagentPanel);
+            }
+        } else {
+            self.app_event_tx.send(AppEvent::ClearSubagentPanel);
+        }
+
+        self.update_subagent_animation(root_active);
+    }
+
+    fn process_subagent_side_effects(&mut self, thread_id: ThreadId, event: &Event) {
+        for cell in self
+            .subagents
+            .process_event(thread_id, self.primary_thread_id, event)
+        {
+            self.emit_or_queue_subagent_history(cell);
+        }
+
+        self.sync_subagent_panel_state();
+    }
+
+    fn known_agent_identity(
+        &self,
+        thread_id: ThreadId,
+    ) -> (Option<String>, Option<String>, Option<AgentSpawnMode>) {
+        let subagent_identity = self.subagents.agents.get(&thread_id);
+        let picker_identity = self.agent_navigation.get(&thread_id);
+        (
+            subagent_identity
+                .and_then(|info| info.nickname.clone())
+                .or_else(|| picker_identity.and_then(|entry| entry.agent_nickname.clone())),
+            subagent_identity
+                .and_then(|info| info.agent_role.clone())
+                .or_else(|| picker_identity.and_then(|entry| entry.agent_role.clone())),
+            subagent_identity.map(|info| info.spawn_mode),
+        )
+    }
+
+    fn backfill_collab_event_identity(&self, event: &mut Event) {
+        match &mut event.msg {
+            EventMsg::CollabAgentInteractionEnd(ev) => {
+                let (nickname, role, _) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+            }
+            EventMsg::CollabWaitingBegin(ev) => {
+                if ev.receiver_agents.is_empty() {
+                    ev.receiver_agents = ev
+                        .receiver_thread_ids
+                        .iter()
+                        .map(|thread_id| {
+                            let (agent_nickname, agent_role, spawn_mode) =
+                                self.known_agent_identity(*thread_id);
+                            CollabAgentRef {
+                                thread_id: *thread_id,
+                                agent_nickname,
+                                agent_role,
+                                spawn_mode,
+                            }
+                        })
+                        .collect();
+                } else {
+                    for agent in &mut ev.receiver_agents {
+                        let (agent_nickname, agent_role, spawn_mode) =
+                            self.known_agent_identity(agent.thread_id);
+                        agent.agent_nickname = agent.agent_nickname.clone().or(agent_nickname);
+                        agent.agent_role = agent.agent_role.clone().or(agent_role);
+                        agent.spawn_mode = agent.spawn_mode.or(spawn_mode);
+                    }
+                }
+            }
+            EventMsg::CollabWaitingEnd(ev) => {
+                if ev.agent_statuses.is_empty() {
+                    ev.agent_statuses = ev
+                        .statuses
+                        .iter()
+                        .map(|(thread_id, status)| {
+                            let (agent_nickname, agent_role, spawn_mode) =
+                                self.known_agent_identity(*thread_id);
+                            CollabAgentStatusEntry {
+                                thread_id: *thread_id,
+                                agent_nickname,
+                                agent_role,
+                                spawn_mode,
+                                status: status.clone(),
+                            }
+                        })
+                        .collect();
+                } else {
+                    for entry in &mut ev.agent_statuses {
+                        let (agent_nickname, agent_role, spawn_mode) =
+                            self.known_agent_identity(entry.thread_id);
+                        entry.agent_nickname = entry.agent_nickname.clone().or(agent_nickname);
+                        entry.agent_role = entry.agent_role.clone().or(agent_role);
+                        entry.spawn_mode = entry.spawn_mode.or(spawn_mode);
+                    }
+                }
+            }
+            EventMsg::CollabCloseEnd(ev) => {
+                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
+            }
+            EventMsg::CollabResumeBegin(ev) => {
+                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
+            }
+            EventMsg::CollabResumeEnd(ev) => {
+                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
+            }
+            _ => {}
+        }
     }
 
     fn thread_label(&self, thread_id: ThreadId) -> String {
@@ -1275,7 +1284,9 @@ impl App {
         self.chat_widget.set_pending_thread_approvals(threads);
     }
 
-    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
+    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, mut event: Event) -> Result<()> {
+        self.process_subagent_side_effects(thread_id, &event);
+        self.backfill_collab_event_identity(&mut event);
         let refresh_pending_thread_approvals =
             ThreadEventStore::event_can_change_pending_thread_approvals(&event);
         let inactive_interactive_request = if self.active_thread_id != Some(thread_id) {
@@ -1553,8 +1564,10 @@ impl App {
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
+        self.subagents.clear();
         self.chat_widget.set_pending_thread_approvals(Vec::new());
         self.sync_active_agent_label();
+        self.sync_subagent_panel_state();
     }
 
     async fn start_fresh_session_with_summary_hint(&mut self, tui: &mut tui::Tui) {
@@ -1610,25 +1623,15 @@ impl App {
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        let Some(mut rx) = self.active_thread_rx.take() else {
-            return Ok(());
-        };
-
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(event) => self.handle_codex_event_now(event),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
+        let mut active_thread_rx = self.active_thread_rx.take();
+        let disconnected =
+            thread_switch_replay::drain_active_thread_events(&mut active_thread_rx, |event| {
+                self.handle_codex_event_now(event)
+            });
         if !disconnected {
-            self.active_thread_rx = Some(rx);
-        } else {
+            self.active_thread_rx = active_thread_rx;
+        }
+        if disconnected {
             self.clear_active_thread().await;
         }
 
@@ -1666,19 +1669,15 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) {
-        if let Some(event) = snapshot.session_configured {
+        let events =
+            thread_switch_replay::prepare_thread_snapshot_replay(&mut self.chat_widget, snapshot);
+        for event in events {
             self.handle_codex_event_replay(event);
         }
-        self.chat_widget.set_queue_autosend_suppressed(true);
-        self.chat_widget
-            .restore_thread_input_state(snapshot.input_state);
-        for event in snapshot.events {
-            self.handle_codex_event_replay(event);
-        }
-        self.chat_widget.set_queue_autosend_suppressed(false);
-        if resume_restored_queue {
-            self.chat_widget.maybe_send_next_queued_input();
-        }
+        thread_switch_replay::finish_thread_snapshot_replay(
+            &mut self.chat_widget,
+            resume_restored_queue,
+        );
         self.refresh_status_line();
     }
 
@@ -1909,6 +1908,7 @@ impl App {
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let animations_enabled = config.animations;
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
@@ -1949,6 +1949,7 @@ impl App {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            subagents: SubagentRegistry::new(animations_enabled),
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -2377,7 +2378,11 @@ impl App {
                 self.subagent_anim_running.store(false, Ordering::Release);
             }
             AppEvent::SubagentTick => {
-                self.chat_widget.on_subagent_tick();
+                let root_active = self.subagents_root_active();
+                self.update_subagent_animation(root_active);
+                if root_active && self.subagents.has_animating_agents() {
+                    self.chat_widget.on_subagent_tick();
+                }
             }
             AppEvent::UpdateSubagentPanel(panel) => {
                 self.chat_widget.on_subagent_panel_updated(panel);
@@ -5190,6 +5195,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_active_agent_label_updates_chat_widget_footer_context() {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000002").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(agent_thread_id);
+        app.agent_navigation
+            .upsert(main_thread_id, None, None, false);
+        app.agent_navigation.upsert(
+            agent_thread_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
+        );
+
+        app.sync_active_agent_label();
+
+        assert_eq!(
+            app.chat_widget.active_agent_label(),
+            Some("Robie [explorer]")
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_pending_thread_approvals_only_lists_inactive_threads() {
         let mut app = make_test_app().await;
         let main_thread_id =
@@ -5601,6 +5633,7 @@ mod tests {
             CodexAuth::from_api_key("Test API Key"),
         );
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let animations_enabled = config.animations;
         let model = codex_core::test_support::get_model_offline(config.model.as_deref());
         let session_telemetry = test_session_telemetry(&config, model.as_str());
 
@@ -5641,6 +5674,7 @@ mod tests {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            subagents: SubagentRegistry::new(animations_enabled),
         }
     }
 
@@ -5661,6 +5695,7 @@ mod tests {
             CodexAuth::from_api_key("Test API Key"),
         );
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let animations_enabled = config.animations;
         let model = codex_core::test_support::get_model_offline(config.model.as_deref());
         let session_telemetry = test_session_telemetry(&config, model.as_str());
 
@@ -5702,6 +5737,7 @@ mod tests {
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
+                subagents: SubagentRegistry::new(animations_enabled),
             },
             rx,
             op_rx,

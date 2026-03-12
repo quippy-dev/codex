@@ -515,6 +515,7 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .loader_overrides(LoaderOverrides {
                 ignore_system_config: true,
                 ignore_system_requirements: true,
@@ -555,6 +556,7 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .loader_overrides(LoaderOverrides {
                 ignore_system_config: true,
                 ignore_system_requirements: true,
@@ -594,6 +596,7 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .loader_overrides(LoaderOverrides {
                 ignore_system_config: true,
                 ignore_system_requirements: true,
@@ -628,6 +631,7 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .loader_overrides(LoaderOverrides {
                 ignore_system_config: true,
                 ignore_system_requirements: true,

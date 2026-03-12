@@ -423,6 +423,9 @@ impl ModelClient {
     /// If websockets are only enabled via model preference (no explicit feature flag), prefer the
     /// current v2 behavior.
     pub fn responses_websocket_enabled(&self, model_info: &ModelInfo) -> bool {
+        if CODEX_RS_SSE_FIXTURE.is_some() {
+            return false;
+        }
         if !self.state.provider.supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
