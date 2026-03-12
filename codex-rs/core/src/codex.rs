@@ -539,7 +539,12 @@ impl Codex {
             SessionSource::SubAgent(_) => crate::models_manager::manager::RefreshStrategy::Offline,
             _ => crate::models_manager::manager::RefreshStrategy::OnlineIfUncached,
         };
-        if config.model.is_none() {
+        if config.model.is_none()
+            || !matches!(
+                refresh_strategy,
+                crate::models_manager::manager::RefreshStrategy::Offline
+            )
+        {
             let _ = models_manager.list_models(refresh_strategy).await;
         }
         let model = models_manager
@@ -2663,6 +2668,12 @@ impl Session {
             session_source: current_turn_context.session_source.clone(),
         })
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
+        .with_available_models(
+            self.services
+                .models_manager
+                .try_list_models()
+                .unwrap_or_default(),
+        )
         .with_agent_roles(per_turn_config.agent_roles.clone());
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
             current_turn_context.sub_id.clone(),
@@ -6925,7 +6936,7 @@ fn filter_codex_apps_mcp_tools(
         .iter()
         .filter(|(_, tool)| {
             if tool.server_name != CODEX_APPS_MCP_SERVER_NAME {
-                return true;
+                return false;
             }
             let Some(connector_id) = codex_apps_connector_id(tool) else {
                 return false;

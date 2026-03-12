@@ -859,19 +859,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabAgentSpawnBegin(begin_event) => {
-            let item = ThreadItem::CollabAgentToolCall {
-                id: begin_event.call_id,
-                tool: CollabAgentTool::SpawnAgent,
-                spawn_mode: None,
-                status: V2CollabToolCallStatus::InProgress,
-                sender_thread_id: begin_event.sender_thread_id.to_string(),
-                receiver_thread_ids: Vec::new(),
-                receiver_agents: Vec::new(),
-                prompt: Some(begin_event.prompt),
-                close_result: None,
-                agents_states: HashMap::new(),
-                agent_statuses: Vec::new(),
-            };
+            let item = collab_spawn_begin_item(begin_event);
             let notification = ItemStartedNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
@@ -882,55 +870,22 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabAgentSpawnEnd(end_event) => {
-            let has_receiver = end_event.new_thread_id.is_some();
-            let status = match &end_event.status {
-                codex_protocol::protocol::AgentStatus::Errored(_)
-                | codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Failed,
-                _ if has_receiver => V2CollabToolCallStatus::Completed,
-                _ => V2CollabToolCallStatus::Failed,
-            };
-            let (receiver_thread_ids, receiver_agents, agents_states, agent_statuses) =
-                match end_event.new_thread_id {
-                    Some(id) => {
-                        let receiver_id = id.to_string();
-                        let received_status = V2CollabAgentStatus::from(end_event.status.clone());
-                        (
-                            vec![receiver_id.clone()],
-                            vec![CollabAgentRef {
-                                thread_id: receiver_id.clone(),
-                                agent_nickname: end_event.new_agent_nickname.clone(),
-                                agent_role: end_event.new_agent_role.clone(),
-                                spawn_mode: Some(V2CollabAgentSpawnMode::from(
-                                    end_event.spawn_mode,
-                                )),
-                            }],
-                            [(receiver_id, received_status)].into_iter().collect(),
-                            vec![CollabAgentStatusEntry {
-                                thread_id: id.to_string(),
-                                agent_nickname: end_event.new_agent_nickname.clone(),
-                                agent_role: end_event.new_agent_role.clone(),
-                                spawn_mode: Some(V2CollabAgentSpawnMode::from(
-                                    end_event.spawn_mode,
-                                )),
-                                status: V2CollabAgentStatus::from(end_event.status.clone()),
-                            }],
-                        )
-                    }
-                    None => (Vec::new(), Vec::new(), HashMap::new(), Vec::new()),
-                };
-            let item = ThreadItem::CollabAgentToolCall {
-                id: end_event.call_id,
-                tool: CollabAgentTool::SpawnAgent,
-                spawn_mode: Some(V2CollabAgentSpawnMode::from(end_event.spawn_mode)),
-                status,
-                sender_thread_id: end_event.sender_thread_id.to_string(),
-                receiver_thread_ids,
-                receiver_agents,
-                prompt: Some(end_event.prompt),
-                close_result: None,
-                agents_states,
-                agent_statuses,
-            };
+            let fallback_model = end_event.model.clone();
+            let fallback_reasoning_effort = end_event.reasoning_effort;
+            let call_id = end_event.call_id.clone();
+            let item = {
+                let state = thread_state.lock().await;
+                state
+                    .active_turn_snapshot()
+                    .and_then(|turn| turn.items.into_iter().find(|item| item.id() == &call_id))
+            }
+            .unwrap_or_else(|| {
+                collab_spawn_end_item(
+                    end_event,
+                    Some(fallback_model),
+                    Some(fallback_reasoning_effort),
+                )
+            });
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
@@ -956,6 +911,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                     spawn_mode: None,
                 }],
                 prompt: Some(begin_event.prompt),
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
@@ -987,6 +944,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                     spawn_mode: None,
                 }],
                 prompt: Some(end_event.prompt),
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: [(receiver_id, received_status.clone())]
                     .into_iter()
@@ -1024,6 +983,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 receiver_agents,
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
@@ -1066,6 +1027,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 receiver_agents,
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states,
                 agent_statuses,
@@ -1094,6 +1057,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                     spawn_mode: None,
                 }],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: HashMap::new(),
                 agent_statuses: Vec::new(),
@@ -1139,6 +1104,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                         .map(V2CollabAgentSpawnMode::from),
                 }],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: Some(V2CollabCloseResult::from(end_event.close_result)),
                 agents_states,
                 agent_statuses: vec![CollabAgentStatusEntry {
@@ -2590,6 +2557,80 @@ async fn on_command_execution_request_approval_response(
     }
 }
 
+fn collab_spawn_begin_item(
+    begin_event: codex_protocol::protocol::CollabAgentSpawnBeginEvent,
+) -> ThreadItem {
+    ThreadItem::CollabAgentToolCall {
+        id: begin_event.call_id,
+        tool: CollabAgentTool::SpawnAgent,
+        spawn_mode: None,
+        status: V2CollabToolCallStatus::InProgress,
+        sender_thread_id: begin_event.sender_thread_id.to_string(),
+        receiver_thread_ids: Vec::new(),
+        receiver_agents: Vec::new(),
+        prompt: Some(begin_event.prompt),
+        model: Some(begin_event.model),
+        reasoning_effort: Some(begin_event.reasoning_effort),
+        close_result: None,
+        agents_states: HashMap::new(),
+        agent_statuses: Vec::new(),
+    }
+}
+
+fn collab_spawn_end_item(
+    end_event: codex_protocol::protocol::CollabAgentSpawnEndEvent,
+    model: Option<String>,
+    reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+) -> ThreadItem {
+    let has_receiver = end_event.new_thread_id.is_some();
+    let status = match &end_event.status {
+        codex_protocol::protocol::AgentStatus::Errored(_)
+        | codex_protocol::protocol::AgentStatus::NotFound => V2CollabToolCallStatus::Failed,
+        _ if has_receiver => V2CollabToolCallStatus::Completed,
+        _ => V2CollabToolCallStatus::Failed,
+    };
+    let (receiver_thread_ids, receiver_agents, agents_states, agent_statuses) =
+        match end_event.new_thread_id {
+            Some(id) => {
+                let receiver_id = id.to_string();
+                let received_status = V2CollabAgentStatus::from(end_event.status.clone());
+                (
+                    vec![receiver_id.clone()],
+                    vec![CollabAgentRef {
+                        thread_id: receiver_id.clone(),
+                        agent_nickname: end_event.new_agent_nickname.clone(),
+                        agent_role: end_event.new_agent_role.clone(),
+                        spawn_mode: Some(V2CollabAgentSpawnMode::from(end_event.spawn_mode)),
+                    }],
+                    [(receiver_id, received_status)].into_iter().collect(),
+                    vec![CollabAgentStatusEntry {
+                        thread_id: id.to_string(),
+                        agent_nickname: end_event.new_agent_nickname.clone(),
+                        agent_role: end_event.new_agent_role.clone(),
+                        spawn_mode: Some(V2CollabAgentSpawnMode::from(end_event.spawn_mode)),
+                        status: V2CollabAgentStatus::from(end_event.status.clone()),
+                    }],
+                )
+            }
+            None => (Vec::new(), Vec::new(), HashMap::new(), Vec::new()),
+        };
+    ThreadItem::CollabAgentToolCall {
+        id: end_event.call_id,
+        tool: CollabAgentTool::SpawnAgent,
+        spawn_mode: Some(V2CollabAgentSpawnMode::from(end_event.spawn_mode)),
+        status,
+        sender_thread_id: end_event.sender_thread_id.to_string(),
+        receiver_thread_ids,
+        receiver_agents,
+        prompt: Some(end_event.prompt),
+        model,
+        reasoning_effort,
+        close_result: None,
+        agents_states,
+        agent_statuses,
+    }
+}
+
 fn collab_resume_begin_item(
     begin_event: codex_protocol::protocol::CollabResumeBeginEvent,
 ) -> ThreadItem {
@@ -2609,6 +2650,8 @@ fn collab_resume_begin_item(
                 .map(V2CollabAgentSpawnMode::from),
         }],
         prompt: None,
+        model: None,
+        reasoning_effort: None,
         close_result: None,
         agents_states: HashMap::new(),
         agent_statuses: Vec::new(),
@@ -2668,6 +2711,8 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
                 .map(V2CollabAgentSpawnMode::from),
         }],
         prompt: None,
+        model: None,
+        reasoning_effort: None,
         close_result: None,
         agents_states,
         agent_statuses: vec![CollabAgentStatusEntry {
@@ -2851,8 +2896,11 @@ mod tests {
     use codex_protocol::models::MacOsContactsPermission;
     use codex_protocol::models::MacOsPreferencesPermission;
     use codex_protocol::models::MacOsSeatbeltProfileExtensions;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
+    use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
+    use codex_protocol::protocol::CollabAgentSpawnEndEvent;
     use codex_protocol::protocol::CollabResumeBeginEvent;
     use codex_protocol::protocol::CollabResumeEndEvent;
     use codex_protocol::protocol::CreditsSnapshot;
@@ -3140,9 +3188,97 @@ mod tests {
                 spawn_mode: None,
             }],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
+        };
+        assert_eq!(item, expected);
+    }
+
+    #[test]
+    fn collab_spawn_begin_maps_requested_model_and_effort() {
+        let event = CollabAgentSpawnBeginEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id: ThreadId::new(),
+            prompt: "new task".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+        };
+
+        let item = collab_spawn_begin_item(event.clone());
+        let expected = ThreadItem::CollabAgentToolCall {
+            id: event.call_id,
+            tool: CollabAgentTool::SpawnAgent,
+            spawn_mode: None,
+            status: V2CollabToolCallStatus::InProgress,
+            sender_thread_id: event.sender_thread_id.to_string(),
+            receiver_thread_ids: Vec::new(),
+            receiver_agents: Vec::new(),
+            prompt: Some("new task".to_string()),
+            model: Some("gpt-5".to_string()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            close_result: None,
+            agents_states: HashMap::new(),
+            agent_statuses: Vec::new(),
+        };
+        assert_eq!(item, expected);
+    }
+
+    #[test]
+    fn collab_spawn_end_maps_requested_model_and_effort() {
+        let receiver_thread_id = ThreadId::new();
+        let event = CollabAgentSpawnEndEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id: ThreadId::new(),
+            new_thread_id: Some(receiver_thread_id),
+            new_agent_nickname: Some("Robie".to_string()),
+            new_agent_role: Some("explorer".to_string()),
+            prompt: "new task".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+            spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
+            status: codex_protocol::protocol::AgentStatus::Completed(None),
+        };
+
+        let item = collab_spawn_end_item(
+            event.clone(),
+            Some("gpt-5".to_string()),
+            Some(ReasoningEffort::High),
+        );
+        let expected = ThreadItem::CollabAgentToolCall {
+            id: event.call_id,
+            tool: CollabAgentTool::SpawnAgent,
+            spawn_mode: Some(V2CollabAgentSpawnMode::Spawn),
+            status: V2CollabToolCallStatus::Completed,
+            sender_thread_id: event.sender_thread_id.to_string(),
+            receiver_thread_ids: vec![receiver_thread_id.to_string()],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: receiver_thread_id.to_string(),
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                spawn_mode: Some(V2CollabAgentSpawnMode::Spawn),
+            }],
+            prompt: Some("new task".to_string()),
+            model: Some("gpt-5".to_string()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            close_result: None,
+            agents_states: [(
+                receiver_thread_id.to_string(),
+                V2CollabAgentStatus::from(codex_protocol::protocol::AgentStatus::Completed(None)),
+            )]
+            .into_iter()
+            .collect(),
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: receiver_thread_id.to_string(),
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                spawn_mode: Some(V2CollabAgentSpawnMode::Spawn),
+                status: V2CollabAgentStatus::from(
+                    codex_protocol::protocol::AgentStatus::Completed(None),
+                ),
+            }],
         };
         assert_eq!(item, expected);
     }
@@ -3175,6 +3311,8 @@ mod tests {
                 spawn_mode: None,
             }],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: [(
                 receiver_id,

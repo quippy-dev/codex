@@ -23,6 +23,7 @@ use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentStatus;
@@ -561,6 +562,8 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: Vec::new(),
             receiver_agents: Vec::new(),
             prompt: Some(payload.prompt.clone()),
+            model: Some(payload.model.clone()),
+            reasoning_effort: Some(payload.reasoning_effort),
             close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
@@ -572,6 +575,7 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabAgentSpawnEndEvent,
     ) {
+        let (model, reasoning_effort) = self.collab_spawn_request_metadata(&payload.call_id);
         let has_receiver = payload.new_thread_id.is_some();
         let status = match &payload.status {
             AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
@@ -612,6 +616,8 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             receiver_agents,
             prompt: Some(payload.prompt.clone()),
+            model,
+            reasoning_effort,
             close_result: None,
             agents_states,
             agent_statuses,
@@ -636,6 +642,8 @@ impl ThreadHistoryBuilder {
                 spawn_mode: None,
             }],
             prompt: Some(payload.prompt.clone()),
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
@@ -667,6 +675,8 @@ impl ThreadHistoryBuilder {
                 spawn_mode: None,
             }],
             prompt: Some(payload.prompt.clone()),
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
             agent_statuses: vec![CollabAgentStatusEntry {
@@ -696,6 +706,8 @@ impl ThreadHistoryBuilder {
                 .collect(),
             receiver_agents: wait_receiver_agents(payload),
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
@@ -742,6 +754,8 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             receiver_agents: wait_end_receiver_agents(payload, &agent_statuses),
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states,
             agent_statuses,
@@ -766,6 +780,8 @@ impl ThreadHistoryBuilder {
                 spawn_mode: None,
             }],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
@@ -796,6 +812,8 @@ impl ThreadHistoryBuilder {
                 spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
             }],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: Some(CollabCloseResult::from(payload.close_result)),
             agents_states,
             agent_statuses: vec![CollabAgentStatusEntry {
@@ -826,6 +844,8 @@ impl ThreadHistoryBuilder {
                 spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
             }],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
@@ -862,6 +882,8 @@ impl ThreadHistoryBuilder {
                 spawn_mode: payload.receiver_spawn_mode.map(CollabAgentSpawnMode::from),
             }],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             close_result: None,
             agents_states,
             agent_statuses: vec![CollabAgentStatusEntry {
@@ -1063,6 +1085,29 @@ impl ThreadHistoryBuilder {
     fn upsert_item_in_current_turn(&mut self, item: ThreadItem) {
         let turn = self.ensure_turn();
         upsert_turn_item(&mut turn.items, item);
+    }
+
+    fn collab_spawn_request_metadata(
+        &self,
+        call_id: &str,
+    ) -> (Option<String>, Option<ReasoningEffort>) {
+        let item = self.current_turn.as_ref().and_then(|turn| {
+            turn.items.iter().find(|item| {
+                matches!(
+                    item,
+                    ThreadItem::CollabAgentToolCall { id, tool, .. }
+                        if id == call_id && *tool == CollabAgentTool::SpawnAgent
+                )
+            })
+        });
+        match item {
+            Some(ThreadItem::CollabAgentToolCall {
+                model,
+                reasoning_effort,
+                ..
+            }) => (model.clone(), reasoning_effort.clone()),
+            _ => (None, None),
+        }
     }
 
     fn next_item_id(&mut self) -> String {
@@ -1319,6 +1364,7 @@ mod tests {
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::parse_command::ParsedCommand;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AgentReasoningEvent;
@@ -2534,6 +2580,8 @@ mod tests {
                     spawn_mode: None,
                 }],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: [(
                     "00000000-0000-0000-0000-000000000002".into(),
@@ -2660,6 +2708,8 @@ mod tests {
                     },
                 ],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: [
                     (
@@ -2782,6 +2832,8 @@ mod tests {
                     spawn_mode: None,
                 }],
                 prompt: Some("new task".into()),
+                model: None,
+                reasoning_effort: None,
                 close_result: None,
                 agents_states: [(
                     receiver.to_string(),
@@ -2799,6 +2851,136 @@ mod tests {
                     spawn_mode: None,
                     status: CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Interrupted,
+                        message: None,
+                    },
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_spawn_begin_with_requested_model_and_effort() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "spawn agent".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabAgentSpawnBegin(codex_protocol::protocol::CollabAgentSpawnBeginEvent {
+                call_id: "spawn-1".into(),
+                sender_thread_id: sender,
+                prompt: "new task".into(),
+                model: "gpt-5".into(),
+                reasoning_effort: ReasoningEffort::High,
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "spawn-1".into(),
+                tool: CollabAgentTool::SpawnAgent,
+                spawn_mode: None,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: sender.to_string(),
+                receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
+                prompt: Some("new task".into()),
+                model: Some("gpt-5".into()),
+                reasoning_effort: Some(ReasoningEffort::High),
+                close_result: None,
+                agents_states: HashMap::new(),
+                agent_statuses: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_spawn_end_with_requested_model_and_effort() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
+            .expect("valid receiver thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "spawn agent".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabAgentSpawnBegin(codex_protocol::protocol::CollabAgentSpawnBeginEvent {
+                call_id: "spawn-1".into(),
+                sender_thread_id: sender,
+                prompt: "new task".into(),
+                model: "gpt-5".into(),
+                reasoning_effort: ReasoningEffort::High,
+            }),
+            EventMsg::CollabAgentSpawnEnd(codex_protocol::protocol::CollabAgentSpawnEndEvent {
+                call_id: "spawn-1".into(),
+                sender_thread_id: sender,
+                new_thread_id: Some(receiver),
+                new_agent_nickname: Some("Robie".into()),
+                new_agent_role: Some("explorer".into()),
+                prompt: "new task".into(),
+                model: "gpt-5".into(),
+                reasoning_effort: ReasoningEffort::High,
+                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
+                status: AgentStatus::Completed(None),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "spawn-1".into(),
+                tool: CollabAgentTool::SpawnAgent,
+                spawn_mode: Some(CollabAgentSpawnMode::Spawn),
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender.to_string(),
+                receiver_thread_ids: vec![receiver.to_string()],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: Some("Robie".into()),
+                    agent_role: Some("explorer".into()),
+                    spawn_mode: Some(CollabAgentSpawnMode::Spawn),
+                }],
+                prompt: Some("new task".into()),
+                model: Some("gpt-5".into()),
+                reasoning_effort: Some(ReasoningEffort::High),
+                close_result: None,
+                agents_states: [(
+                    receiver.to_string(),
+                    CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Completed,
+                        message: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                agent_statuses: vec![CollabAgentStatusEntry {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: Some("Robie".into()),
+                    agent_role: Some("explorer".into()),
+                    spawn_mode: Some(CollabAgentSpawnMode::Spawn),
+                    status: CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Completed,
                         message: None,
                     },
                 }],
@@ -2859,6 +3041,8 @@ mod tests {
                     spawn_mode: Some(CollabAgentSpawnMode::Watchdog),
                 }],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 close_result: Some(CollabCloseResult::NotFound),
                 agents_states: [(
                     receiver.to_string(),

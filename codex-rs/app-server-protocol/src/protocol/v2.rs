@@ -3951,6 +3951,10 @@ pub enum ThreadItem {
         receiver_agents: Vec<CollabAgentRef>,
         /// Prompt text sent as part of the collab tool call, when available.
         prompt: Option<String>,
+        /// Requested model when `tool` is `SpawnAgent`.
+        model: Option<String>,
+        /// Requested reasoning effort when `tool` is `SpawnAgent`.
+        reasoning_effort: Option<ReasoningEffort>,
         /// Optional close result when `tool` is `CloseAgent`.
         close_result: Option<CollabCloseResult>,
         /// Last known status of the target agents, when available.

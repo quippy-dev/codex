@@ -2,6 +2,7 @@ use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
@@ -35,6 +36,12 @@ pub(crate) struct AgentPickerThreadEntry {
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
     pub(crate) is_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnRequestSummary {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: ReasoningEffortConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -146,7 +153,10 @@ fn next_agent_word_motion_fallback(
     false
 }
 
-pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
+pub(crate) fn spawn_end(
+    ev: CollabAgentSpawnEndEvent,
+    request: Option<&SpawnRequestSummary>,
+) -> PlainHistoryCell {
     let CollabAgentSpawnEndEvent {
         call_id: _,
         sender_thread_id: _,
@@ -160,15 +170,24 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
     } = ev;
 
     let title = match new_thread_id {
-        Some(thread_id) => title_with_agent(
-            "Spawned",
-            AgentLabel {
-                thread_id: Some(thread_id),
-                nickname: new_agent_nickname.as_deref(),
-                role: new_agent_role.as_deref(),
-                spawn_mode: Some(spawn_mode),
-            },
-        ),
+        Some(thread_id) => {
+            let mut title = title_with_agent(
+                "Spawned",
+                AgentLabel {
+                    thread_id: Some(thread_id),
+                    nickname: new_agent_nickname.as_deref(),
+                    role: new_agent_role.as_deref(),
+                    spawn_mode: Some(spawn_mode),
+                },
+            );
+            if let Some(summary) = request {
+                title.spans.push(Span::from(format!(
+                    " ({})",
+                    format_spawn_request_summary(summary)
+                )));
+            }
+            title
+        }
         None => title_text("Agent spawn failed"),
     };
 
@@ -400,6 +419,29 @@ fn prompt_line(prompt: &str) -> Option<Line<'static>> {
     }
 }
 
+fn format_spawn_request_summary(summary: &SpawnRequestSummary) -> String {
+    if summary.model.starts_with("codex-auto-") {
+        summary.model.clone()
+    } else {
+        format!(
+            "{} {}",
+            summary.model,
+            reasoning_label(summary.reasoning_effort)
+        )
+    }
+}
+
+fn reasoning_label(reasoning_effort: ReasoningEffortConfig) -> &'static str {
+    match reasoning_effort {
+        ReasoningEffortConfig::Minimal => "minimal",
+        ReasoningEffortConfig::Low => "low",
+        ReasoningEffortConfig::Medium => "medium",
+        ReasoningEffortConfig::High => "high",
+        ReasoningEffortConfig::XHigh => "xhigh",
+        ReasoningEffortConfig::None => "default",
+    }
+}
+
 fn merge_wait_receivers(
     receiver_thread_ids: &[ThreadId],
     mut receiver_agents: Vec<CollabAgentRef>,
@@ -573,16 +615,24 @@ mod tests {
         let bob_id = ThreadId::from_string("00000000-0000-0000-0000-000000000003")
             .expect("valid bob thread id");
 
-        let spawn = spawn_end(CollabAgentSpawnEndEvent {
-            call_id: "call-spawn".to_string(),
-            sender_thread_id,
-            new_thread_id: Some(robie_id),
-            new_agent_nickname: Some("Robie".to_string()),
-            new_agent_role: Some("explorer".to_string()),
-            prompt: "Compute 11! and reply with just the integer result.".to_string(),
-            spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
+        let spawn = spawn_end(
+            CollabAgentSpawnEndEvent {
+                call_id: "call-spawn".to_string(),
+                sender_thread_id,
+                new_thread_id: Some(robie_id),
+                new_agent_nickname: Some("Robie".to_string()),
+                new_agent_role: Some("explorer".to_string()),
+                prompt: "Compute 11! and reply with just the integer result.".to_string(),
+                model: String::new(),
+                reasoning_effort: Default::default(),
+                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
+                status: AgentStatus::PendingInit,
+            },
+            Some(&SpawnRequestSummary {
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::High,
+            }),
+        );
 
         let send = interaction_end(CollabAgentInteractionEndEvent {
             call_id: "call-send".to_string(),
@@ -680,16 +730,21 @@ mod tests {
             .expect("valid sender thread id");
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
             .expect("valid robie thread id");
-        let cell = spawn_end(CollabAgentSpawnEndEvent {
-            call_id: "call-spawn".to_string(),
-            sender_thread_id,
-            new_thread_id: Some(robie_id),
-            new_agent_nickname: Some("Robie".to_string()),
-            new_agent_role: Some("explorer".to_string()),
-            prompt: String::new(),
-            spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
+        let cell = spawn_end(
+            CollabAgentSpawnEndEvent {
+                call_id: "call-spawn".to_string(),
+                sender_thread_id,
+                new_thread_id: Some(robie_id),
+                new_agent_nickname: Some("Robie".to_string()),
+                new_agent_role: Some("explorer".to_string()),
+                prompt: String::new(),
+                model: String::new(),
+                reasoning_effort: Default::default(),
+                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
+                status: AgentStatus::PendingInit,
+            },
+            None,
+        );
 
         let lines = cell.display_lines(200);
         let title = &lines[0];

@@ -365,6 +365,12 @@ impl UnifiedExecWaitStreak {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingCollabSpawnRequest {
+    model: String,
+    reasoning_effort: ReasoningEffortConfig,
+}
+
 fn is_unified_exec_source(source: ExecCommandSource) -> bool {
     matches!(
         source,
@@ -587,6 +593,7 @@ pub(crate) struct ChatWidget {
     last_copyable_output: CopyState,
     running_commands: HashMap<String, RunningCommand>,
     suppressed_exec_calls: HashSet<String>,
+    pending_collab_spawn_requests: HashMap<String, PendingCollabSpawnRequest>,
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<PathBuf, bool>>,
     last_unified_wait: Option<UnifiedExecWaitState>,
@@ -1275,6 +1282,7 @@ impl ChatWidget {
             Some(event.reasoning_effort),
             None,
         );
+        self.pending_collab_spawn_requests.clear();
         if let Some(mask) = self.active_collaboration_mask.as_mut() {
             mask.model = Some(model_for_header.clone());
             mask.reasoning_effort = Some(event.reasoning_effort);
@@ -3322,6 +3330,7 @@ impl ChatWidget {
             last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
+            pending_collab_spawn_requests: HashMap::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
             turn_sleep_inhibitor: SleepInhibitor::new(prevent_idle_sleep),
@@ -3508,6 +3517,7 @@ impl ChatWidget {
             last_copyable_output: CopyState::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
+            pending_collab_spawn_requests: HashMap::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
             turn_sleep_inhibitor: SleepInhibitor::new(prevent_idle_sleep),
@@ -3709,6 +3719,7 @@ impl ChatWidget {
             forked_from: None,
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
+            pending_collab_spawn_requests: HashMap::new(),
             submit_pending_steers_after_interrupt: false,
             queued_message_edit_binding,
             show_welcome_banner: false,
@@ -5092,8 +5103,25 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::CollabAgentSpawnBegin(_) => {}
-            EventMsg::CollabAgentSpawnEnd(ev) => self.on_agent_event(multi_agents::spawn_end(ev)),
+            EventMsg::CollabAgentSpawnBegin(ev) => {
+                self.pending_collab_spawn_requests.insert(
+                    ev.call_id.clone(),
+                    PendingCollabSpawnRequest {
+                        model: ev.model.clone(),
+                        reasoning_effort: ev.reasoning_effort,
+                    },
+                );
+            }
+            EventMsg::CollabAgentSpawnEnd(ev) => {
+                let spawn_request =
+                    self.pending_collab_spawn_requests
+                        .remove(&ev.call_id)
+                        .map(|request| multi_agents::SpawnRequestSummary {
+                            model: request.model,
+                            reasoning_effort: request.reasoning_effort,
+                        });
+                self.on_agent_event(multi_agents::spawn_end(ev, spawn_request.as_ref()))
+            }
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
                 self.on_agent_event(multi_agents::interaction_end(ev))

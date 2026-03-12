@@ -631,6 +631,46 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_model_session_refreshes_remote_model_metadata_on_startup() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = MockServer::start().await;
+    let slug = bundled_model_slug();
+    let mut remote_model = test_remote_model(&slug, ModelVisibility::List, 0);
+    remote_model.display_name = "Pinned Remote Override".to_string();
+    remote_model.context_window = Some(654_321);
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![remote_model.clone()],
+        },
+    )
+    .await;
+
+    let pinned_slug = slug.clone();
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.model = Some(pinned_slug.clone());
+        })
+        .build(&server)
+        .await?;
+
+    let model_info = test
+        .thread_manager
+        .get_models_manager()
+        .get_model_info(&slug, &test.config)
+        .await;
+
+    assert_eq!(models_mock.requests().len(), 1);
+    assert_eq!(model_info.display_name, remote_model.display_name);
+    assert_eq!(model_info.context_window, remote_model.context_window);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_do_not_append_removed_builtin_presets() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));

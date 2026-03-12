@@ -534,6 +534,35 @@ fn non_app_mcp_tools_remain_visible_without_search_selection() {
     assert_eq!(tool_names, vec!["mcp__rmcp__echo".to_string()]);
 }
 
+#[tokio::test]
+async fn filter_codex_apps_mcp_tools_excludes_non_app_servers() {
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let config = build_test_config(codex_home.path()).await;
+    let mcp_tools = HashMap::from([
+        (
+            "mcp__codex_apps__calendar_create_event".to_string(),
+            make_mcp_tool(
+                CODEX_APPS_MCP_SERVER_NAME,
+                "calendar_create_event",
+                Some("calendar"),
+                Some("Calendar"),
+            ),
+        ),
+        (
+            "mcp__rmcp__echo".to_string(),
+            make_mcp_tool("rmcp", "echo", None, None),
+        ),
+    ]);
+
+    let connectors = connectors::accessible_connectors_from_mcp_tools(&mcp_tools);
+    let filtered = filter_codex_apps_mcp_tools(&mcp_tools, &connectors, &config);
+
+    assert_eq!(
+        filtered.into_keys().collect::<Vec<_>>(),
+        vec!["mcp__codex_apps__calendar_create_event".to_string()]
+    );
+}
+
 #[test]
 fn search_tool_selection_keeps_codex_apps_tools_without_mentions() {
     let selected_tool_names = vec![
@@ -3438,6 +3467,34 @@ async fn build_initial_context_prepends_model_switch_message() {
         panic!("expected developer text");
     };
     assert!(text.contains("<model_switch>"));
+}
+
+#[tokio::test]
+async fn build_updated_turn_context_preserves_available_models() {
+    let (session, previous_context) = make_session_and_context().await;
+    let current_turn_context = previous_context
+        .with_model(
+            previous_context.model_info.slug.clone(),
+            &session.services.models_manager,
+        )
+        .await;
+    assert!(
+        !current_turn_context
+            .tools_config
+            .available_models
+            .is_empty(),
+        "expected current turn context to expose available models"
+    );
+
+    let session_configuration = session.state.lock().await.session_configuration.clone();
+    let updated_turn_context = session
+        .build_updated_turn_context(&current_turn_context, &session_configuration)
+        .await;
+
+    assert_eq!(
+        updated_turn_context.tools_config.available_models,
+        current_turn_context.tools_config.available_models
+    );
 }
 
 #[tokio::test]

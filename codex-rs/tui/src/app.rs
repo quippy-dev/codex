@@ -1285,8 +1285,8 @@ impl App {
     }
 
     async fn enqueue_thread_event(&mut self, thread_id: ThreadId, mut event: Event) -> Result<()> {
-        self.process_subagent_side_effects(thread_id, &event);
         self.backfill_collab_event_identity(&mut event);
+        self.process_subagent_side_effects(thread_id, &event);
         let refresh_pending_thread_approvals =
             ThreadEventStore::event_can_change_pending_thread_approvals(&event);
         let inactive_interactive_request = if self.active_thread_id != Some(thread_id) {
@@ -1519,6 +1519,7 @@ impl App {
 
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = Some(receiver);
+        self.sync_subagent_panel_state();
 
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         let codex_op_tx = if let Some(thread) = live_thread {
@@ -1538,6 +1539,7 @@ impl App {
                 None,
             );
         }
+        self.sync_subagent_panel_state();
         self.drain_active_thread_events(tui).await?;
         self.refresh_pending_thread_approvals().await;
 
@@ -3902,6 +3904,7 @@ mod tests {
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
     use crate::multi_agents::AgentPickerThreadEntry;
+    use crate::subagent_panel::SubagentInfo;
     use assert_matches::assert_matches;
     use codex_core::CodexAuth;
     use codex_core::config::ConfigBuilder;
@@ -3915,7 +3918,13 @@ mod tests {
     use codex_protocol::config_types::Settings;
     use codex_protocol::openai_models::ModelAvailabilityNux;
     use codex_protocol::protocol::AgentMessageDeltaEvent;
+    use codex_protocol::protocol::AgentSpawnMode;
+    use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+    use codex_protocol::protocol::CollabCloseEndEvent;
+    use codex_protocol::protocol::CollabCloseResult;
+    use codex_protocol::protocol::CollabWaitingEndEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SandboxPolicy;
@@ -4225,6 +4234,291 @@ mod tests {
             .await
             .expect("timed out waiting for second event")
             .expect("channel closed unexpectedly");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_subagent_panel_state_restores_panel_when_root_becomes_active() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let agent_thread_id = ThreadId::new();
+
+        app.primary_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        let _ = app.subagents.on_spawn_end(&CollabAgentSpawnEndEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id: root_thread_id,
+            new_thread_id: Some(agent_thread_id),
+            new_agent_nickname: Some("Robie".to_string()),
+            new_agent_role: Some("explorer".to_string()),
+            prompt: "Explore the repo".to_string(),
+            model: String::new(),
+            reasoning_effort: Default::default(),
+            spawn_mode: AgentSpawnMode::Spawn,
+            status: AgentStatus::Running,
+        });
+
+        app.active_thread_id = Some(agent_thread_id);
+        app.sync_subagent_panel_state();
+        while app_event_rx.try_recv().is_ok() {}
+
+        app.active_thread_id = Some(root_thread_id);
+        app.sync_subagent_panel_state();
+
+        let panel = match app_event_rx.try_recv() {
+            Ok(AppEvent::UpdateSubagentPanel(panel)) => panel,
+            other => panic!("expected UpdateSubagentPanel event, got {other:?}"),
+        };
+        let rendered = panel
+            .display_lines(120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Subagents"));
+        assert!(rendered.contains("Robie [explorer]"));
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_backfills_close_end_identity_before_subagent_registry_update()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let root_thread_id = ThreadId::new();
+        let agent_thread_id = ThreadId::new();
+
+        app.primary_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        app.subagents.order.push(agent_thread_id);
+        app.subagents.agents.insert(
+            agent_thread_id,
+            SubagentInfo::new(
+                1,
+                None,
+                None,
+                "Explore the repo".to_string(),
+                AgentSpawnMode::Spawn,
+                true,
+            ),
+        );
+        app.agent_navigation.upsert(
+            agent_thread_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
+        );
+
+        app.enqueue_thread_event(
+            root_thread_id,
+            Event {
+                id: "close".to_string(),
+                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                    call_id: "call-close".to_string(),
+                    sender_thread_id: root_thread_id,
+                    receiver_thread_id: agent_thread_id,
+                    receiver_agent_nickname: None,
+                    receiver_agent_role: None,
+                    receiver_spawn_mode: None,
+                    status: AgentStatus::Completed(None),
+                    close_result: CollabCloseResult::Closed,
+                }),
+            },
+        )
+        .await?;
+
+        let info = app
+            .subagents
+            .agents
+            .get(&agent_thread_id)
+            .expect("subagent should still exist");
+        assert_eq!(info.nickname.as_deref(), Some("Robie"));
+        assert_eq!(info.agent_role.as_deref(), Some("explorer"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_backfills_waiting_end_identity_before_subagent_registry_update()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let root_thread_id = ThreadId::new();
+        let agent_thread_id = ThreadId::new();
+
+        app.primary_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        app.subagents.order.push(agent_thread_id);
+        app.subagents.agents.insert(
+            agent_thread_id,
+            SubagentInfo::new(
+                1,
+                None,
+                None,
+                "Explore the repo".to_string(),
+                AgentSpawnMode::Watchdog,
+                true,
+            ),
+        );
+        app.agent_navigation.upsert(
+            agent_thread_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
+        );
+
+        app.enqueue_thread_event(
+            root_thread_id,
+            Event {
+                id: "wait-end".to_string(),
+                msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                    sender_thread_id: root_thread_id,
+                    call_id: "call-wait".to_string(),
+                    agent_statuses: Vec::new(),
+                    statuses: [(agent_thread_id, AgentStatus::Completed(None))]
+                        .into_iter()
+                        .collect(),
+                }),
+            },
+        )
+        .await?;
+
+        let info = app
+            .subagents
+            .agents
+            .get(&agent_thread_id)
+            .expect("subagent should still exist");
+        assert_eq!(info.nickname.as_deref(), Some("Robie"));
+        assert_eq!(info.agent_role.as_deref(), Some("explorer"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_agent_thread_replay_restores_subagent_panel_state() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_thread_id = ThreadId::new();
+        let viewed_agent_thread_id = ThreadId::new();
+        let spawned_thread_id = ThreadId::new();
+
+        app.primary_thread_id = Some(root_thread_id);
+        app.agent_navigation
+            .upsert(root_thread_id, None, None, false);
+        app.agent_navigation.upsert(
+            viewed_agent_thread_id,
+            Some("Viewer".to_string()),
+            Some("explorer".to_string()),
+            false,
+        );
+        app.thread_event_channels.insert(
+            root_thread_id,
+            ThreadEventChannel::new_with_session_configured(
+                THREAD_EVENT_CHANNEL_CAPACITY,
+                Event {
+                    id: "root-session".to_string(),
+                    msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                        session_id: root_thread_id,
+                        forked_from_id: None,
+                        thread_name: None,
+                        model: "gpt-test".to_string(),
+                        model_provider_id: "test-provider".to_string(),
+                        service_tier: None,
+                        approval_policy: AskForApproval::Never,
+                        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                        cwd: PathBuf::from("/tmp/root"),
+                        reasoning_effort: None,
+                        history_log_id: 0,
+                        history_entry_count: 0,
+                        initial_messages: None,
+                        network_proxy: None,
+                        rollout_path: Some(PathBuf::new()),
+                    }),
+                },
+            ),
+        );
+        app.thread_event_channels.insert(
+            viewed_agent_thread_id,
+            ThreadEventChannel::new_with_session_configured(
+                THREAD_EVENT_CHANNEL_CAPACITY,
+                Event {
+                    id: "agent-session".to_string(),
+                    msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                        session_id: viewed_agent_thread_id,
+                        forked_from_id: None,
+                        thread_name: None,
+                        model: "gpt-test".to_string(),
+                        model_provider_id: "test-provider".to_string(),
+                        service_tier: None,
+                        approval_policy: AskForApproval::Never,
+                        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                        cwd: PathBuf::from("/tmp/agent"),
+                        reasoning_effort: None,
+                        history_log_id: 0,
+                        history_entry_count: 0,
+                        initial_messages: None,
+                        network_proxy: None,
+                        rollout_path: Some(PathBuf::new()),
+                    }),
+                },
+            ),
+        );
+        app.activate_thread_channel(viewed_agent_thread_id).await;
+
+        app.enqueue_thread_event(
+            root_thread_id,
+            Event {
+                id: "spawn-root".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(spawned_thread_id),
+                    new_agent_nickname: Some("Robie".to_string()),
+                    new_agent_role: Some("explorer".to_string()),
+                    prompt: "Explore the repo".to_string(),
+                    model: String::new(),
+                    reasoning_effort: Default::default(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::Running,
+                }),
+            },
+        )
+        .await?;
+        while app_event_rx.try_recv().is_ok() {}
+
+        let mut tui = crate::tui::Tui::new(
+            crate::custom_terminal::Terminal::with_options(
+                ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            )
+            .expect("create terminal"),
+        );
+        app.select_agent_thread(&mut tui, root_thread_id).await?;
+
+        let mut saw_panel = false;
+        let mut saw_spawn_history = false;
+        while let Ok(event) = app_event_rx.try_recv() {
+            match event {
+                AppEvent::UpdateSubagentPanel(_) => saw_panel = true,
+                AppEvent::InsertHistoryCell(cell) => {
+                    let rendered = cell
+                        .display_lines(120)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if rendered.contains("Spawned Robie [explorer]") {
+                        saw_spawn_history = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_panel,
+            "expected replay switch to restore the subagent panel"
+        );
+        assert!(
+            saw_spawn_history,
+            "expected replay switch to flush queued subagent history"
+        );
 
         Ok(())
     }
@@ -5055,6 +5349,84 @@ mod tests {
                 agent_role: Some("explorer".to_string()),
                 is_closed: true,
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_subagent_panel_state_flushes_pending_root_updates_when_root_reactivates()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let root_id = ThreadId::new();
+        let agent_id = ThreadId::new();
+        app.primary_thread_id = Some(root_id);
+        app.active_thread_id = Some(agent_id);
+
+        app.enqueue_thread_event(
+            root_id,
+            Event {
+                id: "spawn-end".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_id,
+                    new_thread_id: Some(agent_id),
+                    new_agent_nickname: Some("Robie".to_string()),
+                    new_agent_role: Some("explorer".to_string()),
+                    prompt: "Explore the repo".to_string(),
+                    model: String::new(),
+                    reasoning_effort: Default::default(),
+                    spawn_mode: AgentSpawnMode::Spawn,
+                    status: AgentStatus::PendingInit,
+                }),
+            },
+        )
+        .await?;
+        while app_event_rx.try_recv().is_ok() {}
+
+        app.active_thread_id = Some(root_id);
+        app.sync_subagent_panel_state();
+
+        let mut saw_panel = false;
+        let mut saw_history = false;
+        while let Ok(event) = app_event_rx.try_recv() {
+            match event {
+                AppEvent::UpdateSubagentPanel(panel) => {
+                    let rendered = panel
+                        .display_lines(120)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        rendered.contains("Robie [explorer]"),
+                        "expected reactivated root panel to include queued subagent state, got {rendered:?}"
+                    );
+                    saw_panel = true;
+                }
+                AppEvent::InsertHistoryCell(cell) => {
+                    let rendered = cell
+                        .display_lines(120)
+                        .into_iter()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        rendered.contains("Robie [explorer]"),
+                        "expected reactivated root transcript to flush queued subagent history, got {rendered:?}"
+                    );
+                    saw_history = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_panel,
+            "expected UpdateSubagentPanel when root becomes active"
+        );
+        assert!(
+            saw_history,
+            "expected queued subagent history to flush when root becomes active"
         );
         Ok(())
     }

@@ -667,10 +667,14 @@ impl RolloutRecorder {
     /// Unlike `get_rollout_history`, this intentionally discards the source rollout's
     /// conversation id so the child thread gets a fresh id and preserves `forked_from_id`.
     pub async fn get_fork_history(path: &Path) -> std::io::Result<InitialHistory> {
-        let (items, _thread_id, parse_errors) = Self::load_rollout_items(path).await?;
-        if parse_errors > 0 {
+        let (items, _thread_id, parse_summary) =
+            Self::load_rollout_items_with_parse_summary(path).await?;
+        if parse_summary.has_non_trailing_parse_errors()
+            || (parse_summary.parse_errors > 0 && items.is_empty())
+        {
             return Err(IoError::other(format!(
-                "failed to parse {parse_errors} rollout line(s) from {path:?}; legacy or invalid rollout files are unsupported"
+                "failed to parse {} rollout line(s) from {path:?}; legacy or invalid rollout files are unsupported",
+                parse_summary.parse_errors,
             )));
         }
 
@@ -1688,6 +1692,54 @@ mod tests {
                 "test-provider",
             )
             .await
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_fork_history_tolerates_trailing_parse_errors() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let path = write_session_file(home.path(), "2025-01-03T14-00-00", Uuid::from_u128(9013))?;
+        let mut file = File::options().append(true).open(&path)?;
+        writeln!(
+            file,
+            "{{\"timestamp\":\"2025-01-03T14-00-00\",\"type\":\"event_msg\""
+        )?;
+
+        let history = RolloutRecorder::get_fork_history(&path).await?;
+        let InitialHistory::Forked(items) = history else {
+            panic!("expected forked history");
+        };
+        assert_eq!(items.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_fork_history_rejects_non_trailing_parse_errors() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let path = write_session_file(home.path(), "2025-01-03T15-00-00", Uuid::from_u128(9014))?;
+        let mut file = File::options().append(true).open(&path)?;
+        writeln!(
+            file,
+            "{{\"timestamp\":\"2025-01-03T15-00-00\",\"type\":\"event_msg\""
+        )?;
+        let valid_event = serde_json::json!({
+            "timestamp": "2025-01-03T15-00-00",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Hello from agent",
+                "kind": "plain"
+            },
+        });
+        writeln!(file, "{valid_event}")?;
+
+        let err = RolloutRecorder::get_fork_history(&path)
+            .await
+            .expect_err("non-trailing parse errors should fail");
+        assert!(
+            err.to_string()
+                .contains("legacy or invalid rollout files are unsupported")
         );
         Ok(())
     }

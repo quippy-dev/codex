@@ -62,7 +62,7 @@ fn unified_exec_output_schema() -> JsonValue {
                 "description": "Process exit code when the command finished during this call."
             },
             "session_id": {
-                "type": "string",
+                "type": "number",
                 "description": "Session identifier to pass to write_stdin when the process is still running."
             },
             "original_token_count": {
@@ -155,7 +155,7 @@ impl ToolsConfig {
             features.enabled(Feature::Artifact) && codex_artifacts::can_manage_artifact_runtime();
         let include_image_gen_tool =
             features.enabled(Feature::ImageGeneration) && supports_image_generation(model_info);
-        let include_agent_jobs = include_collab_tools;
+        let include_agent_jobs = features.enabled(Feature::SpawnCsv);
         let request_permission_enabled = features.enabled(Feature::RequestPermissions);
         let request_permissions_tool_enabled = features.enabled(Feature::RequestPermissionsTool);
         let shell_command_backend =
@@ -2842,6 +2842,7 @@ mod tests {
         features.enable(Feature::Collab);
         features.enable(Feature::CollaborationModes);
         features.enable(Feature::Sqlite);
+        features.enable(Feature::SpawnCsv);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -2914,6 +2915,7 @@ mod tests {
         features.enable(Feature::Collab);
         features.enable(Feature::CollaborationModes);
         features.enable(Feature::Sqlite);
+        features.enable(Feature::SpawnCsv);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -2937,6 +2939,89 @@ mod tests {
             ],
         );
         assert_lacks_tool_name(&tools, "request_user_input");
+    }
+
+    #[test]
+    fn test_build_specs_collab_tools_without_spawn_csv_feature() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Collab);
+        features.enable(Feature::CollaborationModes);
+        features.enable(Feature::Sqlite);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert_contains_tool_names(
+            &tools,
+            &[
+                "spawn_agent",
+                "send_input",
+                "resume_agent",
+                "list_agents",
+                "wait",
+                "close_agent",
+            ],
+        );
+        assert_lacks_tool_name(&tools, "spawn_agents_on_csv");
+        assert_lacks_tool_name(&tools, "report_agent_job_result");
+    }
+
+    #[test]
+    fn test_build_specs_agent_job_worker_tools_require_spawn_csv_feature() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Collab);
+        features.enable(Feature::CollaborationModes);
+        features.enable(Feature::Sqlite);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::SubAgent(SubAgentSource::Other(
+                "agent_job:test".to_string(),
+            )),
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert_lacks_tool_name(&tools, "spawn_agents_on_csv");
+        assert_lacks_tool_name(&tools, "report_agent_job_result");
+    }
+
+    #[test]
+    fn unified_exec_tools_use_numeric_session_ids_in_schema() {
+        let ToolSpec::Function(exec_tool) = create_exec_command_tool(true, false) else {
+            panic!("exec_command should use a function tool spec");
+        };
+        let output_schema = exec_tool.output_schema.expect("exec_command output schema");
+        assert_eq!(
+            output_schema
+                .get("properties")
+                .and_then(|properties| properties.get("session_id"))
+                .and_then(|schema| schema.get("type")),
+            Some(&serde_json::json!("number"))
+        );
+
+        let ToolSpec::Function(write_stdin_tool) = create_write_stdin_tool() else {
+            panic!("write_stdin should use a function tool spec");
+        };
+        let JsonSchema::Object { properties, .. } = write_stdin_tool.parameters else {
+            panic!("write_stdin should use object parameters");
+        };
+        assert_eq!(
+            properties.get("session_id"),
+            Some(&JsonSchema::Number {
+                description: Some("Identifier of the running unified exec session.".to_string()),
+            })
+        );
     }
 
     #[test]

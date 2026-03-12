@@ -6257,6 +6257,10 @@
               "description": "Identifier for the collab tool call.",
               "type": "string"
             },
+            "model": {
+              "description": "Requested model for this spawn.",
+              "type": "string"
+            },
             "new_agent_nickname": {
               "description": "Optional nickname assigned to the new agent.",
               "type": [
@@ -6285,6 +6289,14 @@
             "prompt": {
               "description": "Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the beginning.",
               "type": "string"
+            },
+            "reasoning_effort": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReasoningEffort"
+                }
+              ],
+              "description": "Requested reasoning effort for this spawn."
             },
             "sender_thread_id": {
               "allOf": [
@@ -6321,7 +6333,9 @@
           },
           "required": [
             "call_id",
+            "model",
             "prompt",
+            "reasoning_effort",
             "sender_thread_id",
             "status",
             "type"
@@ -13672,12 +13686,30 @@
               "description": "Unique identifier for this collab tool call.",
               "type": "string"
             },
+            "model": {
+              "description": "Requested model when `tool` is `SpawnAgent`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "prompt": {
               "description": "Prompt text sent as part of the collab tool call, when available.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "reasoningEffort": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Requested reasoning effort when `tool` is `SpawnAgent`."
             },
             "receiverAgents": {
               "description": "Optional receiver metadata paired with receiver thread IDs.",

@@ -3275,6 +3275,10 @@ pub struct CollabAgentSpawnEndEvent {
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
+    /// Requested model for this spawn.
+    pub model: String,
+    /// Requested reasoning effort for this spawn.
+    pub reasoning_effort: ReasoningEffortConfig,
     /// Spawn mode used for this agent.
     #[serde(default)]
     pub spawn_mode: AgentSpawnMode,

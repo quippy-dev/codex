@@ -580,6 +580,8 @@ fn collab_spawn_begin_and_end_emit_item_events() {
             new_agent_nickname: None,
             new_agent_role: None,
             prompt: prompt.clone(),
+            model: String::new(),
+            reasoning_effort: Default::default(),
             spawn_mode: AgentSpawnMode::Spawn,
             status: AgentStatus::Running,
         }),
