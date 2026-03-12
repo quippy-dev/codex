@@ -287,6 +287,12 @@ impl PendingInteractiveReplayState {
             EventMsg::RequestUserInput(ev) => {
                 self.request_user_input_call_ids.contains(&ev.call_id)
             }
+            EventMsg::PlanDelta(ev) => !self.has_pending_request_user_input_turn(&ev.turn_id),
+            EventMsg::ItemCompleted(ev)
+                if matches!(&ev.item, codex_protocol::items::TurnItem::Plan(_)) =>
+            {
+                !self.has_pending_request_user_input_turn(&ev.turn_id)
+            }
             EventMsg::RequestPermissions(ev) => {
                 self.request_permissions_call_ids.contains(&ev.call_id)
             }
@@ -307,6 +313,11 @@ impl PendingInteractiveReplayState {
                 self.request_user_input_call_ids.remove(&call_id);
             }
         }
+    }
+
+    fn has_pending_request_user_input_turn(&self, turn_id: &str) -> bool {
+        self.request_user_input_call_ids_by_turn_id
+            .contains_key(turn_id)
     }
 
     fn clear_request_permissions_turn(&mut self, turn_id: &str) {
@@ -434,6 +445,68 @@ mod tests {
             snapshot.events.is_empty(),
             "resolved request_user_input prompt should not replay on thread switch"
         );
+    }
+
+    #[test]
+    fn thread_event_snapshot_stages_plan_until_same_turn_request_user_input_resolves() {
+        let mut store = ThreadEventStore::new(8);
+        let thread_id = codex_protocol::ThreadId::new();
+        store.push_event(Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::RequestUserInput(
+                codex_protocol::request_user_input::RequestUserInputEvent {
+                    call_id: "call-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    questions: Vec::new(),
+                },
+            ),
+        });
+        store.push_event(Event {
+            id: "ev-2".to_string(),
+            msg: EventMsg::PlanDelta(codex_protocol::protocol::PlanDeltaEvent {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "item-1".to_string(),
+                delta: "- step 1\n".to_string(),
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-3".to_string(),
+            msg: EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn-1".to_string(),
+                item: codex_protocol::items::TurnItem::Plan(codex_protocol::items::PlanItem {
+                    id: "item-1".to_string(),
+                    text: "- step 1".to_string(),
+                }),
+            }),
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(matches!(
+            snapshot.events.first().map(|event| &event.msg),
+            Some(EventMsg::RequestUserInput(ev)) if ev.call_id == "call-1"
+        ));
+
+        store.note_outbound_op(&Op::UserInputAnswer {
+            id: "turn-1".to_string(),
+            response: codex_protocol::request_user_input::RequestUserInputResponse {
+                answers: HashMap::new(),
+            },
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 2);
+        assert!(matches!(
+            snapshot.events.first().map(|event| &event.msg),
+            Some(EventMsg::PlanDelta(_))
+        ));
+        assert!(matches!(
+            snapshot.events.get(1).map(|event| &event.msg),
+            Some(EventMsg::ItemCompleted(ev))
+                if matches!(&ev.item, codex_protocol::items::TurnItem::Plan(_))
+        ));
     }
 
     #[test]
