@@ -674,19 +674,26 @@ impl AgentControl {
                                     .session
                                     .arm_post_turn_agent_flush_if_items()
                                     .await
-                                    && let Err(err) = state
+                                {
+                                    if thread.has_active_turn().await {
+                                        return Ok(Uuid::now_v7().to_string());
+                                    }
+                                    if let Err(err) = state
                                         .send_op(
                                             agent_id,
                                             Op::InjectResponseItems { items: Vec::new() },
                                         )
                                         .await
-                                {
-                                    warn!(
-                                        receiver_thread_id = %agent_id,
-                                        sender_thread_id = %sender_thread_id,
-                                        "failed to submit post-turn agent items after late active-turn inject miss: {err}"
-                                    );
-                                    thread.codex.session.clear_post_turn_agent_items().await;
+                                    {
+                                        warn!(
+                                            receiver_thread_id = %agent_id,
+                                            sender_thread_id = %sender_thread_id,
+                                            "failed to submit post-turn agent items after late active-turn inject miss: {err}"
+                                        );
+                                        thread.codex.session.clear_post_turn_agent_items().await;
+                                    } else {
+                                        return Ok(Uuid::now_v7().to_string());
+                                    }
                                 } else {
                                     return Ok(Uuid::now_v7().to_string());
                                 }
@@ -2186,11 +2193,7 @@ mod tests {
             .filter_map(|(thread_id, op)| (thread_id == receiver_thread_id).then_some(op))
             .filter(|op| matches!(op, Op::InjectResponseItems { .. }))
             .collect();
-        assert_eq!(inject_ops.len(), 1);
-        match &inject_ops[0] {
-            Op::InjectResponseItems { items } => assert!(items.is_empty()),
-            other => panic!("expected inject response items op, got {other:?}"),
-        }
+        assert!(inject_ops.is_empty());
 
         receiver_thread
             .codex
