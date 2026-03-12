@@ -130,7 +130,7 @@ pub enum Feature {
     MemoryTool,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
-    /// Allow `detail: "original"` image outputs on supported models.
+    /// Allow the model to request `detail: "original"` image outputs on supported models.
     ImageDetailOriginal,
     /// Enforce UTF8 output in Powershell.
     PowershellUtf8,
@@ -144,6 +144,8 @@ pub enum Feature {
     AgentPromptInjection,
     /// Enable watchdog spawning and watchdog-only agent tools.
     AgentWatchdog,
+    /// Enable CSV-backed agent job tools.
+    SpawnCsv,
     /// Enable apps.
     Apps,
     /// Enable plugins.
@@ -420,6 +422,9 @@ impl Features {
     }
 
     pub(crate) fn normalize_dependencies(&mut self) {
+        if self.enabled(Feature::SpawnCsv) && !self.enabled(Feature::Collab) {
+            self.enable(Feature::Collab);
+        }
         if self.enabled(Feature::JsReplToolsOnly) && !self.enabled(Feature::JsRepl) {
             tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
             self.disable(Feature::JsReplToolsOnly);
@@ -714,8 +719,14 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::AgentWatchdog,
         key: "agent_watchdog",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::SpawnCsv,
+        key: "spawn_csv",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::Apps,
@@ -1020,6 +1031,15 @@ mod tests {
     }
 
     #[test]
+    fn image_detail_original_feature_is_under_development() {
+        assert_eq!(
+            Feature::ImageDetailOriginal.stage(),
+            Stage::UnderDevelopment
+        );
+        assert_eq!(Feature::ImageDetailOriginal.default_enabled(), false);
+    }
+
+    #[test]
     fn collab_is_legacy_alias_for_multi_agent() {
         assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
         assert_eq!(feature_for_key("collab"), Some(Feature::Collab));
@@ -1044,7 +1064,7 @@ mod tests {
             canonical_feature_for_key("agent_watchdog"),
             Some(Feature::AgentWatchdog)
         );
-        assert_eq!(Feature::AgentWatchdog.stage(), Stage::UnderDevelopment);
+        assert_eq!(Feature::AgentWatchdog.stage(), Stage::Stable);
         assert!(Feature::AgentWatchdog.default_enabled());
     }
 
@@ -1054,6 +1074,27 @@ mod tests {
             feature_for_key("agent_prompt_injection"),
             Some(Feature::AgentPromptInjection)
         );
+    }
+
+    #[test]
+    fn spawn_csv_is_under_development() {
+        assert_eq!(Feature::SpawnCsv.stage(), Stage::UnderDevelopment);
+        assert_eq!(Feature::SpawnCsv.default_enabled(), false);
+    }
+
+    #[test]
+    fn spawn_csv_normalization_enables_multi_agent_one_way() {
+        let mut spawn_csv_features = Features::with_defaults();
+        spawn_csv_features.enable(Feature::SpawnCsv);
+        spawn_csv_features.normalize_dependencies();
+        assert_eq!(spawn_csv_features.enabled(Feature::SpawnCsv), true);
+        assert_eq!(spawn_csv_features.enabled(Feature::Collab), true);
+
+        let mut collab_features = Features::with_defaults();
+        collab_features.enable(Feature::Collab);
+        collab_features.normalize_dependencies();
+        assert_eq!(collab_features.enabled(Feature::Collab), true);
+        assert_eq!(collab_features.enabled(Feature::SpawnCsv), false);
     }
 
     #[test]

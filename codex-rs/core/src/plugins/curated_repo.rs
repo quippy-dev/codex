@@ -327,6 +327,8 @@ mod tests {
             .expect("git add should run");
         ensure_git_success(&add_output, "git add").expect("git add should succeed");
         let commit_output = Command::new("git")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .arg("-C")
             .arg(&repo_path)
             .arg("commit")

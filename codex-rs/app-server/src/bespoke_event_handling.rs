@@ -2848,6 +2848,7 @@ mod tests {
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::models::MacOsAutomationPermission;
+    use codex_protocol::models::MacOsContactsPermission;
     use codex_protocol::models::MacOsPreferencesPermission;
     use codex_protocol::models::MacOsSeatbeltProfileExtensions;
     use codex_protocol::plan_tool::PlanItemArg;
@@ -2937,8 +2938,11 @@ mod tests {
                     "com.apple.Notes".to_string(),
                     "com.apple.Reminders".to_string(),
                 ]),
+                macos_launch_services: true,
                 macos_accessibility: true,
                 macos_calendar: true,
+                macos_reminders: true,
+                macos_contacts: MacOsContactsPermission::ReadWrite,
             }),
             ..Default::default()
         };
@@ -2952,8 +2956,11 @@ mod tests {
                     macos: Some(MacOsSeatbeltProfileExtensions {
                         macos_preferences: MacOsPreferencesPermission::ReadOnly,
                         macos_automation: MacOsAutomationPermission::None,
+                        macos_launch_services: false,
                         macos_accessibility: false,
                         macos_calendar: false,
+                        macos_reminders: false,
+                        macos_contacts: MacOsContactsPermission::None,
                     }),
                     ..Default::default()
                 },
@@ -2970,8 +2977,28 @@ mod tests {
                         macos_automation: MacOsAutomationPermission::BundleIds(vec![
                             "com.apple.Notes".to_string(),
                         ]),
+                        macos_launch_services: false,
                         macos_accessibility: false,
                         macos_calendar: false,
+                        macos_reminders: false,
+                        macos_contacts: MacOsContactsPermission::None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                serde_json::json!({
+                    "launchServices": true,
+                }),
+                CorePermissionProfile {
+                    macos: Some(MacOsSeatbeltProfileExtensions {
+                        macos_preferences: MacOsPreferencesPermission::None,
+                        macos_automation: MacOsAutomationPermission::None,
+                        macos_launch_services: true,
+                        macos_accessibility: false,
+                        macos_calendar: false,
+                        macos_reminders: false,
+                        macos_contacts: MacOsContactsPermission::None,
                     }),
                     ..Default::default()
                 },
@@ -2984,8 +3011,11 @@ mod tests {
                     macos: Some(MacOsSeatbeltProfileExtensions {
                         macos_preferences: MacOsPreferencesPermission::None,
                         macos_automation: MacOsAutomationPermission::None,
+                        macos_launch_services: false,
                         macos_accessibility: true,
                         macos_calendar: false,
+                        macos_reminders: false,
+                        macos_contacts: MacOsContactsPermission::None,
                     }),
                     ..Default::default()
                 },
@@ -2998,8 +3028,45 @@ mod tests {
                     macos: Some(MacOsSeatbeltProfileExtensions {
                         macos_preferences: MacOsPreferencesPermission::None,
                         macos_automation: MacOsAutomationPermission::None,
+                        macos_launch_services: false,
                         macos_accessibility: false,
                         macos_calendar: true,
+                        macos_reminders: false,
+                        macos_contacts: MacOsContactsPermission::None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                serde_json::json!({
+                    "reminders": true,
+                }),
+                CorePermissionProfile {
+                    macos: Some(MacOsSeatbeltProfileExtensions {
+                        macos_preferences: MacOsPreferencesPermission::None,
+                        macos_automation: MacOsAutomationPermission::None,
+                        macos_launch_services: false,
+                        macos_accessibility: false,
+                        macos_calendar: false,
+                        macos_reminders: true,
+                        macos_contacts: MacOsContactsPermission::None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                serde_json::json!({
+                    "contacts": "read_only",
+                }),
+                CorePermissionProfile {
+                    macos: Some(MacOsSeatbeltProfileExtensions {
+                        macos_preferences: MacOsPreferencesPermission::None,
+                        macos_automation: MacOsAutomationPermission::None,
+                        macos_launch_services: false,
+                        macos_accessibility: false,
+                        macos_calendar: false,
+                        macos_reminders: false,
+                        macos_contacts: MacOsContactsPermission::ReadOnly,
                     }),
                     ..Default::default()
                 },
@@ -3055,6 +3122,7 @@ mod tests {
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
             receiver_agent_role: None,
+            receiver_spawn_mode: None,
         };
 
         let item = collab_resume_begin_item(event.clone());
@@ -3069,8 +3137,10 @@ mod tests {
                 thread_id: event.receiver_thread_id.to_string(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             }],
             prompt: None,
+            close_result: None,
             agents_states: HashMap::new(),
             agent_statuses: Vec::new(),
         };
@@ -3085,6 +3155,7 @@ mod tests {
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
             receiver_agent_role: None,
+            receiver_spawn_mode: None,
             status: codex_protocol::protocol::AgentStatus::NotFound,
         };
 
@@ -3101,8 +3172,10 @@ mod tests {
                 thread_id: receiver_id.clone(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
             }],
             prompt: None,
+            close_result: None,
             agents_states: [(
                 receiver_id,
                 V2CollabAgentStatus::from(codex_protocol::protocol::AgentStatus::NotFound),
@@ -3113,6 +3186,7 @@ mod tests {
                 thread_id: event.receiver_thread_id.to_string(),
                 agent_nickname: None,
                 agent_role: None,
+                spawn_mode: None,
                 status: V2CollabAgentStatus::from(codex_protocol::protocol::AgentStatus::NotFound),
             }],
         };
@@ -3153,12 +3227,14 @@ mod tests {
                     thread_id: thread_b,
                     agent_nickname: Some("B".to_string()),
                     agent_role: Some("worker".to_string()),
+                    spawn_mode: None,
                     status: codex_protocol::protocol::AgentStatus::Running,
                 },
                 codex_protocol::protocol::CollabAgentStatusEntry {
                     thread_id: thread_a,
                     agent_nickname: Some("A".to_string()),
                     agent_role: Some("default".to_string()),
+                    spawn_mode: None,
                     status: codex_protocol::protocol::AgentStatus::Completed(None),
                 },
             ],
@@ -3185,11 +3261,13 @@ mod tests {
                     thread_id: thread_b.to_string(),
                     agent_nickname: Some("B".to_string()),
                     agent_role: Some("worker".to_string()),
+                    spawn_mode: None,
                 },
                 CollabAgentRef {
                     thread_id: thread_a.to_string(),
                     agent_nickname: Some("A".to_string()),
                     agent_role: Some("default".to_string()),
+                    spawn_mode: None,
                 },
             ]
         );
@@ -3228,11 +3306,13 @@ mod tests {
                     thread_id: thread_a.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                 },
                 CollabAgentRef {
                     thread_id: thread_b.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    spawn_mode: None,
                 },
             ]
         );

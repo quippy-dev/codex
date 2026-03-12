@@ -1716,7 +1716,7 @@ mod tests {
     #[test]
     fn from_auth_storage_with_auth_file_loads_override_path() -> std::io::Result<()> {
         let dir = tempdir()?;
-        let auth_file = dir.path().join("auth-override.json");
+        let auth_file = dir.path().join("override").join("auth.json");
         let auth_dot_json = AuthDotJson {
             auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("sk-from-override".to_string()),

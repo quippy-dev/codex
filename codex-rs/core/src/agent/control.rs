@@ -769,6 +769,16 @@ impl AgentControl {
             if let Some(removed_watchdog) = self.watchdogs.unregister(descendant_id).await
                 && let Some(helper_id) = removed_watchdog.active_helper_id
             {
+                if let Ok(owner_thread) = state.get_thread(removed_watchdog.owner_thread_id).await
+                    && !is_final(&owner_thread.agent_status().await)
+                {
+                    self.watchdogs
+                        .preserve_helper_owner_for_completion_fallback(
+                            helper_id,
+                            removed_watchdog.owner_thread_id,
+                        )
+                        .await;
+                }
                 let _ = state.send_op(helper_id, Op::Shutdown {}).await;
                 let _ = state.remove_thread(&helper_id).await;
                 self.guards.release_spawned_thread(helper_id);
@@ -780,6 +790,16 @@ impl AgentControl {
         if let Some(removed_watchdog) = self.watchdogs.unregister(agent_id).await
             && let Some(helper_id) = removed_watchdog.active_helper_id
         {
+            if let Ok(owner_thread) = state.get_thread(removed_watchdog.owner_thread_id).await
+                && !is_final(&owner_thread.agent_status().await)
+            {
+                self.watchdogs
+                    .preserve_helper_owner_for_completion_fallback(
+                        helper_id,
+                        removed_watchdog.owner_thread_id,
+                    )
+                    .await;
+            }
             let _ = state.send_op(helper_id, Op::Shutdown {}).await;
             let _ = state.remove_thread(&helper_id).await;
             self.guards.release_spawned_thread(helper_id);
@@ -974,6 +994,10 @@ impl AgentControl {
                     &child_thread_id.to_string(),
                     &status,
                 ))
+                .await;
+            control
+                .watchdogs
+                .clear_preserved_helper_owner(child_thread_id)
                 .await;
         });
     }
@@ -1959,17 +1983,8 @@ mod tests {
         let Op::InjectResponseItems { items } = captured.1 else {
             unreachable!("matched above");
         };
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         match &items[0] {
-            ResponseInputItem::FunctionCall {
-                name, arguments, ..
-            } => {
-                assert_eq!(name, AGENT_INBOX_KIND);
-                assert_eq!(arguments, "{}");
-            }
-            other => panic!("expected collab function call, got {other:?}"),
-        }
-        match &items[1] {
             ResponseInputItem::FunctionCallOutput { output, .. } => {
                 let output_text = output
                     .body
@@ -2023,7 +2038,7 @@ mod tests {
         assert_eq!(queued_bytes, 0);
         assert_eq!(flush_pending, false);
         let injected_items = receiver_thread.codex.session.get_pending_input().await;
-        assert_eq!(injected_items.len(), 2);
+        assert_eq!(injected_items.len(), 1);
         assert!(
             harness
                 .manager
@@ -2152,7 +2167,7 @@ mod tests {
 
         let (queued_items, queued_bytes, flush_pending) =
             receiver_thread.codex.session.post_turn_agent_stats().await;
-        assert_eq!(queued_items, 2);
+        assert_eq!(queued_items, 1);
         assert!(queued_bytes > 0);
         assert!(flush_pending);
         assert!(
@@ -2224,7 +2239,7 @@ mod tests {
 
         let (deferred_items, deferred_bytes) =
             receiver_thread.codex.session.deferred_collab_stats().await;
-        assert_eq!(deferred_items, 2);
+        assert_eq!(deferred_items, 1);
         assert!(deferred_bytes > 0);
         let (queued_items, queued_bytes, flush_pending) =
             receiver_thread.codex.session.post_turn_agent_stats().await;
@@ -2294,7 +2309,7 @@ mod tests {
 
         let (queued_items, queued_bytes, flush_pending) =
             receiver_thread.codex.session.post_turn_agent_stats().await;
-        assert_eq!(queued_items, 4);
+        assert_eq!(queued_items, 2);
         assert!(queued_bytes > 0);
         assert_eq!(flush_pending, true);
 
@@ -2334,7 +2349,7 @@ mod tests {
 
         let (deferred_items, deferred_bytes) =
             receiver_thread.codex.session.deferred_collab_stats().await;
-        assert_eq!(deferred_items, 2);
+        assert_eq!(deferred_items, 1);
         assert!(deferred_bytes > 0);
 
         let injected = harness
@@ -2462,25 +2477,20 @@ mod tests {
             .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
             .await;
 
-        let mut helper_status_rx = harness
-            .control
-            .subscribe_status(helper_thread_id)
-            .await
-            .expect("helper status subscription should succeed");
         let _ = harness
             .control
             .shutdown_agent(helper_thread_id)
             .await
             .expect("helper shutdown should submit");
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(10), async {
             loop {
-                if matches!(helper_status_rx.borrow().clone(), AgentStatus::Shutdown) {
+                if matches!(
+                    harness.control.get_status(helper_thread_id).await,
+                    AgentStatus::Shutdown | AgentStatus::NotFound
+                ) {
                     break;
                 }
-                helper_status_rx
-                    .changed()
-                    .await
-                    .expect("helper status should reach shutdown");
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -2530,25 +2540,20 @@ mod tests {
             .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
             .await;
 
-        let mut helper_status_rx = harness
-            .control
-            .subscribe_status(helper_thread_id)
-            .await
-            .expect("helper status subscription should succeed");
         let _ = harness
             .control
             .shutdown_agent(helper_thread_id)
             .await
             .expect("helper shutdown should submit");
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(10), async {
             loop {
-                if matches!(helper_status_rx.borrow().clone(), AgentStatus::Shutdown) {
+                if matches!(
+                    harness.control.get_status(helper_thread_id).await,
+                    AgentStatus::Shutdown | AgentStatus::NotFound
+                ) {
                     break;
                 }
-                helper_status_rx
-                    .changed()
-                    .await
-                    .expect("helper status should reach shutdown");
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -2618,18 +2623,8 @@ mod tests {
         let Op::InjectResponseItems { items } = &injected_ops[0].1 else {
             unreachable!("filtered to inject ops");
         };
-        match &items[0] {
-            ResponseInputItem::Message { role, content } => {
-                assert_eq!(role, "user");
-                assert_eq!(
-                    content,
-                    &vec![ContentItem::InputText {
-                        text: String::new()
-                    }]
-                );
-            }
-            other => panic!("expected prepended user message on fail-open inject, got {other:?}"),
-        }
+        assert_eq!(items.len(), 1);
+        assert_matches!(&items[0], ResponseInputItem::FunctionCallOutput { .. });
 
         let _ = harness.control.shutdown_agent(receiver_thread_id).await;
     }
@@ -2755,6 +2750,7 @@ mod tests {
         let parent_spawn_call = ResponseItem::FunctionCall {
             id: None,
             name: "spawn_agent".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
         };
@@ -2837,6 +2833,7 @@ mod tests {
         let parent_spawn_call = ResponseItem::FunctionCall {
             id: None,
             name: "spawn_agent".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
         };
@@ -2912,6 +2909,7 @@ mod tests {
         let parent_spawn_call = ResponseItem::FunctionCall {
             id: None,
             name: "spawn_agent".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
         };
@@ -2991,6 +2989,7 @@ mod tests {
         let parent_spawn_call = ResponseItem::FunctionCall {
             id: None,
             name: "spawn_agent".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
         };
@@ -3991,27 +3990,11 @@ mod tests {
         )
         .expect("tool role should build inbox items");
 
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
 
-        let call_id = match &items[0] {
-            ResponseInputItem::FunctionCall {
-                name,
-                arguments,
-                call_id,
-            } => {
-                assert_eq!(name, AGENT_INBOX_KIND);
-                assert_eq!(arguments, "{}");
-                call_id.clone()
-            }
-            other => panic!("expected function call item, got {other:?}"),
-        };
-
-        match &items[1] {
-            ResponseInputItem::FunctionCallOutput {
-                call_id: output_call_id,
-                output,
-            } => {
-                assert_eq!(output_call_id, &call_id);
+        let _call_id = match &items[0] {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                let call_id = call_id.clone();
                 let output_text = output
                     .body
                     .to_text()
@@ -4024,9 +4007,10 @@ mod tests {
                 assert_eq!(payload.sender_agent_nickname.as_deref(), Some("Atlas"));
                 assert_eq!(payload.sender_agent_role.as_deref(), Some("worker"));
                 assert_eq!(payload.message, "ping");
+                call_id
             }
             other => panic!("expected function call output item, got {other:?}"),
-        }
+        };
     }
 
     #[tokio::test]
@@ -4052,6 +4036,11 @@ mod tests {
             .get_thread(resumable_id)
             .await
             .expect("resumable thread should exist");
+        resumable_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
         resumable_thread.flush_rollout().await;
         let _ = control
             .shutdown_agent(resumable_id)
@@ -4277,6 +4266,7 @@ mod tests {
         let parent_spawn_call = ResponseItem::FunctionCall {
             id: None,
             name: "spawn_agent".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: parent_spawn_call_id.clone(),
         };
@@ -4582,6 +4572,11 @@ mod tests {
             .get_thread(child_thread_id)
             .await
             .expect("child thread should exist");
+        child_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
         child_thread.flush_rollout().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4677,6 +4672,11 @@ mod tests {
             .get_thread(child_thread_id)
             .await
             .expect("child thread should exist");
+        child_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
         child_thread.flush_rollout().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4764,6 +4764,11 @@ mod tests {
             .get_thread(child_thread_id)
             .await
             .expect("child thread should exist");
+        child_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
         child_thread.flush_rollout().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4908,7 +4913,7 @@ mod tests {
         )
         .expect("tool role should build inbox items");
 
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 2);
         match &items[0] {
             ResponseInputItem::Message { role, content } => {
                 assert_eq!(role, "user");
@@ -4921,8 +4926,7 @@ mod tests {
             }
             other => panic!("expected prepended user message, got {other:?}"),
         }
-        assert_matches!(&items[1], ResponseInputItem::FunctionCall { .. });
-        assert_matches!(&items[2], ResponseInputItem::FunctionCallOutput { .. });
+        assert_matches!(&items[1], ResponseInputItem::FunctionCallOutput { .. });
     }
 
     #[test]

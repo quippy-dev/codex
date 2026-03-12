@@ -168,10 +168,12 @@ impl ConfigService {
         };
 
         let effective = layers.effective_config();
-        validate_config(&effective)
+
+        let effective_config_toml: ConfigToml = effective
+            .try_into()
             .map_err(|err| ConfigServiceError::toml("invalid configuration", err))?;
 
-        let json_value = serde_json::to_value(&effective)
+        let json_value = serde_json::to_value(&effective_config_toml)
             .map_err(|err| ConfigServiceError::json("failed to serialize configuration", err))?;
         let config: ApiConfig = serde_json::from_value(json_value)
             .map_err(|err| ConfigServiceError::json("failed to deserialize configuration", err))?;
@@ -953,7 +955,7 @@ personality = true
         } else {
             layers.as_slice()
         };
-        assert_eq!(layers.len(), 3, "expected three layers");
+        assert_eq!(layers.len(), 2, "expected managed and user layers only");
         assert_eq!(
             layers.first().unwrap().name,
             ConfigLayerSource::LegacyManagedConfigTomlFromFile {
@@ -966,10 +968,6 @@ personality = true
                 file: user_file.clone()
             }
         );
-        assert!(matches!(
-            layers.get(2).unwrap().name,
-            ConfigLayerSource::System { .. }
-        ));
     }
 
     #[tokio::test]

@@ -70,20 +70,13 @@ pub fn build_tool_response_input_items(
     );
     let output = serde_json::to_string(&payload)?;
 
-    Ok(vec![
-        ResponseInputItem::FunctionCall {
-            name: AGENT_INBOX_KIND.to_string(),
-            arguments: "{}".to_string(),
-            call_id: call_id.clone(),
+    Ok(vec![ResponseInputItem::FunctionCallOutput {
+        call_id,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(output),
+            ..Default::default()
         },
-        ResponseInputItem::FunctionCallOutput {
-            call_id,
-            output: FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::Text(output),
-                ..Default::default()
-            },
-        },
-    ])
+    }])
 }
 
 pub fn build_legacy_message_text(sender_thread_id: ThreadId, message: &str) -> String {

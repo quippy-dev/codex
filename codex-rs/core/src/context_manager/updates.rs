@@ -75,7 +75,17 @@ pub(crate) fn build_realtime_update_item(
         next.realtime_active,
     ) {
         (Some(true), false) => Some(DeveloperInstructions::realtime_end_message("inactive")),
-        (Some(false), true) | (None, true) => Some(DeveloperInstructions::realtime_start_message()),
+        (Some(false), true) | (None, true) => Some(
+            if let Some(instructions) = next
+                .config
+                .experimental_realtime_start_instructions
+                .as_deref()
+            {
+                DeveloperInstructions::realtime_start_message_with_instructions(instructions)
+            } else {
+                DeveloperInstructions::realtime_start_message()
+            },
+        ),
         (Some(true), true) | (Some(false), false) => None,
         (None, false) => previous_turn_settings
             .and_then(|settings| settings.realtime_active)
@@ -124,6 +134,10 @@ pub(crate) fn personality_message_for(
         .model_messages
         .as_ref()
         .and_then(|spec| spec.get_personality_message(Some(personality)))
+        .or_else(|| {
+            crate::models_manager::model_info::local_personality_messages_for_slug(&model_info.slug)
+                .and_then(|spec| spec.get_personality_message(Some(personality)))
+        })
         .filter(|message| !message.is_empty())
 }
 

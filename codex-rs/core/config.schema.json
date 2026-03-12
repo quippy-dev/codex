@@ -503,6 +503,9 @@
             "skill_mcp_dependency_install": {
               "type": "boolean"
             },
+            "spawn_csv": {
+              "type": "boolean"
+            },
             "sqlite": {
               "type": "boolean"
             },
@@ -635,10 +638,11 @@
       "type": "object"
     },
     "FileSystemAccessMode": {
+      "description": "Access mode for a filesystem entry.\n\nWhen two equally specific entries target the same path, we compare these by conflict precedence rather than by capability breadth: `none` beats `write`, and `write` beats `read`.",
       "enum": [
-        "none",
         "read",
-        "write"
+        "write",
+        "none"
       ],
       "type": "string"
     },
@@ -1388,6 +1392,11 @@
         "sandbox_approval": {
           "description": "Reject approval prompts related to sandbox escalation.",
           "type": "boolean"
+        },
+        "skill_approval": {
+          "default": false,
+          "description": "Reject approval prompts triggered by skill script execution.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -1827,6 +1836,10 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
+    "experimental_realtime_start_instructions": {
+      "description": "Experimental / do not use. Overrides the synthesized startup instructions injected when realtime mode becomes active.",
+      "type": "string"
+    },
     "experimental_realtime_ws_backend_prompt": {
       "description": "Experimental / do not use. Overrides only the realtime conversation websocket transport instructions (the `Op::RealtimeConversation` `/ws` session.update instructions) without changing normal prompts.",
       "type": "string"
@@ -1999,6 +2012,9 @@
           "type": "boolean"
         },
         "skill_mcp_dependency_install": {
+          "type": "boolean"
+        },
+        "spawn_csv": {
           "type": "boolean"
         },
         "sqlite": {

@@ -376,10 +376,23 @@ mod tests {
             },
         ];
 
-        for item in items {
+        for item in items.into_iter().take(2) {
             let turn_item = parse_turn_item(&item);
             assert!(turn_item.is_none(), "expected none, got {turn_item:?}");
         }
+
+        let truncated_user_shell_command = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "<user_shell_command>\n<command>\necho 42\n</command>\n<result>\nOutput:\n"
+                    .to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let turn_item = parse_turn_item(&truncated_user_shell_command);
+        assert!(matches!(turn_item, Some(TurnItem::UserMessage(_))));
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub(crate) struct WatchdogRegistration {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RemovedWatchdog {
+    pub(crate) owner_thread_id: ThreadId,
     pub(crate) target_thread_id: ThreadId,
     pub(crate) active_helper_id: Option<ThreadId>,
 }
@@ -61,6 +62,7 @@ pub(crate) struct WatchdogManager {
     manager: Weak<ThreadManagerState>,
     guards: Arc<Guards>,
     registrations: Mutex<HashMap<ThreadId, WatchdogEntry>>,
+    preserved_helper_owners: Mutex<HashMap<ThreadId, ThreadId>>,
     started: AtomicBool,
     next_generation: AtomicI64,
 }
@@ -71,6 +73,7 @@ impl WatchdogManager {
             manager,
             guards,
             registrations: Mutex::new(HashMap::new()),
+            preserved_helper_owners: Mutex::new(HashMap::new()),
             started: AtomicBool::new(false),
             next_generation: AtomicI64::new(1),
         })
@@ -131,6 +134,7 @@ impl WatchdogManager {
         for superseded_target in superseded_targets {
             if let Some(removed) = registrations.remove(&superseded_target) {
                 superseded.push(RemovedWatchdog {
+                    owner_thread_id: removed.registration.owner_thread_id,
                     target_thread_id: superseded_target,
                     active_helper_id: removed.active_helper_id,
                 });
@@ -454,6 +458,7 @@ impl WatchdogManager {
         registrations
             .remove(&target_thread_id)
             .map(|removed| RemovedWatchdog {
+                owner_thread_id: removed.registration.owner_thread_id,
                 target_thread_id,
                 active_helper_id: removed.active_helper_id,
             })
@@ -464,10 +469,18 @@ impl WatchdogManager {
         helper_thread_id: ThreadId,
     ) -> Option<ThreadId> {
         let registrations = self.registrations.lock().await;
-        registrations.values().find_map(|entry| {
+        if let Some(owner_thread_id) = registrations.values().find_map(|entry| {
             (entry.active_helper_id == Some(helper_thread_id))
                 .then_some(entry.registration.owner_thread_id)
-        })
+        }) {
+            return Some(owner_thread_id);
+        }
+        drop(registrations);
+        self.preserved_helper_owners
+            .lock()
+            .await
+            .get(&helper_thread_id)
+            .copied()
     }
 
     pub(crate) async fn registered_targets(&self, candidate_ids: &[ThreadId]) -> HashSet<ThreadId> {
@@ -491,6 +504,7 @@ impl WatchdogManager {
         for removed_target in removed_targets {
             if let Some(entry) = registrations.remove(&removed_target) {
                 removed.push(RemovedWatchdog {
+                    owner_thread_id: entry.registration.owner_thread_id,
                     target_thread_id: removed_target,
                     active_helper_id: entry.active_helper_id,
                 });
@@ -515,6 +529,24 @@ impl WatchdogManager {
         entry.owner_idle_since = Some(due_at);
         entry.owner_was_running = false;
         entry.active_helper_id = Some(helper_thread_id);
+    }
+
+    pub(crate) async fn preserve_helper_owner_for_completion_fallback(
+        &self,
+        helper_thread_id: ThreadId,
+        owner_thread_id: ThreadId,
+    ) {
+        self.preserved_helper_owners
+            .lock()
+            .await
+            .insert(helper_thread_id, owner_thread_id);
+    }
+
+    pub(crate) async fn clear_preserved_helper_owner(&self, helper_thread_id: ThreadId) {
+        self.preserved_helper_owners
+            .lock()
+            .await
+            .remove(&helper_thread_id);
     }
 }
 

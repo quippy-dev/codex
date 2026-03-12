@@ -211,8 +211,10 @@ impl ModelsManager {
         let remote = Self::find_model_by_longest_prefix(model, candidates)
             .or_else(|| Self::find_model_by_namespaced_suffix(model, candidates));
         let model_info = if let Some(remote) = remote {
+            let local_fallback = model_info::model_info_from_slug(model);
             ModelInfo {
                 slug: model.to_string(),
+                model_messages: remote.model_messages.or(local_fallback.model_messages),
                 used_fallback_model_metadata: false,
                 ..remote
             }
@@ -356,7 +358,7 @@ impl ModelsManager {
 
     /// Build picker-ready presets from the active catalog snapshot.
     fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
-        remote_models.sort_by(|a, b| a.priority.cmp(&b.priority));
+        remote_models.sort_by_key(|a| a.priority);
 
         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
         let chatgpt_mode = matches!(self.auth_manager.auth_mode(), Some(AuthMode::Chatgpt));
@@ -403,7 +405,7 @@ impl ModelsManager {
             return model.to_string();
         }
         let mut models = Self::load_remote_models_from_file().unwrap_or_default();
-        models.sort_by(|a, b| a.priority.cmp(&b.priority));
+        models.sort_by_key(|a| a.priority);
         let presets: Vec<ModelPreset> = models.into_iter().map(Into::into).collect();
         presets
             .iter()
@@ -433,6 +435,7 @@ mod tests {
     use crate::CodexAuth;
     use crate::auth::AuthCredentialsStoreMode;
     use crate::config::ConfigBuilder;
+    use crate::config_loader::LoaderOverrides;
     use crate::model_provider_info::WireApi;
     use chrono::Utc;
     use codex_protocol::openai_models::ModelsResponse;
@@ -512,6 +515,11 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
             .build()
             .await
             .expect("load default test config");
@@ -547,6 +555,11 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
             .build()
             .await
             .expect("load default test config");
@@ -581,6 +594,11 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
             .build()
             .await
             .expect("load default test config");
@@ -610,6 +628,11 @@ mod tests {
         let codex_home = tempdir().expect("temp dir");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
             .build()
             .await
             .expect("load default test config");

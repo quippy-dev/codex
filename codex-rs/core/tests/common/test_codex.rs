@@ -463,11 +463,9 @@ impl TestCodexHarness {
             .await
             .expect("mock server should not fail")
             .into_iter()
-            .filter(|req| path_matcher.matches(req))
-            .map(|req| {
-                req.body_json::<Value>()
-                    .expect("request body to be valid JSON")
-            })
+            .filter(|req| req.method.as_str() == "POST" && path_matcher.matches(req))
+            .filter(|req| !req.body.is_empty())
+            .map(|req| parse_request_body_json(&req))
             .collect()
     }
 
@@ -505,6 +503,31 @@ impl TestCodexHarness {
             }
         }
     }
+}
+
+fn parse_request_body_json(req: &wiremock::Request) -> Value {
+    let content_encoding = req
+        .headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok());
+    let body = decode_request_body_bytes(&req.body, content_encoding);
+    serde_json::from_slice(&body).expect("request body to be valid JSON")
+}
+
+fn decode_request_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
+    if content_encoding.is_some_and(is_zstd_encoding) {
+        zstd::stream::decode_all(std::io::Cursor::new(body)).unwrap_or_else(|err| {
+            panic!("failed to decode zstd request body: {err}");
+        })
+    } else {
+        body.to_vec()
+    }
+}
+
+fn is_zstd_encoding(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
 }
 
 fn custom_tool_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {

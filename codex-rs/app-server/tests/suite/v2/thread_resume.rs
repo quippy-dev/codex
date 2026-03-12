@@ -317,6 +317,7 @@ stream_max_retries = 0
     assert!(
         Command::new("git")
             .current_dir(&repo_path)
+            .args(["-c", "commit.gpgsign=false"])
             .args(["commit", "-m", "initial"])
             .status()?
             .success()

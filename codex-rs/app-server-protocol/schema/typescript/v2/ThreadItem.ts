@@ -9,6 +9,7 @@ import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentStatusEntry } from "./CollabAgentStatusEntry";
 import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
+import type { CollabCloseResult } from "./CollabCloseResult";
 import type { CommandAction } from "./CommandAction";
 import type { CommandExecutionStatus } from "./CommandExecutionStatus";
 import type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputContentItem";
@@ -93,6 +94,10 @@ receiverAgents: Array<CollabAgentRef>,
  * Prompt text sent as part of the collab tool call, when available.
  */
 prompt: string | null, 
+/**
+ * Optional close result when `tool` is `CloseAgent`.
+ */
+closeResult: CollabCloseResult | null, 
 /**
  * Last known status of the target agents, when available.
  */

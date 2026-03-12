@@ -47,6 +47,10 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
         };
     }
 
+    if model.model_messages.is_none() {
+        model.model_messages = local_personality_messages_for_slug(&model.slug);
+    }
+
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
         model.model_messages = None;
@@ -93,7 +97,7 @@ pub(crate) fn model_info_from_slug(slug: &str) -> ModelInfo {
     }
 }
 
-fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
+pub(crate) fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
     match slug {
         "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
             instructions_template: Some(format!(

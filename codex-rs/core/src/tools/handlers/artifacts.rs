@@ -276,6 +276,7 @@ async fn prepare_artifact_build(
             command: &command,
             approval_policy: turn.approval_policy.value(),
             sandbox_policy: turn.sandbox_policy.get(),
+            file_system_sandbox_policy: &turn.file_system_sandbox_policy,
             sandbox_permissions: SandboxPermissions::RequireEscalated,
             prefix_rule: Some(approval_key.command_prefix.clone()),
         })

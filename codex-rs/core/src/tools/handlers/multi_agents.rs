@@ -223,6 +223,8 @@ mod spawn {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     prompt: prompt.clone(),
+                    model: args.model.clone().unwrap_or_default(),
+                    reasoning_effort: args.reasoning_effort.unwrap_or_default(),
                 }
                 .into(),
             )
@@ -1350,7 +1352,7 @@ fn build_wait_agent_statuses(
             status: status.clone(),
         })
         .collect::<Vec<_>>();
-    extras.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
+    extras.sort_by_key(|left| left.thread_id.to_string());
     entries.extend(extras);
     entries
 }
@@ -1958,6 +1960,7 @@ mod tests {
             tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
             call_id: "call-1".to_string(),
             tool_name: tool_name.to_string(),
+            tool_namespace: None,
             payload,
         }
     }
@@ -2121,7 +2124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_agent_uses_explorer_role_and_sets_never_approval_policy() {
+    async fn spawn_agent_uses_explorer_role_and_preserves_runtime_approval_policy() {
         #[derive(Debug, Deserialize)]
         struct SpawnAgentResult {
             agent_id: String,
@@ -2138,6 +2141,9 @@ mod tests {
             .set(AskForApproval::OnRequest)
             .expect("approval policy should be set");
         turn.config = Arc::new(config);
+        turn.approval_policy
+            .set(AskForApproval::OnRequest)
+            .expect("approval policy should be set");
         let expected_model = turn.model_info.slug.clone();
 
         let invocation = invocation(
@@ -2170,7 +2176,7 @@ mod tests {
             .config_snapshot()
             .await;
         assert_eq!(snapshot.model, expected_model);
-        assert_eq!(snapshot.approval_policy, AskForApproval::Never);
+        assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
+use crate::chatwidget::ThreadInputState;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -22,33 +23,17 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
-#[cfg(test)]
-use crate::history_cell::new_subagent_spawned_cell;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
-use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
-use crate::multi_agents::next_agent_shortcut;
 use crate::multi_agents::next_agent_shortcut_matches;
-use crate::multi_agents::previous_agent_shortcut;
 use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
-#[cfg(test)]
-use crate::subagent_panel::SubagentInfo;
-use crate::subagent_panel::SubagentRegistry;
-#[cfg(test)]
-use crate::subagent_transcript::SUBAGENT_UPDATE_PREVIEW_BUDGET;
-#[cfg(test)]
-use crate::text_formatting::truncate_text;
-use crate::thread_switch_replay;
-use crate::thread_switch_replay::ThreadEventChannel;
-use crate::thread_switch_replay::ThreadEventSnapshot;
-use crate::thread_switch_replay::ThreadEventStore;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -78,14 +63,12 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::CollabAgentRef;
-use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
@@ -104,7 +87,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
@@ -123,10 +105,18 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
+
+mod agent_navigation;
+mod pending_interactive_replay;
+
+use self::agent_navigation::AgentNavigationDirection;
+use self::agent_navigation::AgentNavigationState;
+use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -140,6 +130,7 @@ enum ThreadInteractiveRequest {
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+const SUBAGENT_ANIMATION_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -270,7 +261,151 @@ struct SessionSummary {
     resume_command: Option<String>,
 }
 
-const SUBAGENT_ANIMATION_TICK: Duration = Duration::from_millis(100);
+#[derive(Debug, Clone)]
+struct ThreadEventSnapshot {
+    session_configured: Option<Event>,
+    events: Vec<Event>,
+    input_state: Option<ThreadInputState>,
+}
+
+#[derive(Debug)]
+struct ThreadEventStore {
+    session_configured: Option<Event>,
+    buffer: VecDeque<Event>,
+    user_message_ids: HashSet<String>,
+    pending_interactive_replay: PendingInteractiveReplayState,
+    input_state: Option<ThreadInputState>,
+    capacity: usize,
+    active: bool,
+}
+
+impl ThreadEventStore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            session_configured: None,
+            buffer: VecDeque::new(),
+            user_message_ids: HashSet::new(),
+            pending_interactive_replay: PendingInteractiveReplayState::default(),
+            input_state: None,
+            capacity,
+            active: false,
+        }
+    }
+
+    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
+        let mut store = Self::new(capacity);
+        store.session_configured = Some(event);
+        store
+    }
+
+    fn push_event(&mut self, event: Event) {
+        self.pending_interactive_replay.note_event(&event);
+        match &event.msg {
+            EventMsg::SessionConfigured(_) => {
+                self.session_configured = Some(event);
+                return;
+            }
+            EventMsg::ItemCompleted(completed) => {
+                if let TurnItem::UserMessage(item) = &completed.item {
+                    if !event.id.is_empty() && self.user_message_ids.contains(&event.id) {
+                        return;
+                    }
+                    let legacy = Event {
+                        id: event.id,
+                        msg: item.as_legacy_event(),
+                    };
+                    self.push_legacy_event(legacy);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        self.push_legacy_event(event);
+    }
+
+    fn push_legacy_event(&mut self, event: Event) {
+        if let EventMsg::UserMessage(_) = &event.msg
+            && !event.id.is_empty()
+            && !self.user_message_ids.insert(event.id.clone())
+        {
+            return;
+        }
+        self.buffer.push_back(event);
+        if self.buffer.len() > self.capacity
+            && let Some(removed) = self.buffer.pop_front()
+        {
+            self.pending_interactive_replay.note_evicted_event(&removed);
+            if matches!(removed.msg, EventMsg::UserMessage(_)) && !removed.id.is_empty() {
+                self.user_message_ids.remove(&removed.id);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> ThreadEventSnapshot {
+        ThreadEventSnapshot {
+            session_configured: self.session_configured.clone(),
+            // Thread switches replay buffered events into a rebuilt ChatWidget. Only replay
+            // interactive prompts that are still pending, or answered approvals/input will reappear.
+            events: self
+                .buffer
+                .iter()
+                .filter(|event| {
+                    self.pending_interactive_replay
+                        .should_replay_snapshot_event(event)
+                })
+                .cloned()
+                .collect(),
+            input_state: self.input_state.clone(),
+        }
+    }
+
+    fn note_outbound_op(&mut self, op: &Op) {
+        self.pending_interactive_replay.note_outbound_op(op);
+    }
+
+    fn op_can_change_pending_replay_state(op: &Op) -> bool {
+        PendingInteractiveReplayState::op_can_change_state(op)
+    }
+
+    fn event_can_change_pending_thread_approvals(event: &Event) -> bool {
+        PendingInteractiveReplayState::event_can_change_pending_thread_approvals(event)
+    }
+
+    fn has_pending_thread_approvals(&self) -> bool {
+        self.pending_interactive_replay
+            .has_pending_thread_approvals()
+    }
+}
+
+#[derive(Debug)]
+struct ThreadEventChannel {
+    sender: mpsc::Sender<Event>,
+    receiver: Option<mpsc::Receiver<Event>>,
+    store: Arc<Mutex<ThreadEventStore>>,
+}
+
+impl ThreadEventChannel {
+    fn new(capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
+        Self {
+            sender,
+            receiver: Some(receiver),
+            store: Arc::new(Mutex::new(ThreadEventStore::new(capacity))),
+        }
+    }
+
+    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
+        Self {
+            sender,
+            receiver: Some(receiver),
+            store: Arc::new(Mutex::new(ThreadEventStore::new_with_session_configured(
+                capacity, event,
+            ))),
+        }
+    }
+}
 
 fn should_show_model_migration_prompt(
     current_model: &str,
@@ -568,14 +703,12 @@ pub(crate) struct App {
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
-    agent_picker_threads: HashMap<ThreadId, AgentPickerThreadEntry>,
-    agent_picker_thread_order: Vec<ThreadId>,
+    agent_navigation: AgentNavigationState,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<Event>>,
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
-    subagents: SubagentRegistry,
 }
 
 #[derive(Default)]
@@ -583,12 +716,6 @@ struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
     // One-shot suppression of the next world-writable scan after user confirmation.
     skip_world_writable_scan_once: bool,
-}
-
-#[derive(Clone, Copy)]
-enum AgentNavigationDirection {
-    Previous,
-    Next,
 }
 
 fn normalize_harness_overrides_for_cwd(
@@ -820,15 +947,6 @@ impl App {
         }
     }
 
-    fn reset_app_ui_state_after_clear(&mut self) {
-        self.overlay = None;
-        self.transcript_cells.clear();
-        self.deferred_history_lines.clear();
-        self.has_emitted_history_lines = false;
-        self.backtrack = BacktrackState::default();
-        self.backtrack_render_pending = false;
-    }
-
     fn clear_terminal_ui(&mut self, tui: &mut tui::Tui, redraw_header: bool) -> Result<()> {
         let is_alt_screen_active = tui.is_alt_screen_active();
 
@@ -853,14 +971,18 @@ impl App {
         self.has_emitted_history_lines = false;
 
         if redraw_header {
-            let width = tui.terminal.last_known_screen_size.width;
-            let header_lines = self.clear_ui_header_lines(width);
-            if !header_lines.is_empty() {
-                tui.insert_history_lines(header_lines);
-                self.has_emitted_history_lines = true;
-            }
+            self.queue_clear_ui_header(tui);
         }
         Ok(())
+    }
+
+    fn reset_app_ui_state_after_clear(&mut self) {
+        self.overlay = None;
+        self.transcript_cells.clear();
+        self.deferred_history_lines.clear();
+        self.has_emitted_history_lines = false;
+        self.backtrack = BacktrackState::default();
+        self.backtrack_render_pending = false;
     }
 
     async fn shutdown_current_thread(&mut self) {
@@ -896,53 +1018,61 @@ impl App {
             .or_insert_with(|| ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     async fn set_thread_active(&mut self, thread_id: ThreadId, active: bool) {
-        thread_switch_replay::set_thread_active(&mut self.thread_event_channels, thread_id, active)
-            .await;
+        if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+            let mut store = channel.store.lock().await;
+            store.active = active;
+        }
     }
 
     async fn activate_thread_channel(&mut self, thread_id: ThreadId) {
         if self.active_thread_id.is_some() {
             return;
         }
-        thread_switch_replay::activate_thread_channel(
-            &mut self.thread_event_channels,
-            &mut self.active_thread_id,
-            &mut self.active_thread_rx,
-            thread_id,
-        )
-        .await;
-        self.sync_subagent_panel_state();
+        self.set_thread_active(thread_id, true).await;
+        let receiver = if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+            channel.receiver.take()
+        } else {
+            None
+        };
+        self.active_thread_id = Some(thread_id);
+        self.active_thread_rx = receiver;
         self.refresh_pending_thread_approvals().await;
     }
 
     async fn store_active_thread_receiver(&mut self) {
-        thread_switch_replay::store_active_thread_receiver(
-            &mut self.thread_event_channels,
-            self.active_thread_id,
-            &mut self.active_thread_rx,
-            &self.chat_widget,
-        )
-        .await;
+        let Some(active_id) = self.active_thread_id else {
+            return;
+        };
+        let input_state = self.chat_widget.capture_thread_input_state();
+        if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
+            let receiver = self.active_thread_rx.take();
+            let mut store = channel.store.lock().await;
+            store.active = false;
+            store.input_state = input_state;
+            if let Some(receiver) = receiver {
+                channel.receiver = Some(receiver);
+            }
+        }
     }
 
     async fn activate_thread_for_replay(
         &mut self,
         thread_id: ThreadId,
     ) -> Option<(mpsc::Receiver<Event>, ThreadEventSnapshot)> {
-        thread_switch_replay::activate_thread_for_replay(&mut self.thread_event_channels, thread_id)
-            .await
+        let channel = self.thread_event_channels.get_mut(&thread_id)?;
+        let receiver = channel.receiver.take()?;
+        let mut store = channel.store.lock().await;
+        store.active = true;
+        let snapshot = store.snapshot();
+        Some((receiver, snapshot))
     }
 
     async fn clear_active_thread(&mut self) {
-        thread_switch_replay::clear_active_thread(
-            &mut self.thread_event_channels,
-            &mut self.active_thread_id,
-            &mut self.active_thread_rx,
-        )
-        .await;
-        self.sync_subagent_panel_state();
+        if let Some(active_id) = self.active_thread_id.take() {
+            self.set_thread_active(active_id, false).await;
+        }
+        self.active_thread_rx = None;
         self.refresh_pending_thread_approvals().await;
     }
 
@@ -973,7 +1103,7 @@ impl App {
             let short_id: String = thread_id.chars().take(8).collect();
             format!("Agent ({short_id})")
         };
-        if let Some(entry) = self.agent_picker_threads.get(&thread_id) {
+        if let Some(entry) = self.agent_navigation.get(&thread_id) {
             let label = format_agent_picker_item_name(
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
@@ -991,97 +1121,27 @@ impl App {
         }
     }
 
+    /// Returns the thread whose transcript is currently on screen.
+    ///
+    /// `active_thread_id` is the source of truth during steady state, but the widget can briefly
+    /// lag behind thread bookkeeping during transitions. The footer label and adjacent-thread
+    /// navigation both follow what the user is actually looking at, not whichever thread most
+    /// recently began switching.
     fn current_displayed_thread_id(&self) -> Option<ThreadId> {
         self.active_thread_id.or(self.chat_widget.thread_id())
     }
 
+    /// Mirrors the visible thread into the contextual footer row.
+    ///
+    /// The footer sometimes shows ambient context instead of an instructional hint. In multi-agent
+    /// sessions, that contextual row includes the currently viewed agent label. The label is
+    /// intentionally hidden until there is more than one known thread so single-thread sessions do
+    /// not spend footer space restating that the user is already on the main conversation.
     fn sync_active_agent_label(&mut self) {
-        let label = if self.agent_picker_threads.len() > 1 {
-            self.current_displayed_thread_id().map(|thread_id| {
-                let is_primary = self.primary_thread_id == Some(thread_id);
-                self.agent_picker_threads
-                    .get(&thread_id)
-                    .map(|entry| {
-                        format_agent_picker_item_name(
-                            entry.agent_nickname.as_deref(),
-                            entry.agent_role.as_deref(),
-                            is_primary,
-                        )
-                    })
-                    .unwrap_or_else(|| format_agent_picker_item_name(None, None, is_primary))
-            })
-        } else {
-            None
-        };
+        let label = self
+            .agent_navigation
+            .active_agent_label(self.current_displayed_thread_id(), self.primary_thread_id);
         self.chat_widget.set_active_agent_label(label);
-    }
-
-    fn ordered_agent_picker_threads(&self) -> Vec<(ThreadId, &AgentPickerThreadEntry)> {
-        self.agent_picker_thread_order
-            .iter()
-            .filter_map(|thread_id| {
-                self.agent_picker_threads
-                    .get(thread_id)
-                    .map(|entry| (*thread_id, entry))
-            })
-            .collect()
-    }
-
-    fn adjacent_agent_picker_thread_id(
-        &self,
-        direction: AgentNavigationDirection,
-    ) -> Option<ThreadId> {
-        let agent_threads = self.ordered_agent_picker_threads();
-        if agent_threads.len() < 2 {
-            return None;
-        }
-
-        let current_thread_id = self.current_displayed_thread_id()?;
-        let current_idx = agent_threads
-            .iter()
-            .position(|(thread_id, _)| *thread_id == current_thread_id)?;
-        let next_idx = match direction {
-            AgentNavigationDirection::Next => (current_idx + 1) % agent_threads.len(),
-            AgentNavigationDirection::Previous => {
-                if current_idx == 0 {
-                    agent_threads.len() - 1
-                } else {
-                    current_idx - 1
-                }
-            }
-        };
-        Some(agent_threads[next_idx].0)
-    }
-
-    fn agent_navigation_shortcut_target(&self, key_event: KeyEvent) -> Option<ThreadId> {
-        if self.overlay.is_some() || !self.chat_widget.no_modal_or_popup_active() {
-            return None;
-        }
-
-        if !self.chat_widget.composer_text_with_pending().is_empty() {
-            return None;
-        }
-
-        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported;
-
-        if previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
-            return self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous);
-        }
-
-        if next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback) {
-            return self.adjacent_agent_picker_thread_id(AgentNavigationDirection::Next);
-        }
-
-        None
-    }
-
-    fn agent_picker_subtitle() -> String {
-        let previous: Span<'static> = previous_agent_shortcut().into();
-        let next: Span<'static> = next_agent_shortcut().into();
-        format!(
-            "Select an agent to watch. {} previous, {} next.",
-            previous.content, next.content
-        )
     }
 
     async fn thread_cwd(&self, thread_id: ThreadId) -> Option<PathBuf> {
@@ -1215,169 +1275,7 @@ impl App {
         self.chat_widget.set_pending_thread_approvals(threads);
     }
 
-    fn subagents_root_active(&self) -> bool {
-        self.primary_thread_id.is_some() && self.active_thread_id == self.primary_thread_id
-    }
-
-    fn emit_or_queue_subagent_history(&mut self, cell: Box<dyn HistoryCell>) {
-        if self.subagents_root_active() {
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
-        } else {
-            self.subagents.queue_history(cell);
-        }
-    }
-
-    fn flush_subagent_history_if_root_active(&mut self) {
-        if !self.subagents_root_active() {
-            return;
-        }
-        let pending = self.subagents.take_pending_history();
-        for cell in pending {
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
-        }
-    }
-
-    fn update_subagent_animation(&mut self, root_active: bool) {
-        let should_run = root_active && self.subagents.has_animating_agents();
-        let is_running = self.subagent_anim_running.load(Ordering::Relaxed);
-        if should_run && !is_running {
-            self.app_event_tx.send(AppEvent::StartSubagentAnimation);
-        } else if !should_run && is_running {
-            self.app_event_tx.send(AppEvent::StopSubagentAnimation);
-        }
-    }
-
-    fn sync_subagent_panel_state(&mut self) {
-        let root_active = self.subagents_root_active();
-        self.subagents.rebuild_panel_state();
-
-        if root_active {
-            self.flush_subagent_history_if_root_active();
-            if let Some(panel) = self.subagents.panel_cell() {
-                self.app_event_tx.send(AppEvent::UpdateSubagentPanel(panel));
-            } else {
-                self.app_event_tx.send(AppEvent::ClearSubagentPanel);
-            }
-        } else {
-            self.app_event_tx.send(AppEvent::ClearSubagentPanel);
-        }
-
-        self.update_subagent_animation(root_active);
-    }
-
-    fn process_subagent_side_effects(&mut self, thread_id: ThreadId, event: &Event) {
-        for cell in self
-            .subagents
-            .process_event(thread_id, self.primary_thread_id, event)
-        {
-            self.emit_or_queue_subagent_history(cell);
-        }
-
-        self.sync_subagent_panel_state();
-    }
-
-    fn known_agent_identity(
-        &self,
-        thread_id: ThreadId,
-    ) -> (Option<String>, Option<String>, Option<AgentSpawnMode>) {
-        let subagent_identity = self.subagents.agents.get(&thread_id);
-        let picker_identity = self.agent_picker_threads.get(&thread_id);
-        (
-            subagent_identity
-                .and_then(|info| info.nickname.clone())
-                .or_else(|| picker_identity.and_then(|entry| entry.agent_nickname.clone())),
-            subagent_identity
-                .and_then(|info| info.agent_role.clone())
-                .or_else(|| picker_identity.and_then(|entry| entry.agent_role.clone())),
-            subagent_identity.map(|info| info.spawn_mode),
-        )
-    }
-
-    fn backfill_collab_event_identity(&self, event: &mut Event) {
-        match &mut event.msg {
-            EventMsg::CollabAgentInteractionEnd(ev) => {
-                let (nickname, role, _) = self.known_agent_identity(ev.receiver_thread_id);
-                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
-                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
-            }
-            EventMsg::CollabWaitingBegin(ev) => {
-                if ev.receiver_agents.is_empty() {
-                    ev.receiver_agents = ev
-                        .receiver_thread_ids
-                        .iter()
-                        .map(|thread_id| {
-                            let (agent_nickname, agent_role, spawn_mode) =
-                                self.known_agent_identity(*thread_id);
-                            CollabAgentRef {
-                                thread_id: *thread_id,
-                                agent_nickname,
-                                agent_role,
-                                spawn_mode,
-                            }
-                        })
-                        .collect();
-                } else {
-                    for agent in &mut ev.receiver_agents {
-                        let (agent_nickname, agent_role, spawn_mode) =
-                            self.known_agent_identity(agent.thread_id);
-                        agent.agent_nickname = agent.agent_nickname.clone().or(agent_nickname);
-                        agent.agent_role = agent.agent_role.clone().or(agent_role);
-                        agent.spawn_mode = agent.spawn_mode.or(spawn_mode);
-                    }
-                }
-            }
-            EventMsg::CollabWaitingEnd(ev) => {
-                if ev.agent_statuses.is_empty() {
-                    ev.agent_statuses = ev
-                        .statuses
-                        .iter()
-                        .map(|(thread_id, status)| {
-                            let (agent_nickname, agent_role, spawn_mode) =
-                                self.known_agent_identity(*thread_id);
-                            CollabAgentStatusEntry {
-                                thread_id: *thread_id,
-                                agent_nickname,
-                                agent_role,
-                                spawn_mode,
-                                status: status.clone(),
-                            }
-                        })
-                        .collect();
-                } else {
-                    for entry in &mut ev.agent_statuses {
-                        let (agent_nickname, agent_role, spawn_mode) =
-                            self.known_agent_identity(entry.thread_id);
-                        entry.agent_nickname = entry.agent_nickname.clone().or(agent_nickname);
-                        entry.agent_role = entry.agent_role.clone().or(agent_role);
-                        entry.spawn_mode = entry.spawn_mode.or(spawn_mode);
-                    }
-                }
-            }
-            EventMsg::CollabCloseEnd(ev) => {
-                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
-                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
-                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
-                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
-            }
-            EventMsg::CollabResumeBegin(ev) => {
-                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
-                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
-                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
-                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
-            }
-            EventMsg::CollabResumeEnd(ev) => {
-                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
-                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
-                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
-                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
-            }
-            _ => {}
-        }
-    }
-
-    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, mut event: Event) -> Result<()> {
-        self.process_subagent_side_effects(thread_id, &event);
-        self.backfill_collab_event_identity(&mut event);
+    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
         let refresh_pending_thread_approvals =
             ThreadEventStore::event_can_change_pending_thread_approvals(&event);
         let inactive_interactive_request = if self.active_thread_id != Some(thread_id) {
@@ -1468,6 +1366,12 @@ impl App {
         Ok(())
     }
 
+    /// Opens the `/agent` picker after refreshing cached labels for known threads.
+    ///
+    /// The picker state is derived from long-lived thread channels plus best-effort metadata
+    /// refreshes from the backend. Refresh failures are treated as "thread is only inspectable by
+    /// historical id now" and converted into closed picker entries instead of deleting them, so
+    /// the stable traversal order remains intact for review and keyboard navigation.
     async fn open_agent_picker(&mut self) {
         let thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
         for thread_id in thread_ids {
@@ -1488,15 +1392,14 @@ impl App {
         }
 
         let has_non_primary_agent_thread = self
-            .agent_picker_threads
-            .keys()
-            .any(|thread_id| Some(*thread_id) != self.primary_thread_id);
+            .agent_navigation
+            .has_non_primary_thread(self.primary_thread_id);
         if !self.config.features.enabled(Feature::Collab) && !has_non_primary_agent_thread {
             self.chat_widget.open_multi_agent_enable_prompt();
             return;
         }
 
-        if self.agent_picker_threads.is_empty() {
+        if self.agent_navigation.is_empty() {
             self.chat_widget
                 .add_info_message("No agents available yet.".to_string(), None);
             return;
@@ -1504,7 +1407,8 @@ impl App {
 
         let mut initial_selected_idx = None;
         let items: Vec<SelectionItem> = self
-            .ordered_agent_picker_threads()
+            .agent_navigation
+            .ordered_threads()
             .iter()
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
@@ -1536,7 +1440,7 @@ impl App {
 
         self.chat_widget.show_selection_view(SelectionViewParams {
             title: Some("Multi-agents".to_string()),
-            subtitle: Some(Self::agent_picker_subtitle()),
+            subtitle: Some(AgentNavigationState::picker_subtitle()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             initial_selected_idx,
@@ -1544,6 +1448,10 @@ impl App {
         });
     }
 
+    /// Updates cached picker metadata and then mirrors any visible-label change into the footer.
+    ///
+    /// These two writes stay paired so the picker rows and contextual footer continue to describe
+    /// the same displayed thread after nickname or role updates.
     fn upsert_agent_picker_thread(
         &mut self,
         thread_id: ThreadId,
@@ -1551,27 +1459,18 @@ impl App {
         agent_role: Option<String>,
         is_closed: bool,
     ) {
-        if !self.agent_picker_threads.contains_key(&thread_id) {
-            self.agent_picker_thread_order.push(thread_id);
-        }
-        self.agent_picker_threads.insert(
-            thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname,
-                agent_role,
-                is_closed,
-            },
-        );
+        self.agent_navigation
+            .upsert(thread_id, agent_nickname, agent_role, is_closed);
         self.sync_active_agent_label();
     }
 
+    /// Marks a cached picker thread closed and recomputes the contextual footer label.
+    ///
+    /// Closing a thread is not the same as removing it: users can still inspect finished agent
+    /// transcripts, and the stable next/previous traversal order should not collapse around them.
     fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) {
-        if let Some(entry) = self.agent_picker_threads.get_mut(&thread_id) {
-            entry.is_closed = true;
-            self.sync_active_agent_label();
-        } else {
-            self.upsert_agent_picker_thread(thread_id, None, None, true);
-        }
+        self.agent_navigation.mark_closed(thread_id);
+        self.sync_active_agent_label();
     }
 
     async fn select_agent_thread(&mut self, tui: &mut tui::Tui, thread_id: ThreadId) -> Result<()> {
@@ -1629,6 +1528,7 @@ impl App {
             );
         }
         self.drain_active_thread_events(tui).await?;
+        self.refresh_pending_thread_approvals().await;
 
         Ok(())
     }
@@ -1648,16 +1548,13 @@ impl App {
     fn reset_thread_event_state(&mut self) {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
-        self.agent_picker_threads.clear();
-        self.agent_picker_thread_order.clear();
+        self.agent_navigation.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
-        self.subagents.clear();
         self.chat_widget.set_pending_thread_approvals(Vec::new());
         self.sync_active_agent_label();
-        self.sync_subagent_panel_state();
     }
 
     async fn start_fresh_session_with_summary_hint(&mut self, tui: &mut tui::Tui) {
@@ -1713,15 +1610,25 @@ impl App {
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        let mut active_thread_rx = self.active_thread_rx.take();
-        let disconnected =
-            thread_switch_replay::drain_active_thread_events(&mut active_thread_rx, |event| {
-                self.handle_codex_event_now(event)
-            });
-        if !disconnected {
-            self.active_thread_rx = active_thread_rx;
+        let Some(mut rx) = self.active_thread_rx.take() else {
+            return Ok(());
+        };
+
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => self.handle_codex_event_now(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
         }
-        if disconnected {
+
+        if !disconnected {
+            self.active_thread_rx = Some(rx);
+        } else {
             self.clear_active_thread().await;
         }
 
@@ -1759,15 +1666,19 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) {
-        let events =
-            thread_switch_replay::prepare_thread_snapshot_replay(&mut self.chat_widget, snapshot);
-        for event in events {
+        if let Some(event) = snapshot.session_configured {
             self.handle_codex_event_replay(event);
         }
-        thread_switch_replay::finish_thread_snapshot_replay(
-            &mut self.chat_widget,
-            resume_restored_queue,
-        );
+        self.chat_widget.set_queue_autosend_suppressed(true);
+        self.chat_widget
+            .restore_thread_input_state(snapshot.input_state);
+        for event in snapshot.events {
+            self.handle_codex_event_replay(event);
+        }
+        self.chat_widget.set_queue_autosend_suppressed(false);
+        if resume_restored_queue {
+            self.chat_widget.maybe_send_next_queued_input();
+        }
         self.refresh_status_line();
     }
 
@@ -2000,7 +1911,6 @@ impl App {
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
-        let animations_enabled = config.animations;
 
         let mut app = Self {
             server: thread_manager.clone(),
@@ -2033,14 +1943,12 @@ impl App {
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
-            agent_picker_threads: HashMap::new(),
-            agent_picker_thread_order: Vec::new(),
+            agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
-            subagents: SubagentRegistry::new(animations_enabled),
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -2050,8 +1958,8 @@ impl App {
                 != WindowsSandboxLevel::Disabled
                 && matches!(
                     app.config.permissions.sandbox_policy.get(),
-                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. }
-                        | codex_core::protocol::SandboxPolicy::ReadOnly { .. }
+                    codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
                 )
                 && !app
                     .config
@@ -2131,12 +2039,7 @@ impl App {
                             app.handle_thread_created(thread_id).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            tracing::warn!("thread_created receiver lagged; forcing thread resync");
-                            if let Err(err) = app.resync_thread_created_channels().await {
-                                tracing::warn!(
-                                    "failed to resync thread listeners after lag event: {err}"
-                                );
-                            }
+                            tracing::warn!("thread_created receiver lagged; skipping resync");
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             listen_for_threads = false;
@@ -2234,12 +2137,7 @@ impl App {
             }
             AppEvent::ClearUi => {
                 self.clear_terminal_ui(tui, false)?;
-                self.overlay = None;
-                self.transcript_cells.clear();
-                self.deferred_history_lines.clear();
-                self.has_emitted_history_lines = false;
-                self.backtrack = BacktrackState::default();
-                self.backtrack_render_pending = false;
+                self.reset_app_ui_state_after_clear();
 
                 self.start_fresh_session_with_summary_hint(tui).await;
             }
@@ -2479,11 +2377,7 @@ impl App {
                 self.subagent_anim_running.store(false, Ordering::Release);
             }
             AppEvent::SubagentTick => {
-                let root_active = self.subagents_root_active();
-                self.update_subagent_animation(root_active);
-                if root_active && self.subagents.has_animating_agents() {
-                    self.chat_widget.on_subagent_tick();
-                }
+                self.chat_widget.on_subagent_tick();
             }
             AppEvent::UpdateSubagentPanel(panel) => {
                 self.chat_widget.on_subagent_panel_updated(panel);
@@ -2504,8 +2398,13 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
-                self.note_active_thread_outbound_op(&op).await;
-                self.chat_widget.submit_op(op);
+                let replay_state_op =
+                    ThreadEventStore::op_can_change_pending_replay_state(&op).then(|| op.clone());
+                let submitted = self.chat_widget.submit_op(op);
+                if submitted && let Some(op) = replay_state_op.as_ref() {
+                    self.note_active_thread_outbound_op(op).await;
+                    self.refresh_pending_thread_approvals().await;
+                }
             }
             AppEvent::SubmitThreadOp { thread_id, op } => {
                 self.submit_op_to_thread(thread_id, op).await;
@@ -2945,6 +2844,10 @@ impl App {
                     .await
                 {
                     Ok(()) => {
+                        let effort_label = effort
+                            .map(|selected_effort| selected_effort.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
                         let mut message = format!("Model changed to {model}");
                         if let Some(label) = Self::reasoning_label_for(&model, effort) {
                             message.push(' ');
@@ -3105,8 +3008,8 @@ impl App {
                 #[cfg(target_os = "windows")]
                 let policy_is_workspace_write_or_ro = matches!(
                     &policy,
-                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. }
-                        | codex_core::protocol::SandboxPolicy::ReadOnly { .. }
+                    codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
                 );
                 let policy_for_chat = policy.clone();
 
@@ -3461,6 +3364,7 @@ impl App {
             }
             #[cfg(not(target_os = "linux"))]
             AppEvent::UpdateRecordingMeter { id, text } => {
+                // Update in place to preserve the element id for subsequent frames.
                 let updated = self.chat_widget.update_transcription_in_place(&id, &text);
                 if updated {
                     tui.frame_requester().schedule_frame();
@@ -3685,21 +3589,6 @@ impl App {
         Ok(())
     }
 
-    async fn resync_thread_created_channels(&mut self) -> Result<()> {
-        let known_thread_ids = self
-            .thread_event_channels
-            .keys()
-            .copied()
-            .collect::<HashSet<_>>();
-        let thread_ids = self.server.list_thread_ids().await;
-        for thread_id in thread_ids {
-            if !known_thread_ids.contains(&thread_id) {
-                self.handle_thread_created(thread_id).await?;
-            }
-        }
-        Ok(())
-    }
-
     fn reasoning_label(reasoning_effort: Option<ReasoningEffortConfig>) -> &'static str {
         match reasoning_effort {
             Some(ReasoningEffortConfig::Minimal) => "minimal",
@@ -3829,8 +3718,41 @@ impl App {
     }
 
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
-        if let Some(thread_id) = self.agent_navigation_shortcut_target(key_event) {
-            let _ = self.select_agent_thread(tui, thread_id).await;
+        // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
+        // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
+        // agent-switch shortcuts when the composer is empty so we never steal the expected
+        // editing behavior for moving across words inside a draft.
+        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
+            && self.chat_widget.composer_text_with_pending().is_empty();
+        if self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            // Alt+Left/Right are also natural word-motion keys in the composer. Keep agent
+            // fast-switch available only once the draft is empty so editing behavior wins whenever
+            // there is text on screen.
+            && self.chat_widget.composer_text_with_pending().is_empty()
+            && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
+        {
+            if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
+                self.current_displayed_thread_id(),
+                AgentNavigationDirection::Previous,
+            ) {
+                let _ = self.select_agent_thread(tui, thread_id).await;
+            }
+            return;
+        }
+        if self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            // Mirror the previous-agent rule above: empty drafts may use these keys for thread
+            // switching, but non-empty drafts keep them for expected word-wise cursor motion.
+            && self.chat_widget.composer_text_with_pending().is_empty()
+            && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
+        {
+            if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
+                self.current_displayed_thread_id(),
+                AgentNavigationDirection::Next,
+            ) {
+                let _ = self.select_agent_thread(tui, thread_id).await;
+            }
             return;
         }
 
@@ -3923,7 +3845,7 @@ impl App {
                 self.chat_widget.handle_key_event(key_event);
             }
             _ => {
-                // Ignore Release key events.
+                self.chat_widget.handle_key_event(key_event);
             }
         };
     }
@@ -3937,7 +3859,7 @@ impl App {
         cwd: PathBuf,
         env_map: std::collections::HashMap<String, String>,
         logs_base_dir: PathBuf,
-        sandbox_policy: codex_core::protocol::SandboxPolicy,
+        sandbox_policy: codex_protocol::protocol::SandboxPolicy,
         tx: AppEventSender,
     ) {
         tokio::task::spawn_blocking(move || {
@@ -3974,6 +3896,7 @@ mod tests {
     use crate::history_cell::HistoryCell;
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
+    use crate::multi_agents::AgentPickerThreadEntry;
     use assert_matches::assert_matches;
     use codex_core::CodexAuth;
     use codex_core::config::ConfigBuilder;
@@ -3981,28 +3904,15 @@ mod tests {
     use codex_core::config::types::ModelAvailabilityNuxConfig;
     use codex_otel::SessionTelemetry;
     use codex_protocol::ThreadId;
-    use codex_protocol::agent_inbox::AgentInboxPayload;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::CollaborationModeMask;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
-    use codex_protocol::models::FunctionCallOutputPayload;
-    use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ModelAvailabilityNux;
     use codex_protocol::protocol::AgentMessageDeltaEvent;
-    use codex_protocol::protocol::AgentReasoningDeltaEvent;
-    use codex_protocol::protocol::AgentSpawnMode;
-    use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::AskForApproval;
-    use codex_protocol::protocol::CollabAgentSpawnEndEvent;
-    use codex_protocol::protocol::CollabAgentStatusEntry;
-    use codex_protocol::protocol::CollabCloseEndEvent;
-    use codex_protocol::protocol::CollabWaitingBeginEvent;
-    use codex_protocol::protocol::CollabWaitingEndEvent;
-    use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::RawResponseItemEvent;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
     use codex_protocol::protocol::SessionSource;
@@ -4014,13 +3924,10 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -4816,66 +4723,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_subagent_panel_update_mounts_on_fresh_chat_widget_after_thread_switch() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-
-        let mut info = SubagentInfo::new(
-            1,
-            Some("watchdog-agent".to_string()),
-            None,
-            "watchdog idle".to_string(),
-            AgentSpawnMode::Watchdog,
-            true,
-        );
-        info.status = AgentStatus::PendingInit;
-        info.latest_preview = "watchdog idle".to_string();
-        info.latest_update_at = Instant::now();
-        app.subagents.order.push(subagent_thread_id);
-        app.subagents.agents.insert(subagent_thread_id, info);
-
-        app.sync_subagent_panel_state();
-
-        let queued_panel = match app_event_rx.try_recv() {
-            Ok(AppEvent::UpdateSubagentPanel(panel)) => panel,
-            other => panic!("expected queued subagent panel update, got {other:?}"),
-        };
-
-        let (fresh_chat_widget, _fresh_app_event_tx, _fresh_rx, _fresh_op_rx) =
-            make_chatwidget_manual_with_sender().await;
-        app.chat_widget = fresh_chat_widget;
-        app.chat_widget.set_composer_text(
-            "back on the root thread".to_string(),
-            Vec::new(),
-            Vec::new(),
-        );
-
-        app.chat_widget.on_subagent_panel_updated(queued_panel);
-
-        let width = 80;
-        let height = app.chat_widget.desired_height(width);
-        let mut terminal =
-            ratatui::Terminal::new(crate::test_backend::VT100Backend::new(width, height))
-                .expect("create terminal");
-        terminal.set_viewport_area(ratatui::prelude::Rect::new(0, 0, width, height));
-        terminal
-            .draw(|f| app.chat_widget.render(f.area(), f.buffer_mut()))
-            .expect("render fresh widget with queued subagent panel");
-        let screen = terminal.backend().vt100().screen().contents();
-
-        assert!(
-            screen.contains("Subagents"),
-            "queued subagent panel update should mount on the fresh widget"
-        );
-        assert!(screen.contains("watchdog-agent"));
-    }
-
-    #[tokio::test]
     async fn replay_thread_snapshot_restores_collaboration_mode_for_draft_submit() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let thread_id = ThreadId::new();
@@ -5169,14 +5016,14 @@ mod tests {
 
         assert_eq!(app.thread_event_channels.contains_key(&thread_id), true);
         assert_eq!(
-            app.agent_picker_threads.get(&thread_id),
+            app.agent_navigation.get(&thread_id),
             Some(&AgentPickerThreadEntry {
                 agent_nickname: None,
                 agent_role: None,
                 is_closed: true,
             })
         );
-        assert_eq!(app.agent_picker_thread_order, vec![thread_id]);
+        assert_eq!(app.agent_navigation.ordered_thread_ids(), vec![thread_id]);
         Ok(())
     }
 
@@ -5186,21 +5033,18 @@ mod tests {
         let thread_id = ThreadId::new();
         app.thread_event_channels
             .insert(thread_id, ThreadEventChannel::new(1));
-        app.agent_picker_threads.insert(
+        app.agent_navigation.upsert(
             thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
         );
-        app.agent_picker_thread_order.push(thread_id);
 
         app.open_agent_picker().await;
 
         assert_eq!(app.thread_event_channels.contains_key(&thread_id), true);
         assert_eq!(
-            app.agent_picker_threads.get(&thread_id),
+            app.agent_navigation.get(&thread_id),
             Some(&AgentPickerThreadEntry {
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
@@ -5384,15 +5228,12 @@ mod tests {
         }
         app.thread_event_channels
             .insert(agent_thread_id, agent_channel);
-        app.agent_picker_threads.insert(
+        app.agent_navigation.upsert(
             agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
         );
-        app.agent_picker_thread_order.push(agent_thread_id);
 
         app.refresh_pending_thread_approvals().await;
         assert_eq!(
@@ -5404,6 +5245,7 @@ mod tests {
         app.refresh_pending_thread_approvals().await;
         assert!(app.chat_widget.pending_thread_approvals().is_empty());
     }
+
     #[tokio::test]
     async fn inactive_thread_approval_bubbles_into_active_view() -> Result<()> {
         let mut app = make_test_app().await;
@@ -5442,15 +5284,12 @@ mod tests {
                 },
             ),
         );
-        app.agent_picker_threads.insert(
+        app.agent_navigation.upsert(
             agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            false,
         );
-        app.agent_picker_thread_order.push(agent_thread_id);
 
         app.enqueue_thread_event(
             agent_thread_id,
@@ -5485,6 +5324,7 @@ mod tests {
 
         Ok(())
     }
+
     #[test]
     fn agent_picker_item_name_snapshot() {
         let thread_id =
@@ -5518,221 +5358,6 @@ mod tests {
         ]
         .join("\n");
         assert_snapshot!("agent_picker_item_name", snapshot);
-    }
-
-    #[tokio::test]
-    async fn agent_cycle_wraps_in_spawn_order() {
-        let mut app = make_test_app().await;
-        let main_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000101").expect("valid thread");
-        let first_agent_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000102").expect("valid thread");
-        let second_agent_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000103").expect("valid thread");
-
-        app.primary_thread_id = Some(main_thread_id);
-        app.active_thread_id = Some(second_agent_id);
-        app.agent_picker_threads.insert(
-            main_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: None,
-                agent_role: None,
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(main_thread_id);
-        app.agent_picker_threads.insert(
-            first_agent_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(first_agent_id);
-        app.agent_picker_threads.insert(
-            second_agent_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Bob".to_string()),
-                agent_role: Some("worker".to_string()),
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(second_agent_id);
-
-        assert_eq!(
-            app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Next),
-            Some(main_thread_id),
-            "next should wrap to the first spawned thread"
-        );
-        assert_eq!(
-            app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous),
-            Some(first_agent_id),
-            "previous should move backward through spawn order"
-        );
-
-        app.active_thread_id = Some(main_thread_id);
-        assert_eq!(
-            app.adjacent_agent_picker_thread_id(AgentNavigationDirection::Previous),
-            Some(second_agent_id),
-            "previous from the first spawned thread should wrap to the end"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_navigation_shortcut_target_is_none_without_adjacent_thread() {
-        let mut app = make_test_app().await;
-        let main_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000121").expect("valid thread");
-
-        app.primary_thread_id = Some(main_thread_id);
-        app.active_thread_id = Some(main_thread_id);
-        app.agent_picker_threads.insert(
-            main_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: None,
-                agent_role: None,
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(main_thread_id);
-        app.chat_widget
-            .set_composer_text("foo bar".to_string(), Vec::new(), Vec::new());
-
-        assert_eq!(
-            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_navigation_shortcut_target_is_none_with_draft_and_adjacent_thread() {
-        let mut app = make_test_app().await;
-        let main_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000131").expect("valid thread");
-        let agent_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000132").expect("valid thread");
-
-        app.primary_thread_id = Some(main_thread_id);
-        app.active_thread_id = Some(main_thread_id);
-        app.agent_picker_threads.insert(
-            main_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: None,
-                agent_role: None,
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(main_thread_id);
-        app.agent_picker_threads.insert(
-            agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(agent_thread_id);
-        app.chat_widget
-            .set_composer_text("foo bar".to_string(), Vec::new(), Vec::new());
-
-        assert_eq!(
-            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
-            None
-        );
-        assert_eq!(
-            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_navigation_shortcut_target_switches_threads_when_composer_is_empty() {
-        let mut app = make_test_app().await;
-        let main_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000141").expect("valid thread");
-        let agent_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000142").expect("valid thread");
-
-        app.primary_thread_id = Some(main_thread_id);
-        app.active_thread_id = Some(main_thread_id);
-        app.agent_picker_threads.insert(
-            main_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: None,
-                agent_role: None,
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(main_thread_id);
-        app.agent_picker_threads.insert(
-            agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(agent_thread_id);
-
-        assert_eq!(
-            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
-            Some(agent_thread_id)
-        );
-        assert_eq!(
-            app.agent_navigation_shortcut_target(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
-            Some(agent_thread_id)
-        );
-    }
-
-    #[test]
-    fn agent_picker_subtitle_mentions_shortcuts() {
-        let previous: Span<'static> = previous_agent_shortcut().into();
-        let next: Span<'static> = next_agent_shortcut().into();
-        let subtitle = App::agent_picker_subtitle();
-
-        assert!(subtitle.contains(previous.content.as_ref()));
-        assert!(subtitle.contains(next.content.as_ref()));
-    }
-
-    #[tokio::test]
-    async fn sync_active_agent_label_tracks_selected_thread() {
-        let mut app = make_test_app().await;
-        let main_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000111").expect("valid thread");
-        let agent_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000112").expect("valid thread");
-
-        app.primary_thread_id = Some(main_thread_id);
-        app.active_thread_id = Some(agent_thread_id);
-        app.agent_picker_threads.insert(
-            main_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: None,
-                agent_role: None,
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(main_thread_id);
-        app.agent_picker_threads.insert(
-            agent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(agent_thread_id);
-
-        app.sync_active_agent_label();
-        assert_eq!(
-            app.chat_widget.active_agent_label(),
-            Some("Robie [explorer]")
-        );
-
-        app.active_thread_id = Some(main_thread_id);
-        app.sync_active_agent_label();
-        assert_eq!(app.chat_widget.active_agent_label(), Some("Main [default]"));
     }
 
     #[tokio::test]
@@ -5814,8 +5439,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn clear_ui_after_long_transcript_snapshots_fresh_header_only() {
+    async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
         let mut app = make_test_app().await;
         app.config.cwd = PathBuf::from("/tmp/project");
         app.chat_widget.set_model("gpt-test");
@@ -5923,6 +5547,18 @@ mod tests {
             !rendered.contains("Bracken Ferry"),
             "clear header should not replay prior conversation turns"
         );
+        rendered
+    }
+
+    #[tokio::test]
+    async fn clear_ui_after_long_transcript_snapshots_fresh_header_only() {
+        let rendered = render_clear_ui_header_after_long_transcript_for_snapshot().await;
+        assert_snapshot!("clear_ui_after_long_transcript_fresh_header_only", rendered);
+    }
+
+    #[tokio::test]
+    async fn ctrl_l_clear_ui_after_long_transcript_reuses_clear_header_snapshot() {
+        let rendered = render_clear_ui_header_after_long_transcript_for_snapshot().await;
         assert_snapshot!("clear_ui_after_long_transcript_fresh_header_only", rendered);
     }
 
@@ -5974,7 +5610,7 @@ mod tests {
             app_event_tx,
             chat_widget,
             auth_manager,
-            config: config.clone(),
+            config,
             active_profile: None,
             cli_kv_overrides: Vec::new(),
             harness_overrides: ConfigOverrides::default(),
@@ -5999,14 +5635,12 @@ mod tests {
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
-            agent_picker_threads: HashMap::new(),
-            agent_picker_thread_order: Vec::new(),
+            agent_navigation: AgentNavigationState::default(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
-            subagents: SubagentRegistry::new(config.animations),
         }
     }
 
@@ -6037,7 +5671,7 @@ mod tests {
                 app_event_tx,
                 chat_widget,
                 auth_manager,
-                config: config.clone(),
+                config,
                 active_profile: None,
                 cli_kv_overrides: Vec::new(),
                 harness_overrides: ConfigOverrides::default(),
@@ -6062,55 +5696,16 @@ mod tests {
                 windows_sandbox: WindowsSandboxState::default(),
                 thread_event_channels: HashMap::new(),
                 thread_event_listener_tasks: HashMap::new(),
-                agent_picker_threads: HashMap::new(),
-                agent_picker_thread_order: Vec::new(),
+                agent_navigation: AgentNavigationState::default(),
                 active_thread_id: None,
                 active_thread_rx: None,
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
-                subagents: SubagentRegistry::new(config.animations),
             },
             rx,
             op_rx,
         )
-    }
-
-    fn agent_inbox_function_call_output_event(sender: ThreadId, message: &str) -> Event {
-        let payload = serde_json::to_string(&AgentInboxPayload::new(
-            sender,
-            None,
-            None,
-            message.to_string(),
-        ))
-        .expect("collab inbox payload should serialize");
-        Event {
-            id: "agent-inbox".to_string(),
-            msg: EventMsg::RawResponseItem(RawResponseItemEvent {
-                item: ResponseItem::FunctionCallOutput {
-                    call_id: "call-collab-inbox".to_string(),
-                    output: FunctionCallOutputPayload::from_text(payload),
-                },
-            }),
-        }
-    }
-
-    fn drain_insert_history_text(
-        app_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
-    ) -> Vec<String> {
-        let mut rendered = Vec::new();
-        while let Ok(event) = app_event_rx.try_recv() {
-            if let AppEvent::InsertHistoryCell(cell) = event {
-                let text = cell
-                    .display_lines(120)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                rendered.push(text);
-            }
-        }
-        rendered
     }
 
     fn next_user_turn_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) -> Op {
@@ -6407,7 +6002,7 @@ mod tests {
             .await
             .expect("config");
 
-        let available_models = all_model_presets();
+        let mut available_models = all_model_presets();
         let current = available_models
             .iter()
             .find(|preset| preset.model == "gpt-5.1-codex")
@@ -6419,6 +6014,13 @@ mod tests {
         );
 
         let upgrade = current.upgrade.as_ref().expect("upgrade configured");
+        // Test "hidden current model still prompts" even if bundled
+        // catalog data changes the target model's picker visibility.
+        available_models
+            .iter_mut()
+            .find(|preset| preset.model == upgrade.id)
+            .expect("upgrade target present")
+            .show_in_picker = true;
         assert!(
             should_show_model_migration_prompt(
                 &current.model,
@@ -7231,1093 +6833,5 @@ mod tests {
             summary.resume_command,
             Some("codex resume my-session".to_string())
         );
-    }
-
-    #[test]
-    fn subagent_registry_uses_reasoning_bold_text_for_preview() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "Solve a problem".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-        assert!(spawned.is_some(), "expected spawn cell for new subagent");
-
-        let updates = registry.on_agent_event(
-            subagent_thread_id,
-            &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                delta: "Thinking... **Build finite-state parser** next.".to_string(),
-            }),
-        );
-        assert!(
-            updates.is_empty(),
-            "reasoning delta should not emit history cell"
-        );
-
-        registry.rebuild_panel_state();
-        let panel = registry.panel_state.expect("panel state");
-        let guard = panel.lock().expect("panel lock");
-        let preview = guard
-            .running_agents
-            .iter()
-            .find(|agent| agent.ordinal == 1)
-            .map(|agent| agent.preview.clone())
-            .expect("preview for first subagent");
-        assert_eq!(preview, "Build finite-state parser");
-    }
-
-    #[test]
-    fn subagent_registry_updates_statuses_from_wait_end() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "Collect data".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-        assert!(spawned.is_some(), "expected spawn cell for new subagent");
-
-        let mut statuses = HashMap::new();
-        statuses.insert(
-            subagent_thread_id,
-            AgentStatus::Completed(Some("done".to_string())),
-        );
-        registry.on_wait_end(&CollabWaitingEndEvent {
-            sender_thread_id: root_thread_id,
-            call_id: "wait-1".to_string(),
-            agent_statuses: Vec::new(),
-            statuses,
-        });
-
-        let status = registry
-            .agents
-            .get(&subagent_thread_id)
-            .map(|info| info.status.clone())
-            .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Completed(Some("done".to_string())));
-    }
-
-    #[test]
-    fn subagent_registry_uses_nickname_and_role_labels() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: Some("Apple".to_string()),
-            new_agent_role: Some("default".to_string()),
-            prompt: "Solve a problem".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-        let spawned = spawned.expect("expected spawn cell");
-        let spawned_text = spawned
-            .display_lines(u16::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(spawned_text.contains("Spawned subagent Apple [default]"));
-
-        let updates = registry.on_agent_event(
-            subagent_thread_id,
-            &EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: "turn-1".to_string(),
-                last_agent_message: Some("done".to_string()),
-            }),
-        );
-        assert_eq!(updates.len(), 1);
-        let update_text = updates[0]
-            .display_lines(u16::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(update_text.contains("Subagent update: Apple [default] completed"));
-    }
-
-    #[test]
-    fn subagent_registry_uses_agent_ordinal_when_nickname_missing() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: None,
-            new_agent_role: Some("git_ops".to_string()),
-            prompt: "Solve a problem".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-        let spawned = spawned.expect("expected spawn cell");
-        let spawned_text = spawned
-            .display_lines(u16::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(spawned_text.contains("Spawned subagent Agent #1 [git_ops]"));
-
-        let updates = registry.on_agent_event(
-            subagent_thread_id,
-            &EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: "turn-1".to_string(),
-                last_agent_message: Some("done".to_string()),
-            }),
-        );
-        assert_eq!(updates.len(), 1);
-        let update_text = updates[0]
-            .display_lines(u16::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(update_text.contains("Subagent update: Agent #1 [git_ops] completed"));
-    }
-
-    #[test]
-    fn subagent_registry_watchdog_labels_use_watchdog_tag() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let _spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: Some("Assigned-Name-If-Any".to_string()),
-            new_agent_role: Some("default".to_string()),
-            prompt: "watchdog setup".to_string(),
-            spawn_mode: AgentSpawnMode::Watchdog,
-            status: AgentStatus::PendingInit,
-        });
-
-        registry.rebuild_panel_state();
-        let panel = registry.panel_state.expect("panel state");
-        let guard = panel.lock().expect("panel lock");
-        assert_eq!(
-            guard.running_agents[0].name,
-            "Assigned-Name-If-Any [watchdog]"
-        );
-    }
-
-    #[test]
-    fn subagent_registry_wait_end_backfills_identity_metadata() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let _spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "Solve a problem".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-
-        let mut statuses = HashMap::new();
-        statuses.insert(subagent_thread_id, AgentStatus::Running);
-        registry.on_wait_end(&CollabWaitingEndEvent {
-            sender_thread_id: root_thread_id,
-            call_id: "wait-1".to_string(),
-            agent_statuses: vec![CollabAgentStatusEntry {
-                thread_id: subagent_thread_id,
-                agent_nickname: Some("Wisteria".to_string()),
-                agent_role: Some("git_ops".to_string()),
-                spawn_mode: None,
-                status: AgentStatus::Running,
-            }],
-            statuses,
-        });
-
-        let label = registry
-            .agents
-            .get(&subagent_thread_id)
-            .map(SubagentInfo::label)
-            .expect("subagent exists");
-        assert_eq!(label, "Wisteria [git_ops]");
-    }
-
-    #[test]
-    fn subagent_registry_turn_complete_history_collapses_and_truncates_summary() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "Summarize merge findings".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-        assert!(spawned.is_some(), "expected spawn cell for new subagent");
-
-        let tail = format!("tail-{}", "a".repeat(SUBAGENT_UPDATE_PREVIEW_BUDGET + 40));
-        let message = format!("top candidate\ndetails line\n{tail}");
-        let updates = registry.on_agent_event(
-            subagent_thread_id,
-            &EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: "turn-1".to_string(),
-                last_agent_message: Some(message.clone()),
-            }),
-        );
-
-        assert_eq!(updates.len(), 1);
-        let status = registry
-            .agents
-            .get(&subagent_thread_id)
-            .map(|info| info.status.clone())
-            .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Completed(Some(message.clone())));
-
-        let rendered = updates[0]
-            .display_lines(u16::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Subagent update:"));
-        assert!(!rendered.contains(message.as_str()));
-        assert_eq!(rendered.lines().count(), 1);
-    }
-
-    #[test]
-    fn subagent_registry_error_history_collapses_and_truncates_summary() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "Summarize merge findings".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::PendingInit,
-        });
-        assert!(spawned.is_some(), "expected spawn cell for new subagent");
-
-        let tail = format!("error-{}", "z".repeat(SUBAGENT_UPDATE_PREVIEW_BUDGET + 40));
-        let message = format!("fatal mismatch\n{tail}");
-        let updates = registry.on_agent_event(
-            subagent_thread_id,
-            &EventMsg::Error(ErrorEvent {
-                message: message.clone(),
-                codex_error_info: None,
-            }),
-        );
-
-        assert_eq!(updates.len(), 1);
-        let expected = truncate_text(
-            &message.split_whitespace().collect::<Vec<_>>().join(" "),
-            240,
-        );
-        let status = registry
-            .agents
-            .get(&subagent_thread_id)
-            .map(|info| info.status.clone())
-            .expect("status for first subagent");
-        assert_eq!(status, AgentStatus::Errored(message.clone()));
-
-        let rendered = updates[0]
-            .display_lines(u16::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Subagent update:"));
-        assert!(rendered.contains(expected.as_str()));
-        assert!(!rendered.contains(message.as_str()));
-        assert_eq!(rendered.lines().count(), 2);
-    }
-
-    #[test]
-    fn subagent_registry_prunes_superseded_watchdog_rows() {
-        let mut registry = SubagentRegistry::new(false);
-        let root_thread_id = ThreadId::new();
-        let watchdog_a = ThreadId::new();
-        let watchdog_b = ThreadId::new();
-        registry.set_root_thread(root_thread_id);
-
-        let first_spawn = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(watchdog_a),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "watchdog A".to_string(),
-            spawn_mode: AgentSpawnMode::Watchdog,
-            status: AgentStatus::PendingInit,
-        });
-        assert!(first_spawn.is_some(), "expected first watchdog spawn cell");
-        assert!(registry.agents.contains_key(&watchdog_a));
-
-        let second_spawn = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-2".to_string(),
-            sender_thread_id: root_thread_id,
-            new_thread_id: Some(watchdog_b),
-            new_agent_nickname: None,
-            new_agent_role: None,
-            prompt: "watchdog B".to_string(),
-            spawn_mode: AgentSpawnMode::Watchdog,
-            status: AgentStatus::PendingInit,
-        });
-        assert!(
-            second_spawn.is_some(),
-            "expected second watchdog spawn cell"
-        );
-        assert!(
-            !registry.agents.contains_key(&watchdog_a),
-            "superseded watchdog should be pruned from registry"
-        );
-        assert!(registry.agents.contains_key(&watchdog_b));
-
-        registry.rebuild_panel_state();
-        let panel = registry.panel_state.expect("panel state");
-        let guard = panel.lock().expect("panel lock");
-        assert_eq!(guard.running_agents.len(), 1);
-        assert!(guard.running_agents[0].is_watchdog);
-        assert!(guard.running_agents[0].preview.contains("watchdog B"));
-    }
-
-    #[test]
-    fn subagent_registry_clears_state_when_root_thread_changes() {
-        let mut registry = SubagentRegistry::new(false);
-        let first_root_thread_id = ThreadId::new();
-        let second_root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        let buffered_thread_id = ThreadId::new();
-        registry.set_root_thread(first_root_thread_id);
-
-        let spawned = registry.on_spawn_end(&CollabAgentSpawnEndEvent {
-            call_id: "call-1".to_string(),
-            sender_thread_id: first_root_thread_id,
-            new_thread_id: Some(subagent_thread_id),
-            new_agent_nickname: Some("Nested".to_string()),
-            new_agent_role: Some("worker".to_string()),
-            prompt: "nested prompt".to_string(),
-            spawn_mode: AgentSpawnMode::Spawn,
-            status: AgentStatus::Running,
-        });
-        assert!(spawned.is_some(), "expected spawn cell for new subagent");
-        registry.buffer_pending_event(buffered_thread_id, EventMsg::ShutdownComplete);
-        registry.queue_history(Box::new(new_subagent_spawned_cell(
-            "Nested [worker]",
-            "nested prompt",
-        )));
-        registry.rebuild_panel_state();
-
-        assert!(!registry.agents.is_empty());
-        assert!(!registry.pending_events.is_empty());
-        assert!(!registry.pending_history.is_empty());
-        assert!(registry.panel_state.is_some());
-        assert!(registry.panel_cell.is_some());
-
-        registry.set_root_thread(second_root_thread_id);
-
-        assert_eq!(registry.root_thread_id, Some(second_root_thread_id));
-        assert!(registry.agents.is_empty());
-        assert!(registry.order.is_empty());
-        assert!(registry.pending_events.is_empty());
-        assert!(registry.pending_history.is_empty());
-        assert!(registry.panel_state.is_none());
-        assert!(registry.panel_cell.is_none());
-    }
-
-    #[tokio::test]
-    async fn root_subagent_side_effects_do_not_emit_lifecycle_cells() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-1".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(subagent_thread_id),
-                    new_agent_nickname: None,
-                    new_agent_role: None,
-                    prompt: "compute pi".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::PendingInit,
-                }),
-            },
-        );
-        let spawn_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(
-            spawn_cells.is_empty(),
-            "app should not emit duplicate spawn lifecycle cells"
-        );
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "wait-begin".to_string(),
-                msg: EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
-                    sender_thread_id: root_thread_id,
-                    receiver_thread_ids: vec![subagent_thread_id],
-                    receiver_agents: Vec::new(),
-                    call_id: "call-2".to_string(),
-                }),
-            },
-        );
-        let wait_begin_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(
-            wait_begin_cells.is_empty(),
-            "app should not emit duplicate waiting-begin lifecycle cells"
-        );
-
-        let mut statuses = HashMap::new();
-        statuses.insert(
-            subagent_thread_id,
-            AgentStatus::Completed(Some("3.1415926535".to_string())),
-        );
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "wait-end".to_string(),
-                msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
-                    sender_thread_id: root_thread_id,
-                    call_id: "call-2".to_string(),
-                    agent_statuses: Vec::new(),
-                    statuses,
-                }),
-            },
-        );
-        let wait_end_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(
-            !wait_end_cells
-                .iter()
-                .any(|text| text.contains("Wait complete")),
-            "app should not emit duplicate wait-complete lifecycle cells"
-        );
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "close-end".to_string(),
-                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
-                    call_id: "call-3".to_string(),
-                    sender_thread_id: root_thread_id,
-                    receiver_thread_id: subagent_thread_id,
-                    receiver_agent_nickname: None,
-                    receiver_agent_role: None,
-                    receiver_spawn_mode: None,
-                    status: AgentStatus::Completed(Some("3.1415926535".to_string())),
-                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
-                }),
-            },
-        );
-        let close_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(
-            close_cells.is_empty(),
-            "app should not emit duplicate close lifecycle cells"
-        );
-    }
-
-    #[tokio::test]
-    async fn enqueue_thread_event_backfills_wait_identity_from_known_subagent() -> Result<()> {
-        let mut app = make_test_app().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-        app.thread_event_channels
-            .insert(root_thread_id, ThreadEventChannel::new(8));
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-spawn".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(subagent_thread_id),
-                    new_agent_nickname: Some("Atlas".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "run job".to_string(),
-                    spawn_mode: AgentSpawnMode::Watchdog,
-                    status: AgentStatus::PendingInit,
-                }),
-            },
-        );
-
-        let mut statuses = HashMap::new();
-        statuses.insert(subagent_thread_id, AgentStatus::PendingInit);
-        app.enqueue_thread_event(
-            root_thread_id,
-            Event {
-                id: "wait-end".to_string(),
-                msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
-                    sender_thread_id: root_thread_id,
-                    call_id: "call-wait".to_string(),
-                    agent_statuses: Vec::new(),
-                    statuses,
-                }),
-            },
-        )
-        .await?;
-
-        let snapshot = {
-            let channel = app
-                .thread_event_channels
-                .get(&root_thread_id)
-                .expect("root thread channel should exist");
-            let store = channel.store.lock().await;
-            store.snapshot()
-        };
-        let event = snapshot.events.last().expect("wait-end event stored");
-        let EventMsg::CollabWaitingEnd(event) = &event.msg else {
-            panic!("expected CollabWaitingEnd event");
-        };
-        assert_eq!(event.agent_statuses.len(), 1);
-        assert_eq!(
-            event.agent_statuses[0].agent_nickname.as_deref(),
-            Some("Atlas")
-        );
-        assert_eq!(
-            event.agent_statuses[0].agent_role.as_deref(),
-            Some("worker")
-        );
-        assert_eq!(
-            event.agent_statuses[0].spawn_mode,
-            Some(AgentSpawnMode::Watchdog)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn enqueue_thread_event_backfills_resume_identity_from_agent_picker() -> Result<()> {
-        let mut app = make_test_app().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.thread_event_channels
-            .insert(root_thread_id, ThreadEventChannel::new(8));
-        app.agent_picker_threads.insert(
-            subagent_thread_id,
-            AgentPickerThreadEntry {
-                agent_nickname: Some("Curie".to_string()),
-                agent_role: Some("reviewer".to_string()),
-                is_closed: false,
-            },
-        );
-        app.agent_picker_thread_order.push(subagent_thread_id);
-
-        app.enqueue_thread_event(
-            root_thread_id,
-            Event {
-                id: "resume-begin".to_string(),
-                msg: EventMsg::CollabResumeBegin(
-                    codex_protocol::protocol::CollabResumeBeginEvent {
-                        call_id: "call-resume".to_string(),
-                        sender_thread_id: root_thread_id,
-                        receiver_thread_id: subagent_thread_id,
-                        receiver_agent_nickname: None,
-                        receiver_agent_role: None,
-                        receiver_spawn_mode: None,
-                    },
-                ),
-            },
-        )
-        .await?;
-
-        let snapshot = {
-            let channel = app
-                .thread_event_channels
-                .get(&root_thread_id)
-                .expect("root thread channel should exist");
-            let store = channel.store.lock().await;
-            store.snapshot()
-        };
-        let event = snapshot.events.last().expect("resume-begin event stored");
-        let EventMsg::CollabResumeBegin(event) = &event.msg else {
-            panic!("expected CollabResumeBegin event");
-        };
-        assert_eq!(event.receiver_agent_nickname.as_deref(), Some("Curie"));
-        assert_eq!(event.receiver_agent_role.as_deref(), Some("reviewer"));
-        assert_eq!(event.receiver_spawn_mode, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn enqueue_thread_event_keeps_root_agent_inbox_after_completion() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-        app.thread_event_channels
-            .insert(root_thread_id, ThreadEventChannel::new(8));
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-spawn".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(subagent_thread_id),
-                    new_agent_nickname: Some("Closer".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "close with a summary".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-
-        app.process_subagent_side_effects(
-            subagent_thread_id,
-            &Event {
-                id: "turn-complete".to_string(),
-                msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                    turn_id: "turn-1".to_string(),
-                    last_agent_message: Some("late final summary".to_string()),
-                }),
-            },
-        );
-        let terminal_cells = drain_insert_history_text(&mut app_event_rx);
-        assert_eq!(terminal_cells.len(), 1);
-        assert!(terminal_cells[0].contains("Subagent update:"));
-
-        app.enqueue_thread_event(
-            root_thread_id,
-            agent_inbox_function_call_output_event(subagent_thread_id, "late final summary"),
-        )
-        .await
-        .expect("late duplicate inbox event should not fail");
-
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-        let snapshot = {
-            let channel = app
-                .thread_event_channels
-                .get(&root_thread_id)
-                .expect("root thread channel should exist");
-            let store = channel.store.lock().await;
-            store.snapshot()
-        };
-        assert_eq!(snapshot.events.len(), 1);
-        assert!(matches!(
-            snapshot.events[0].msg,
-            EventMsg::RawResponseItem(RawResponseItemEvent { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn enqueue_thread_event_keeps_distinct_root_agent_inbox_after_completion() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-        app.thread_event_channels
-            .insert(root_thread_id, ThreadEventChannel::new(8));
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-spawn".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(subagent_thread_id),
-                    new_agent_nickname: Some("Closer".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "close with a summary".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-
-        app.process_subagent_side_effects(
-            subagent_thread_id,
-            &Event {
-                id: "turn-complete".to_string(),
-                msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                    turn_id: "turn-1".to_string(),
-                    last_agent_message: Some("late final summary".to_string()),
-                }),
-            },
-        );
-        drain_insert_history_text(&mut app_event_rx);
-
-        let distinct_event =
-            agent_inbox_function_call_output_event(subagent_thread_id, "different follow-up");
-        app.enqueue_thread_event(root_thread_id, distinct_event.clone())
-            .await
-            .expect("distinct inbox event should not fail");
-
-        let snapshot = {
-            let channel = app
-                .thread_event_channels
-                .get(&root_thread_id)
-                .expect("root thread channel should exist");
-            let store = channel.store.lock().await;
-            store.snapshot()
-        };
-        assert_eq!(snapshot.events.len(), 1);
-        assert!(matches!(
-            snapshot.events[0].msg,
-            EventMsg::RawResponseItem(RawResponseItemEvent { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn enqueue_thread_event_keeps_root_agent_inbox_after_error() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let subagent_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-        app.thread_event_channels
-            .insert(root_thread_id, ThreadEventChannel::new(8));
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-spawn".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(subagent_thread_id),
-                    new_agent_nickname: Some("Closer".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "fail with a summary".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-
-        app.process_subagent_side_effects(
-            subagent_thread_id,
-            &Event {
-                id: "error".to_string(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: "late error summary".to_string(),
-                    codex_error_info: None,
-                }),
-            },
-        );
-        let terminal_cells = drain_insert_history_text(&mut app_event_rx);
-        assert_eq!(terminal_cells.len(), 1);
-        assert!(terminal_cells[0].contains("late error summary"));
-
-        app.enqueue_thread_event(
-            root_thread_id,
-            agent_inbox_function_call_output_event(subagent_thread_id, "late error summary"),
-        )
-        .await
-        .expect("late duplicate inbox event should not fail");
-
-        let snapshot = {
-            let channel = app
-                .thread_event_channels
-                .get(&root_thread_id)
-                .expect("root thread channel should exist");
-            let store = channel.store.lock().await;
-            store.snapshot()
-        };
-        assert_eq!(snapshot.events.len(), 1);
-        assert!(matches!(
-            snapshot.events[0].msg,
-            EventMsg::RawResponseItem(RawResponseItemEvent { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn root_subagent_side_effects_emit_nested_close_end_summary_once() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let parent_thread_id = ThreadId::new();
-        let nested_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn-root".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-root".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(parent_thread_id),
-                    new_agent_nickname: Some("RootChild".to_string()),
-                    new_agent_role: Some("default".to_string()),
-                    prompt: "root child prompt".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        let root_spawn_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(root_spawn_cells.is_empty());
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn-nested".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-nested".to_string(),
-                    sender_thread_id: parent_thread_id,
-                    new_thread_id: Some(nested_thread_id),
-                    new_agent_nickname: Some("NestedWorker".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "nested worker prompt".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        let nested_spawn_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(nested_spawn_cells.is_empty());
-
-        let nested_summary = "nested completed summary";
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "close-nested-1".to_string(),
-                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
-                    call_id: "call-close".to_string(),
-                    sender_thread_id: parent_thread_id,
-                    receiver_thread_id: nested_thread_id,
-                    receiver_agent_nickname: Some("NestedWorker".to_string()),
-                    receiver_agent_role: Some("worker".to_string()),
-                    receiver_spawn_mode: None,
-                    status: AgentStatus::Completed(Some(nested_summary.to_string())),
-                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
-                }),
-            },
-        );
-
-        let close_cells = drain_insert_history_text(&mut app_event_rx);
-        assert_eq!(close_cells.len(), 1);
-        assert!(close_cells[0].contains("Subagent update: NestedWorker [worker] completed"));
-        assert!(close_cells[0].contains(nested_summary));
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "close-nested-2".to_string(),
-                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
-                    call_id: "call-close".to_string(),
-                    sender_thread_id: parent_thread_id,
-                    receiver_thread_id: nested_thread_id,
-                    receiver_agent_nickname: Some("NestedWorker".to_string()),
-                    receiver_agent_role: Some("worker".to_string()),
-                    receiver_spawn_mode: None,
-                    status: AgentStatus::Completed(Some(nested_summary.to_string())),
-                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
-                }),
-            },
-        );
-        let duplicate_close_cells = drain_insert_history_text(&mut app_event_rx);
-        assert!(duplicate_close_cells.is_empty());
-    }
-
-    #[tokio::test]
-    async fn root_subagent_close_end_treats_running_status_as_terminal_shutdown() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let parent_thread_id = ThreadId::new();
-        let nested_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn-running".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-running".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(parent_thread_id),
-                    new_agent_nickname: Some("Parent".to_string()),
-                    new_agent_role: Some("default".to_string()),
-                    prompt: "spawn nested closer".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn-nested-running".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-nested-running".to_string(),
-                    sender_thread_id: parent_thread_id,
-                    new_thread_id: Some(nested_thread_id),
-                    new_agent_nickname: Some("Closer".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "close this thread".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "close-running".to_string(),
-                msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
-                    call_id: "call-close".to_string(),
-                    sender_thread_id: parent_thread_id,
-                    receiver_thread_id: nested_thread_id,
-                    receiver_agent_nickname: Some("Closer".to_string()),
-                    receiver_agent_role: Some("worker".to_string()),
-                    receiver_spawn_mode: None,
-                    status: AgentStatus::Running,
-                    close_result: codex_protocol::protocol::CollabCloseResult::Closed,
-                }),
-            },
-        );
-
-        let close_cells = drain_insert_history_text(&mut app_event_rx);
-        assert_eq!(close_cells.len(), 1);
-        assert!(close_cells[0].contains("Subagent update: Closer [worker] shutdown"));
-    }
-
-    #[tokio::test]
-    async fn nested_spawn_on_parent_channel_registers_nested_subagent() {
-        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let root_thread_id = ThreadId::new();
-        let parent_thread_id = ThreadId::new();
-        let nested_thread_id = ThreadId::new();
-        app.primary_thread_id = Some(root_thread_id);
-        app.active_thread_id = Some(root_thread_id);
-        app.subagents.set_root_thread(root_thread_id);
-
-        app.process_subagent_side_effects(
-            root_thread_id,
-            &Event {
-                id: "spawn-root".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-root".to_string(),
-                    sender_thread_id: root_thread_id,
-                    new_thread_id: Some(parent_thread_id),
-                    new_agent_nickname: Some("RootChild".to_string()),
-                    new_agent_role: Some("default".to_string()),
-                    prompt: "root child prompt".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(drain_insert_history_text(&mut app_event_rx).is_empty());
-
-        app.process_subagent_side_effects(
-            parent_thread_id,
-            &Event {
-                id: "spawn-nested".to_string(),
-                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
-                    call_id: "call-nested".to_string(),
-                    sender_thread_id: parent_thread_id,
-                    new_thread_id: Some(nested_thread_id),
-                    new_agent_nickname: Some("NestedWorker".to_string()),
-                    new_agent_role: Some("worker".to_string()),
-                    prompt: "nested worker prompt".to_string(),
-                    spawn_mode: AgentSpawnMode::Spawn,
-                    status: AgentStatus::Running,
-                }),
-            },
-        );
-        assert!(
-            app.subagents.contains(nested_thread_id),
-            "nested subagent should be registered from the parent channel"
-        );
-
-        let nested_summary = "nested completed summary";
-        app.process_subagent_side_effects(
-            nested_thread_id,
-            &Event {
-                id: "turn-complete-nested".to_string(),
-                msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                    turn_id: "turn-1".to_string(),
-                    last_agent_message: Some(nested_summary.to_string()),
-                }),
-            },
-        );
-
-        let nested_cells = drain_insert_history_text(&mut app_event_rx);
-        assert_eq!(nested_cells.len(), 1);
-        assert!(nested_cells[0].contains("Subagent update: NestedWorker [worker] completed"));
-        assert!(nested_cells[0].contains(nested_summary));
-    }
-
-    #[test]
-    fn thread_event_store_keeps_non_agent_events() {
-        let mut store = ThreadEventStore::new(8);
-        store.push_event(Event {
-            id: "keep-me".to_string(),
-            msg: EventMsg::ShutdownComplete,
-        });
-
-        let snapshot = store.snapshot();
-        assert_eq!(snapshot.events.len(), 1);
-        assert!(matches!(
-            snapshot.events.first().map(|event| &event.msg),
-            Some(EventMsg::ShutdownComplete)
-        ));
     }
 }

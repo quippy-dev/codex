@@ -10,6 +10,7 @@ use crate::config_loader::Sourced;
 use crate::exec::ExecToolCallOutput;
 use crate::function_tool::FunctionCallError;
 use crate::mcp_connection_manager::ToolInfo;
+use crate::mcp_connection_manager::filter_mcp_tools_by_name;
 use crate::models_manager::model_info;
 use crate::shell::default_user_shell;
 use crate::tools::format_exec_output_str;
@@ -61,7 +62,6 @@ use codex_protocol::RetainedProposedPlan;
 use codex_protocol::agent_inbox::build_tool_response_input_items;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::McpToolOutput;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
@@ -243,9 +243,19 @@ fn make_mcp_tool(
     connector_id: Option<&str>,
     connector_name: Option<&str>,
 ) -> ToolInfo {
+    let tool_namespace = if server_name == CODEX_APPS_MCP_SERVER_NAME {
+        connector_name
+            .map(crate::connectors::sanitize_name)
+            .map(|connector_name| format!("mcp__{server_name}__{connector_name}"))
+            .unwrap_or_else(|| server_name.to_string())
+    } else {
+        server_name.to_string()
+    };
+
     ToolInfo {
         server_name: server_name.to_string(),
         tool_name: tool_name.to_string(),
+        tool_namespace,
         tool: Tool {
             name: tool_name.to_string().into(),
             title: None,
@@ -259,24 +269,9 @@ fn make_mcp_tool(
         },
         connector_id: connector_id.map(str::to_string),
         connector_name: connector_name.map(str::to_string),
+        connector_description: None,
         plugin_display_names: Vec::new(),
     }
-}
-
-fn function_call_rollout_item(name: &str, call_id: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-        id: None,
-        name: name.to_string(),
-        arguments: "{}".to_string(),
-        call_id: call_id.to_string(),
-    })
-}
-
-fn function_call_output_rollout_item(call_id: &str, output: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text(output.to_string()),
-    })
 }
 
 #[test]
@@ -624,106 +619,6 @@ fn apps_mentions_add_codex_apps_tools_to_search_selected_set() {
             "mcp__rmcp__echo".to_string(),
         ]
     );
-}
-
-#[test]
-fn extract_mcp_tool_selection_from_rollout_reads_search_tool_output() {
-    let rollout_items = vec![
-        function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1"),
-        function_call_output_rollout_item(
-            "search-1",
-            &json!({
-                "active_selected_tools": [
-                    "mcp__codex_apps__calendar_create_event",
-                    "mcp__codex_apps__calendar_list_events",
-                ],
-            })
-            .to_string(),
-        ),
-    ];
-
-    let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
-    assert_eq!(
-        selected,
-        Some(vec![
-            "mcp__codex_apps__calendar_create_event".to_string(),
-            "mcp__codex_apps__calendar_list_events".to_string(),
-        ])
-    );
-}
-
-#[test]
-fn extract_mcp_tool_selection_from_rollout_latest_valid_payload_wins() {
-    let rollout_items = vec![
-        function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1"),
-        function_call_output_rollout_item(
-            "search-1",
-            &json!({
-                "active_selected_tools": ["mcp__codex_apps__calendar_create_event"],
-            })
-            .to_string(),
-        ),
-        function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-2"),
-        function_call_output_rollout_item(
-            "search-2",
-            &json!({
-                "active_selected_tools": ["mcp__codex_apps__calendar_delete_event"],
-            })
-            .to_string(),
-        ),
-    ];
-
-    let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
-    assert_eq!(
-        selected,
-        Some(vec!["mcp__codex_apps__calendar_delete_event".to_string(),])
-    );
-}
-
-#[test]
-fn extract_mcp_tool_selection_from_rollout_ignores_non_search_and_malformed_payloads() {
-    let rollout_items = vec![
-        function_call_rollout_item("shell", "shell-1"),
-        function_call_output_rollout_item(
-            "shell-1",
-            &json!({
-                "active_selected_tools": ["mcp__codex_apps__should_be_ignored"],
-            })
-            .to_string(),
-        ),
-        function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1"),
-        function_call_output_rollout_item("search-1", "{not-json"),
-        function_call_output_rollout_item(
-            "unknown-search-call",
-            &json!({
-                "active_selected_tools": ["mcp__codex_apps__also_ignored"],
-            })
-            .to_string(),
-        ),
-        function_call_output_rollout_item(
-            "search-1",
-            &json!({
-                "active_selected_tools": ["mcp__codex_apps__calendar_list_events"],
-            })
-            .to_string(),
-        ),
-    ];
-
-    let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
-    assert_eq!(
-        selected,
-        Some(vec!["mcp__codex_apps__calendar_list_events".to_string(),])
-    );
-}
-
-#[test]
-fn extract_mcp_tool_selection_from_rollout_returns_none_without_valid_search_output() {
-    let rollout_items = vec![function_call_rollout_item(
-        SEARCH_TOOL_BM25_TOOL_NAME,
-        "search-1",
-    )];
-    let selected = Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
-    assert_eq!(selected, None);
 }
 
 #[tokio::test]
@@ -1780,7 +1675,7 @@ fn prefers_structured_content_when_present() {
         meta: None,
     };
 
-    let got = McpToolOutput::from(&ctr).into_function_call_output_payload();
+    let got = ctr.as_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
         body: FunctionCallOutputBody::Text(
             serde_json::to_string(&json!({
@@ -1862,7 +1757,7 @@ fn falls_back_to_content_when_structured_is_null() {
         meta: None,
     };
 
-    let got = McpToolOutput::from(&ctr).into_function_call_output_payload();
+    let got = ctr.as_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
         body: FunctionCallOutputBody::Text(
             serde_json::to_string(&vec![text_block("hello"), text_block("world")]).unwrap(),
@@ -1882,7 +1777,7 @@ fn success_flag_reflects_is_error_true() {
         meta: None,
     };
 
-    let got = McpToolOutput::from(&ctr).into_function_call_output_payload();
+    let got = ctr.as_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
         body: FunctionCallOutputBody::Text(
             serde_json::to_string(&json!({ "message": "bad" })).unwrap(),
@@ -1902,7 +1797,7 @@ fn success_flag_true_with_no_error_and_content_used() {
         meta: None,
     };
 
-    let got = McpToolOutput::from(&ctr).into_function_call_output_payload();
+    let got = ctr.as_function_call_output_payload();
     let expected = FunctionCallOutputPayload {
         body: FunctionCallOutputBody::Text(
             serde_json::to_string(&vec![text_block("alpha")]).unwrap(),
@@ -2391,6 +2286,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
         ),
+        code_mode_store: Default::default(),
     };
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
@@ -2469,6 +2365,7 @@ async fn request_permissions_emits_event_when_reject_policy_allows_requests() {
             crate::protocol::RejectConfig {
                 sandbox_approval: true,
                 rules: true,
+                skill_approval: false,
                 request_permissions: false,
                 mcp_elicitations: true,
             },
@@ -2543,6 +2440,7 @@ async fn request_permissions_returns_empty_grant_when_reject_policy_blocks_reque
             crate::protocol::RejectConfig {
                 sandbox_approval: false,
                 rules: false,
+                skill_approval: false,
                 request_permissions: true,
                 mcp_elicitations: false,
             },
@@ -2955,6 +2853,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_channels(
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
         ),
+        code_mode_store: Default::default(),
     };
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
@@ -3475,7 +3374,13 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     let update_items = session
         .build_settings_update_items(Some(&previous_context_item), &turn_context)
         .await;
-    assert_eq!(update_items, Vec::new());
+    let developer_texts = developer_input_texts(&update_items);
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("<model_switch>")),
+        "expected model switch update items, got {developer_texts:?}"
+    );
 
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
@@ -3483,7 +3388,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
 
     assert_eq!(
         session.clone_history().await.raw_items().to_vec(),
-        Vec::new()
+        update_items
     );
     assert_eq!(
         serde_json::to_value(session.reference_context_item().await)
@@ -4436,6 +4341,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
             tracker: Arc::clone(&turn_diff_tracker),
             call_id,
             tool_name: tool_name.to_string(),
+            tool_namespace: None,
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "command": params.command.clone(),
@@ -4479,6 +4385,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
             tracker: Arc::clone(&turn_diff_tracker),
             call_id: "test-call-2".to_string(),
             tool_name: tool_name.to_string(),
+            tool_namespace: None,
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "command": params2.command.clone(),
@@ -4534,6 +4441,7 @@ async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request()
             tracker: Arc::clone(&tracker),
             call_id: "exec-call".to_string(),
             tool_name: "exec_command".to_string(),
+            tool_namespace: None,
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "cmd": "echo hi",
@@ -4738,7 +4646,7 @@ async fn on_task_finished_flushes_post_turn_agent_items_on_follow_up_turn_path()
     sess.enqueue_post_turn_agent_items(agent_items)
         .await
         .expect("enqueue post-turn agent items");
-    assert_eq!(sess.post_turn_agent_stats().await.0, 2);
+    assert_eq!(sess.post_turn_agent_stats().await.0, 1);
 
     while rx.try_recv().is_ok() {}
 
@@ -4765,7 +4673,7 @@ async fn on_task_finished_flushes_post_turn_agent_items_on_follow_up_turn_path()
         Op::InjectResponseItems { ref items } if items.is_empty()
     ));
     let (queued_items, queued_bytes, flush_pending) = sess.post_turn_agent_stats().await;
-    assert_eq!(queued_items, 2);
+    assert_eq!(queued_items, 1);
     assert!(queued_bytes > 0);
     assert_eq!(flush_pending, true);
 
@@ -4803,7 +4711,7 @@ async fn abort_all_tasks_clears_post_turn_agent_items() {
     sess.enqueue_post_turn_agent_items(agent_items)
         .await
         .expect("enqueue post-turn agent items");
-    assert_eq!(sess.post_turn_agent_stats().await.0, 2);
+    assert_eq!(sess.post_turn_agent_stats().await.0, 1);
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 
@@ -4871,8 +4779,10 @@ async fn load_root_agent_prompt_includes_watchdog_fragment_when_enabled() {
 
     assert!(prompt.contains("## Watchdogs"));
     assert!(prompt.contains("`interval_s` sets the watchdog interval in seconds"));
-    assert!(prompt.contains("does not update the registered watchdog prompt or active helper"));
-    assert!(prompt.contains("Do not treat it as a watchdog-update mechanism"));
+    assert!(prompt.contains(
+        "Primary delivery path: the watchdog check-in agent calls `send_input` to the owner thread"
+    ));
+    assert!(prompt.contains("Do not call `send_input` on watchdog handles."));
 }
 
 #[tokio::test]

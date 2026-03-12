@@ -5,6 +5,7 @@ use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_core::features::Feature;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -65,7 +66,15 @@ async fn run_turn_and_measure(test: &TestCodex, prompt: &str) -> anyhow::Result<
 
 #[allow(clippy::expect_used)]
 async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
-    let mut builder = test_codex().with_model("test-gpt-5.1-codex");
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            config.model_provider.supports_websockets = false;
+            config
+                .features
+                .disable(Feature::ShellSnapshot)
+                .expect("test config should allow feature update");
+        });
     builder.build(server).await
 }
 
@@ -144,7 +153,13 @@ async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
+        config.model_provider.supports_websockets = false;
+        config
+            .features
+            .disable(Feature::ShellSnapshot)
+            .expect("test config should allow feature update");
+    });
     let test = builder.build(&server).await?;
 
     let shell_args = json!({
@@ -343,7 +358,13 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     ])
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
+        config.model_provider.supports_websockets = false;
+        config
+            .features
+            .disable(Feature::ShellSnapshot)
+            .expect("test config should allow feature update");
+    });
     let test = builder
         .build_with_streaming_server(&streaming_server)
         .await?;

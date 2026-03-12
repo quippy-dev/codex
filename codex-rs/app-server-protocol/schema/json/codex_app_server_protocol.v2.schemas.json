@@ -755,6 +755,10 @@
                 },
                 "sandbox_approval": {
                   "type": "boolean"
+                },
+                "skill_approval": {
+                  "default": false,
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -2205,6 +2209,16 @@
             "null"
           ]
         },
+        "spawnMode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentSpawnMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "threadId": {
           "type": "string"
         }
@@ -2265,6 +2279,16 @@
             "null"
           ]
         },
+        "spawnMode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentSpawnMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "$ref": "#/definitions/CollabAgentState"
         },
@@ -2293,6 +2317,14 @@
         "inProgress",
         "completed",
         "failed"
+      ],
+      "type": "string"
+    },
+    "CollabCloseResult": {
+      "enum": [
+        "closed",
+        "alreadyClosed",
+        "notFound"
       ],
       "type": "string"
     },
@@ -6181,9 +6213,15 @@
               "description": "Identifier for the collab tool call.",
               "type": "string"
             },
+            "model": {
+              "type": "string"
+            },
             "prompt": {
               "description": "Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the beginning.",
               "type": "string"
+            },
+            "reasoning_effort": {
+              "$ref": "#/definitions/ReasoningEffort"
             },
             "sender_thread_id": {
               "allOf": [
@@ -6203,7 +6241,9 @@
           },
           "required": [
             "call_id",
+            "model",
             "prompt",
+            "reasoning_effort",
             "sender_thread_id",
             "type"
           ],
@@ -6541,6 +6581,15 @@
               "description": "Identifier for the collab tool call.",
               "type": "string"
             },
+            "close_result": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CollabCloseResult"
+                }
+              ],
+              "default": "closed",
+              "description": "Close outcome reported by the close_agent tool."
+            },
             "receiver_agent_nickname": {
               "description": "Optional nickname assigned to the receiver agent.",
               "type": [
@@ -6554,6 +6603,17 @@
                 "string",
                 "null"
               ]
+            },
+            "receiver_spawn_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AgentSpawnMode"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional spawn mode assigned to the receiver agent."
             },
             "receiver_thread_id": {
               "allOf": [
@@ -6618,6 +6678,17 @@
                 "null"
               ]
             },
+            "receiver_spawn_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AgentSpawnMode"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional spawn mode assigned to the receiver agent."
+            },
             "receiver_thread_id": {
               "allOf": [
                 {
@@ -6671,6 +6742,17 @@
                 "string",
                 "null"
               ]
+            },
+            "receiver_spawn_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AgentSpawnMode"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional spawn mode assigned to the receiver agent."
             },
             "receiver_thread_id": {
               "allOf": [
@@ -7707,7 +7789,7 @@
           "type": "boolean"
         },
         "optOutNotificationMethods": {
-          "description": "Exact notification method names that should be suppressed for this connection (for example `codex/event/session_configured`).",
+          "description": "Exact notification method names that should be suppressed for this connection (for example `thread/started`).",
           "items": {
             "type": "string"
           },
@@ -8084,6 +8166,14 @@
         }
       ]
     },
+    "MacOsContactsPermission": {
+      "enum": [
+        "none",
+        "read_only",
+        "read_write"
+      ],
+      "type": "string"
+    },
     "MacOsPreferencesPermission": {
       "enum": [
         "none",
@@ -8110,6 +8200,18 @@
           "default": false,
           "type": "boolean"
         },
+        "macos_contacts": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MacOsContactsPermission"
+            }
+          ],
+          "default": "none"
+        },
+        "macos_launch_services": {
+          "default": false,
+          "type": "boolean"
+        },
         "macos_preferences": {
           "allOf": [
             {
@@ -8117,6 +8219,10 @@
             }
           ],
           "default": "read_only"
+        },
+        "macos_reminders": {
+          "default": false,
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -9076,6 +9182,13 @@
       ],
       "type": "string"
     },
+    "PluginAuthPolicy": {
+      "enum": [
+        "ON_INSTALL",
+        "ON_USE"
+      ],
+      "type": "string"
+    },
     "PluginInstallParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -9093,6 +9206,14 @@
       "title": "PluginInstallParams",
       "type": "object"
     },
+    "PluginInstallPolicy": {
+      "enum": [
+        "NOT_AVAILABLE",
+        "AVAILABLE",
+        "INSTALLED_BY_DEFAULT"
+      ],
+      "type": "string"
+    },
     "PluginInstallResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -9101,6 +9222,16 @@
             "$ref": "#/definitions/AppSummary"
           },
           "type": "array"
+        },
+        "authPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PluginAuthPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -9222,6 +9353,10 @@
             "array",
             "null"
           ]
+        },
+        "forceRemoteSync": {
+          "description": "When true, reconcile the official curated marketplace against the remote plugin state before listing marketplaces.",
+          "type": "boolean"
         }
       },
       "title": "PluginListParams",
@@ -9235,6 +9370,12 @@
             "$ref": "#/definitions/PluginMarketplaceEntry"
           },
           "type": "array"
+        },
+        "remoteSyncError": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -9291,11 +9432,31 @@
     },
     "PluginSummary": {
       "properties": {
+        "authPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PluginAuthPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "enabled": {
           "type": "boolean"
         },
         "id": {
           "type": "string"
+        },
+        "installPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PluginInstallPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "installed": {
           "type": "boolean"
@@ -10335,6 +10496,12 @@
             "name": {
               "type": "string"
             },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "function_call"
@@ -10350,6 +10517,47 @@
             "type"
           ],
           "title": "FunctionCallResponseItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "arguments": true,
+            "call_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution": {
+              "type": "string"
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "writeOnly": true
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "tool_search_call"
+              ],
+              "title": "ToolSearchCallResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "arguments",
+            "execution",
+            "type"
+          ],
+          "title": "ToolSearchCallResponseItem",
           "type": "object"
         },
         {
@@ -10439,6 +10647,41 @@
             "type"
           ],
           "title": "CustomToolCallOutputResponseItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "call_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "tools": {
+              "items": true,
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "tool_search_output"
+              ],
+              "title": "ToolSearchOutputResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "execution",
+            "status",
+            "tools",
+            "type"
+          ],
+          "title": "ToolSearchOutputResponseItem",
           "type": "object"
         },
         {
@@ -12948,6 +13191,9 @@
             "null"
           ]
         },
+        "ephemeral": {
+          "type": "boolean"
+        },
         "model": {
           "description": "Configuration overrides for the forked thread, if any.",
           "type": [
@@ -13410,6 +13656,17 @@
               },
               "description": "Last known status of the target agents, when available.",
               "type": "object"
+            },
+            "closeResult": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CollabCloseResult"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional close result when `tool` is `CloseAgent`."
             },
             "id": {
               "description": "Unique identifier for this collab tool call.",

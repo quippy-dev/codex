@@ -278,6 +278,11 @@ mod tests {
             ToolInfo {
                 server_name: server_name.to_string(),
                 tool_name: tool_name.to_string(),
+                tool_namespace: if server_name == CODEX_APPS_MCP_SERVER_NAME {
+                    format!("mcp__{server_name}__")
+                } else {
+                    server_name.to_string()
+                },
                 tool: Tool {
                     name: tool_name.to_string().into(),
                     title: None,
@@ -291,6 +296,7 @@ mod tests {
                 },
                 connector_id: connector_id.map(str::to_string),
                 connector_name: connector_id.map(str::to_string),
+                connector_description: None,
                 plugin_display_names: Vec::new(),
             },
         )

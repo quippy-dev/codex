@@ -3754,6 +3754,7 @@ impl CodexMessageProcessor {
             config: cli_overrides,
             base_instructions,
             developer_instructions,
+            ephemeral,
             persist_extended_history,
         } = params;
 
@@ -3828,7 +3829,7 @@ impl CodexMessageProcessor {
         } else {
             Some(cli_overrides)
         };
-        let typesafe_overrides = self.build_thread_config_overrides(
+        let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
             service_tier,
@@ -3839,6 +3840,7 @@ impl CodexMessageProcessor {
             developer_instructions,
             None,
         );
+        typesafe_overrides.ephemeral = Some(ephemeral);
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
         let config = match derive_config_for_cwd(
@@ -4743,6 +4745,7 @@ impl CodexMessageProcessor {
             }
             MarketplaceError::InvalidMarketplaceFile { .. }
             | MarketplaceError::PluginNotFound { .. }
+            | MarketplaceError::PluginNotAvailable { .. }
             | MarketplaceError::InvalidPlugin(_) => {
                 self.send_invalid_request_error(request_id, err.to_string())
                     .await;
@@ -5419,6 +5422,8 @@ impl CodexMessageProcessor {
                                         PluginSource::Local { path }
                                     }
                                 },
+                                install_policy: plugin.install_policy.map(Into::into),
+                                auth_policy: plugin.auth_policy.map(Into::into),
                                 interface: plugin.interface.map(|interface| PluginInterface {
                                     display_name: interface.display_name,
                                     short_description: interface.short_description,
@@ -5460,7 +5465,13 @@ impl CodexMessageProcessor {
         };
 
         self.outgoing
-            .send_response(request_id, PluginListResponse { marketplaces: data })
+            .send_response(
+                request_id,
+                PluginListResponse {
+                    marketplaces: data,
+                    remote_sync_error: None,
+                },
+            )
             .await;
     }
 
@@ -5662,7 +5673,13 @@ impl CodexMessageProcessor {
 
                 self.clear_plugin_related_caches();
                 self.outgoing
-                    .send_response(request_id, PluginInstallResponse { apps_needing_auth })
+                    .send_response(
+                        request_id,
+                        PluginInstallResponse {
+                            auth_policy: result.auth_policy.map(Into::into),
+                            apps_needing_auth,
+                        },
+                    )
                     .await;
             }
             Err(err) => {

@@ -10,6 +10,7 @@ use crate::config::AgentRoleConfig;
 use crate::config::AgentRoleSpawnMode;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
+use crate::config::agent_roles::parse_agent_role_file_contents;
 use crate::config::deserialize_config_toml_with_base;
 use crate::config_loader::ConfigLayerEntry;
 use crate::config_loader::ConfigLayerStack;
@@ -59,26 +60,34 @@ pub(crate) async fn apply_role_to_config(
         return Ok(());
     };
 
-    let (role_config_contents, role_config_base) = if is_built_in {
-        (
-            built_in::config_file_contents(config_file)
-                .map(str::to_owned)
-                .ok_or_else(|| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
-            config.codex_home.as_path(),
-        )
+    let (role_config_toml, role_config_base) = if is_built_in {
+        let role_config_contents = built_in::config_file_contents(config_file)
+            .map(str::to_owned)
+            .ok_or_else(|| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        let role_config_toml: TomlValue = toml::from_str(&role_config_contents)
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        (role_config_toml, config.codex_home.as_path())
     } else {
+        let role_config_contents = tokio::fs::read_to_string(config_file)
+            .await
+            .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+        let role_config_toml = parse_agent_role_file_contents(
+            &role_config_contents,
+            config_file,
+            config_file
+                .parent()
+                .ok_or_else(|| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
+            Some(role_name),
+        )
+        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?
+        .config;
         (
-            tokio::fs::read_to_string(config_file)
-                .await
-                .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
+            role_config_toml,
             config_file
                 .parent()
                 .ok_or_else(|| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
         )
     };
-
-    let role_config_toml: TomlValue = toml::from_str(&role_config_contents)
-        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
     deserialize_config_toml_with_base(role_config_toml.clone(), role_config_base)
         .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
     let mut role_layer_toml =
@@ -190,17 +199,46 @@ pub(crate) mod spawn_tool_spec {
         }
 
         format!(
-            r#"Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.
-Available roles:
-{}
-            "#,
+            "Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.\nAvailable roles:\n{}",
             formatted_roles.join("\n"),
         )
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
         let has_inline_metadata = declaration.model.is_some() || declaration.spawn_mode.is_some();
-        if declaration.description.is_none() && !has_inline_metadata {
+        let locked_settings_note = declaration
+            .config_file
+            .as_ref()
+            .and_then(|config_file| {
+                built_in::config_file_contents(config_file)
+                    .map(str::to_owned)
+                    .or_else(|| std::fs::read_to_string(config_file).ok())
+            })
+            .and_then(|contents| toml::from_str::<TomlValue>(&contents).ok())
+            .map(|role_toml| {
+                let model = role_toml.get("model").and_then(TomlValue::as_str);
+                let reasoning_effort = role_toml
+                    .get("model_reasoning_effort")
+                    .and_then(TomlValue::as_str);
+
+                match (model, reasoning_effort) {
+                    (Some(model), Some(reasoning_effort)) => format!(
+                        "- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+                    ),
+                    (Some(model), None) => {
+                        format!("- This role's model is set to `{model}` and cannot be changed.")
+                    }
+                    (None, Some(reasoning_effort)) => format!(
+                        "- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
+                    ),
+                    (None, None) => String::new(),
+                }
+            })
+            .filter(|note| !note.is_empty());
+        if declaration.description.is_none()
+            && !has_inline_metadata
+            && locked_settings_note.is_none()
+        {
             format!("{name}: no description")
         } else {
             let mut body = Vec::new();
@@ -214,6 +252,9 @@ Available roles:
             body.push(format!("Default spawn mode: {default_spawn_mode}"));
             if let Some(model) = &declaration.model {
                 body.push(format!("Model override: {model}"));
+            }
+            if let Some(locked_settings_note) = locked_settings_note {
+                body.push(locked_settings_note);
             }
             format!("{name}: {{\n{}\n}}", body.join("\n"))
         }
@@ -398,15 +439,17 @@ mod tests {
     #[tokio::test]
     async fn apply_explorer_role_adds_session_flags_layer_without_overriding_model() {
         let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+        let before_model = config.model.clone();
+        let before_reasoning_effort = config.model_reasoning_effort;
         let before_layers = session_flags_layer_count(&config);
 
         apply_role_to_config(&mut config, Some("explorer"))
             .await
             .expect("explorer role should apply");
 
-        assert_eq!(config.model.as_deref(), None);
-        assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
-        assert_eq!(session_flags_layer_count(&config), before_layers + 1);
+        assert_eq!(config.model, before_model);
+        assert_eq!(config.model_reasoning_effort, before_reasoning_effort);
+        assert_eq!(session_flags_layer_count(&config), before_layers);
     }
 
     #[tokio::test]
@@ -485,6 +528,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_role_ignores_agent_metadata_fields_in_user_role_file() {
+        let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+        let role_path = write_role_config(
+            &home,
+            "metadata-role.toml",
+            r#"
+name = "archivist"
+description = "Role metadata"
+nickname_candidates = ["Hypatia"]
+developer_instructions = "Stay focused"
+model = "role-model"
+"#,
+        )
+        .await;
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: None,
+                model: None,
+                config_file: Some(role_path),
+                spawn_mode: None,
+                nickname_candidates: None,
+            },
+        );
+
+        apply_role_to_config(&mut config, Some("custom"))
+            .await
+            .expect("custom role should apply");
+
+        assert_eq!(config.model.as_deref(), Some("role-model"));
+    }
+
+    #[tokio::test]
     async fn apply_role_preserves_unspecified_keys() {
         let (home, mut config) = test_config_with_cli_overrides(vec![(
             "model".to_string(),
@@ -496,7 +572,7 @@ mod tests {
         let role_path = write_role_config(
             &home,
             "effort-only.toml",
-            "model_reasoning_effort = \"high\"",
+            "developer_instructions = \"Stay focused\"\nmodel_reasoning_effort = \"high\"",
         )
         .await;
         config.agent_roles.insert(
@@ -553,7 +629,12 @@ model_provider = "test-provider"
             .build()
             .await
             .expect("load config");
-        let role_path = write_role_config(&home, "empty-role.toml", "").await;
+        let role_path = write_role_config(
+            &home,
+            "empty-role.toml",
+            "developer_instructions = \"Stay focused\"",
+        )
+        .await;
         config.agent_roles.insert(
             "custom".to_string(),
             AgentRoleConfig {
@@ -610,8 +691,12 @@ model_provider = "role-provider"
             .build()
             .await
             .expect("load config");
-        let role_path =
-            write_role_config(&home, "profile-role.toml", "profile = \"role-profile\"").await;
+        let role_path = write_role_config(
+            &home,
+            "profile-role.toml",
+            "developer_instructions = \"Stay focused\"\nprofile = \"role-profile\"",
+        )
+        .await;
         config.agent_roles.insert(
             "custom".to_string(),
             AgentRoleConfig {
@@ -668,7 +753,7 @@ model_provider = "base-provider"
         let role_path = write_role_config(
             &home,
             "provider-role.toml",
-            "model_provider = \"role-provider\"",
+            "developer_instructions = \"Stay focused\"\nmodel_provider = \"role-provider\"",
         )
         .await;
         config.agent_roles.insert(
@@ -728,7 +813,9 @@ model_reasoning_effort = "low"
         let role_path = write_role_config(
             &home,
             "profile-edit-role.toml",
-            r#"[profiles.base-profile]
+            r#"developer_instructions = "Stay focused"
+
+[profiles.base-profile]
 model_provider = "role-provider"
 model_reasoning_effort = "high"
 "#,
@@ -772,7 +859,9 @@ model_reasoning_effort = "high"
         let role_path = write_role_config(
             &home,
             "sandbox-role.toml",
-            r#"[sandbox_workspace_write]
+            r#"developer_instructions = "Stay focused"
+
+[sandbox_workspace_write]
 writable_roots = ["./sandbox-root"]
 "#,
         )
@@ -831,7 +920,12 @@ writable_roots = ["./sandbox-root"]
         )])
         .await;
         let before_layers = session_flags_layer_count(&config);
-        let role_path = write_role_config(&home, "model-role.toml", "model = \"role-model\"").await;
+        let role_path = write_role_config(
+            &home,
+            "model-role.toml",
+            "developer_instructions = \"Stay focused\"\nmodel = \"role-model\"",
+        )
+        .await;
         config.agent_roles.insert(
             "custom".to_string(),
             AgentRoleConfig {
@@ -867,7 +961,9 @@ writable_roots = ["./sandbox-root"]
             &home,
             "skills-role.toml",
             &format!(
-                r#"[[skills.config]]
+                r#"developer_instructions = "Stay focused"
+
+[[skills.config]]
 path = "{}"
 enabled = false
 "#,
@@ -949,7 +1045,63 @@ enabled = false
     }
 
     #[test]
-    fn built_in_config_file_contents_resolves_explorer_only() {
+    fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
+        let tempdir = TempDir::new().expect("create temp dir");
+        let role_path = tempdir.path().join("researcher.toml");
+        fs::write(
+            &role_path,
+            "developer_instructions = \"Research carefully\"\nmodel = \"gpt-5\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .expect("write role config");
+        let user_defined_roles = BTreeMap::from([(
+            "researcher".to_string(),
+            AgentRoleConfig {
+                description: Some("Research carefully.".to_string()),
+                model: None,
+                config_file: Some(role_path),
+                spawn_mode: None,
+                nickname_candidates: None,
+            },
+        )]);
+
+        let spec = spawn_tool_spec::build(&user_defined_roles);
+
+        assert!(spec.contains(
+            "Research carefully.\nDefault spawn mode: spawn\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
+        ));
+    }
+
+    #[test]
+    fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
+        let tempdir = TempDir::new().expect("create temp dir");
+        let role_path = tempdir.path().join("reviewer.toml");
+        fs::write(
+            &role_path,
+            "developer_instructions = \"Review carefully\"\nmodel_reasoning_effort = \"medium\"\n",
+        )
+        .expect("write role config");
+        let user_defined_roles = BTreeMap::from([(
+            "reviewer".to_string(),
+            AgentRoleConfig {
+                description: Some("Review carefully.".to_string()),
+                model: None,
+                config_file: Some(role_path),
+                spawn_mode: None,
+                nickname_candidates: None,
+            },
+        )]);
+
+        let spec = spawn_tool_spec::build(&user_defined_roles);
+
+        assert!(spec.contains(
+            "Review carefully.\nDefault spawn mode: spawn\n- This role's reasoning effort is set to `medium` and cannot be changed."
+        ));
+    }
+
+    #[test]
+    fn built_in_config_file_contents_resolves_explorer_and_awaiter() {
+        assert!(built_in::config_file_contents(Path::new("explorer.toml")).is_some());
+        assert!(built_in::config_file_contents(Path::new("awaiter.toml")).is_some());
         assert_eq!(
             built_in::config_file_contents(Path::new("missing.toml")),
             None

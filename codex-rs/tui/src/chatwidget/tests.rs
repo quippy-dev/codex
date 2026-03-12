@@ -71,10 +71,13 @@ use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
 use codex_protocol::protocol::AgentReasoningEvent;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
+use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -2434,6 +2437,49 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
         s.push('\n');
     }
     s
+}
+
+#[tokio::test]
+async fn collab_spawn_end_shows_requested_model_and_effort() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+    let sender_thread_id = ThreadId::new();
+    let spawned_thread_id = ThreadId::new();
+
+    chat.handle_codex_event(Event {
+        id: "spawn-begin".into(),
+        msg: EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id,
+            prompt: "Explore the repo".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: ReasoningEffortConfig::High,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "spawn-end".into(),
+        msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id,
+            new_thread_id: Some(spawned_thread_id),
+            new_agent_nickname: Some("Robie".to_string()),
+            new_agent_role: Some("explorer".to_string()),
+            prompt: "Explore the repo".to_string(),
+            spawn_mode: AgentSpawnMode::Spawn,
+            status: AgentStatus::PendingInit,
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Spawned Robie [explorer] (gpt-5 high)"),
+        "expected spawn line to include agent metadata and requested model, got {rendered:?}"
+    );
 }
 
 fn status_line_text(chat: &ChatWidget) -> Option<String> {
@@ -6950,7 +6996,7 @@ async fn image_generation_call_adds_history_cell() {
             status: "completed".into(),
             revised_prompt: Some("A tiny blue square".into()),
             result: "Zm9v".into(),
-            saved_path: Some("/tmp/project/ig-1.png".into()),
+            saved_path: Some("/tmp/ig-1.png".into()),
         }),
     });
 

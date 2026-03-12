@@ -148,6 +148,16 @@
             "null"
           ]
         },
+        "spawnMode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentSpawnMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "threadId": {
           "type": "string"
         }
@@ -208,6 +218,16 @@
             "null"
           ]
         },
+        "spawnMode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentSpawnMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "status": {
           "$ref": "#/definitions/CollabAgentState"
         },
@@ -236,6 +256,14 @@
         "inProgress",
         "completed",
         "failed"
+      ],
+      "type": "string"
+    },
+    "CollabCloseResult": {
+      "enum": [
+        "closed",
+        "alreadyClosed",
+        "notFound"
       ],
       "type": "string"
     },
@@ -926,6 +954,17 @@
               },
               "description": "Last known status of the target agents, when available.",
               "type": "object"
+            },
+            "closeResult": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CollabCloseResult"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional close result when `tool` is `CloseAgent`."
             },
             "id": {
               "description": "Unique identifier for this collab tool call.",
