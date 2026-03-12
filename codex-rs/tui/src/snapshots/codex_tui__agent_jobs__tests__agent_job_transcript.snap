@@ -1,0 +1,13 @@
+---
+source: tui/src/agent_jobs.rs
+expression: snapshot
+---
+• Started CSV agent job 12345678
+  └ 2 items, concurrency 4
+    /tmp/input.csv -> /tmp/output.csv
+
+• Finished CSV agent job 12345678
+  └ 2 completed, 0 failed, 2 total
+    /tmp/output.csv
+
+Agent job 12345678: 1/2 complete, 1 running, ETA 3s

@@ -187,8 +187,22 @@ fn snapshot(percent: f64) -> RateLimitSnapshot {
 }
 
 fn agent_inbox_function_call_output(sender: ThreadId, message: &str) -> ResponseItem {
-    let payload = serde_json::to_string(&AgentInboxPayload::new(sender, message.to_string()))
-        .expect("collab inbox payload should serialize");
+    agent_inbox_function_call_output_with_identity(sender, None, None, message)
+}
+
+fn agent_inbox_function_call_output_with_identity(
+    sender: ThreadId,
+    sender_agent_nickname: Option<&str>,
+    sender_agent_role: Option<&str>,
+    message: &str,
+) -> ResponseItem {
+    let payload = serde_json::to_string(&AgentInboxPayload::new(
+        sender,
+        sender_agent_nickname.map(str::to_string),
+        sender_agent_role.map(str::to_string),
+        message.to_string(),
+    ))
+    .expect("collab inbox payload should serialize");
     ResponseItem::FunctionCallOutput {
         call_id: "call-collab-inbox".to_string(),
         output: FunctionCallOutputPayload::from_text(payload),
@@ -405,6 +419,72 @@ async fn thread_snapshot_replay_resets_agent_inbox_dedupe_after_non_agent_raw_it
         .collect::<String>();
     assert_eq!(combined.matches("Agent message:").count(), 2);
     assert_eq!(combined.matches("Please review the latest diff").count(), 2);
+}
+
+#[tokio::test]
+async fn thread_snapshot_replay_renders_agent_inbox_sender_label_from_payload_identity() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Please review the latest diff";
+
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: agent_inbox_function_call_output_with_identity(
+                sender,
+                Some("Atlas"),
+                Some("worker"),
+                message,
+            ),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(combined.contains("Agent message:"));
+    assert!(combined.contains("from Atlas [worker]"));
+    assert!(!combined.contains(&sender.to_string()));
+}
+
+#[tokio::test]
+async fn thread_snapshot_replay_deduplicates_mixed_agent_inbox_encodings_with_payload_identity() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Please review the latest diff";
+
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-output".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: agent_inbox_function_call_output_with_identity(
+                sender,
+                Some("Atlas"),
+                Some("worker"),
+                message,
+            ),
+        }),
+    });
+    chat.handle_codex_event_replay(Event {
+        id: "evt-collab-message".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: agent_inbox_message(sender, message),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(combined.matches("Agent message:").count(), 1);
+    assert_eq!(combined.matches(message).count(), 1);
+    assert!(combined.contains("from Atlas [worker]"));
 }
 
 #[tokio::test]

@@ -82,7 +82,10 @@ use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CollabAgentRef;
+use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
@@ -1273,8 +1276,108 @@ impl App {
         self.sync_subagent_panel_state();
     }
 
-    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
+    fn known_agent_identity(
+        &self,
+        thread_id: ThreadId,
+    ) -> (Option<String>, Option<String>, Option<AgentSpawnMode>) {
+        let subagent_identity = self.subagents.agents.get(&thread_id);
+        let picker_identity = self.agent_picker_threads.get(&thread_id);
+        (
+            subagent_identity
+                .and_then(|info| info.nickname.clone())
+                .or_else(|| picker_identity.and_then(|entry| entry.agent_nickname.clone())),
+            subagent_identity
+                .and_then(|info| info.agent_role.clone())
+                .or_else(|| picker_identity.and_then(|entry| entry.agent_role.clone())),
+            subagent_identity.map(|info| info.spawn_mode),
+        )
+    }
+
+    fn backfill_collab_event_identity(&self, event: &mut Event) {
+        match &mut event.msg {
+            EventMsg::CollabAgentInteractionEnd(ev) => {
+                let (nickname, role, _) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+            }
+            EventMsg::CollabWaitingBegin(ev) => {
+                if ev.receiver_agents.is_empty() {
+                    ev.receiver_agents = ev
+                        .receiver_thread_ids
+                        .iter()
+                        .map(|thread_id| {
+                            let (agent_nickname, agent_role, spawn_mode) =
+                                self.known_agent_identity(*thread_id);
+                            CollabAgentRef {
+                                thread_id: *thread_id,
+                                agent_nickname,
+                                agent_role,
+                                spawn_mode,
+                            }
+                        })
+                        .collect();
+                } else {
+                    for agent in &mut ev.receiver_agents {
+                        let (agent_nickname, agent_role, spawn_mode) =
+                            self.known_agent_identity(agent.thread_id);
+                        agent.agent_nickname = agent.agent_nickname.clone().or(agent_nickname);
+                        agent.agent_role = agent.agent_role.clone().or(agent_role);
+                        agent.spawn_mode = agent.spawn_mode.or(spawn_mode);
+                    }
+                }
+            }
+            EventMsg::CollabWaitingEnd(ev) => {
+                if ev.agent_statuses.is_empty() {
+                    ev.agent_statuses = ev
+                        .statuses
+                        .iter()
+                        .map(|(thread_id, status)| {
+                            let (agent_nickname, agent_role, spawn_mode) =
+                                self.known_agent_identity(*thread_id);
+                            CollabAgentStatusEntry {
+                                thread_id: *thread_id,
+                                agent_nickname,
+                                agent_role,
+                                spawn_mode,
+                                status: status.clone(),
+                            }
+                        })
+                        .collect();
+                } else {
+                    for entry in &mut ev.agent_statuses {
+                        let (agent_nickname, agent_role, spawn_mode) =
+                            self.known_agent_identity(entry.thread_id);
+                        entry.agent_nickname = entry.agent_nickname.clone().or(agent_nickname);
+                        entry.agent_role = entry.agent_role.clone().or(agent_role);
+                        entry.spawn_mode = entry.spawn_mode.or(spawn_mode);
+                    }
+                }
+            }
+            EventMsg::CollabCloseEnd(ev) => {
+                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
+            }
+            EventMsg::CollabResumeBegin(ev) => {
+                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
+            }
+            EventMsg::CollabResumeEnd(ev) => {
+                let (nickname, role, spawn_mode) = self.known_agent_identity(ev.receiver_thread_id);
+                ev.receiver_agent_nickname = ev.receiver_agent_nickname.clone().or(nickname);
+                ev.receiver_agent_role = ev.receiver_agent_role.clone().or(role);
+                ev.receiver_spawn_mode = ev.receiver_spawn_mode.or(spawn_mode);
+            }
+            _ => {}
+        }
+    }
+
+    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, mut event: Event) -> Result<()> {
         self.process_subagent_side_effects(thread_id, &event);
+        self.backfill_collab_event_identity(&mut event);
         let refresh_pending_thread_approvals =
             ThreadEventStore::event_can_change_pending_thread_approvals(&event);
         let inactive_interactive_request = if self.active_thread_id != Some(thread_id) {
@@ -5974,8 +6077,13 @@ mod tests {
     }
 
     fn agent_inbox_function_call_output_event(sender: ThreadId, message: &str) -> Event {
-        let payload = serde_json::to_string(&AgentInboxPayload::new(sender, message.to_string()))
-            .expect("collab inbox payload should serialize");
+        let payload = serde_json::to_string(&AgentInboxPayload::new(
+            sender,
+            None,
+            None,
+            message.to_string(),
+        ))
+        .expect("collab inbox payload should serialize");
         Event {
             id: "agent-inbox".to_string(),
             msg: EventMsg::RawResponseItem(RawResponseItemEvent {
@@ -7649,6 +7757,133 @@ mod tests {
             close_cells.is_empty(),
             "app should not emit duplicate close lifecycle cells"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_backfills_wait_identity_from_known_subagent() -> Result<()> {
+        let mut app = make_test_app().await;
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.subagents.set_root_thread(root_thread_id);
+        app.thread_event_channels
+            .insert(root_thread_id, ThreadEventChannel::new(8));
+
+        app.process_subagent_side_effects(
+            root_thread_id,
+            &Event {
+                id: "spawn".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                    call_id: "call-spawn".to_string(),
+                    sender_thread_id: root_thread_id,
+                    new_thread_id: Some(subagent_thread_id),
+                    new_agent_nickname: Some("Atlas".to_string()),
+                    new_agent_role: Some("worker".to_string()),
+                    prompt: "run job".to_string(),
+                    spawn_mode: AgentSpawnMode::Watchdog,
+                    status: AgentStatus::PendingInit,
+                }),
+            },
+        );
+
+        let mut statuses = HashMap::new();
+        statuses.insert(subagent_thread_id, AgentStatus::PendingInit);
+        app.enqueue_thread_event(
+            root_thread_id,
+            Event {
+                id: "wait-end".to_string(),
+                msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                    sender_thread_id: root_thread_id,
+                    call_id: "call-wait".to_string(),
+                    agent_statuses: Vec::new(),
+                    statuses,
+                }),
+            },
+        )
+        .await?;
+
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&root_thread_id)
+                .expect("root thread channel should exist");
+            let store = channel.store.lock().await;
+            store.snapshot()
+        };
+        let event = snapshot.events.last().expect("wait-end event stored");
+        let EventMsg::CollabWaitingEnd(event) = &event.msg else {
+            panic!("expected CollabWaitingEnd event");
+        };
+        assert_eq!(event.agent_statuses.len(), 1);
+        assert_eq!(
+            event.agent_statuses[0].agent_nickname.as_deref(),
+            Some("Atlas")
+        );
+        assert_eq!(
+            event.agent_statuses[0].agent_role.as_deref(),
+            Some("worker")
+        );
+        assert_eq!(
+            event.agent_statuses[0].spawn_mode,
+            Some(AgentSpawnMode::Watchdog)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_backfills_resume_identity_from_agent_picker() -> Result<()> {
+        let mut app = make_test_app().await;
+        let root_thread_id = ThreadId::new();
+        let subagent_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(root_thread_id);
+        app.active_thread_id = Some(root_thread_id);
+        app.thread_event_channels
+            .insert(root_thread_id, ThreadEventChannel::new(8));
+        app.agent_picker_threads.insert(
+            subagent_thread_id,
+            AgentPickerThreadEntry {
+                agent_nickname: Some("Curie".to_string()),
+                agent_role: Some("reviewer".to_string()),
+                is_closed: false,
+            },
+        );
+        app.agent_picker_thread_order.push(subagent_thread_id);
+
+        app.enqueue_thread_event(
+            root_thread_id,
+            Event {
+                id: "resume-begin".to_string(),
+                msg: EventMsg::CollabResumeBegin(
+                    codex_protocol::protocol::CollabResumeBeginEvent {
+                        call_id: "call-resume".to_string(),
+                        sender_thread_id: root_thread_id,
+                        receiver_thread_id: subagent_thread_id,
+                        receiver_agent_nickname: None,
+                        receiver_agent_role: None,
+                        receiver_spawn_mode: None,
+                    },
+                ),
+            },
+        )
+        .await?;
+
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&root_thread_id)
+                .expect("root thread channel should exist");
+            let store = channel.store.lock().await;
+            store.snapshot()
+        };
+        let event = snapshot.events.last().expect("resume-begin event stored");
+        let EventMsg::CollabResumeBegin(event) = &event.msg else {
+            panic!("expected CollabResumeBegin event");
+        };
+        assert_eq!(event.receiver_agent_nickname.as_deref(), Some("Curie"));
+        assert_eq!(event.receiver_agent_role.as_deref(), Some("reviewer"));
+        assert_eq!(event.receiver_spawn_mode, None);
+        Ok(())
     }
 
     #[tokio::test]

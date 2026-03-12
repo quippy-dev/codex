@@ -11,6 +11,8 @@ use uuid::Uuid;
 pub(super) fn build_agent_inbox_items(
     role: CollabInboxDeliveryRole,
     sender_thread_id: ThreadId,
+    sender_agent_nickname: Option<String>,
+    sender_agent_role: Option<String>,
     message: String,
     prepend_turn_start_user_message: bool,
 ) -> CodexResult<Vec<ResponseInputItem>> {
@@ -27,7 +29,14 @@ pub(super) fn build_agent_inbox_items(
     let role_items = match role {
         CollabInboxDeliveryRole::Tool => {
             let call_id = format!("agent_inbox_{}", Uuid::new_v4());
-            build_tool_response_input_items(sender_thread_id, message, call_id).map_err(|err| {
+            build_tool_response_input_items(
+                sender_thread_id,
+                sender_agent_nickname,
+                sender_agent_role,
+                message,
+                call_id,
+            )
+            .map_err(|err| {
                 CodexErr::UnsupportedOperation(format!(
                     "failed to serialize collab inbox payload: {err}"
                 ))

@@ -3798,6 +3798,8 @@ async fn record_conversation_items_keeps_agent_inbox_live_only() {
 
     let response_items: Vec<ResponseItem> = build_tool_response_input_items(
         ThreadId::new(),
+        None,
+        None,
         "live only subagent body".to_string(),
         "agent-inbox-call".to_string(),
     )
@@ -4720,6 +4722,8 @@ async fn on_task_finished_flushes_post_turn_agent_items_on_follow_up_turn_path()
     let (sess, tc, rx, rx_sub) = make_session_and_context_with_submission_rx().await;
     let agent_items = build_tool_response_input_items(
         ThreadId::new(),
+        None,
+        None,
         "post-turn agent inbox".to_string(),
         "post-turn-agent-call".to_string(),
     )
@@ -4788,6 +4792,8 @@ async fn abort_all_tasks_clears_post_turn_agent_items() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let agent_items = build_tool_response_input_items(
         ThreadId::new(),
+        None,
+        None,
         "stale post-turn agent inbox".to_string(),
         "post-turn-agent-abort".to_string(),
     )

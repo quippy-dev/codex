@@ -162,6 +162,26 @@ struct AgentJobProgressMessage {
     eta_seconds: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentJobBeginMessage {
+    job_id: String,
+    input_csv_path: String,
+    output_csv_path: String,
+    total_items: usize,
+    effective_concurrency: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentJobEndMessage {
+    job_id: String,
+    status: String,
+    output_csv_path: String,
+    total_items: usize,
+    completed_items: usize,
+    failed_items: usize,
+    job_error: Option<String>,
+}
+
 struct PatchApplyBegin {
     start_time: Instant,
     auto_approved: bool,
@@ -212,11 +232,19 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 
     fn process_event(&mut self, event: Event) -> CodexStatus {
         let Event { id: _, msg } = event;
-        if let EventMsg::BackgroundEvent(BackgroundEventEvent { message }) = &msg
-            && let Some(update) = Self::parse_agent_job_progress(message)
-        {
-            self.render_agent_job_progress(update);
-            return CodexStatus::Running;
+        if let EventMsg::BackgroundEvent(BackgroundEventEvent { message }) = &msg {
+            if let Some(update) = Self::parse_agent_job_begin(message) {
+                self.render_agent_job_begin(update);
+                return CodexStatus::Running;
+            }
+            if let Some(update) = Self::parse_agent_job_progress(message) {
+                self.render_agent_job_progress(update);
+                return CodexStatus::Running;
+            }
+            if let Some(update) = Self::parse_agent_job_end(message) {
+                self.render_agent_job_end(update);
+                return CodexStatus::Running;
+            }
         }
         if self.progress_active && !Self::should_interrupt_progress(&msg) {
             return CodexStatus::Running;
@@ -930,9 +958,19 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 }
 
 impl EventProcessorWithHumanOutput {
+    fn parse_agent_job_begin(message: &str) -> Option<AgentJobBeginMessage> {
+        let payload = message.strip_prefix("agent_job_begin:")?;
+        serde_json::from_str::<AgentJobBeginMessage>(payload).ok()
+    }
+
     fn parse_agent_job_progress(message: &str) -> Option<AgentJobProgressMessage> {
         let payload = message.strip_prefix("agent_job_progress:")?;
         serde_json::from_str::<AgentJobProgressMessage>(payload).ok()
+    }
+
+    fn parse_agent_job_end(message: &str) -> Option<AgentJobEndMessage> {
+        let payload = message.strip_prefix("agent_job_end:")?;
+        serde_json::from_str::<AgentJobEndMessage>(payload).ok()
     }
 
     fn render_hook_started(&self, event: HookStartedEvent) {
@@ -1152,6 +1190,55 @@ impl EventProcessorWithHumanOutput {
         let _ = std::io::stderr().flush();
         self.progress_active = true;
         self.progress_last_len = line.len();
+    }
+
+    fn render_agent_job_begin(&mut self, update: AgentJobBeginMessage) {
+        self.finish_progress_line();
+        let job_label = update.job_id.chars().take(8).collect::<String>();
+        ts_msg!(
+            self,
+            "{} {job_label} ({} items, concurrency {})",
+            "agent job started".style(self.cyan),
+            update.total_items,
+            update.effective_concurrency
+        );
+        ts_msg!(
+            self,
+            "{} {} -> {}",
+            "agent job paths".style(self.dimmed),
+            update.input_csv_path,
+            update.output_csv_path
+        );
+    }
+
+    fn render_agent_job_end(&mut self, update: AgentJobEndMessage) {
+        self.finish_progress_line();
+        let job_label = update.job_id.chars().take(8).collect::<String>();
+        ts_msg!(
+            self,
+            "{} {job_label} ({}/{}, {} failed, status {})",
+            "agent job finished".style(self.cyan),
+            update.completed_items,
+            update.total_items,
+            update.failed_items,
+            update.status
+        );
+        ts_msg!(
+            self,
+            "{} {}",
+            "agent job output".style(self.dimmed),
+            update.output_csv_path
+        );
+        if let Some(job_error) = update.job_error
+            && !job_error.trim().is_empty()
+        {
+            ts_msg!(
+                self,
+                "{} {}",
+                "agent job error".style(self.yellow),
+                job_error
+            );
+        }
     }
 }
 
@@ -1428,6 +1515,27 @@ mod tests {
         assert!(EventProcessorWithHumanOutput::is_silent_event(
             &EventMsg::HookCompleted(event)
         ));
+    }
+
+    #[test]
+    fn parses_agent_job_begin_background_event() {
+        let message = "agent_job_begin:{\"job_id\":\"1234567890\",\"input_csv_path\":\"/tmp/in.csv\",\"output_csv_path\":\"/tmp/out.csv\",\"total_items\":2,\"effective_concurrency\":4}";
+        let parsed = EventProcessorWithHumanOutput::parse_agent_job_begin(message)
+            .expect("begin payload should parse");
+        assert_eq!(parsed.job_id, "1234567890");
+        assert_eq!(parsed.total_items, 2);
+        assert_eq!(parsed.effective_concurrency, 4);
+    }
+
+    #[test]
+    fn parses_agent_job_end_background_event() {
+        let message = "agent_job_end:{\"job_id\":\"1234567890\",\"status\":\"completed\",\"output_csv_path\":\"/tmp/out.csv\",\"total_items\":2,\"completed_items\":2,\"failed_items\":0,\"job_error\":null}";
+        let parsed = EventProcessorWithHumanOutput::parse_agent_job_end(message)
+            .expect("end payload should parse");
+        assert_eq!(parsed.job_id, "1234567890");
+        assert_eq!(parsed.status, "completed");
+        assert_eq!(parsed.completed_items, 2);
+        assert_eq!(parsed.failed_items, 0);
     }
 
     fn hook_run(

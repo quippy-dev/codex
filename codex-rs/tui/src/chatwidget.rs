@@ -206,6 +206,7 @@ fn queued_message_edit_binding_for_terminal(terminal_name: TerminalName) -> KeyB
     }
 }
 
+use crate::agent_jobs;
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
@@ -2524,7 +2525,7 @@ impl ChatWidget {
 
         if from_replay {
             if let Some(previous) = &self.last_replayed_agent_inbox_message
-                && previous.sender == replay_message.sender
+                && previous.canonical_sender == replay_message.canonical_sender
                 && previous.message == replay_message.message
                 && previous.encoding != replay_message.encoding
             {
@@ -2581,6 +2582,34 @@ impl ChatWidget {
     }
 
     fn on_background_event(&mut self, message: String) {
+        if let Some(agent_job_event) = agent_jobs::parse_background_event(message.as_str()) {
+            match agent_job_event {
+                agent_jobs::AgentJobBackgroundEvent::Begin(update) => {
+                    self.add_to_history(agent_jobs::begin_cell(&update));
+                    self.set_status_header(format!(
+                        "Started agent job {} ({} items)",
+                        &update.job_id.chars().take(8).collect::<String>(),
+                        update.total_items
+                    ));
+                }
+                agent_jobs::AgentJobBackgroundEvent::Progress(update) => {
+                    self.set_status_header(agent_jobs::progress_status_line(&update));
+                }
+                agent_jobs::AgentJobBackgroundEvent::End(update) => {
+                    self.add_to_history(agent_jobs::end_cell(&update));
+                    self.set_status_header(format!(
+                        "Agent job {} finished: {}/{} complete",
+                        &update.job_id.chars().take(8).collect::<String>(),
+                        update.completed_items,
+                        update.total_items
+                    ));
+                }
+            }
+            self.bottom_pane.ensure_status_indicator();
+            self.bottom_pane.set_interrupt_hint_visible(true);
+            self.request_redraw();
+            return;
+        }
         debug!("BackgroundEvent: {message}");
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);

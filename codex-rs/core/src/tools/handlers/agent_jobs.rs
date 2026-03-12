@@ -90,6 +90,26 @@ struct AgentJobProgressUpdate {
 }
 
 #[derive(Debug, Serialize)]
+struct AgentJobBeginUpdate {
+    job_id: String,
+    input_csv_path: String,
+    output_csv_path: String,
+    total_items: usize,
+    effective_concurrency: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentJobEndUpdate {
+    job_id: String,
+    status: String,
+    output_csv_path: String,
+    total_items: usize,
+    completed_items: usize,
+    failed_items: usize,
+    job_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ReportAgentJobResultToolResult {
     accepted: bool,
 }
@@ -191,6 +211,7 @@ impl ToolHandler for BatchJobHandler {
             turn,
             tool_name,
             payload,
+            call_id,
             ..
         } = invocation;
 
@@ -204,7 +225,9 @@ impl ToolHandler for BatchJobHandler {
         };
 
         match tool_name.as_str() {
-            "spawn_agents_on_csv" => spawn_agents_on_csv::handle(session, turn, arguments).await,
+            "spawn_agents_on_csv" => {
+                spawn_agents_on_csv::handle(session, turn, call_id, arguments).await
+            }
             "report_agent_job_result" => report_agent_job_result::handle(session, arguments).await,
             other => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported agent job tool {other}"
@@ -224,6 +247,7 @@ mod spawn_agents_on_csv {
     pub async fn handle(
         session: Arc<Session>,
         turn: Arc<TurnContext>,
+        _call_id: String,
         arguments: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
@@ -355,6 +379,19 @@ mod spawn_agents_on_csv {
             })?;
         let max_threads = turn.config.agent_max_threads;
         let effective_concurrency = options.max_concurrency;
+        let begin_payload = serde_json::to_string(&AgentJobBeginUpdate {
+            job_id: job_id.clone(),
+            input_csv_path: input_path.display().to_string(),
+            output_csv_path: output_csv_path.display().to_string(),
+            total_items: items.len(),
+            effective_concurrency,
+        })
+        .map_err(|err| {
+            FunctionCallError::Fatal(format!("failed to serialize agent job begin event: {err}"))
+        })?;
+        let _ = session
+            .notify_background_event(&turn, format!("agent_job_begin:{begin_payload}"))
+            .await;
         let message = format!(
             "agent job concurrency: job_id={job_id} requested={requested_concurrency:?} max_threads={max_threads:?} effective={effective_concurrency}"
         );
@@ -443,14 +480,16 @@ mod spawn_agents_on_csv {
         } else {
             None
         };
+        let status = job.status.as_str().to_string();
+        let output_csv_path = job.output_csv_path.clone();
         let content = serde_json::to_string(&SpawnAgentsOnCsvResult {
-            job_id,
-            status: job.status.as_str().to_string(),
-            output_csv_path: job.output_csv_path,
+            job_id: job_id.clone(),
+            status: status.clone(),
+            output_csv_path: output_csv_path.clone(),
             total_items: progress.total_items,
             completed_items: progress.completed_items,
             failed_items: progress.failed_items,
-            job_error,
+            job_error: job_error.clone(),
             failed_item_errors,
         })
         .map_err(|err| {
@@ -458,6 +497,21 @@ mod spawn_agents_on_csv {
                 "failed to serialize spawn_agents_on_csv result: {err}"
             ))
         })?;
+        let end_payload = serde_json::to_string(&AgentJobEndUpdate {
+            job_id,
+            status,
+            output_csv_path,
+            total_items: progress.total_items,
+            completed_items: progress.completed_items,
+            failed_items: progress.failed_items,
+            job_error,
+        })
+        .map_err(|err| {
+            FunctionCallError::Fatal(format!("failed to serialize agent job end event: {err}"))
+        })?;
+        let _ = session
+            .notify_background_event(&turn, format!("agent_job_end:{end_payload}"))
+            .await;
         Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 }

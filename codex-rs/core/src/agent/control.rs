@@ -577,6 +577,10 @@ impl AgentControl {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         let snapshot = thread.config_snapshot().await;
+        let (sender_agent_nickname, sender_agent_role) = self
+            .get_agent_nickname_and_role(sender_thread_id)
+            .await
+            .unwrap_or((None, None));
 
         if matches!(snapshot.session_source, SessionSource::SubAgent(_)) {
             return self.send_prompt(agent_id, message).await;
@@ -598,6 +602,8 @@ impl AgentControl {
             let queued_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
                 sender_thread_id,
+                sender_agent_nickname.clone(),
+                sender_agent_role.clone(),
                 message.clone(),
                 false,
             )?;
@@ -621,6 +627,8 @@ impl AgentControl {
             let live_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
                 sender_thread_id,
+                sender_agent_nickname.clone(),
+                sender_agent_role.clone(),
                 message.clone(),
                 false,
             )?;
@@ -699,6 +707,8 @@ impl AgentControl {
             let deferred_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
                 sender_thread_id,
+                sender_agent_nickname.clone(),
+                sender_agent_role.clone(),
                 message.clone(),
                 false,
             )?;
@@ -718,6 +728,8 @@ impl AgentControl {
         let items = build_agent_inbox_items(
             snapshot.collab_inbox_delivery_role,
             sender_thread_id,
+            sender_agent_nickname,
+            sender_agent_role,
             message,
             false,
         )?;
@@ -2250,6 +2262,8 @@ mod tests {
         let queued_items = build_agent_inbox_items(
             CollabInboxDeliveryRole::Tool,
             first_sender,
+            None,
+            None,
             "queued before boundary".to_string(),
             false,
         )
@@ -3970,6 +3984,8 @@ mod tests {
         let items = build_agent_inbox_items(
             CollabInboxDeliveryRole::Tool,
             sender_thread_id,
+            Some("Atlas".to_string()),
+            Some("worker".to_string()),
             message,
             false,
         )
@@ -4005,6 +4021,8 @@ mod tests {
                 assert!(payload.injected);
                 assert_eq!(payload.kind, AGENT_INBOX_KIND);
                 assert_eq!(payload.sender_thread_id, sender_thread_id);
+                assert_eq!(payload.sender_agent_nickname.as_deref(), Some("Atlas"));
+                assert_eq!(payload.sender_agent_role.as_deref(), Some("worker"));
                 assert_eq!(payload.message, "ping");
             }
             other => panic!("expected function call output item, got {other:?}"),
@@ -4883,6 +4901,8 @@ mod tests {
         let items = build_agent_inbox_items(
             CollabInboxDeliveryRole::Tool,
             sender_thread_id,
+            None,
+            None,
             message,
             true,
         )
@@ -4913,6 +4933,8 @@ mod tests {
         let items = build_agent_inbox_items(
             CollabInboxDeliveryRole::Assistant,
             sender_thread_id,
+            None,
+            None,
             message,
             true,
         )
@@ -4945,6 +4967,8 @@ mod tests {
         let items = build_agent_inbox_items(
             CollabInboxDeliveryRole::Developer,
             sender_thread_id,
+            None,
+            None,
             message,
             true,
         )
