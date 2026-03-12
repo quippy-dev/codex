@@ -3324,6 +3324,49 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
 }
 
 #[tokio::test]
+async fn maybe_record_context_updates_for_turn_keeps_seeded_startup_baseline_without_duplication() {
+    let (session, turn_context) = make_session_and_context().await;
+    assert!(
+        session.reference_context_item().await.is_none(),
+        "new sessions should start without a persisted baseline before the first turn"
+    );
+    assert_eq!(session.clone_history().await.raw_items().len(), 0);
+    assert_eq!(session.previous_turn_settings().await, None);
+
+    session
+        .record_context_updates_and_set_reference_context_item(&turn_context)
+        .await;
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    assert_eq!(
+        session.clone_history().await.raw_items().to_vec(),
+        initial_context
+    );
+    assert_eq!(
+        serde_json::to_value(session.reference_context_item().await)
+            .expect("serialize current context item"),
+        serde_json::to_value(Some(turn_context.to_turn_context_item()))
+            .expect("serialize expected context item")
+    );
+
+    session
+        .maybe_record_context_updates_for_turn(&turn_context)
+        .await;
+
+    assert_eq!(
+        session.clone_history().await.raw_items().to_vec(),
+        initial_context
+    );
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: turn_context.model_info.slug.clone(),
+            realtime_active: Some(turn_context.realtime_active),
+        })
+    );
+}
+
+#[tokio::test]
 async fn record_context_updates_and_set_reference_context_item_reinjects_full_context_after_clear()
 {
     let (session, turn_context) = make_session_and_context().await;

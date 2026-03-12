@@ -4051,6 +4051,8 @@ impl Session {
             state.reference_context_item()
         };
         if reference_context_item.as_ref() == Some(&current_context_item) {
+            self.set_previous_turn_settings_from_turn_context(turn_context)
+                .await;
             return;
         }
 
@@ -6188,6 +6190,10 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
+    if sess.reference_context_item().await.is_none() {
+        sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+            .await;
+    }
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
