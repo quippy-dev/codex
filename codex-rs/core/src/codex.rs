@@ -800,8 +800,12 @@ pub(crate) struct Session {
     next_internal_sub_id: AtomicU64,
     /// Tracks whether the current turn delivered a collab inbox message via send_input.
     turn_used_agent_send_input: AtomicBool,
+    /// Tracks the exact collab messages the current turn already surfaced live.
+    turn_forwarded_agent_messages: Mutex<HashSet<String>>,
     /// Snapshots whether the last completed turn used collab send_input.
     last_completed_turn_used_agent_send_input: AtomicBool,
+    /// Snapshots the exact collab messages the last completed turn already surfaced live.
+    last_completed_turn_forwarded_agent_messages: Mutex<HashSet<String>>,
     /// If set, emit the standard "invalid image" error event after the next /responses request
     /// has started (avoids racing with follow-up request assertions in tests).
     pending_invalid_image_error: AtomicBool,
@@ -1898,7 +1902,9 @@ impl Session {
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
             turn_used_agent_send_input: AtomicBool::new(false),
+            turn_forwarded_agent_messages: Mutex::new(HashSet::new()),
             last_completed_turn_used_agent_send_input: AtomicBool::new(false),
+            last_completed_turn_forwarded_agent_messages: Mutex::new(HashSet::new()),
             pending_invalid_image_error: AtomicBool::new(false),
         });
         if let Some(network_policy_decider_session) = network_policy_decider_session {
@@ -2049,6 +2055,16 @@ impl Session {
             .store(true, Ordering::Release);
     }
 
+    pub(crate) async fn record_turn_forwarded_agent_message(&self, message: &str) {
+        if message.trim().is_empty() {
+            return;
+        }
+        self.turn_forwarded_agent_messages
+            .lock()
+            .await
+            .insert(message.to_string());
+    }
+
     pub(crate) fn mark_pending_invalid_image_error(&self) {
         self.pending_invalid_image_error
             .store(true, Ordering::Release);
@@ -2059,22 +2075,38 @@ impl Session {
             .swap(false, Ordering::AcqRel)
     }
 
-    pub(crate) fn reset_turn_collab_send_input_flag(&self) {
+    pub(crate) async fn reset_turn_collab_send_input_flag(&self) {
         self.turn_used_agent_send_input
             .store(false, Ordering::Release);
+        self.turn_forwarded_agent_messages.lock().await.clear();
     }
 
-    pub(crate) fn snapshot_agent_send_input_on_turn_complete(&self) {
+    pub(crate) async fn snapshot_agent_send_input_on_turn_complete(&self) {
         let used_agent_send_input = self
             .turn_used_agent_send_input
             .swap(false, Ordering::AcqRel);
         self.last_completed_turn_used_agent_send_input
             .store(used_agent_send_input, Ordering::Release);
+        let mut current_messages = self.turn_forwarded_agent_messages.lock().await;
+        let mut last_messages = self
+            .last_completed_turn_forwarded_agent_messages
+            .lock()
+            .await;
+        std::mem::swap(&mut *last_messages, &mut *current_messages);
+        current_messages.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn last_completed_turn_used_agent_send_input(&self) -> bool {
         self.last_completed_turn_used_agent_send_input
             .load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn last_completed_turn_forwarded_agent_message(&self, message: &str) -> bool {
+        self.last_completed_turn_forwarded_agent_messages
+            .lock()
+            .await
+            .contains(message)
     }
 
     /// Ensure all rollout writes are durably flushed.

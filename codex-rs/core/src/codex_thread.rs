@@ -112,12 +112,6 @@ impl CodexThread {
         self.codex.session.has_active_turn().await
     }
 
-    pub(crate) fn last_completed_turn_used_agent_send_input(&self) -> bool {
-        self.codex
-            .session
-            .last_completed_turn_used_agent_send_input()
-    }
-
     /// Records a user-role session-prefix message without creating a new user turn boundary.
     pub(crate) async fn inject_user_message_without_turn(&self, message: String) {
         let pending_item = ResponseInputItem::Message {

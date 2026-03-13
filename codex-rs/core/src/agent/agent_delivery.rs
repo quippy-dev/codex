@@ -111,15 +111,15 @@ pub(crate) fn log_deferred_agent_enqueue_error(
 
 pub(crate) fn completed_message_for_agent_fallback(
     status: &AgentStatus,
-    last_completed_turn_used_agent_send_input: bool,
+    last_completed_turn_forwarded_same_message: bool,
     require_message_for_final_status: bool,
 ) -> Option<String> {
-    if last_completed_turn_used_agent_send_input {
-        return None;
-    }
-
     match status {
-        AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => Some(message.clone()),
+        AgentStatus::Completed(Some(message))
+            if !message.trim().is_empty() && !last_completed_turn_forwarded_same_message =>
+        {
+            Some(message.clone())
+        }
         AgentStatus::Completed(None) | AgentStatus::Completed(Some(_))
             if require_message_for_final_status =>
         {
