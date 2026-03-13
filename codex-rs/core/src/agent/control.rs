@@ -405,6 +405,7 @@ impl AgentControl {
                 rollout_path,
                 session_source,
                 inherited_shell_snapshot,
+                None,
             )
             .await?;
         reservation.commit(new_thread.thread_id);
@@ -1838,6 +1839,7 @@ mod tests {
                     InitialHistory::New,
                     auth_manager,
                     false,
+                    None,
                 )
                 .await
                 .expect("start thread");
@@ -5574,6 +5576,7 @@ mod tests {
                 InitialHistory::New,
                 parent_auth_manager,
                 false,
+                None,
             )
             .await
             .expect("start parent thread");

@@ -216,7 +216,7 @@ async fn fork_thread_twice_drops_to_first_message() {
         thread: codex_fork1,
         ..
     } = thread_manager
-        .fork_thread(1, config_for_fork.clone(), base_path.clone(), false)
+        .fork_thread(1, config_for_fork.clone(), base_path.clone(), false, None)
         .await
         .expect("fork 1");
 
@@ -244,7 +244,7 @@ async fn fork_thread_twice_drops_to_first_message() {
         thread: codex_fork2,
         ..
     } = thread_manager
-        .fork_thread(0, config_for_fork.clone(), fork1_path.clone(), false)
+        .fork_thread(0, config_for_fork.clone(), fork1_path.clone(), false, None)
         .await
         .expect("fork 2");
 
@@ -302,7 +302,7 @@ async fn fork_thread_twice_with_nonzero_cut_keeps_expected_prefix() {
         thread: codex_fork1,
         ..
     } = thread_manager
-        .fork_thread(2, config_for_fork.clone(), base_path, false)
+        .fork_thread(2, config_for_fork.clone(), base_path, false, None)
         .await
         .expect("fork 1");
     let fork1_path = codex_fork1.rollout_path().expect("rollout path");
@@ -321,7 +321,7 @@ async fn fork_thread_twice_with_nonzero_cut_keeps_expected_prefix() {
         thread: codex_fork2,
         ..
     } = thread_manager
-        .fork_thread(1, config_for_fork, fork1_path, false)
+        .fork_thread(1, config_for_fork, fork1_path, false, None)
         .await
         .expect("fork 2");
     let fork2_path = codex_fork2.rollout_path().expect("rollout path");
@@ -380,7 +380,7 @@ async fn fork_thread_session_configured_preserves_parent_and_history() {
         session_configured,
         ..
     } = thread_manager
-        .fork_thread(usize::MAX, config_for_fork, base_path, false)
+        .fork_thread(usize::MAX, config_for_fork, base_path, false, None)
         .await
         .expect("fork thread");
 

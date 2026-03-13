@@ -16,6 +16,7 @@ mod request_user_input;
 mod shell;
 mod test_sync;
 pub(crate) mod tool_search;
+mod tool_suggest;
 pub(crate) mod unified_exec;
 mod view_image;
 
@@ -34,6 +35,7 @@ use crate::sandboxing::normalize_additional_permissions;
 pub use apply_patch::ApplyPatchHandler;
 pub use artifacts::ArtifactsHandler;
 pub use code_mode::CodeModeHandler;
+pub use code_mode::CodeModeWaitHandler;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub use dynamic::DynamicToolHandler;
@@ -53,6 +55,9 @@ pub(crate) use request_user_input::request_user_input_tool_description;
 pub use shell::ShellCommandHandler;
 pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;
+pub use tool_search::ToolSearchHandler;
+pub(crate) use tool_suggest::TOOL_SUGGEST_TOOL_NAME;
+pub use tool_suggest::ToolSuggestHandler;
 pub use unified_exec::UnifiedExecHandler;
 pub use view_image::ViewImageHandler;
 

@@ -191,7 +191,7 @@ async fn plugin_install_returns_apps_needing_auth() -> Result<()> {
         "sample-plugin",
         "./sample-plugin",
         None,
-        Some("ON_INSTALL"),
+        None,
     )?;
     write_plugin_source(repo_root.path(), "sample-plugin", &["alpha", "beta"])?;
     let marketplace_path =
