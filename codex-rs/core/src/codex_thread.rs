@@ -149,6 +149,15 @@ impl CodexThread {
         self.rollout_path.clone()
     }
 
+    pub async fn response_history_items(&self) -> Vec<ResponseItem> {
+        self.codex
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .to_vec()
+    }
+
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.codex.state_db()
     }

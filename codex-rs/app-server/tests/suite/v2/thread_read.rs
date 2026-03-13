@@ -309,6 +309,75 @@ async fn thread_read_include_turns_keeps_fork_history_after_parent_archive_and_u
 }
 
 #[tokio::test]
+async fn thread_read_keeps_backfilled_history_for_loaded_pathless_forks() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread: forked, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+
+    assert!(forked.ephemeral, "fork should stay ephemeral");
+    assert_eq!(forked.path, None, "pathless fork should remain pathless");
+    assert_eq!(forked.preview, preview);
+    assert_eq!(
+        forked.turns.len(),
+        1,
+        "fork response should include source turns"
+    );
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: forked.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: reread } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert!(
+        reread.ephemeral,
+        "thread/read should preserve ephemeral flag"
+    );
+    assert_eq!(
+        reread.path, None,
+        "thread/read should keep pathless forks pathless"
+    );
+    assert_eq!(reread.preview, preview);
+    assert_eq!(reread.turns, forked.turns);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_read_loaded_thread_returns_precomputed_path_before_materialization() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

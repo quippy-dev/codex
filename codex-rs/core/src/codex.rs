@@ -5031,6 +5031,23 @@ async fn flush_post_interrupt_deferred_collab_items(sess: &Arc<Session>, flush_s
     }
 }
 
+pub(crate) async fn skip_watchdog_parent_compact_if_parent_busy(sess: &Arc<Session>) -> bool {
+    let agent_control = sess.services.agent_control.clone();
+    let thread_id = sess.conversation_id;
+    if agent_control
+        .watchdog_parent_compaction_in_progress(thread_id)
+        .await
+        && sess.has_active_turn().await
+    {
+        agent_control
+            .finish_watchdog_parent_compaction(thread_id)
+            .await;
+        return true;
+    }
+
+    false
+}
+
 fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
     let dispatch_span = match &sub.op {
         Op::RealtimeConversationAudio(_) => {
@@ -5672,6 +5689,10 @@ mod handlers {
     }
 
     pub async fn compact(sess: &Arc<Session>, sub_id: String) {
+        if super::skip_watchdog_parent_compact_if_parent_busy(sess).await {
+            return;
+        }
+
         let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
 
         sess.spawn_task(

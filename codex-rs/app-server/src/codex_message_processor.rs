@@ -3063,11 +3063,40 @@ impl CodexMessageProcessor {
             return;
         }
 
+        let loaded_history_items = if let Some(thread) = loaded_thread.as_ref() {
+            if loaded_rollout_path.is_none() {
+                Some(
+                    thread
+                        .response_history_items()
+                        .await
+                        .into_iter()
+                        .map(RolloutItem::ResponseItem)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (cached_pathless_preview, cached_pathless_turns) =
+            if loaded_thread.is_some() && loaded_rollout_path.is_none() {
+                let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
+                let thread_state = thread_state.lock().await;
+                (
+                    thread_state.pathless_thread_preview().map(str::to_string),
+                    thread_state.pathless_thread_turns(),
+                )
+            } else {
+                (None, Vec::new())
+            };
+
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
         } else if let Some(ref thread) = loaded_thread {
             let config_snapshot = thread.config_snapshot().await;
-            if include_turns && loaded_rollout_path.is_none() {
+            let has_cached_pathless_turns = !cached_pathless_turns.is_empty();
+            if include_turns && loaded_rollout_path.is_none() && !has_cached_pathless_turns {
                 self.send_invalid_request_error(
                     request_id,
                     "ephemeral threads do not support includeTurns".to_string(),
@@ -3098,6 +3127,12 @@ impl CodexMessageProcessor {
                         return;
                     }
                 }
+            } else if let Some(preview) = cached_pathless_preview.as_ref() {
+                thread.preview = preview.clone();
+            } else if let Some(history_items) = loaded_history_items.as_ref()
+                && !history_items.is_empty()
+            {
+                thread.preview = preview_from_rollout_items(history_items);
             }
             thread
         } else if let Some(rollout_path) = rollout_path.as_ref() {
@@ -3126,7 +3161,8 @@ impl CodexMessageProcessor {
                 return;
             };
             let config_snapshot = thread.config_snapshot().await;
-            if include_turns && loaded_rollout_path.is_none() {
+            let has_cached_pathless_turns = !cached_pathless_turns.is_empty();
+            if include_turns && loaded_rollout_path.is_none() && !has_cached_pathless_turns {
                 self.send_invalid_request_error(
                     request_id,
                     "ephemeral threads do not support includeTurns".to_string(),
@@ -3137,36 +3173,49 @@ impl CodexMessageProcessor {
             if include_turns {
                 rollout_path = loaded_rollout_path.clone();
             }
-            build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
+            let mut thread =
+                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path);
+            if let Some(preview) = cached_pathless_preview.as_ref() {
+                thread.preview = preview.clone();
+            } else if let Some(history_items) = loaded_history_items.as_ref()
+                && !history_items.is_empty()
+            {
+                thread.preview = preview_from_rollout_items(history_items);
+            }
+            thread
         };
         self.attach_thread_name(thread_uuid, &mut thread).await;
 
-        if include_turns && let Some(rollout_path) = rollout_path.as_ref() {
-            match read_rollout_items_from_rollout(rollout_path).await {
-                Ok(items) => {
-                    thread.turns = build_turns_from_rollout_items(&items);
+        if include_turns {
+            if let Some(rollout_path) = rollout_path.as_ref() {
+                match read_rollout_items_from_rollout(rollout_path).await {
+                    Ok(items) => {
+                        thread.turns = build_turns_from_rollout_items(&items);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        self.send_invalid_request_error(
+                            request_id,
+                            format!(
+                                "thread {thread_uuid} is not materialized yet; includeTurns is unavailable before first user message"
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!(
+                                "failed to load rollout `{}` for thread {thread_uuid}: {err}",
+                                rollout_path.display()
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!(
-                            "thread {thread_uuid} is not materialized yet; includeTurns is unavailable before first user message"
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to load rollout `{}` for thread {thread_uuid}: {err}",
-                            rollout_path.display()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
+            } else {
+                thread.turns = cached_pathless_turns.clone();
             }
         }
 
@@ -3754,8 +3803,7 @@ impl CodexMessageProcessor {
             config: cli_overrides,
             base_instructions,
             developer_instructions,
-            ephemeral: _,
-            ephemeral_override,
+            ephemeral,
             persist_extended_history,
         } = params;
 
@@ -3841,7 +3889,7 @@ impl CodexMessageProcessor {
             developer_instructions,
             None,
         );
-        typesafe_overrides.ephemeral = ephemeral_override;
+        typesafe_overrides.ephemeral = ephemeral;
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
         let config = match derive_config_for_cwd(
@@ -4001,6 +4049,11 @@ impl CodexMessageProcessor {
                     return;
                 }
             }
+        }
+        if thread.path.is_none() && !thread.turns.is_empty() {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            let mut thread_state = thread_state.lock().await;
+            thread_state.set_pathless_thread_history(thread.preview.clone(), thread.turns.clone());
         }
 
         self.thread_watch_manager

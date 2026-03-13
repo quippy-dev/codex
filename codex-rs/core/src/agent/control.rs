@@ -1088,6 +1088,14 @@ impl AgentControl {
         compacting.remove(&parent_thread_id);
     }
 
+    pub(crate) async fn watchdog_parent_compaction_in_progress(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> bool {
+        let compacting = self.watchdog_compactions_in_progress.lock().await;
+        compacting.contains(&parent_thread_id)
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) async fn run_watchdogs_once_for_tests(&self) {
@@ -1110,6 +1118,15 @@ impl AgentControl {
         self.watchdogs
             .set_active_helper_for_tests(target_thread_id, helper_thread_id)
             .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mark_watchdog_parent_compaction_in_progress_for_tests(
+        &self,
+        parent_thread_id: ThreadId,
+    ) {
+        let mut compacting = self.watchdog_compactions_in_progress.lock().await;
+        compacting.insert(parent_thread_id);
     }
 
     pub(crate) async fn watchdog_owner_for_active_helper(
@@ -3938,6 +3955,100 @@ mod tests {
             .expect("watchdog handle shutdown should submit");
         let _ = harness
             .control
+            .shutdown_agent(owner_thread_id)
+            .await
+            .expect("owner shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn compact_handler_rechecks_watchdog_parent_idleness_at_execution_time() {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+
+        harness
+            .control
+            .mark_watchdog_parent_compaction_in_progress_for_tests(owner_thread_id)
+            .await;
+
+        {
+            let mut active_turn = owner_thread.codex.session.active_turn.lock().await;
+            *active_turn = Some(crate::state::ActiveTurn::default());
+        }
+
+        owner_thread
+            .submit(Op::Compact)
+            .await
+            .expect("compact submit should succeed");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if !harness
+                    .control
+                    .watchdog_parent_compaction_in_progress(owner_thread_id)
+                    .await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watchdog compaction marker should be cleared");
+
+        assert!(
+            owner_thread.has_active_turn().await,
+            "execution-time recheck must not replace an active parent turn"
+        );
+
+        {
+            let mut active_turn = owner_thread.codex.session.active_turn.lock().await;
+            *active_turn = None;
+        }
+
+        let _ = harness
+            .control
+            .shutdown_agent(owner_thread_id)
+            .await
+            .expect("owner shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn queued_watchdog_compact_skips_execution_when_parent_became_active() {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+        let owner_control = owner_thread.codex.session.services.agent_control.clone();
+
+        owner_control
+            .mark_watchdog_parent_compaction_in_progress_for_tests(owner_thread_id)
+            .await;
+
+        {
+            let mut active_turn = owner_thread.codex.session.active_turn.lock().await;
+            *active_turn = Some(crate::state::ActiveTurn::default());
+        }
+
+        assert!(
+            crate::codex::skip_watchdog_parent_compact_if_parent_busy(&owner_thread.codex.session)
+                .await,
+            "execution-time watchdog compaction recheck should skip when the parent is active"
+        );
+
+        let active_turn = owner_thread.codex.session.active_turn.lock().await;
+        let active_turn = active_turn
+            .as_ref()
+            .expect("queued watchdog compact must not replace the active turn");
+        assert!(
+            active_turn.tasks.is_empty(),
+            "queued watchdog compact should not spawn a replacement task"
+        );
+        assert!(
+            !owner_control
+                .watchdog_parent_compaction_in_progress(owner_thread_id)
+                .await,
+            "execution-time recheck should clear the in-progress marker"
+        );
+
+        let _ = owner_control
             .shutdown_agent(owner_thread_id)
             .await
             .expect("owner shutdown should submit");

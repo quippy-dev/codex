@@ -59,6 +59,8 @@ pub(crate) struct ThreadState {
     pub(crate) listener_generation: u64,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
+    pathless_thread_preview: Option<String>,
+    pathless_thread_turns: Vec<Turn>,
     listener_thread: Option<Weak<CodexThread>>,
 }
 
@@ -91,6 +93,8 @@ impl ThreadState {
         }
         self.listener_command_tx = None;
         self.current_turn_history.reset();
+        self.pathless_thread_preview = None;
+        self.pathless_thread_turns.clear();
         self.listener_thread = None;
     }
 
@@ -106,6 +110,19 @@ impl ThreadState {
 
     pub(crate) fn active_turn_snapshot(&self) -> Option<Turn> {
         self.current_turn_history.active_turn_snapshot()
+    }
+
+    pub(crate) fn set_pathless_thread_history(&mut self, preview: String, turns: Vec<Turn>) {
+        self.pathless_thread_preview = Some(preview);
+        self.pathless_thread_turns = turns;
+    }
+
+    pub(crate) fn pathless_thread_preview(&self) -> Option<&str> {
+        self.pathless_thread_preview.as_deref()
+    }
+
+    pub(crate) fn pathless_thread_turns(&self) -> Vec<Turn> {
+        self.pathless_thread_turns.clone()
     }
 
     pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {

@@ -234,7 +234,7 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
             thread_id: conversation_id.clone(),
-            ephemeral: true,
+            ephemeral: Some(true),
             ..Default::default()
         })
         .await?;
@@ -382,12 +382,15 @@ fn thread_fork_omitted_ephemeral_does_not_force_false_override() {
     }))
     .expect("thread/fork params should deserialize without ephemeral");
     assert!(
-        !omitted.ephemeral,
-        "omitted ephemeral should still deserialize as false"
+        omitted.ephemeral.is_none(),
+        "omitted ephemeral must remain omitted"
     );
+    let omitted_json =
+        serde_json::to_value(&omitted).expect("omitted params should serialize cleanly");
     assert_eq!(
-        omitted.ephemeral_override, None,
-        "omitted ephemeral must not synthesize a false override"
+        omitted_json.get("ephemeral"),
+        Some(&Value::Null),
+        "omitted ephemeral must not synthesize false on the wire"
     );
 
     let explicit_false: ThreadForkParams = serde_json::from_value(serde_json::json!({
@@ -396,9 +399,16 @@ fn thread_fork_omitted_ephemeral_does_not_force_false_override() {
     }))
     .expect("thread/fork params should deserialize explicit false");
     assert_eq!(
-        explicit_false.ephemeral_override,
+        explicit_false.ephemeral,
         Some(false),
         "explicit false must remain distinguishable from omission"
+    );
+    let explicit_false_json =
+        serde_json::to_value(&explicit_false).expect("explicit false should serialize cleanly");
+    assert_eq!(
+        explicit_false_json.get("ephemeral"),
+        Some(&Value::Bool(false)),
+        "explicit false must be serialized on the wire"
     );
 }
 
