@@ -111,6 +111,7 @@ pub(crate) fn log_deferred_agent_enqueue_error(
 
 pub(crate) fn completed_message_for_agent_fallback(
     status: &AgentStatus,
+    last_completed_turn_used_agent_send_input: bool,
     last_completed_turn_forwarded_same_message: bool,
     require_message_for_final_status: bool,
 ) -> Option<String> {
@@ -123,12 +124,18 @@ pub(crate) fn completed_message_for_agent_fallback(
         AgentStatus::Completed(None) | AgentStatus::Completed(Some(_))
             if require_message_for_final_status =>
         {
+            if last_completed_turn_used_agent_send_input {
+                return None;
+            }
             Some(
                 "Watchdog check-in completed without calling send_input or returning a final message."
                     .to_string(),
             )
         }
         AgentStatus::Errored(message) if require_message_for_final_status => {
+            if last_completed_turn_used_agent_send_input {
+                return None;
+            }
             if message.trim().is_empty() {
                 Some("Watchdog check-in failed before calling send_input.".to_string())
             } else {
@@ -138,9 +145,15 @@ pub(crate) fn completed_message_for_agent_fallback(
             }
         }
         AgentStatus::Shutdown if require_message_for_final_status => {
+            if last_completed_turn_used_agent_send_input {
+                return None;
+            }
             Some("Watchdog check-in ended before calling send_input.".to_string())
         }
         AgentStatus::NotFound if require_message_for_final_status => {
+            if last_completed_turn_used_agent_send_input {
+                return None;
+            }
             Some("Watchdog check-in disappeared before calling send_input.".to_string())
         }
         AgentStatus::Completed(None)
@@ -167,66 +180,90 @@ mod tests {
         let errored = AgentStatus::Errored("boom".to_string());
 
         assert_eq!(
-            completed_message_for_agent_fallback(&completed, false, false),
+            completed_message_for_agent_fallback(&completed, false, false, false),
             Some("done".to_string())
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&completed, true, false),
+            completed_message_for_agent_fallback(&completed, false, true, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&whitespace, false, false),
+            completed_message_for_agent_fallback(&whitespace, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&empty, false, false),
+            completed_message_for_agent_fallback(&empty, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&errored, false, false),
+            completed_message_for_agent_fallback(&errored, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&AgentStatus::PendingInit, false, false),
+            completed_message_for_agent_fallback(&AgentStatus::PendingInit, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&AgentStatus::Running, false, false),
+            completed_message_for_agent_fallback(&AgentStatus::Running, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&AgentStatus::Shutdown, false, false),
+            completed_message_for_agent_fallback(&AgentStatus::Shutdown, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&AgentStatus::NotFound, false, false),
+            completed_message_for_agent_fallback(&AgentStatus::NotFound, false, false, false),
             None
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&empty, false, true),
+            completed_message_for_agent_fallback(&empty, false, false, true),
             Some(
                 "Watchdog check-in completed without calling send_input or returning a final message."
                     .to_string(),
             )
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&whitespace, false, true),
+            completed_message_for_agent_fallback(&whitespace, false, false, true),
             Some(
                 "Watchdog check-in completed without calling send_input or returning a final message."
                     .to_string(),
             )
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&errored, false, true),
+            completed_message_for_agent_fallback(&errored, false, false, true),
             Some("Watchdog check-in failed before calling send_input: boom".to_string())
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&AgentStatus::Shutdown, false, true),
+            completed_message_for_agent_fallback(&AgentStatus::Shutdown, false, false, true),
             Some("Watchdog check-in ended before calling send_input.".to_string())
         );
         assert_eq!(
-            completed_message_for_agent_fallback(&AgentStatus::NotFound, false, true),
+            completed_message_for_agent_fallback(&AgentStatus::NotFound, false, false, true),
             Some("Watchdog check-in disappeared before calling send_input.".to_string())
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&empty, true, false, true),
+            None
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&whitespace, true, false, true),
+            None
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&errored, true, false, true),
+            None
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&AgentStatus::Shutdown, true, false, true),
+            None
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&AgentStatus::NotFound, true, false, true),
+            None
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&completed, true, false, false),
+            Some("done".to_string())
         );
     }
 }

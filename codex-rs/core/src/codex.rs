@@ -2096,7 +2096,6 @@ impl Session {
         current_messages.clear();
     }
 
-    #[cfg(test)]
     pub(crate) fn last_completed_turn_used_agent_send_input(&self) -> bool {
         self.last_completed_turn_used_agent_send_input
             .load(Ordering::Acquire)

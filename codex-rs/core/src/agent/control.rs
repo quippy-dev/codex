@@ -987,6 +987,15 @@ impl AgentControl {
                 == Some(parent_thread_id);
 
             if parent_is_root_thread {
+                let child_used_agent_send_input =
+                    if let Ok(child_thread) = state.get_thread(child_thread_id).await {
+                        child_thread
+                            .codex
+                            .session
+                            .last_completed_turn_used_agent_send_input()
+                    } else {
+                        false
+                    };
                 let child_completed_message_already_forwarded = match &status {
                     AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => {
                         if let Ok(child_thread) = state.get_thread(child_thread_id).await {
@@ -1003,6 +1012,7 @@ impl AgentControl {
                 };
                 if let Some(message) = completed_message_for_agent_fallback(
                     &status,
+                    child_used_agent_send_input,
                     child_completed_message_already_forwarded,
                     child_is_watchdog_helper_for_parent,
                 ) && let Err(err) = control
@@ -2715,6 +2725,130 @@ mod tests {
             wait_for_history_text(&owner_thread, "before calling send_input").await,
             true
         );
+    }
+
+    #[tokio::test]
+    async fn root_watchdog_helper_completed_without_final_body_after_send_input_does_not_emit_false_fallback()
+     {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+        let owner_turn = owner_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("owner-watchdog-wait-turn".to_string())
+            .await;
+        owner_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&owner_turn),
+                text_input("wait for watchdog"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        let watchdog_handle_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog handle should spawn");
+        let helper_thread_id = harness
+            .control
+            .spawn_agent(
+                harness.config.clone(),
+                text_input("check in"),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog helper should spawn");
+        let helper_thread = harness
+            .manager
+            .get_thread(helper_thread_id)
+            .await
+            .expect("watchdog helper thread should exist");
+        let helper_turn = helper_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("watchdog-helper-turn".to_string())
+            .await;
+        helper_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&helper_turn),
+                text_input("helper task"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        let removed = harness
+            .control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 1,
+                prompt: "check in".to_string(),
+                config: harness.config.clone(),
+            })
+            .await
+            .expect("watchdog registration should succeed");
+        assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+        harness
+            .control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
+            .await;
+
+        helper_thread
+            .codex
+            .session
+            .mark_turn_used_agent_send_input();
+        harness
+            .control
+            .send_agent_message(
+                owner_thread_id,
+                helper_thread_id,
+                "watchdog progress".to_string(),
+            )
+            .await
+            .expect("watchdog progress send_input should succeed");
+        assert!(wait_for_raw_response_text(&owner_thread, "watchdog progress").await);
+
+        helper_thread
+            .codex
+            .session
+            .on_task_finished(Arc::clone(&helper_turn), None)
+            .await;
+
+        let duplicate_false_fallback =
+            tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                loop {
+                    let event = owner_thread
+                        .next_event()
+                        .await
+                        .expect("event should be available");
+                    if matches!(
+                        event.msg,
+                        EventMsg::RawResponseItem(RawResponseItemEvent { item })
+                            if history_contains_text(&[item.clone()], "without calling send_input")
+                                || history_contains_text(&[item.clone()], "before calling send_input")
+                    ) {
+                        return true;
+                    }
+                }
+            })
+            .await
+            .is_ok();
+        assert_eq!(duplicate_false_fallback, false);
+
+        owner_thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
     }
 
     #[tokio::test]

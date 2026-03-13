@@ -127,6 +127,13 @@ impl ThreadState {
 
     pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {
         self.current_turn_history.handle_event(event);
+        if self.pathless_thread_preview.is_some()
+            && let Some(turn) = self.current_turn_history.active_turn_snapshot()
+        {
+            self.pathless_thread_turns
+                .retain(|existing| existing.id != turn.id);
+            self.pathless_thread_turns.push(turn);
+        }
         if !self.current_turn_history.has_active_turn() {
             self.current_turn_history.reset();
         }

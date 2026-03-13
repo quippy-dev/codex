@@ -350,6 +350,28 @@ async fn thread_read_keeps_backfilled_history_for_loaded_pathless_forks() -> Res
         "fork response should include source turns"
     );
 
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: forked.id.clone(),
+            input: vec![UserInput::Text {
+                text: "follow-up on fork".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {
             thread_id: forked.id.clone(),
@@ -372,7 +394,8 @@ async fn thread_read_keeps_backfilled_history_for_loaded_pathless_forks() -> Res
         "thread/read should keep pathless forks pathless"
     );
     assert_eq!(reread.preview, preview);
-    assert_eq!(reread.turns, forked.turns);
+    assert_eq!(reread.turns.len(), forked.turns.len() + 1);
+    assert_eq!(reread.turns[0], forked.turns[0]);
 
     Ok(())
 }
