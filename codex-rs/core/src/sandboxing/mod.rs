@@ -94,7 +94,7 @@ pub(crate) struct SandboxTransformRequest<'a> {
     #[cfg(target_os = "macos")]
     pub macos_seatbelt_profile_extensions: Option<&'a MacOsSeatbeltProfileExtensions>,
     pub codex_linux_sandbox_exe: Option<&'a PathBuf>,
-    pub use_linux_sandbox_bwrap: bool,
+    pub use_legacy_landlock: bool,
     pub windows_sandbox_level: WindowsSandboxLevel,
 }
 
@@ -388,6 +388,26 @@ fn merge_file_system_policy_with_additional_permissions(
     }
 }
 
+pub(crate) fn effective_file_system_sandbox_policy(
+    file_system_policy: &FileSystemSandboxPolicy,
+    additional_permissions: Option<&PermissionProfile>,
+) -> FileSystemSandboxPolicy {
+    let Some(additional_permissions) = additional_permissions else {
+        return file_system_policy.clone();
+    };
+
+    let (extra_reads, extra_writes) = additional_permission_roots(additional_permissions);
+    if extra_reads.is_empty() && extra_writes.is_empty() {
+        file_system_policy.clone()
+    } else {
+        merge_file_system_policy_with_additional_permissions(
+            file_system_policy,
+            extra_reads,
+            extra_writes,
+        )
+    }
+}
+
 fn merge_read_only_access_with_additional_reads(
     read_only_access: &ReadOnlyAccess,
     extra_reads: Vec<AbsolutePathBuf>,
@@ -571,7 +591,7 @@ impl SandboxManager {
             #[cfg(target_os = "macos")]
             macos_seatbelt_profile_extensions,
             codex_linux_sandbox_exe,
-            use_linux_sandbox_bwrap,
+            use_legacy_landlock,
             windows_sandbox_level,
         } = request;
         #[cfg(not(target_os = "macos"))]
@@ -587,18 +607,10 @@ impl SandboxManager {
         );
         let (effective_file_system_policy, effective_network_policy) =
             if let Some(additional_permissions) = additional_permissions {
-                let (extra_reads, extra_writes) =
-                    additional_permission_roots(&additional_permissions);
-                let file_system_sandbox_policy =
-                    if extra_reads.is_empty() && extra_writes.is_empty() {
-                        file_system_policy.clone()
-                    } else {
-                        merge_file_system_policy_with_additional_permissions(
-                            file_system_policy,
-                            extra_reads,
-                            extra_writes,
-                        )
-                    };
+                let file_system_sandbox_policy = effective_file_system_sandbox_policy(
+                    file_system_policy,
+                    Some(&additional_permissions),
+                );
                 let network_sandbox_policy =
                     if merge_network_access(network_policy.is_enabled(), &additional_permissions) {
                         NetworkSandboxPolicy::Enabled
@@ -653,7 +665,7 @@ impl SandboxManager {
                     &effective_file_system_policy,
                     effective_network_policy,
                     sandbox_policy_cwd,
-                    use_linux_sandbox_bwrap,
+                    use_legacy_landlock,
                     allow_proxy_network,
                 );
                 let mut full_command = Vec::with_capacity(1 + args.len());
@@ -721,6 +733,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::EffectiveSandboxPermissions;
     use super::SandboxManager;
+    use super::effective_file_system_sandbox_policy;
     #[cfg(target_os = "macos")]
     use super::intersect_permission_profiles;
     use super::merge_file_system_policy_with_additional_permissions;
@@ -886,7 +899,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 macos_seatbelt_profile_extensions: None,
                 codex_linux_sandbox_exe: None,
-                use_linux_sandbox_bwrap: false,
+                use_legacy_landlock: false,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
             })
             .expect("transform");
@@ -1219,7 +1232,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 macos_seatbelt_profile_extensions: None,
                 codex_linux_sandbox_exe: None,
-                use_linux_sandbox_bwrap: false,
+                use_legacy_landlock: false,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
             })
             .expect("transform");
@@ -1291,7 +1304,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 macos_seatbelt_profile_extensions: None,
                 codex_linux_sandbox_exe: None,
-                use_linux_sandbox_bwrap: false,
+                use_legacy_landlock: false,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
             })
             .expect("transform");
@@ -1360,6 +1373,82 @@ mod tests {
             merged_policy.entries.contains(&FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: allowed_path },
                 access: FileSystemAccessMode::Read,
+            }),
+            true
+        );
+    }
+
+    #[test]
+    fn effective_file_system_sandbox_policy_returns_base_policy_without_additional_permissions() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(
+            canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
+        )
+        .expect("absolute temp dir");
+        let denied_path = cwd.join("denied").expect("denied path");
+        let base_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: denied_path },
+                access: FileSystemAccessMode::None,
+            },
+        ]);
+
+        let effective_policy = effective_file_system_sandbox_policy(&base_policy, None);
+
+        assert_eq!(effective_policy, base_policy);
+    }
+
+    #[test]
+    fn effective_file_system_sandbox_policy_merges_additional_write_roots() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(
+            canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
+        )
+        .expect("absolute temp dir");
+        let allowed_path = cwd.join("allowed").expect("allowed path");
+        let denied_path = cwd.join("denied").expect("denied path");
+        let base_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: denied_path.clone(),
+                },
+                access: FileSystemAccessMode::None,
+            },
+        ]);
+        let additional_permissions = PermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                read: Some(vec![]),
+                write: Some(vec![allowed_path.clone()]),
+            }),
+            ..Default::default()
+        };
+
+        let effective_policy =
+            effective_file_system_sandbox_policy(&base_policy, Some(&additional_permissions));
+
+        assert_eq!(
+            effective_policy.entries.contains(&FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: denied_path },
+                access: FileSystemAccessMode::None,
+            }),
+            true
+        );
+        assert_eq!(
+            effective_policy.entries.contains(&FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: allowed_path },
+                access: FileSystemAccessMode::Write,
             }),
             true
         );
