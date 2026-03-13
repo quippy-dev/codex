@@ -1022,6 +1022,21 @@ impl AgentControl {
         &self,
         helper_thread_id: ThreadId,
     ) -> CodexResult<WatchdogParentCompactionResult> {
+        self.compact_parent_for_watchdog_helper_inner(
+            helper_thread_id,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn compact_parent_for_watchdog_helper_inner(
+        &self,
+        helper_thread_id: ThreadId,
+        #[cfg(test)] before_submit_recheck: Option<
+            Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        >,
+    ) -> CodexResult<WatchdogParentCompactionResult> {
         let Some(parent_thread_id) = self
             .watchdogs
             .owner_for_active_helper(helper_thread_id)
@@ -1033,6 +1048,11 @@ impl AgentControl {
         let parent_thread = state.get_thread(parent_thread_id).await?;
         let parent_has_active_turn = parent_thread.has_active_turn().await;
 
+        #[cfg(test)]
+        if let Some(before_submit_recheck) = before_submit_recheck {
+            before_submit_recheck.await;
+        }
+
         {
             let mut compacting = self.watchdog_compactions_in_progress.lock().await;
             if compacting.contains(&parent_thread_id) {
@@ -1042,6 +1062,12 @@ impl AgentControl {
                 return Ok(WatchdogParentCompactionResult::ParentBusy { parent_thread_id });
             }
             compacting.insert(parent_thread_id);
+        }
+
+        if parent_thread.has_active_turn().await {
+            let mut compacting = self.watchdog_compactions_in_progress.lock().await;
+            compacting.remove(&parent_thread_id);
+            return Ok(WatchdogParentCompactionResult::ParentBusy { parent_thread_id });
         }
 
         match state.send_op(parent_thread_id, Op::Compact).await {
@@ -3792,6 +3818,117 @@ mod tests {
                 .filter(|(thread_id, op)| *thread_id == owner_thread_id && matches!(op, Op::Compact))
                 .count(),
             2
+        );
+
+        let _ = harness
+            .control
+            .shutdown_agent(watchdog_handle_id)
+            .await
+            .expect("watchdog handle shutdown should submit");
+        let _ = harness
+            .control
+            .shutdown_agent(owner_thread_id)
+            .await
+            .expect("owner shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn compact_parent_for_watchdog_helper_rechecks_parent_idleness_before_submitting() {
+        let harness = AgentControlHarness::new().await;
+        let (owner_thread_id, owner_thread) = harness.start_thread().await;
+        let watchdog_handle_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog handle should spawn");
+        let helper_thread_id = harness
+            .control
+            .spawn_agent_handle(
+                harness.config.clone(),
+                Some(thread_spawn_source(owner_thread_id)),
+            )
+            .await
+            .expect("watchdog helper should spawn");
+        let removed = harness
+            .control
+            .register_watchdog(WatchdogRegistration {
+                owner_thread_id,
+                target_thread_id: watchdog_handle_id,
+                child_depth: 1,
+                interval_s: 1,
+                prompt: "compact if needed".to_string(),
+                config: harness.config.clone(),
+            })
+            .await
+            .expect("watchdog registration should succeed");
+        assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+        harness
+            .control
+            .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
+            .await;
+
+        let owner_session = Arc::clone(&owner_thread.codex.session);
+        let result = harness
+            .control
+            .compact_parent_for_watchdog_helper_inner(
+                helper_thread_id,
+                Some(Box::pin(async move {
+                    let mut active_turn = owner_session.active_turn.lock().await;
+                    *active_turn = Some(crate::state::ActiveTurn::default());
+                })),
+            )
+            .await
+            .expect("recheck should return a busy result");
+        assert_eq!(
+            result,
+            WatchdogParentCompactionResult::ParentBusy {
+                parent_thread_id: owner_thread_id
+            }
+        );
+        assert_eq!(
+            harness
+                .manager
+                .captured_ops()
+                .iter()
+                .filter(|(thread_id, op)| *thread_id == owner_thread_id && matches!(op, Op::Compact))
+                .count(),
+            0
+        );
+
+        {
+            let mut active_turn = owner_thread.codex.session.active_turn.lock().await;
+            *active_turn = None;
+        }
+
+        let result = harness
+            .control
+            .compact_parent_for_watchdog_helper(helper_thread_id)
+            .await
+            .expect("recheck cleanup should allow a later submit");
+        let submission_id = match result {
+            WatchdogParentCompactionResult::Submitted {
+                parent_thread_id,
+                submission_id,
+            } => {
+                assert_eq!(parent_thread_id, owner_thread_id);
+                submission_id
+            }
+            other => {
+                panic!("expected submitted compaction result after parent idles, got {other:?}")
+            }
+        };
+        assert!(!submission_id.is_empty());
+        assert_eq!(
+            harness
+                .manager
+                .captured_ops()
+                .iter()
+                .filter(|(thread_id, op)| *thread_id == owner_thread_id && matches!(op, Op::Compact))
+                .count(),
+            1
         );
 
         let _ = harness

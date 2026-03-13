@@ -2418,9 +2418,7 @@ pub struct ThreadResumeResponse {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(
-    Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
-)]
+#[derive(Serialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// There are two ways to fork a thread:
@@ -2467,11 +2465,63 @@ pub struct ThreadForkParams {
     pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub ephemeral_override: Option<bool>,
     /// If true, persist additional rollout EventMsg variants required to
     /// reconstruct a richer thread history on subsequent resume/fork/read.
     #[experimental("thread/fork.persistFullHistory")]
     #[serde(default)]
     pub persist_extended_history: bool,
+}
+
+impl<'de> Deserialize<'de> for ThreadForkParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireThreadForkParams {
+            thread_id: String,
+            path: Option<PathBuf>,
+            model: Option<String>,
+            model_provider: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "super::serde_helpers::deserialize_double_option"
+            )]
+            service_tier: Option<Option<ServiceTier>>,
+            cwd: Option<String>,
+            approval_policy: Option<AskForApproval>,
+            sandbox: Option<SandboxMode>,
+            config: Option<HashMap<String, serde_json::Value>>,
+            base_instructions: Option<String>,
+            developer_instructions: Option<String>,
+            ephemeral: Option<bool>,
+            #[serde(default)]
+            persist_extended_history: bool,
+        }
+
+        let params = WireThreadForkParams::deserialize(deserializer)?;
+        Ok(Self {
+            thread_id: params.thread_id,
+            path: params.path,
+            model: params.model,
+            model_provider: params.model_provider,
+            service_tier: params.service_tier,
+            cwd: params.cwd,
+            approval_policy: params.approval_policy,
+            sandbox: params.sandbox,
+            config: params.config,
+            base_instructions: params.base_instructions,
+            developer_instructions: params.developer_instructions,
+            ephemeral: params.ephemeral.unwrap_or_default(),
+            ephemeral_override: params.ephemeral,
+            persist_extended_history: params.persist_extended_history,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]

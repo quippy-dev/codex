@@ -100,15 +100,13 @@ impl ThreadEventStore {
     }
 
     pub(crate) fn snapshot(&self) -> ThreadEventSnapshot {
+        let mut pending_interactive_replay = self.pending_interactive_replay.clone();
         ThreadEventSnapshot {
             session_configured: self.session_configured.clone(),
             events: self
                 .buffer
                 .iter()
-                .filter(|event| {
-                    self.pending_interactive_replay
-                        .should_replay_snapshot_event(event)
-                })
+                .filter(|event| pending_interactive_replay.should_replay_snapshot_event(event))
                 .cloned()
                 .collect(),
             input_state: self.input_state.clone(),

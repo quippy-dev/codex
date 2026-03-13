@@ -375,6 +375,33 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
     Ok(())
 }
 
+#[test]
+fn thread_fork_omitted_ephemeral_does_not_force_false_override() {
+    let omitted: ThreadForkParams = serde_json::from_value(serde_json::json!({
+        "threadId": "thr_123"
+    }))
+    .expect("thread/fork params should deserialize without ephemeral");
+    assert!(
+        !omitted.ephemeral,
+        "omitted ephemeral should still deserialize as false"
+    );
+    assert_eq!(
+        omitted.ephemeral_override, None,
+        "omitted ephemeral must not synthesize a false override"
+    );
+
+    let explicit_false: ThreadForkParams = serde_json::from_value(serde_json::json!({
+        "threadId": "thr_123",
+        "ephemeral": false
+    }))
+    .expect("thread/fork params should deserialize explicit false");
+    assert_eq!(
+        explicit_false.ephemeral_override,
+        Some(false),
+        "explicit false must remain distinguishable from omission"
+    );
+}
+
 // Helper to create a config.toml pointing at the mock model server.
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
     let config_toml = codex_home.join("config.toml");

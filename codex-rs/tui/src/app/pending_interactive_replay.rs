@@ -3,6 +3,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ElicitationRequestKey {
@@ -19,7 +20,7 @@ impl ElicitationRequestKey {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 // Tracks which interactive prompts are still unresolved in the thread-event buffer.
 //
 // Thread snapshots are replayed when switching threads/agents. Most events should replay
@@ -32,7 +33,8 @@ impl ElicitationRequestKey {
 // We keep both fast lookup sets (for snapshot filtering by call_id/request key) and
 // turn-indexed queues/vectors so `TurnComplete`/`TurnAborted` can clear stale prompts tied
 // to a turn. `request_user_input` removal is FIFO because the overlay answers queued prompts
-// in FIFO order for a shared `turn_id`.
+// in FIFO order for a shared `turn_id`. `PlanUpdate` lacks an explicit turn id, so we infer
+// its turn from the surrounding turn lifecycle and keep a buffer-ordered queue for replay.
 pub(super) struct PendingInteractiveReplayState {
     exec_approval_call_ids: HashSet<String>,
     exec_approval_call_ids_by_turn_id: HashMap<String, Vec<String>>,
@@ -43,6 +45,8 @@ pub(super) struct PendingInteractiveReplayState {
     request_permissions_call_ids_by_turn_id: HashMap<String, Vec<String>>,
     request_user_input_call_ids: HashSet<String>,
     request_user_input_call_ids_by_turn_id: HashMap<String, Vec<String>>,
+    current_turn_id: Option<String>,
+    plan_update_turn_ids: VecDeque<Option<String>>,
 }
 
 impl PendingInteractiveReplayState {
@@ -171,6 +175,7 @@ impl PendingInteractiveReplayState {
                 ));
             }
             EventMsg::RequestUserInput(ev) => {
+                self.current_turn_id = Some(ev.turn_id.clone());
                 self.request_user_input_call_ids.insert(ev.call_id.clone());
                 self.request_user_input_call_ids_by_turn_id
                     .entry(ev.turn_id.clone())
@@ -184,6 +189,13 @@ impl PendingInteractiveReplayState {
                     .or_default()
                     .push(ev.call_id.clone());
             }
+            EventMsg::TurnStarted(ev) => {
+                self.current_turn_id = Some(ev.turn_id.clone());
+            }
+            EventMsg::PlanUpdate(_) => {
+                self.plan_update_turn_ids
+                    .push_back(self.current_turn_id.clone());
+            }
             // A turn ending (normally or aborted/replaced) invalidates any unresolved
             // turn-scoped approvals, permission prompts, and request_user_input prompts.
             EventMsg::TurnComplete(ev) => {
@@ -191,6 +203,9 @@ impl PendingInteractiveReplayState {
                 self.clear_patch_approval_turn(&ev.turn_id);
                 self.clear_request_permissions_turn(&ev.turn_id);
                 self.clear_request_user_input_turn(&ev.turn_id);
+                if self.current_turn_id.as_deref() == Some(ev.turn_id.as_str()) {
+                    self.current_turn_id = None;
+                }
             }
             EventMsg::TurnAborted(ev) => {
                 if let Some(turn_id) = &ev.turn_id {
@@ -198,6 +213,9 @@ impl PendingInteractiveReplayState {
                     self.clear_patch_approval_turn(turn_id);
                     self.clear_request_permissions_turn(turn_id);
                     self.clear_request_user_input_turn(turn_id);
+                    if self.current_turn_id.as_deref() == Some(turn_id.as_str()) {
+                        self.current_turn_id = None;
+                    }
                 }
             }
             EventMsg::ShutdownComplete => self.clear(),
@@ -265,11 +283,14 @@ impl PendingInteractiveReplayState {
                         .remove(&ev.turn_id);
                 }
             }
+            EventMsg::PlanUpdate(_) => {
+                self.plan_update_turn_ids.pop_front();
+            }
             _ => {}
         }
     }
 
-    pub(super) fn should_replay_snapshot_event(&self, event: &Event) -> bool {
+    pub(super) fn should_replay_snapshot_event(&mut self, event: &Event) -> bool {
         match &event.msg {
             EventMsg::ExecApprovalRequest(ev) => self
                 .exec_approval_call_ids
@@ -286,6 +307,12 @@ impl PendingInteractiveReplayState {
             }
             EventMsg::RequestUserInput(ev) => {
                 self.request_user_input_call_ids.contains(&ev.call_id)
+            }
+            EventMsg::PlanUpdate(_) => {
+                self.plan_update_turn_ids.pop_front().is_none_or(|turn_id| {
+                    turn_id
+                        .is_none_or(|turn_id| !self.has_pending_request_user_input_turn(&turn_id))
+                })
             }
             EventMsg::PlanDelta(ev) => !self.has_pending_request_user_input_turn(&ev.turn_id),
             EventMsg::ItemCompleted(ev)
@@ -381,6 +408,8 @@ impl PendingInteractiveReplayState {
         self.request_permissions_call_ids_by_turn_id.clear();
         self.request_user_input_call_ids.clear();
         self.request_user_input_call_ids_by_turn_id.clear();
+        self.current_turn_id = None;
+        self.plan_update_turn_ids.clear();
     }
 }
 
@@ -463,6 +492,16 @@ mod tests {
         });
         store.push_event(Event {
             id: "ev-2".to_string(),
+            msg: EventMsg::PlanUpdate(codex_protocol::plan_tool::UpdatePlanArgs {
+                explanation: Some("Need confirmation".to_string()),
+                plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                    step: "step 1".to_string(),
+                    status: codex_protocol::plan_tool::StepStatus::InProgress,
+                }],
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-3".to_string(),
             msg: EventMsg::PlanDelta(codex_protocol::protocol::PlanDeltaEvent {
                 thread_id: thread_id.to_string(),
                 turn_id: "turn-1".to_string(),
@@ -471,7 +510,7 @@ mod tests {
             }),
         });
         store.push_event(Event {
-            id: "ev-3".to_string(),
+            id: "ev-4".to_string(),
             msg: EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
                 thread_id,
                 turn_id: "turn-1".to_string(),
@@ -497,16 +536,144 @@ mod tests {
         });
 
         let snapshot = store.snapshot();
-        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events.len(), 3);
         assert!(matches!(
             snapshot.events.first().map(|event| &event.msg),
-            Some(EventMsg::PlanDelta(_))
+            Some(EventMsg::PlanUpdate(_))
         ));
         assert!(matches!(
             snapshot.events.get(1).map(|event| &event.msg),
+            Some(EventMsg::PlanDelta(_))
+        ));
+        assert!(matches!(
+            snapshot.events.get(2).map(|event| &event.msg),
             Some(EventMsg::ItemCompleted(ev))
                 if matches!(&ev.item, codex_protocol::items::TurnItem::Plan(_))
         ));
+    }
+
+    #[test]
+    fn thread_event_snapshot_stages_same_turn_plan_update_when_prompt_arrives_later() {
+        let mut store = ThreadEventStore::new(8);
+        store.push_event(Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: codex_protocol::config_types::ModeKind::Default,
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-2".to_string(),
+            msg: EventMsg::PlanUpdate(codex_protocol::plan_tool::UpdatePlanArgs {
+                explanation: Some("plan first".to_string()),
+                plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                    step: "step 1".to_string(),
+                    status: codex_protocol::plan_tool::StepStatus::InProgress,
+                }],
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-3".to_string(),
+            msg: EventMsg::RequestUserInput(
+                codex_protocol::request_user_input::RequestUserInputEvent {
+                    call_id: "call-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    questions: Vec::new(),
+                },
+            ),
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 2);
+        assert!(matches!(
+            snapshot.events.first().map(|event| &event.msg),
+            Some(EventMsg::TurnStarted(_))
+        ));
+        assert!(matches!(
+            snapshot.events.get(1).map(|event| &event.msg),
+            Some(EventMsg::RequestUserInput(_))
+        ));
+
+        store.note_outbound_op(&Op::UserInputAnswer {
+            id: "turn-1".to_string(),
+            response: codex_protocol::request_user_input::RequestUserInputResponse {
+                answers: HashMap::new(),
+            },
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 2);
+        assert!(matches!(
+            snapshot.events.first().map(|event| &event.msg),
+            Some(EventMsg::TurnStarted(_))
+        ));
+        assert!(matches!(
+            snapshot.events.get(1).map(|event| &event.msg),
+            Some(EventMsg::PlanUpdate(_))
+        ));
+    }
+
+    #[test]
+    fn thread_event_snapshot_keeps_prior_turn_plan_update_while_new_turn_is_pending() {
+        let mut store = ThreadEventStore::new(8);
+        store.push_event(Event {
+            id: "ev-1".to_string(),
+            msg: EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: codex_protocol::config_types::ModeKind::Default,
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-2".to_string(),
+            msg: EventMsg::PlanUpdate(codex_protocol::plan_tool::UpdatePlanArgs {
+                explanation: Some("prior turn".to_string()),
+                plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                    step: "done".to_string(),
+                    status: codex_protocol::plan_tool::StepStatus::Completed,
+                }],
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-3".to_string(),
+            msg: EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: "turn-1".to_string(),
+                last_agent_message: None,
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-4".to_string(),
+            msg: EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: "turn-2".to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: codex_protocol::config_types::ModeKind::Default,
+            }),
+        });
+        store.push_event(Event {
+            id: "ev-5".to_string(),
+            msg: EventMsg::RequestUserInput(
+                codex_protocol::request_user_input::RequestUserInputEvent {
+                    call_id: "call-1".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    questions: Vec::new(),
+                },
+            ),
+        });
+
+        let snapshot = store.snapshot();
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| matches!(&event.msg, EventMsg::PlanUpdate(_)),)
+        );
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| matches!(&event.msg, EventMsg::RequestUserInput(_)),)
+        );
     }
 
     #[test]

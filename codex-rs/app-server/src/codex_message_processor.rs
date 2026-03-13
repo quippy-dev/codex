@@ -3754,7 +3754,8 @@ impl CodexMessageProcessor {
             config: cli_overrides,
             base_instructions,
             developer_instructions,
-            ephemeral,
+            ephemeral: _,
+            ephemeral_override,
             persist_extended_history,
         } = params;
 
@@ -3840,7 +3841,7 @@ impl CodexMessageProcessor {
             developer_instructions,
             None,
         );
-        typesafe_overrides.ephemeral = Some(ephemeral);
+        typesafe_overrides.ephemeral = ephemeral_override;
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
         let config = match derive_config_for_cwd(
@@ -3868,6 +3869,7 @@ impl CodexMessageProcessor {
 
         let NewThread {
             thread_id,
+            thread: forked_thread,
             session_configured,
             ..
         } = match self
@@ -3902,19 +3904,12 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        let config_snapshot = forked_thread.config_snapshot().await;
 
         let SessionConfiguredEvent {
             rollout_path: fork_rollout_path,
             ..
         } = session_configured;
-        let Some(fork_rollout_path) = fork_rollout_path else {
-            self.send_internal_error(
-                request_id,
-                format!("rollout path missing for thread {thread_id}"),
-            )
-            .await;
-            return;
-        };
         // Auto-attach a conversation listener when forking a thread.
         Self::log_listener_attach_result(
             self.ensure_conversation_listener(
@@ -3929,66 +3924,82 @@ impl CodexMessageProcessor {
             "thread",
         );
 
-        let mut thread = match read_summary_from_rollout(
-            fork_rollout_path.as_path(),
-            fallback_model_provider.as_str(),
-        )
-        .await
-        {
-            Ok(summary) => summary_to_thread(summary),
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!(
-                        "failed to load rollout `{}` for thread {thread_id}: {err}",
-                        fork_rollout_path.display()
-                    ),
-                )
-                .await;
-                return;
+        let mut thread = if let Some(fork_rollout_path) = fork_rollout_path {
+            let mut thread = match read_summary_from_rollout(
+                fork_rollout_path.as_path(),
+                fallback_model_provider.as_str(),
+            )
+            .await
+            {
+                Ok(summary) => summary_to_thread(summary),
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!(
+                            "failed to load rollout `{}` for thread {thread_id}: {err}",
+                            fork_rollout_path.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            // forked thread names do not inherit the source thread name
+            match read_rollout_items_from_rollout(fork_rollout_path.as_path()).await {
+                Ok(items) => {
+                    thread.turns = build_turns_from_rollout_items(&items);
+                }
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!(
+                            "failed to load rollout `{}` for thread {thread_id}: {err}",
+                            fork_rollout_path.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
+            thread
+        } else {
+            build_thread_from_snapshot(thread_id, &config_snapshot, None)
         };
-        // forked thread names do not inherit the source thread name
-        match read_rollout_items_from_rollout(fork_rollout_path.as_path()).await {
-            Ok(items) => {
-                thread.turns = build_turns_from_rollout_items(&items);
-            }
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!(
-                        "failed to load rollout `{}` for thread {thread_id}: {err}",
-                        fork_rollout_path.display()
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-        if thread.turns.is_empty()
-            && !persist_extended_history
-            && let Ok(source_items) =
-                read_rollout_items_from_rollout(source_rollout_path.as_path()).await
-        {
-            let source_turns = build_turns_from_rollout_items(&source_items);
-            if !source_turns.is_empty() {
-                if thread.preview.is_empty()
-                    && let Some(first_user_text) = source_turns
-                        .iter()
-                        .flat_map(|turn| turn.items.iter())
-                        .find_map(|item| match item {
-                            ThreadItem::UserMessage { content, .. } => {
-                                content.iter().find_map(|input| match input {
-                                    V2UserInput::Text { text, .. } => Some(text.as_str()),
+        if thread.turns.is_empty() && (thread.path.is_none() || !persist_extended_history) {
+            match read_rollout_items_from_rollout(source_rollout_path.as_path()).await {
+                Ok(source_items) => {
+                    let source_turns = build_turns_from_rollout_items(&source_items);
+                    if !source_turns.is_empty() {
+                        if thread.preview.is_empty()
+                            && let Some(first_user_text) = source_turns
+                                .iter()
+                                .flat_map(|turn| turn.items.iter())
+                                .find_map(|item| match item {
+                                    ThreadItem::UserMessage { content, .. } => {
+                                        content.iter().find_map(|input| match input {
+                                            V2UserInput::Text { text, .. } => Some(text.as_str()),
+                                            _ => None,
+                                        })
+                                    }
                                     _ => None,
                                 })
-                            }
-                            _ => None,
-                        })
-                {
-                    thread.preview = first_user_text.to_string();
+                        {
+                            thread.preview = first_user_text.to_string();
+                        }
+                        thread.turns = source_turns;
+                    }
                 }
-                thread.turns = source_turns;
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!(
+                            "failed to load rollout `{}` for thread {thread_id}: {err}",
+                            source_rollout_path.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
         }
 
