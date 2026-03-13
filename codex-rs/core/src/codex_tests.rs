@@ -3991,6 +3991,126 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inject_response_items_emits_live_raw_agent_inbox_before_turn_completion() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    spawn_never_ending_regular_task(&sess, &tc, "live-agent-inbox-turn").await;
+    while rx.try_recv().is_ok() {}
+
+    let response_items = build_tool_response_input_items(
+        ThreadId::new(),
+        None,
+        None,
+        "live root agent message".to_string(),
+        "live-root-agent-call".to_string(),
+    )
+    .expect("build agent inbox response items");
+    let expected_response_items = response_items
+        .clone()
+        .into_iter()
+        .map(ResponseItem::from)
+        .collect::<Vec<_>>();
+
+    sess.inject_response_items(response_items)
+        .await
+        .expect("inject agent inbox items into active turn");
+
+    for expected in &expected_response_items {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected live raw response item event")
+            .expect("channel open");
+        assert!(matches!(
+            event.msg,
+            EventMsg::RawResponseItem(RawResponseItemEvent { item }) if item == *expected
+        ));
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "did not expect turn-complete-boundary replay"
+    );
+    assert!(
+        sess.clone_history()
+            .await
+            .raw_items()
+            .iter()
+            .all(|item| !expected_response_items
+                .iter()
+                .any(|expected| expected == item)),
+        "live inject should not record agent inbox items into history before the turn drains them"
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_finish_does_not_duplicate_live_emitted_agent_inbox_raw_events() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    spawn_never_ending_regular_task(&sess, &tc, "finish-live-agent-inbox-turn").await;
+    while rx.try_recv().is_ok() {}
+
+    let response_items = build_tool_response_input_items(
+        ThreadId::new(),
+        None,
+        None,
+        "live root agent message".to_string(),
+        "finish-live-root-agent-call".to_string(),
+    )
+    .expect("build agent inbox response items");
+    let expected_response_items = response_items
+        .clone()
+        .into_iter()
+        .map(ResponseItem::from)
+        .collect::<Vec<_>>();
+
+    sess.inject_response_items(response_items)
+        .await
+        .expect("inject agent inbox items into active turn");
+
+    let mut live_raw_events = Vec::new();
+    for _ in 0..expected_response_items.len() {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected live raw response item event")
+            .expect("channel open");
+        let EventMsg::RawResponseItem(raw) = event.msg else {
+            panic!("expected live raw response item");
+        };
+        live_raw_events.push(raw.item);
+    }
+    assert_eq!(live_raw_events, expected_response_items);
+
+    sess.on_task_finished(Arc::clone(&tc), None).await;
+
+    let mut post_finish_raw_events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected post-finish event")
+            .expect("channel open");
+        match event.msg {
+            EventMsg::RawResponseItem(raw) => post_finish_raw_events.push(raw.item),
+            EventMsg::TurnComplete(TurnCompleteEvent { turn_id, .. }) => {
+                assert_eq!(turn_id, tc.sub_id);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        post_finish_raw_events.is_empty(),
+        "agent inbox raw events should not replay again at turn completion"
+    );
+    let history = sess.clone_history().await;
+    for expected in &expected_response_items {
+        assert!(
+            history.raw_items().iter().any(|item| item == expected),
+            "expected drained agent inbox item in in-memory history"
+        );
+    }
+}
+
 #[tokio::test]
 async fn steer_input_requires_active_turn() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;

@@ -44,6 +44,7 @@ use crate::realtime_conversation::handle_close as handle_realtime_conversation_c
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use crate::rollout::session_index;
+use crate::state::PendingInputItem;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
@@ -3777,6 +3778,34 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
+    pub(crate) async fn record_pending_response_item(
+        &self,
+        turn_context: &TurnContext,
+        pending_item: PendingInputItem,
+    ) {
+        let response_item: ResponseItem = pending_item.item.into();
+        if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
+            self.record_user_prompt_and_emit_turn_item(
+                turn_context,
+                &user_message.content,
+                response_item,
+            )
+            .await;
+            return;
+        }
+
+        self.record_into_history(std::slice::from_ref(&response_item), turn_context)
+            .await;
+        if !is_agent_inbox_response_item(&response_item) {
+            self.persist_rollout_response_items(std::slice::from_ref(&response_item))
+                .await;
+        }
+        if !pending_item.raw_response_item_emitted_live {
+            self.send_raw_response_items(turn_context, std::slice::from_ref(&response_item))
+                .await;
+        }
+    }
+
     /// Append ResponseItems to the in-memory conversation history only.
     pub(crate) async fn record_into_history(
         &self,
@@ -4353,21 +4382,41 @@ impl Session {
         input: Vec<ResponseInputItem>,
     ) -> Result<(), Vec<ResponseInputItem>> {
         let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
-                if ts.sampling_completed() {
-                    return Err(input);
-                }
-                for item in input {
+        let Some(at) = active.as_mut() else {
+            return Err(input);
+        };
+
+        let turn_context = at.current_turn_context.clone();
+        let mut live_response_items = Vec::new();
+        {
+            let mut ts = at.turn_state.lock().await;
+            if ts.sampling_completed() {
+                return Err(input);
+            }
+            for item in input {
+                let response_item: ResponseItem = item.clone().into();
+                let live_emit =
+                    turn_context.is_some() && is_agent_inbox_response_item(&response_item);
+                if live_emit {
+                    live_response_items.push(response_item);
+                    ts.push_live_emitted_pending_input(item);
+                } else {
                     ts.push_pending_input(item);
                 }
-                Ok(())
             }
-            None => Err(input),
         }
+        drop(active);
+
+        if let Some(turn_context) = turn_context
+            && !live_response_items.is_empty()
+        {
+            self.send_raw_response_items(&turn_context, &live_response_items)
+                .await;
+        }
+        Ok(())
     }
 
+    #[cfg(test)]
     pub async fn get_pending_input(&self) -> Vec<ResponseInputItem> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
@@ -6478,30 +6527,21 @@ pub(crate) async fn run_turn(
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_response_items = sess
-            .get_pending_input()
-            .await
-            .into_iter()
-            .map(ResponseItem::from)
-            .collect::<Vec<ResponseItem>>();
-
-        if !pending_response_items.is_empty() {
-            for response_item in pending_response_items {
-                if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
-                    // todo(aibrahim): move pending input to be UserInput only to keep TextElements. context: https://github.com/openai/codex/pull/10656#discussion_r2765522480
-                    sess.record_user_prompt_and_emit_turn_item(
-                        turn_context.as_ref(),
-                        &user_message.content,
-                        response_item,
-                    )
-                    .await;
-                } else {
-                    sess.record_conversation_items(
-                        &turn_context,
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
+        let pending_input = {
+            let mut active = sess.active_turn.lock().await;
+            match active.as_mut() {
+                Some(at) => {
+                    let mut ts = at.turn_state.lock().await;
+                    ts.take_pending_input_entries()
                 }
+                None => Vec::with_capacity(0),
+            }
+        };
+
+        if !pending_input.is_empty() {
+            for pending_item in pending_input {
+                sess.record_pending_response_item(turn_context.as_ref(), pending_item)
+                    .await;
             }
         }
 

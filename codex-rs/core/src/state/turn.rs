@@ -75,6 +75,28 @@ impl ActiveTurn {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingInputItem {
+    pub(crate) item: ResponseInputItem,
+    pub(crate) raw_response_item_emitted_live: bool,
+}
+
+impl PendingInputItem {
+    pub(crate) fn queued(item: ResponseInputItem) -> Self {
+        Self {
+            item,
+            raw_response_item_emitted_live: false,
+        }
+    }
+
+    pub(crate) fn live_emitted(item: ResponseInputItem) -> Self {
+        Self {
+            item,
+            raw_response_item_emitted_live: true,
+        }
+    }
+}
+
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
@@ -83,7 +105,7 @@ pub(crate) struct TurnState {
     pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
-    pending_input: Vec<ResponseInputItem>,
+    pending_input: Vec<PendingInputItem>,
     sampling_completed: bool,
     granted_permissions: Option<PermissionProfile>,
     pub(crate) tool_calls: u64,
@@ -188,7 +210,12 @@ impl TurnState {
     }
 
     pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {
-        self.pending_input.push(input);
+        self.pending_input.push(PendingInputItem::queued(input));
+    }
+
+    pub(crate) fn push_live_emitted_pending_input(&mut self, input: ResponseInputItem) {
+        self.pending_input
+            .push(PendingInputItem::live_emitted(input));
     }
 
     pub(crate) fn mark_sampling_completed(&mut self) {
@@ -200,6 +227,13 @@ impl TurnState {
     }
 
     pub(crate) fn take_pending_input(&mut self) -> Vec<ResponseInputItem> {
+        self.take_pending_input_entries()
+            .into_iter()
+            .map(|pending| pending.item)
+            .collect()
+    }
+
+    pub(crate) fn take_pending_input_entries(&mut self) -> Vec<PendingInputItem> {
         if self.pending_input.is_empty() {
             Vec::with_capacity(0)
         } else {

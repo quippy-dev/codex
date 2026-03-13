@@ -23,7 +23,6 @@ use crate::AuthManager;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::contextual_user_message::TURN_ABORTED_OPEN_TAG;
-use crate::event_mapping::parse_turn_item;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::EventMsg;
 use crate::protocol::TokenUsage;
@@ -31,6 +30,7 @@ use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
 use crate::state::ActiveTurn;
+use crate::state::PendingInputItem;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_otel::SessionTelemetry;
@@ -38,9 +38,7 @@ use codex_otel::metrics::names::TURN_E2E_DURATION_METRIC;
 use codex_otel::metrics::names::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::metrics::names::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::metrics::names::TURN_TOOL_CALL_METRIC;
-use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
@@ -249,7 +247,7 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
         let mut active = self.active_turn.lock().await;
-        let mut pending_input = Vec::<ResponseInputItem>::new();
+        let mut pending_input = Vec::<PendingInputItem>::new();
         let mut should_clear_active_turn = false;
         let mut token_usage_at_turn_start = None;
         let mut turn_tool_calls = 0_u64;
@@ -262,7 +260,7 @@ impl Session {
                 .take()
                 .map(|current_turn_context| Arc::clone(&current_turn_context.turn_metadata_state));
             let mut ts = at.turn_state.lock().await;
-            pending_input = ts.take_pending_input();
+            pending_input = ts.take_pending_input_entries();
             turn_tool_calls = ts.tool_calls;
             token_usage_at_turn_start = Some(ts.token_usage_at_turn_start.clone());
             should_clear_active_turn = true;
@@ -275,28 +273,9 @@ impl Session {
             current_turn_metadata_state.cancel_git_enrichment_task();
         }
         if !pending_input.is_empty() {
-            let pending_response_items = pending_input
-                .into_iter()
-                .map(ResponseItem::from)
-                .collect::<Vec<_>>();
-            for response_item in pending_response_items {
-                if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
-                    // Keep leftover user input on the same persistence + lifecycle path as the
-                    // normal pre-sampling drain. This helper records the response item once, then
-                    // emits ItemStarted/UserMessage and ItemCompleted/UserMessage for clients.
-                    self.record_user_prompt_and_emit_turn_item(
-                        initial_turn_context.as_ref(),
-                        &user_message.content,
-                        response_item,
-                    )
+            for pending_item in pending_input {
+                self.record_pending_response_item(initial_turn_context.as_ref(), pending_item)
                     .await;
-                } else {
-                    self.record_conversation_items(
-                        initial_turn_context.as_ref(),
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
-                }
             }
         }
         // Emit token usage metrics.
