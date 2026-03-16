@@ -27,7 +27,6 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
-use codex_protocol::agent_inbox::parse_agent_inbox_message_from_item;
 #[cfg(test)]
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -582,7 +581,7 @@ impl AgentControl {
         agent_id: ThreadId,
         sender_thread_id: ThreadId,
         message: String,
-        record_sender_message_for_completion_dedupe: bool,
+        record_live_sender_message_for_completion_dedupe: bool,
         late_delivery_mode: LateAgentDeliveryMode,
         #[cfg(test)] before_live_inject: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     ) -> CodexResult<String> {
@@ -625,13 +624,7 @@ impl AgentControl {
                 .enqueue_post_turn_agent_items(queued_items)
                 .await
             {
-                Ok(()) => {
-                    if record_sender_message_for_completion_dedupe {
-                        self.record_forwarded_agent_message(sender_thread_id, &message)
-                            .await;
-                    }
-                    return Ok(Uuid::now_v7().to_string());
-                }
+                Ok(()) => return Ok(Uuid::now_v7().to_string()),
                 Err(err) => log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err),
             }
         }
@@ -650,8 +643,8 @@ impl AgentControl {
             )?;
             match thread.codex.session.inject_response_items(live_items).await {
                 Ok(()) => {
-                    if record_sender_message_for_completion_dedupe {
-                        self.record_forwarded_agent_message(sender_thread_id, &message)
+                    if record_live_sender_message_for_completion_dedupe {
+                        self.record_live_forwarded_agent_message(sender_thread_id, &message)
                             .await;
                     }
                     return Ok(Uuid::now_v7().to_string());
@@ -675,10 +668,6 @@ impl AgentControl {
                             .await
                         {
                             Ok(()) => {
-                                if record_sender_message_for_completion_dedupe {
-                                    self.record_forwarded_agent_message(sender_thread_id, &message)
-                                        .await;
-                                }
                                 return Ok(Uuid::now_v7().to_string());
                             }
                             Err(err) => {
@@ -711,6 +700,10 @@ impl AgentControl {
                             .session
                             .record_conversation_items(turn_context.as_ref(), &live_response_items)
                             .await;
+                        if record_live_sender_message_for_completion_dedupe {
+                            self.record_live_forwarded_agent_message(sender_thread_id, &message)
+                                .await;
+                        }
                         return Ok(Uuid::now_v7().to_string());
                     } else {
                         match thread
@@ -720,10 +713,6 @@ impl AgentControl {
                             .await
                         {
                             Ok(()) => {
-                                if record_sender_message_for_completion_dedupe {
-                                    self.record_forwarded_agent_message(sender_thread_id, &message)
-                                        .await;
-                                }
                                 if thread
                                     .codex
                                     .session
@@ -781,10 +770,6 @@ impl AgentControl {
                 .await
             {
                 Ok(()) => {
-                    if record_sender_message_for_completion_dedupe {
-                        self.record_forwarded_agent_message(sender_thread_id, &message)
-                            .await;
-                    }
                     return Ok(Uuid::now_v7().to_string());
                 }
                 Err(err) => log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err),
@@ -799,14 +784,9 @@ impl AgentControl {
             message.clone(),
             false,
         )?;
-        let submission_id = state
+        state
             .send_op(agent_id, Op::InjectResponseItems { items })
-            .await?;
-        if record_sender_message_for_completion_dedupe {
-            self.record_forwarded_agent_message(sender_thread_id, &message)
-                .await;
-        }
-        Ok(submission_id)
+            .await
     }
 
     /// Interrupt the current task for an existing agent thread.
@@ -1035,31 +1015,15 @@ impl AgentControl {
                     };
                 let child_completed_message_already_forwarded = match &status {
                     AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => {
-                        let child_thread_id_text = child_thread_id.to_string();
-                        let child_session_recorded =
-                            if let Ok(child_thread) = state.get_thread(child_thread_id).await {
-                                child_thread
-                                    .codex
-                                    .session
-                                    .current_or_last_completed_turn_forwarded_agent_message(message)
-                                    .await
-                            } else {
-                                false
-                            };
-                        let parent_history_recorded = parent_thread
-                            .codex
-                            .session
-                            .clone_history()
-                            .await
-                            .raw_items()
-                            .iter()
-                            .filter_map(parse_agent_inbox_message_from_item)
-                            .any(|inbox_message| {
-                                inbox_message.canonical_sender.as_deref()
-                                    == Some(child_thread_id_text.as_str())
-                                    && inbox_message.message == *message
-                            });
-                        child_session_recorded || parent_history_recorded
+                        if let Ok(child_thread) = state.get_thread(child_thread_id).await {
+                            child_thread
+                                .codex
+                                .session
+                                .last_completed_turn_live_forwarded_agent_message(message)
+                                .await
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
@@ -1104,14 +1068,14 @@ impl AgentControl {
         });
     }
 
-    async fn record_forwarded_agent_message(&self, sender_thread_id: ThreadId, message: &str) {
+    async fn record_live_forwarded_agent_message(&self, sender_thread_id: ThreadId, message: &str) {
         if let Ok(state) = self.upgrade()
             && let Ok(sender_thread) = state.get_thread(sender_thread_id).await
         {
             sender_thread
                 .codex
                 .session
-                .record_turn_forwarded_agent_message(message)
+                .record_turn_live_forwarded_agent_message(message)
                 .await;
         }
     }
@@ -1820,6 +1784,15 @@ mod tests {
     }
 
     async fn wait_for_raw_response_text(thread: &Arc<CodexThread>, needle: &str) -> bool {
+        wait_for_raw_response_text_with_timeout(thread, needle, std::time::Duration::from_secs(2))
+            .await
+    }
+
+    async fn wait_for_raw_response_text_with_timeout(
+        thread: &Arc<CodexThread>,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
         let wait = async {
             loop {
                 let event = thread
@@ -1833,9 +1806,7 @@ mod tests {
                 }
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(2), wait)
-            .await
-            .is_ok()
+        tokio::time::timeout(timeout, wait).await.is_ok()
     }
 
     fn auth_manager_with_auth_file(
@@ -5003,6 +4974,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_watcher_forwards_terminal_message_when_same_text_progress_was_only_queued()
+    {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        let parent_turn = parent_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("parent-queued-same-text-wait-turn".to_string())
+            .await;
+        parent_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&parent_turn),
+                text_input("wait for child"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        let (child_thread_id, child_thread) = harness.start_thread().await;
+        let child_turn = child_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("child-queued-same-text-turn".to_string())
+            .await;
+        child_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&child_turn),
+                text_input("child work"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        harness.control.maybe_start_completion_watcher(
+            child_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        );
+
+        child_thread.codex.session.mark_turn_used_agent_send_input();
+        parent_thread
+            .codex
+            .session
+            .mark_active_turn_sampling_completed()
+            .await;
+        harness
+            .control
+            .send_agent_message(
+                parent_thread_id,
+                child_thread_id,
+                "same queued final message".to_string(),
+            )
+            .await
+            .expect("queued progress send_input should succeed");
+
+        assert!(
+            !wait_for_raw_response_text_with_timeout(
+                &parent_thread,
+                "same queued final message",
+                std::time::Duration::from_millis(300),
+            )
+            .await,
+            "expected same-text progress to stay queued once parent sampling completed"
+        );
+
+        child_thread
+            .codex
+            .session
+            .on_task_finished(
+                Arc::clone(&child_turn),
+                Some("same queued final message".to_string()),
+            )
+            .await;
+
+        assert!(
+            wait_for_raw_response_text(&parent_thread, "same queued final message").await,
+            "expected queued same-text progress not to suppress the live completion body"
+        );
+        assert!(
+            harness
+                .manager
+                .captured_ops()
+                .into_iter()
+                .all(|(thread_id, op)| {
+                    thread_id != parent_thread_id || !matches!(op, Op::InjectResponseItems { .. })
+                }),
+            "late completion fallback should not arm a follow-up inject turn"
+        );
+
+        parent_thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn completion_watcher_reused_child_repeated_same_terminal_message_stays_live() {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        let parent_turn = parent_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("parent-reused-child-wait-turn".to_string())
+            .await;
+        parent_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&parent_turn),
+                text_input("wait for child"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        let (child_thread_id, child_thread) = harness.start_thread().await;
+        harness.control.maybe_start_completion_watcher(
+            child_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        );
+
+        let first_child_turn = child_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("child-reused-first-turn".to_string())
+            .await;
+        child_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&first_child_turn),
+                text_input("child work"),
+                WaitForCancellationTask,
+            )
+            .await;
+        child_thread
+            .codex
+            .session
+            .on_task_finished(Arc::clone(&first_child_turn), Some("Done".to_string()))
+            .await;
+        assert!(wait_for_raw_response_text(&parent_thread, "Done").await);
+
+        let second_child_turn = child_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("child-reused-second-turn".to_string())
+            .await;
+        child_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&second_child_turn),
+                text_input("child work again"),
+                WaitForCancellationTask,
+            )
+            .await;
+        harness.control.maybe_start_completion_watcher(
+            child_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        );
+        child_thread
+            .codex
+            .session
+            .on_task_finished(Arc::clone(&second_child_turn), Some("Done".to_string()))
+            .await;
+
+        assert!(
+            wait_for_raw_response_text(&parent_thread, "Done").await,
+            "expected reused child to surface repeated same-text completion on a later turn"
+        );
+
+        parent_thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+    }
+
+    #[tokio::test]
     async fn completion_watcher_suppresses_duplicate_terminal_message_already_forwarded_live() {
         let harness = AgentControlHarness::new().await;
         let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -5072,7 +5238,7 @@ mod tests {
             child_thread
                 .codex
                 .session
-                .current_or_last_completed_turn_forwarded_agent_message("same final message")
+                .last_completed_turn_live_forwarded_agent_message("same final message")
                 .await,
             "expected child dedupe state to survive task completion"
         );

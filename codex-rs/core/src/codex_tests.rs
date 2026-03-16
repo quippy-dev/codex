@@ -2354,9 +2354,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services,
         js_repl,
         turn_used_agent_send_input: AtomicBool::new(false),
-        turn_forwarded_agent_messages: Mutex::new(HashSet::new()),
+        turn_live_forwarded_agent_messages: Mutex::new(HashSet::new()),
         last_completed_turn_used_agent_send_input: AtomicBool::new(false),
-        last_completed_turn_forwarded_agent_messages: Mutex::new(HashSet::new()),
+        last_completed_turn_live_forwarded_agent_messages: Mutex::new(HashSet::new()),
         pending_invalid_image_error: AtomicBool::new(false),
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -3002,9 +3002,9 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_channels(
         services,
         js_repl,
         turn_used_agent_send_input: AtomicBool::new(false),
-        turn_forwarded_agent_messages: Mutex::new(HashSet::new()),
+        turn_live_forwarded_agent_messages: Mutex::new(HashSet::new()),
         last_completed_turn_used_agent_send_input: AtomicBool::new(false),
-        last_completed_turn_forwarded_agent_messages: Mutex::new(HashSet::new()),
+        last_completed_turn_live_forwarded_agent_messages: Mutex::new(HashSet::new()),
         pending_invalid_image_error: AtomicBool::new(false),
         next_internal_sub_id: AtomicU64::new(0),
     });
