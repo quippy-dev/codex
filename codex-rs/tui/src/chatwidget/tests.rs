@@ -78,6 +78,7 @@ use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -560,6 +561,51 @@ async fn live_agent_inbox_messages_are_not_deduplicated() {
         .collect::<String>();
     assert_eq!(combined.matches("Agent message:").count(), 2);
     assert_eq!(combined.matches("Please review the latest diff").count(), 2);
+}
+
+#[tokio::test]
+async fn live_agent_inbox_message_renders_during_wait_without_turn_complete() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+    let parent = ThreadId::new();
+    let sender =
+        ThreadId::from_string("019cbff7-558b-77d3-8653-8238ab5361ec").expect("valid thread id");
+    let message = "Final waited result";
+
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: Some(950_000),
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "wait-end".into(),
+        msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+            sender_thread_id: parent,
+            call_id: "wait-1".to_string(),
+            agent_statuses: Vec::new(),
+            statuses: [(sender, AgentStatus::Completed(None))]
+                .into_iter()
+                .collect(),
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "evt-live-output".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: agent_inbox_function_call_output(sender, message),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+
+    assert!(combined.contains("Finished waiting"));
+    assert_eq!(combined.matches("Agent message:").count(), 1);
+    assert!(combined.contains(message));
 }
 
 #[tokio::test]

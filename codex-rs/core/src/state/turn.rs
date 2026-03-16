@@ -2,6 +2,7 @@
 
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -106,6 +107,7 @@ pub(crate) struct TurnState {
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pending_input: Vec<PendingInputItem>,
+    live_emitted_agent_inbox_messages: HashSet<(String, String)>,
     sampling_completed: bool,
     granted_permissions: Option<PermissionProfile>,
     pub(crate) tool_calls: u64,
@@ -143,6 +145,7 @@ impl TurnState {
         self.pending_elicitations.clear();
         self.pending_dynamic_tools.clear();
         self.pending_input.clear();
+        self.live_emitted_agent_inbox_messages.clear();
     }
 
     pub(crate) fn insert_pending_request_permissions(
@@ -216,6 +219,24 @@ impl TurnState {
     pub(crate) fn push_live_emitted_pending_input(&mut self, input: ResponseInputItem) {
         self.pending_input
             .push(PendingInputItem::live_emitted(input));
+    }
+
+    pub(crate) fn record_live_emitted_agent_inbox_message(
+        &mut self,
+        canonical_sender: String,
+        message: String,
+    ) {
+        self.live_emitted_agent_inbox_messages
+            .insert((canonical_sender, message));
+    }
+
+    pub(crate) fn has_live_emitted_agent_inbox_message(
+        &self,
+        canonical_sender: &str,
+        message: &str,
+    ) -> bool {
+        self.live_emitted_agent_inbox_messages
+            .contains(&(canonical_sender.to_string(), message.to_string()))
     }
 
     pub(crate) fn mark_sampling_completed(&mut self) {

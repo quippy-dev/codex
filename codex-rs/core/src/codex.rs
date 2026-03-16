@@ -76,6 +76,7 @@ use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::agent_inbox::is_agent_inbox_response_item;
+use codex_protocol::agent_inbox::parse_agent_inbox_message_from_item;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::approvals::ExecApprovalRequestSkillMetadata;
 use codex_protocol::approvals::ExecPolicyAmendment;
@@ -2189,11 +2190,36 @@ impl Session {
             .load(Ordering::Acquire)
     }
 
-    pub(crate) async fn last_completed_turn_forwarded_agent_message(&self, message: &str) -> bool {
+    pub(crate) async fn current_or_last_completed_turn_forwarded_agent_message(
+        &self,
+        message: &str,
+    ) -> bool {
+        if self
+            .turn_forwarded_agent_messages
+            .lock()
+            .await
+            .contains(message)
+        {
+            return true;
+        }
+
         self.last_completed_turn_forwarded_agent_messages
             .lock()
             .await
             .contains(message)
+    }
+
+    pub(crate) async fn active_turn_has_live_emitted_agent_inbox_message(
+        &self,
+        canonical_sender: &str,
+        message: &str,
+    ) -> bool {
+        let active = self.active_turn.lock().await;
+        let Some(at) = active.as_ref() else {
+            return false;
+        };
+        let turn_state = at.turn_state.lock().await;
+        turn_state.has_live_emitted_agent_inbox_message(canonical_sender, message)
     }
 
     /// Ensure all rollout writes are durably flushed.
@@ -4510,6 +4536,14 @@ impl Session {
                 let live_emit =
                     turn_context.is_some() && is_agent_inbox_response_item(&response_item);
                 if live_emit {
+                    if let Some(inbox_message) = parse_agent_inbox_message_from_item(&response_item)
+                        && let Some(canonical_sender) = inbox_message.canonical_sender
+                    {
+                        ts.record_live_emitted_agent_inbox_message(
+                            canonical_sender,
+                            inbox_message.message,
+                        );
+                    }
                     live_response_items.push(response_item);
                     ts.push_live_emitted_pending_input(item);
                 } else {

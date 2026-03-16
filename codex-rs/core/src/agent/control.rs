@@ -27,6 +27,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
+use codex_protocol::agent_inbox::parse_agent_inbox_message_from_item;
 #[cfg(test)]
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -65,6 +66,12 @@ const FORKED_SPAWN_AGENT_OUTPUT_MESSAGE: &str = "You are the newly spawned agent
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LateAgentDeliveryMode {
+    QueuePostTurn,
+    LiveOnlyAfterSamplingComplete,
 }
 
 fn default_agent_nickname_list() -> Vec<&'static str> {
@@ -563,6 +570,7 @@ impl AgentControl {
             sender_thread_id,
             message,
             true,
+            LateAgentDeliveryMode::QueuePostTurn,
             #[cfg(test)]
             None,
         )
@@ -575,6 +583,7 @@ impl AgentControl {
         sender_thread_id: ThreadId,
         message: String,
         record_sender_message_for_completion_dedupe: bool,
+        late_delivery_mode: LateAgentDeliveryMode,
         #[cfg(test)] before_live_inject: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
@@ -676,6 +685,33 @@ impl AgentControl {
                                 log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err)
                             }
                         }
+                    } else if late_delivery_mode
+                        == LateAgentDeliveryMode::LiveOnlyAfterSamplingComplete
+                        && let Some(turn_context) =
+                            thread.codex.session.current_active_turn_context().await
+                    {
+                        let sender_thread_id_text = sender_thread_id.to_string();
+                        if thread
+                            .codex
+                            .session
+                            .active_turn_has_live_emitted_agent_inbox_message(
+                                sender_thread_id_text.as_str(),
+                                &message,
+                            )
+                            .await
+                        {
+                            return Ok(Uuid::now_v7().to_string());
+                        }
+                        let live_response_items = late_items
+                            .into_iter()
+                            .map(ResponseItem::from)
+                            .collect::<Vec<_>>();
+                        thread
+                            .codex
+                            .session
+                            .record_conversation_items(turn_context.as_ref(), &live_response_items)
+                            .await;
+                        return Ok(Uuid::now_v7().to_string());
                     } else {
                         match thread
                             .codex
@@ -999,15 +1035,31 @@ impl AgentControl {
                     };
                 let child_completed_message_already_forwarded = match &status {
                     AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => {
-                        if let Ok(child_thread) = state.get_thread(child_thread_id).await {
-                            child_thread
-                                .codex
-                                .session
-                                .last_completed_turn_forwarded_agent_message(message)
-                                .await
-                        } else {
-                            false
-                        }
+                        let child_thread_id_text = child_thread_id.to_string();
+                        let child_session_recorded =
+                            if let Ok(child_thread) = state.get_thread(child_thread_id).await {
+                                child_thread
+                                    .codex
+                                    .session
+                                    .current_or_last_completed_turn_forwarded_agent_message(message)
+                                    .await
+                            } else {
+                                false
+                            };
+                        let parent_history_recorded = parent_thread
+                            .codex
+                            .session
+                            .clone_history()
+                            .await
+                            .raw_items()
+                            .iter()
+                            .filter_map(parse_agent_inbox_message_from_item)
+                            .any(|inbox_message| {
+                                inbox_message.canonical_sender.as_deref()
+                                    == Some(child_thread_id_text.as_str())
+                                    && inbox_message.message == *message
+                            });
+                        child_session_recorded || parent_history_recorded
                     }
                     _ => false,
                 };
@@ -1022,6 +1074,11 @@ impl AgentControl {
                         child_thread_id,
                         message,
                         false,
+                        if child_is_watchdog_helper_for_parent {
+                            LateAgentDeliveryMode::QueuePostTurn
+                        } else {
+                            LateAgentDeliveryMode::LiveOnlyAfterSamplingComplete
+                        },
                         #[cfg(test)]
                         None,
                     )
@@ -2237,6 +2294,7 @@ mod tests {
                 sender_thread_id,
                 "late same-turn update".to_string(),
                 true,
+                LateAgentDeliveryMode::QueuePostTurn,
                 Some(Box::pin(async move {
                     receiver_session
                         .abort_all_tasks(TurnAbortReason::Replaced)
@@ -2300,6 +2358,7 @@ mod tests {
                 sender_thread_id,
                 "late completed update".to_string(),
                 true,
+                LateAgentDeliveryMode::QueuePostTurn,
                 Some(Box::pin(async move {
                     receiver_session.mark_active_turn_sampling_completed().await;
                 })),
@@ -2369,6 +2428,7 @@ mod tests {
                 sender_thread_id,
                 "late interrupt update".to_string(),
                 true,
+                LateAgentDeliveryMode::QueuePostTurn,
                 Some(Box::pin(async move {
                     receiver_session.interrupt_task().await;
                 })),
@@ -4686,6 +4746,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_watcher_forwards_terminal_message_live_after_parent_sampling_completed() {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        let parent_turn = parent_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("parent-post-sampling-wait-turn".to_string())
+            .await;
+        parent_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&parent_turn),
+                text_input("wait for child"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        let (child_thread_id, child_thread) = harness.start_thread().await;
+        let child_turn = child_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("child-post-sampling-final-turn".to_string())
+            .await;
+        child_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&child_turn),
+                text_input("child work"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        harness.control.maybe_start_completion_watcher(
+            child_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        );
+
+        parent_thread
+            .codex
+            .session
+            .mark_active_turn_sampling_completed()
+            .await;
+
+        child_thread
+            .codex
+            .session
+            .on_task_finished(
+                Arc::clone(&child_turn),
+                Some("late final explorer result".to_string()),
+            )
+            .await;
+
+        assert!(
+            wait_for_raw_response_text(&parent_thread, "late final explorer result").await,
+            "expected live fallback Agent message even after parent sampling completed"
+        );
+        assert!(
+            harness
+                .manager
+                .captured_ops()
+                .into_iter()
+                .all(|(thread_id, op)| {
+                    thread_id != parent_thread_id || !matches!(op, Op::InjectResponseItems { .. })
+                }),
+            "late completion fallback should not arm an empty boundary flush turn"
+        );
+
+        parent_thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+    }
+
+    #[tokio::test]
     async fn completion_watcher_forwards_distinct_terminal_message_after_progress_send_input() {
         let harness = AgentControlHarness::new().await;
         let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -4765,6 +4907,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_watcher_forwards_distinct_terminal_message_after_progress_send_input_and_parent_sampling_completed()
+     {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        let parent_turn = parent_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("parent-progress-post-sampling-wait-turn".to_string())
+            .await;
+        parent_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&parent_turn),
+                text_input("wait for child"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        let (child_thread_id, child_thread) = harness.start_thread().await;
+        let child_turn = child_thread
+            .codex
+            .session
+            .new_default_turn_with_sub_id("child-progress-post-sampling-turn".to_string())
+            .await;
+        child_thread
+            .codex
+            .session
+            .spawn_task(
+                Arc::clone(&child_turn),
+                text_input("child work"),
+                WaitForCancellationTask,
+            )
+            .await;
+
+        harness.control.maybe_start_completion_watcher(
+            child_thread_id,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        );
+
+        child_thread.codex.session.mark_turn_used_agent_send_input();
+        harness
+            .control
+            .send_agent_message(
+                parent_thread_id,
+                child_thread_id,
+                "progress update".to_string(),
+            )
+            .await
+            .expect("progress send_input should succeed");
+
+        assert!(wait_for_raw_response_text(&parent_thread, "progress update").await);
+
+        parent_thread
+            .codex
+            .session
+            .mark_active_turn_sampling_completed()
+            .await;
+
+        child_thread
+            .codex
+            .session
+            .on_task_finished(
+                Arc::clone(&child_turn),
+                Some("late final explorer result".to_string()),
+            )
+            .await;
+
+        assert!(
+            wait_for_raw_response_text(&parent_thread, "late final explorer result").await,
+            "expected final completion body to stay live after sampling completed"
+        );
+        assert!(
+            harness
+                .manager
+                .captured_ops()
+                .into_iter()
+                .all(|(thread_id, op)| {
+                    thread_id != parent_thread_id || !matches!(op, Op::InjectResponseItems { .. })
+                }),
+            "late completion fallback should not arm a follow-up inject turn"
+        );
+
+        parent_thread
+            .codex
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+    }
+
+    #[tokio::test]
     async fn completion_watcher_suppresses_duplicate_terminal_message_already_forwarded_live() {
         let harness = AgentControlHarness::new().await;
         let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -4830,6 +5068,14 @@ mod tests {
                 Some("same final message".to_string()),
             )
             .await;
+        assert!(
+            child_thread
+                .codex
+                .session
+                .current_or_last_completed_turn_forwarded_agent_message("same final message")
+                .await,
+            "expected child dedupe state to survive task completion"
+        );
 
         let duplicate = tokio::time::timeout(std::time::Duration::from_millis(300), async {
             loop {
