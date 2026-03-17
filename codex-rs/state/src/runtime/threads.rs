@@ -13,6 +13,8 @@ SELECT
     agent_nickname,
     agent_role,
     model_provider,
+    model,
+    reasoning_effort,
     cwd,
     cli_version,
     title,
@@ -50,7 +52,7 @@ WHERE id = ?
     ) -> anyhow::Result<Option<Vec<DynamicToolSpec>>> {
         let rows = sqlx::query(
             r#"
-SELECT name, description, input_schema
+SELECT name, description, input_schema, defer_loading
 FROM thread_dynamic_tools
 WHERE thread_id = ?
 ORDER BY position ASC
@@ -70,6 +72,7 @@ ORDER BY position ASC
                 name: row.try_get("name")?,
                 description: row.try_get("description")?,
                 input_schema,
+                defer_loading: row.try_get("defer_loading")?,
             });
         }
         Ok(Some(tools))
@@ -124,6 +127,8 @@ SELECT
     agent_nickname,
     agent_role,
     model_provider,
+    model,
+    reasoning_effort,
     cwd,
     cli_version,
     title,
@@ -188,7 +193,7 @@ FROM threads
             model_providers,
             anchor,
             sort_key,
-            None,
+            /*search_term*/ None,
         );
         push_thread_order_and_limit(&mut builder, sort_key, limit);
 
@@ -203,7 +208,7 @@ FROM threads
 
     /// Insert or replace thread metadata directly.
     pub async fn upsert_thread(&self, metadata: &crate::ThreadMetadata) -> anyhow::Result<()> {
-        self.upsert_thread_with_creation_memory_mode(metadata, None)
+        self.upsert_thread_with_creation_memory_mode(metadata, /*creation_memory_mode*/ None)
             .await
     }
 
@@ -222,6 +227,8 @@ INSERT INTO threads (
     agent_nickname,
     agent_role,
     model_provider,
+    model,
+    reasoning_effort,
     cwd,
     cli_version,
     title,
@@ -235,7 +242,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -247,6 +254,13 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
         .bind(metadata.model_provider.as_str())
+        .bind(metadata.model.as_deref())
+        .bind(
+            metadata
+                .reasoning_effort
+                .as_ref()
+                .map(crate::extract::enum_to_string),
+        )
         .bind(metadata.cwd.display().to_string())
         .bind(metadata.cli_version.as_str())
         .bind(metadata.title.as_str())
@@ -336,6 +350,8 @@ INSERT INTO threads (
     agent_nickname,
     agent_role,
     model_provider,
+    model,
+    reasoning_effort,
     cwd,
     cli_version,
     title,
@@ -349,7 +365,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -358,6 +374,8 @@ ON CONFLICT(id) DO UPDATE SET
     agent_nickname = excluded.agent_nickname,
     agent_role = excluded.agent_role,
     model_provider = excluded.model_provider,
+    model = excluded.model,
+    reasoning_effort = excluded.reasoning_effort,
     cwd = excluded.cwd,
     cli_version = excluded.cli_version,
     title = excluded.title,
@@ -380,6 +398,13 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
         .bind(metadata.model_provider.as_str())
+        .bind(metadata.model.as_deref())
+        .bind(
+            metadata
+                .reasoning_effort
+                .as_ref()
+                .map(crate::extract::enum_to_string),
+        )
         .bind(metadata.cwd.display().to_string())
         .bind(metadata.cli_version.as_str())
         .bind(metadata.title.as_str())
@@ -425,8 +450,9 @@ INSERT INTO thread_dynamic_tools (
     position,
     name,
     description,
-    input_schema
-) VALUES (?, ?, ?, ?, ?)
+    input_schema,
+    defer_loading
+) VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(thread_id, position) DO NOTHING
                 "#,
             )
@@ -435,6 +461,7 @@ ON CONFLICT(thread_id, position) DO NOTHING
             .bind(tool.name.as_str())
             .bind(tool.description.as_str())
             .bind(input_schema)
+            .bind(tool.defer_loading)
             .execute(&mut *tx)
             .await?;
         }

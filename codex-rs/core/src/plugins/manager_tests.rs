@@ -227,6 +227,117 @@ fn load_plugins_loads_default_skills_and_mcp_servers() {
 }
 
 #[test]
+fn plugin_telemetry_metadata_uses_default_mcp_config_path() {
+    let codex_home = TempDir::new().unwrap();
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache")
+        .join("test/sample/local");
+
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{
+  "name": "sample"
+}"#,
+    );
+    write_file(
+        &plugin_root.join(".mcp.json"),
+        r#"{
+  "mcpServers": {
+    "sample": {
+      "type": "http",
+      "url": "https://sample.example/mcp"
+    }
+  }
+}"#,
+    );
+
+    let metadata = plugin_telemetry_metadata_from_root(
+        &PluginId::parse("sample@test").expect("plugin id should parse"),
+        &plugin_root,
+    );
+
+    assert_eq!(
+        metadata.capability_summary,
+        Some(PluginCapabilitySummary {
+            config_name: "sample@test".to_string(),
+            display_name: "sample".to_string(),
+            description: None,
+            has_skills: false,
+            mcp_server_names: vec!["sample".to_string()],
+            app_connector_ids: Vec::new(),
+        })
+    );
+}
+
+#[test]
+fn capability_summary_sanitizes_plugin_descriptions_to_one_line() {
+    let codex_home = TempDir::new().unwrap();
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache")
+        .join("test/sample/local");
+
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{
+  "name": "sample",
+  "description": "Plugin that\n includes   the sample\tserver"
+}"#,
+    );
+    write_file(
+        &plugin_root.join("skills/sample-search/SKILL.md"),
+        "---\nname: sample-search\ndescription: search sample data\n---\n",
+    );
+
+    let outcome = load_plugins_from_config(&plugin_config_toml(true, true), codex_home.path());
+
+    assert_eq!(
+        outcome.plugins[0].manifest_description.as_deref(),
+        Some("Plugin that\n includes   the sample\tserver")
+    );
+    assert_eq!(
+        outcome.capability_summaries()[0].description.as_deref(),
+        Some("Plugin that includes the sample server")
+    );
+}
+
+#[test]
+fn capability_summary_truncates_overlong_plugin_descriptions() {
+    let codex_home = TempDir::new().unwrap();
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache")
+        .join("test/sample/local");
+    let too_long = "x".repeat(MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN + 1);
+
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        &format!(
+            r#"{{
+  "name": "sample",
+  "description": "{too_long}"
+}}"#
+        ),
+    );
+    write_file(
+        &plugin_root.join("skills/sample-search/SKILL.md"),
+        "---\nname: sample-search\ndescription: search sample data\n---\n",
+    );
+
+    let outcome = load_plugins_from_config(&plugin_config_toml(true, true), codex_home.path());
+
+    assert_eq!(
+        outcome.plugins[0].manifest_description.as_deref(),
+        Some(too_long.as_str())
+    );
+    assert_eq!(
+        outcome.capability_summaries()[0].description,
+        Some("x".repeat(MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN))
+    );
+}
+
+#[test]
 fn load_plugins_uses_manifest_configured_component_paths() {
     let codex_home = TempDir::new().unwrap();
     let plugin_root = codex_home
@@ -888,6 +999,7 @@ enabled = false
                 tmp.path().join("repo/.agents/plugins/marketplace.json"),
             )
             .unwrap(),
+            interface: None,
             plugins: vec![
                 ConfiguredMarketplacePluginSummary {
                     id: "enabled-plugin@debug".to_string(),
@@ -932,6 +1044,9 @@ async fn list_marketplaces_includes_curated_repo_marketplace() {
         curated_root.join(".agents/plugins/marketplace.json"),
         r#"{
   "name": "openai-curated",
+  "interface": {
+    "displayName": "ChatGPT Official"
+  },
   "plugins": [
     {
       "name": "linear",
@@ -966,6 +1081,9 @@ async fn list_marketplaces_includes_curated_repo_marketplace() {
             name: "openai-curated".to_string(),
             path: AbsolutePathBuf::try_from(curated_root.join(".agents/plugins/marketplace.json"))
                 .unwrap(),
+            interface: Some(MarketplaceInterfaceSummary {
+                display_name: Some("ChatGPT Official".to_string()),
+            }),
             plugins: vec![ConfiguredMarketplacePluginSummary {
                 id: "linear@openai-curated".to_string(),
                 name: "linear".to_string(),
@@ -1170,6 +1288,7 @@ enabled = true
                 tmp.path().join("repo/.agents/plugins/marketplace.json"),
             )
             .unwrap(),
+            interface: None,
             plugins: vec![ConfiguredMarketplacePluginSummary {
                 id: "sample-plugin@debug".to_string(),
                 name: "sample-plugin".to_string(),
@@ -1199,6 +1318,11 @@ async fn sync_plugins_from_remote_reconciles_cache_and_config() {
     );
     write_plugin(
         &tmp.path().join("plugins/cache/openai-curated"),
+        "gmail/local",
+        "gmail",
+    );
+    write_plugin(
+        &tmp.path().join("plugins/cache/openai-curated"),
         "calendar/local",
         "calendar",
     );
@@ -1208,6 +1332,9 @@ async fn sync_plugins_from_remote_reconciles_cache_and_config() {
 plugins = true
 
 [plugins."linear@openai-curated"]
+enabled = false
+
+[plugins."gmail@openai-curated"]
 enabled = false
 
 [plugins."calendar@openai-curated"]
@@ -1243,10 +1370,13 @@ enabled = true
     assert_eq!(
         result,
         RemotePluginSyncResult {
-            installed_plugin_ids: vec!["gmail@openai-curated".to_string()],
+            installed_plugin_ids: Vec::new(),
             enabled_plugin_ids: vec!["linear@openai-curated".to_string()],
-            disabled_plugin_ids: vec!["gmail@openai-curated".to_string()],
-            uninstalled_plugin_ids: vec!["calendar@openai-curated".to_string()],
+            disabled_plugin_ids: Vec::new(),
+            uninstalled_plugin_ids: vec![
+                "gmail@openai-curated".to_string(),
+                "calendar@openai-curated".to_string(),
+            ],
         }
     );
 
@@ -1256,11 +1386,9 @@ enabled = true
             .is_dir()
     );
     assert!(
-        tmp.path()
-            .join(format!(
-                "plugins/cache/openai-curated/gmail/{TEST_CURATED_PLUGIN_SHA}"
-            ))
-            .is_dir()
+        !tmp.path()
+            .join("plugins/cache/openai-curated/gmail")
+            .exists()
     );
     assert!(
         !tmp.path()
@@ -1270,9 +1398,8 @@ enabled = true
 
     let config = fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
     assert!(config.contains(r#"[plugins."linear@openai-curated"]"#));
-    assert!(config.contains(r#"[plugins."gmail@openai-curated"]"#));
     assert!(config.contains("enabled = true"));
-    assert!(config.contains("enabled = false"));
+    assert!(!config.contains(r#"[plugins."gmail@openai-curated"]"#));
     assert!(!config.contains(r#"[plugins."calendar@openai-curated"]"#));
 
     let synced_config = load_config(tmp.path(), tmp.path()).await;
@@ -1290,7 +1417,7 @@ enabled = true
             .collect::<Vec<_>>(),
         vec![
             ("linear@openai-curated".to_string(), true, true),
-            ("gmail@openai-curated".to_string(), true, false),
+            ("gmail@openai-curated".to_string(), false, false),
             ("calendar@openai-curated".to_string(), false, false),
         ]
     );

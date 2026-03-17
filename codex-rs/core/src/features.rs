@@ -87,6 +87,8 @@ pub enum Feature {
     JsRepl,
     /// Enable a minimal JavaScript mode backed by Node's built-in vm runtime.
     CodeMode,
+    /// Restrict model-visible tools to code mode entrypoints (`exec`, `exec_wait`).
+    CodeModeOnly,
     /// Only expose js_repl tools directly to the model.
     JsReplToolsOnly,
     /// Use the single unified PTY-backed exec tool.
@@ -95,8 +97,8 @@ pub enum Feature {
     ShellZshFork,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
-    /// Allow requesting additional filesystem permissions while staying sandboxed.
-    RequestPermissions,
+    /// Allow exec tools to request additional permissions while staying sandboxed.
+    ExecPermissionApprovals,
     /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
     CodexHooks,
     /// Expose the built-in request_permissions tool.
@@ -108,6 +110,9 @@ pub enum Feature {
     WebSearchCached,
     /// Legacy search-tool feature flag kept for backward compatibility.
     SearchTool,
+    /// Removed legacy Linux bubblewrap opt-in flag retained as a no-op so old
+    /// wrappers and config can still parse it.
+    UseLinuxSandboxBwrap,
     /// Use the legacy Landlock Linux sandbox fallback instead of the default
     /// bubblewrap pipeline.
     UseLegacyLandlock,
@@ -149,8 +154,6 @@ pub enum Feature {
     Plugins,
     /// Allow the model to invoke the built-in image generation tool.
     ImageGeneration,
-    /// Route apps MCP calls through the configured gateway.
-    AppsMcpGateway,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
     /// Prompt for missing skill env var dependencies.
@@ -177,6 +180,8 @@ pub enum Feature {
     VoiceTranscription,
     /// Enable experimental realtime voice conversation mode in the TUI.
     RealtimeConversation,
+    /// Route interactive startup to the app-server-backed TUI implementation.
+    TuiAppServer,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
     /// Use the Responses API WebSocket transport for OpenAI by default.
@@ -336,7 +341,7 @@ impl Features {
             if self.enabled(feature.id) != feature.default_enabled {
                 otel.counter(
                     "codex.feature.state",
-                    1,
+                    /*inc*/ 1,
                     &[
                         ("feature", feature.key),
                         ("value", &self.enabled(feature.id).to_string()),
@@ -426,6 +431,9 @@ impl Features {
         if self.enabled(Feature::SpawnCsv) && !self.enabled(Feature::Collab) {
             self.enable(Feature::Collab);
         }
+        if self.enabled(Feature::CodeModeOnly) && !self.enabled(Feature::CodeMode) {
+            self.enable(Feature::CodeMode);
+        }
         if self.enabled(Feature::JsReplToolsOnly) && !self.enabled(Feature::JsRepl) {
             tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
             self.disable(Feature::JsReplToolsOnly);
@@ -452,7 +460,12 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
             (summary, Some(web_search_details().to_string()))
         }
         _ => {
-            let summary = format!("`{alias}` is deprecated. Use `[features].{canonical}` instead.");
+            let label = if alias.contains('.') || alias.starts_with('[') {
+                alias.to_string()
+            } else {
+                format!("[features].{alias}")
+            };
+            let summary = format!("`{label}` is deprecated. Use `[features].{canonical}` instead.");
             let details = if alias == canonical {
                 None
             } else {
@@ -556,6 +569,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::CodeModeOnly,
+        key: "code_mode_only",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::JsReplToolsOnly,
         key: "js_repl_tools_only",
         stage: Stage::UnderDevelopment,
@@ -623,8 +642,8 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::RequestPermissions,
-        key: "request_permissions",
+        id: Feature::ExecPermissionApprovals,
+        key: "exec_permission_approvals",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -638,6 +657,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::RequestPermissionsTool,
         key: "request_permissions_tool",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::UseLinuxSandboxBwrap,
+        key: "use_linux_sandbox_bwrap",
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -691,16 +716,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Collab,
         key: "multi_agent",
-        stage: Stage::Experimental {
-            name: "Multi-agents",
-            menu_description: "Ask Codex to spawn multiple agents to parallelize the work and win in efficiency.",
-            announcement: "NEW: Multi-agents can now be spawned by Codex. Enable in /experimental and restart Codex!",
-        },
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::SpawnCsv,
-        key: "spawn_csv",
+        key: "enable_fanout",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -733,12 +754,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::AppsMcpGateway,
-        key: "apps_mcp_gateway",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::SkillMcpDependencyInstall,
         key: "skill_mcp_dependency_install",
         stage: Stage::Stable,
@@ -760,8 +775,8 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::GuardianApproval,
         key: "guardian_approval",
         stage: Stage::Experimental {
-            name: "Automatic approval review",
-            menu_description: "Dispatch `on-request` approval prompts (for e.g. sandbox escapes or blocked network access) to a carefully-prompted security reviewer subagent rather than blocking the agent on your input.",
+            name: "Guardian Approvals",
+            menu_description: "When Codex needs approval for higher-risk actions (e.g. sandbox escapes or blocked network access), route eligible approval requests to a carefully-prompted security reviewer subagent rather than blocking the agent on your input. This can consume significantly more tokens because it runs a subagent on every approval request.",
             announcement: "",
         },
         default_enabled: false,
@@ -816,6 +831,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::RealtimeConversation,
         key: "realtime_conversation",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::TuiAppServer,
+        key: "tui_app_server",
+        stage: Stage::Experimental {
+            name: "App-server TUI",
+            menu_description: "Use the app-server-backed TUI implementation.",
+            announcement: "",
+        },
         default_enabled: false,
     },
     FeatureSpec {
