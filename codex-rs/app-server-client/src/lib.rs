@@ -205,7 +205,7 @@ pub struct InProcessClientStartArgs {
 impl InProcessClientStartArgs {
     fn shared_core_managers(&self) -> SharedCoreManagers {
         let auth_manager = AuthManager::shared(
-            self.config.codex_home.clone(),
+            self.auth_storage_home.clone(),
             self.enable_codex_api_key_env,
             self.config.cli_auth_credentials_store_mode,
         );
@@ -907,6 +907,59 @@ mod tests {
 
     async fn start_test_client(session_source: SessionSource) -> InProcessAppServerClient {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+    }
+
+    #[tokio::test]
+    async fn shared_core_managers_use_resolved_auth_storage_home() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let test_root = std::env::temp_dir().join(format!("codex-app-server-client-test-{unique}"));
+        let default_auth_home = test_root.join("default");
+        let override_auth_home = test_root.join("override");
+        std::fs::create_dir_all(&default_auth_home).expect("create default auth home");
+        std::fs::create_dir_all(&override_auth_home).expect("create override auth home");
+        let default_auth_file = default_auth_home.join("auth.json");
+        let override_auth_file = override_auth_home.join("auth.json");
+        std::fs::write(&default_auth_file, "{}").expect("seed default auth file");
+        std::fs::write(&override_auth_file, "{}").expect("seed override auth file");
+
+        let config = Arc::new(
+            ConfigBuilder::default()
+                .codex_home(default_auth_home.clone())
+                .build()
+                .await
+                .expect("config should build"),
+        );
+        let start_args = InProcessClientStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            auth_storage_home: override_auth_home.clone(),
+            config,
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: CodexFeedback::new(),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            client_name: "codex-app-server-client-test".to_string(),
+            client_version: "0.0.0-test".to_string(),
+            experimental_api: true,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        };
+
+        let shared_core = start_args.shared_core_managers();
+        let removed = shared_core
+            .auth_manager
+            .logout()
+            .expect("logout should succeed");
+
+        assert_eq!(removed, true);
+        assert_eq!(override_auth_file.exists(), false);
+        assert_eq!(default_auth_file.exists(), true);
+        std::fs::remove_dir_all(&test_root).expect("cleanup test auth homes");
     }
 
     async fn start_test_remote_server<F, Fut>(handler: F) -> String

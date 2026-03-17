@@ -1142,6 +1142,7 @@ fn into_app_server_tui_cli(cli: TuiCli) -> codex_tui_app_server::Cli {
         web_search: cli.web_search,
         add_dir: cli.add_dir,
         no_alt_screen: cli.no_alt_screen,
+        auth_file: cli.auth_file,
         config_overrides: cli.config_overrides,
     }
 }
@@ -1856,6 +1857,19 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/auth.json"))
         );
         assert_matches!(cli.subcommand, Some(Subcommand::Exec(_)));
+    }
+
+    #[test]
+    fn app_server_tui_cli_inherits_auth_file_override() {
+        let interactive = finalize_resume_from_args(
+            ["codex", "--auth-file", "/tmp/auth.json", "resume"].as_ref(),
+        );
+        let app_server_tui = into_app_server_tui_cli(interactive);
+
+        assert_eq!(
+            app_server_tui.auth_file,
+            Some(std::path::PathBuf::from("/tmp/auth.json"))
+        );
     }
 
     #[test]

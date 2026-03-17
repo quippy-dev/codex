@@ -356,6 +356,54 @@ fn assistant_message_stream_parsers_seed_plan_parser_across_added_and_delta_boun
     assert!(tail.plan_segments.is_empty());
 }
 
+#[tokio::test]
+async fn later_plain_plan_mode_messages_do_not_clear_cached_latest_proposed_plan_text() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_context_item = turn_context.to_turn_context_item();
+    let turn_id = turn_context_item
+        .turn_id
+        .as_deref()
+        .expect("turn context should have turn id");
+    let mut state = PlanModeStreamState::new(turn_id);
+    let plan_text = "- first step\n";
+
+    maybe_complete_plan_item_from_message(
+        &session,
+        &turn_context,
+        &mut state,
+        &ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: format!("<proposed_plan>\n{plan_text}</proposed_plan>\n"),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+    )
+    .await;
+    let cached_plan_text = session.latest_proposed_plan_text().await;
+    assert_eq!(cached_plan_text.is_some(), true);
+
+    maybe_complete_plan_item_from_message(
+        &session,
+        &turn_context,
+        &mut state,
+        &ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "trailing explanation without plan markup".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+    )
+    .await;
+
+    assert_eq!(session.latest_proposed_plan_text().await, cached_plan_text);
+}
+
 fn make_mcp_tool(
     server_name: &str,
     tool_name: &str,

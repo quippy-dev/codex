@@ -111,5 +111,8 @@ pub struct Cli {
     pub no_alt_screen: bool,
 
     #[clap(skip)]
+    pub auth_file: Option<PathBuf>,
+
+    #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

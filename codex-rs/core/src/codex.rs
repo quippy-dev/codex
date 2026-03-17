@@ -7293,7 +7293,6 @@ async fn maybe_complete_plan_item_from_message(
             }
         }
         let Some(plan_text) = extract_proposed_plan_text(&text) else {
-            crate::compact::plan_retention::cache::clear_latest_proposed_plan_text(sess).await;
             return;
         };
         let (plan_text, _citations) = strip_citations(&plan_text);

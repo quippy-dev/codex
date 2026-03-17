@@ -22,6 +22,7 @@ use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
 use codex_core::auth::enforce_login_restrictions;
+use codex_core::auth::resolve_auth_storage_home;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -245,6 +246,7 @@ pub use public_widgets::composer_input::ComposerInput;
 async fn start_embedded_app_server(
     arg0_paths: Arg0DispatchPaths,
     config: Config,
+    auth_file: Option<PathBuf>,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     loader_overrides: LoaderOverrides,
     cloud_requirements: CloudRequirementsLoader,
@@ -253,6 +255,7 @@ async fn start_embedded_app_server(
     start_embedded_app_server_with(
         arg0_paths,
         config,
+        auth_file,
         cli_kv_overrides,
         loader_overrides,
         cloud_requirements,
@@ -339,6 +342,7 @@ async fn start_app_server(
     target: &AppServerTarget,
     arg0_paths: Arg0DispatchPaths,
     config: Config,
+    auth_file: Option<PathBuf>,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     loader_overrides: LoaderOverrides,
     cloud_requirements: CloudRequirementsLoader,
@@ -348,6 +352,7 @@ async fn start_app_server(
         AppServerTarget::Embedded => start_embedded_app_server(
             arg0_paths,
             config,
+            auth_file,
             cli_kv_overrides,
             loader_overrides,
             cloud_requirements,
@@ -369,6 +374,7 @@ pub(crate) async fn start_app_server_for_picker(
         target,
         Arg0DispatchPaths::default(),
         config.clone(),
+        None,
         Vec::new(),
         LoaderOverrides::default(),
         CloudRequirementsLoader::default(),
@@ -388,6 +394,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
 async fn start_embedded_app_server_with<F, Fut>(
     arg0_paths: Arg0DispatchPaths,
     config: Config,
+    auth_file: Option<PathBuf>,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     loader_overrides: LoaderOverrides,
     cloud_requirements: CloudRequirementsLoader,
@@ -408,7 +415,11 @@ where
             range: None,
         })
         .collect();
-    let auth_storage_home = config.codex_home.clone();
+    let auth_storage_home = resolve_auth_storage_home(
+        config.codex_home.clone(),
+        auth_file.as_deref(),
+        config.cli_auth_credentials_store_mode,
+    )?;
     let client = start_client(InProcessClientStartArgs {
         arg0_paths,
         config: Arc::new(config),
@@ -575,6 +586,7 @@ pub async fn run_main(
     remote: Option<String>,
 ) -> std::io::Result<AppExitInfo> {
     let remote_url = remote;
+    let auth_file = cli.auth_file.clone();
     let app_server_target = remote_url
         .clone()
         .map(AppServerTarget::Remote)
@@ -876,6 +888,7 @@ pub async fn run_main(
         arg0_paths,
         loader_overrides,
         app_server_target,
+        auth_file,
         config,
         overrides,
         cli_kv_overrides,
@@ -893,6 +906,7 @@ async fn run_ratatui_app(
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     app_server_target: AppServerTarget,
+    auth_file: Option<PathBuf>,
     initial_config: Config,
     overrides: ConfigOverrides,
     cli_kv_overrides: Vec<(String, toml::Value)>,
@@ -954,6 +968,7 @@ async fn run_ratatui_app(
                 &app_server_target,
                 arg0_paths.clone(),
                 initial_config.clone(),
+                auth_file.clone(),
                 cli_kv_overrides.clone(),
                 loader_overrides.clone(),
                 cloud_requirements.clone(),
@@ -1068,6 +1083,7 @@ async fn run_ratatui_app(
                 &app_server_target,
                 arg0_paths.clone(),
                 config.clone(),
+                auth_file.clone(),
                 cli_kv_overrides.clone(),
                 loader_overrides.clone(),
                 cloud_requirements.clone(),
@@ -1274,6 +1290,7 @@ async fn run_ratatui_app(
         &app_server_target,
         arg0_paths,
         config.clone(),
+        auth_file,
         cli_kv_overrides.clone(),
         loader_overrides,
         cloud_requirements.clone(),
@@ -1582,6 +1599,7 @@ mod tests {
         start_embedded_app_server(
             Arg0DispatchPaths::default(),
             config,
+            None,
             Vec::new(),
             LoaderOverrides::default(),
             CloudRequirementsLoader::default(),
@@ -1736,6 +1754,7 @@ mod tests {
         let result = start_embedded_app_server_with(
             Arg0DispatchPaths::default(),
             config,
+            None,
             Vec::new(),
             LoaderOverrides::default(),
             CloudRequirementsLoader::default(),
@@ -1752,6 +1771,38 @@ mod tests {
             err.to_string()
                 .contains("failed to start embedded app server"),
             "error should preserve the embedded app server startup context"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_app_server_uses_auth_file_override_for_auth_storage_home()
+    -> color_eyre::Result<()> {
+        let default_auth_home = TempDir::new()?;
+        let override_auth_home = TempDir::new()?;
+        let config = build_config(&default_auth_home).await?;
+        let auth_file = override_auth_home.path().join("auth.json");
+        let mut observed_auth_storage_home = None;
+
+        let result = start_embedded_app_server_with(
+            Arg0DispatchPaths::default(),
+            config,
+            Some(auth_file.clone()),
+            Vec::new(),
+            LoaderOverrides::default(),
+            CloudRequirementsLoader::default(),
+            codex_feedback::CodexFeedback::new(),
+            |args| {
+                observed_auth_storage_home = Some(args.auth_storage_home.clone());
+                async { Err(std::io::Error::other("stop after capture")) }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            observed_auth_storage_home,
+            Some(override_auth_home.path().to_path_buf())
         );
         Ok(())
     }
