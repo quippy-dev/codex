@@ -695,6 +695,84 @@ fn drop_last_n_user_turns_preserves_prefix() {
 }
 
 #[test]
+fn remove_oldest_item_between_first_and_last_user_message_preserves_anchors() {
+    let items = vec![
+        assistant_msg("session prefix item"),
+        user_msg("u1"),
+        assistant_msg("a1"),
+        user_msg("u2"),
+        assistant_msg("a2"),
+        user_msg("u3"),
+        assistant_msg("a3"),
+    ];
+
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(items);
+
+    assert!(history.remove_oldest_item_between_first_and_last_user_message());
+    assert_eq!(
+        history.clone().for_prompt(&modalities),
+        vec![
+            assistant_msg("session prefix item"),
+            user_msg("u1"),
+            user_msg("u2"),
+            assistant_msg("a2"),
+            user_msg("u3"),
+            assistant_msg("a3"),
+        ]
+    );
+
+    assert!(history.remove_oldest_item_between_first_and_last_user_message());
+    assert_eq!(
+        history.clone().for_prompt(&modalities),
+        vec![
+            assistant_msg("session prefix item"),
+            user_msg("u1"),
+            assistant_msg("a2"),
+            user_msg("u3"),
+            assistant_msg("a3"),
+        ]
+    );
+
+    assert!(history.remove_oldest_item_between_first_and_last_user_message());
+    assert_eq!(
+        history.clone().for_prompt(&modalities),
+        vec![
+            assistant_msg("session prefix item"),
+            user_msg("u1"),
+            user_msg("u3"),
+            assistant_msg("a3"),
+        ]
+    );
+
+    assert!(!history.remove_oldest_item_between_first_and_last_user_message());
+}
+
+#[test]
+fn remove_oldest_item_between_first_and_last_user_message_ignores_summary_anchor() {
+    let items = vec![
+        user_input_text_msg("u1"),
+        assistant_msg("a1"),
+        user_input_text_msg("u2"),
+        user_input_text_msg(&format!("{}\nsummary", crate::compact::SUMMARY_PREFIX)),
+    ];
+
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(items);
+
+    assert!(history.remove_oldest_item_between_first_and_last_user_message());
+    assert_eq!(
+        history.clone().for_prompt(&modalities),
+        vec![
+            user_input_text_msg("u1"),
+            user_input_text_msg("u2"),
+            user_input_text_msg(&format!("{}\nsummary", crate::compact::SUMMARY_PREFIX)),
+        ]
+    );
+    assert!(!history.remove_oldest_item_between_first_and_last_user_message());
+}
+
+#[test]
 fn drop_last_n_user_turns_ignores_session_prefix_user_messages() {
     let items = vec![
         user_input_text_msg("<environment_context>ctx</environment_context>"),
