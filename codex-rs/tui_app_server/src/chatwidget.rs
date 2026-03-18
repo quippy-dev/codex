@@ -54,6 +54,7 @@ use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_chatgpt::connectors;
+use codex_core::AuthManager;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
@@ -463,6 +464,7 @@ pub(crate) fn get_limits_duration(windows_minutes: i64) -> String {
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
     pub(crate) config: Config,
+    pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) frame_requester: FrameRequester,
     pub(crate) app_event_tx: AppEventSender,
     pub(crate) initial_user_message: Option<UserMessage>,
@@ -641,6 +643,7 @@ pub(crate) struct ChatWidget {
     /// where the overlay may briefly treat new tail content as already cached.
     active_cell_revision: u64,
     config: Config,
+    pub(crate) auth_manager: Arc<AuthManager>,
     /// The unmasked collaboration mode settings (always Default mode).
     ///
     /// Masks are applied on top of this base mode to derive the effective mode.
@@ -3530,6 +3533,7 @@ impl ChatWidget {
     fn new_with_op_target(common: ChatWidgetInit, codex_op_target: CodexOpTarget) -> Self {
         let ChatWidgetInit {
             config,
+            auth_manager,
             frame_requester,
             app_event_tx,
             initial_user_message,
@@ -3596,6 +3600,7 @@ impl ChatWidget {
             active_cell,
             active_cell_revision: 0,
             config,
+            auth_manager,
             skills_all: Vec::new(),
             skills_initial_state: None,
             current_collaboration_mode,
@@ -3723,6 +3728,7 @@ impl ChatWidget {
     ) -> Self {
         let ChatWidgetInit {
             config,
+            auth_manager,
             frame_requester,
             app_event_tx,
             initial_user_message,
@@ -3789,6 +3795,7 @@ impl ChatWidget {
             active_cell: None,
             active_cell_revision: 0,
             config,
+            auth_manager,
             skills_all: Vec::new(),
             skills_initial_state: None,
             current_collaboration_mode,
@@ -4331,10 +4338,7 @@ impl ChatWidget {
                 self.request_quit_without_confirmation();
             }
             SlashCommand::Logout => {
-                if let Err(e) = codex_core::auth::logout(
-                    &self.config.codex_home,
-                    self.config.cli_auth_credentials_store_mode,
-                ) {
+                if let Err(e) = self.auth_manager.logout() {
                     tracing::error!("failed to logout: {e}");
                 }
                 self.request_quit_without_confirmation();
