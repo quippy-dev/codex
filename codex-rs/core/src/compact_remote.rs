@@ -13,7 +13,6 @@ use crate::compact_remote_invariants::retry_once_invalid_encrypted_content_with_
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
-use crate::context_manager::is_codex_generated_item;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -109,7 +108,7 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await?;
     let compact_tool_token_count = estimate_tool_token_count(&compact_tools)?;
-    let deleted_items = trim_function_call_history_to_fit_context_window(
+    let deleted_items = trim_history_to_fit_context_window_for_remote_compaction(
         &mut history,
         turn_context.as_ref(),
         &base_instructions,
@@ -326,7 +325,7 @@ fn log_remote_compact_failure(
     );
 }
 
-fn trim_function_call_history_to_fit_context_window(
+fn trim_history_to_fit_context_window_for_remote_compaction(
     history: &mut ContextManager,
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
@@ -336,7 +335,7 @@ fn trim_function_call_history_to_fit_context_window(
         return 0;
     };
 
-    trim_function_call_history_to_fit_token_budget(
+    trim_history_to_fit_token_budget_for_remote_compaction(
         history,
         context_window,
         base_instructions,
@@ -344,7 +343,7 @@ fn trim_function_call_history_to_fit_context_window(
     )
 }
 
-fn trim_function_call_history_to_fit_token_budget(
+fn trim_history_to_fit_token_budget_for_remote_compaction(
     history: &mut ContextManager,
     context_window: i64,
     base_instructions: &BaseInstructions,
@@ -358,13 +357,9 @@ fn trim_function_call_history_to_fit_token_budget(
             estimated_tokens.saturating_add(extra_token_budget) > context_window
         })
     {
-        let Some(last_item) = history.raw_items().last() else {
-            break;
-        };
-        if !is_codex_generated_item(last_item) {
-            break;
-        }
-        if !history.remove_last_item() {
+        // Preserve the oldest real user goal plus the newest user/tail context. If that still
+        // cannot fit, fall through and keep the existing remote compaction failure behavior.
+        if !history.remove_oldest_item_between_first_and_last_user_message() {
             break;
         }
         deleted_items += 1;
@@ -400,7 +395,7 @@ fn estimate_tool_token_count(tools: &[crate::client_common::tools::ToolSpec]) ->
 
 #[cfg(test)]
 mod tests {
-    use super::trim_function_call_history_to_fit_token_budget;
+    use super::trim_history_to_fit_token_budget_for_remote_compaction;
     use crate::context_manager::ContextManager;
     use crate::truncate::TruncationPolicy;
     use codex_protocol::models::BaseInstructions;
@@ -412,11 +407,166 @@ mod tests {
     #[test]
     fn trim_function_call_history_accounts_for_tool_budget() {
         let mut history = ContextManager::new();
-        let user_message = ResponseItem::Message {
+        let first_user = ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: "hello compact".to_string(),
+                text: "first goal".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let middle_assistant = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "older response".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let latest_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "latest question".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        history.record_items(
+            [&first_user, &middle_assistant, &latest_user],
+            TruncationPolicy::Tokens(10_000),
+        );
+
+        let base_instructions = BaseInstructions {
+            text: String::new(),
+        };
+        let mut trimmed_history = ContextManager::new();
+        trimmed_history.record_items(
+            [&first_user, &latest_user],
+            TruncationPolicy::Tokens(10_000),
+        );
+        let trimmed_tokens = trimmed_history
+            .estimate_token_count_with_base_instructions(&base_instructions)
+            .expect("history should estimate");
+        let extra_tool_budget = 64;
+        let context_window = trimmed_tokens.saturating_add(extra_tool_budget);
+
+        let deleted_items = trim_history_to_fit_token_budget_for_remote_compaction(
+            &mut history,
+            context_window,
+            &base_instructions,
+            extra_tool_budget,
+        );
+
+        assert_eq!(deleted_items, 1);
+        assert_eq!(history.raw_items(), &[first_user, latest_user]);
+    }
+
+    #[test]
+    fn trim_history_preserves_first_and_last_user_messages() {
+        let mut history = ContextManager::new();
+        let prefix = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "session prefix".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let first_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "first goal".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let old_assistant = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "older response".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let middle_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "middle question".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let latest_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "latest question".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let latest_assistant = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "latest answer".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        history.record_items(
+            [
+                &prefix,
+                &first_user,
+                &old_assistant,
+                &middle_user,
+                &latest_user,
+                &latest_assistant,
+            ],
+            TruncationPolicy::Tokens(10_000),
+        );
+
+        let base_instructions = BaseInstructions {
+            text: String::new(),
+        };
+        let mut trimmed_history = ContextManager::new();
+        trimmed_history.record_items(
+            [&prefix, &first_user, &latest_user, &latest_assistant],
+            TruncationPolicy::Tokens(10_000),
+        );
+        let latest_tail_tokens = trimmed_history
+            .estimate_token_count_with_base_instructions(&base_instructions)
+            .expect("trimmed history should estimate");
+
+        let deleted_items = trim_history_to_fit_token_budget_for_remote_compaction(
+            &mut history,
+            latest_tail_tokens,
+            &base_instructions,
+            0,
+        );
+
+        assert_eq!(deleted_items, 2);
+        assert_eq!(
+            history.raw_items(),
+            &[prefix, first_user, latest_user, latest_assistant]
+        );
+    }
+
+    #[test]
+    fn trim_history_without_real_user_messages_falls_back_to_oldest_items() {
+        let mut history = ContextManager::new();
+        let developer = ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "system guidance".to_string(),
             }],
             end_turn: None,
             phase: None,
@@ -428,30 +578,21 @@ mod tests {
                 ..Default::default()
             },
         };
-        history.record_items(
-            [&user_message, &tool_output],
-            TruncationPolicy::Tokens(10_000),
-        );
+        history.record_items([&developer, &tool_output], TruncationPolicy::Tokens(10_000));
 
         let base_instructions = BaseInstructions {
             text: String::new(),
         };
-        let history_tokens = history
-            .estimate_token_count_with_base_instructions(&base_instructions)
-            .expect("history should estimate");
-        let extra_tool_budget = 64;
-        let context_window = history_tokens
-            .saturating_add(extra_tool_budget)
-            .saturating_sub(1);
+        let context_window = 0;
 
-        let deleted_items = trim_function_call_history_to_fit_token_budget(
+        let deleted_items = trim_history_to_fit_token_budget_for_remote_compaction(
             &mut history,
             context_window,
             &base_instructions,
-            extra_tool_budget,
+            0,
         );
 
-        assert_eq!(deleted_items, 1);
-        assert_eq!(history.raw_items(), &[user_message]);
+        assert_eq!(deleted_items, 2);
+        assert!(history.raw_items().is_empty());
     }
 }

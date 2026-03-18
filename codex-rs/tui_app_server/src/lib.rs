@@ -1794,7 +1794,7 @@ mod tests {
             CloudRequirementsLoader::default(),
             codex_feedback::CodexFeedback::new(),
             |args| {
-                observed_auth_storage_home = Some(args.auth_storage_home.clone());
+                observed_auth_storage_home = Some(args.auth_storage_home);
                 async { Err(std::io::Error::other("stop after capture")) }
             },
         )

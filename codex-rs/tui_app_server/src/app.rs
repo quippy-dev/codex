@@ -2365,6 +2365,12 @@ impl App {
             codex_core::terminal::user_agent(),
             SessionSource::Cli,
         );
+        let auth_manager = AuthManager::shared_with_auth_file(
+            config.codex_home.clone(),
+            /*enable_codex_api_key_env*/ false,
+            config.cli_auth_credentials_store_mode,
+            auth_file,
+        )?;
         if config
             .tui_status_line
             .as_ref()
@@ -2372,12 +2378,6 @@ impl App {
         {
             session_telemetry.counter("codex.status_line", /*inc*/ 1, &[]);
         }
-        let auth_manager = AuthManager::shared_with_auth_file(
-            config.codex_home.clone(),
-            /*enable_codex_api_key_env*/ false,
-            config.cli_auth_credentials_store_mode,
-            auth_file,
-        )?;
 
         let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
 

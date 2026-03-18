@@ -1,6 +1,8 @@
 use crate::codex::TurnContext;
+use crate::compact::is_summary_message;
 use crate::context_manager::normalize;
 use crate::event_mapping::is_contextual_user_message_content;
+use crate::event_mapping::parse_turn_item;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_bytes_for_tokens;
 use crate::truncate::approx_token_count;
@@ -160,6 +162,7 @@ impl ContextManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
@@ -167,6 +170,28 @@ impl ContextManager {
         } else {
             false
         }
+    }
+
+    pub(crate) fn remove_oldest_item_between_first_and_last_user_message(&mut self) -> bool {
+        let user_positions = real_user_message_positions(&self.items);
+        let (Some(&first_user_idx), Some(&last_user_idx)) =
+            (user_positions.first(), user_positions.last())
+        else {
+            if self.items.is_empty() {
+                return false;
+            }
+            self.remove_first_item();
+            return true;
+        };
+
+        let remove_idx = first_user_idx.saturating_add(1);
+        if remove_idx >= last_user_idx {
+            return false;
+        }
+
+        let removed = self.items.remove(remove_idx);
+        normalize::remove_corresponding_for(&mut self.items, &removed);
+        true
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
@@ -622,15 +647,6 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
     }
 }
 
-pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
-    matches!(
-        item,
-        ResponseItem::FunctionCallOutput { .. }
-            | ResponseItem::ToolSearchOutput { .. }
-            | ResponseItem::CustomToolCallOutput { .. }
-    ) || matches!(item, ResponseItem::Message { role, .. } if role == "developer")
-}
-
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
     let ResponseItem::Message { role, content, .. } = item else {
         return false;
@@ -642,6 +658,19 @@ fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {
     let mut positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         if is_user_turn_boundary(item) {
+            positions.push(idx);
+        }
+    }
+    positions
+}
+
+fn real_user_message_positions(items: &[ResponseItem]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let Some(codex_protocol::items::TurnItem::UserMessage(user)) = parse_turn_item(item) else {
+            continue;
+        };
+        if !is_summary_message(&user.message()) {
             positions.push(idx);
         }
     }
