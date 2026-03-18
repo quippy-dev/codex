@@ -1,3 +1,4 @@
+use super::append_code_mode_sample;
 use super::code_mode_output_type;
 use super::render_json_schema_to_typescript;
 use pretty_assertions::assert_eq;
@@ -17,7 +18,7 @@ fn render_json_schema_to_typescript_renders_object_properties() {
 
     assert_eq!(
         render_json_schema_to_typescript(&schema),
-        "{\n  path: string;\n  recursive?: boolean;\n}"
+        "{ path: string; recursive?: boolean; }"
     );
 }
 
@@ -52,7 +53,7 @@ fn render_json_schema_to_typescript_renders_additional_properties() {
 
     assert_eq!(
         render_json_schema_to_typescript(&schema),
-        "{\n  tags?: Array<string>;\n  [key: string]: number;\n}"
+        "{ tags?: Array<string>; [key: string]: number; }"
     );
 }
 
@@ -71,7 +72,35 @@ fn render_json_schema_to_typescript_sorts_object_properties() {
 
     assert_eq!(
         render_json_schema_to_typescript(&schema),
-        "{\n  _meta?: string;\n  content: Array<string>;\n  isError?: boolean;\n  structuredContent?: string;\n}"
+        "{ _meta?: string; content: Array<string>; isError?: boolean; structuredContent?: string; }"
+    );
+}
+
+#[test]
+fn append_code_mode_sample_uses_global_tools_for_valid_identifiers() {
+    assert_eq!(
+        append_code_mode_sample(
+            "desc",
+            "mcp__ologs__get_profile",
+            "args",
+            "{ foo: string }".to_string(),
+            "unknown".to_string(),
+        ),
+        "desc\n\nexec tool declaration:\n```ts\ndeclare const tools: { mcp__ologs__get_profile(args: { foo: string }): Promise<unknown>; };\n```"
+    );
+}
+
+#[test]
+fn append_code_mode_sample_normalizes_invalid_identifiers() {
+    assert_eq!(
+        append_code_mode_sample(
+            "desc",
+            "mcp__rmcp__echo-tool",
+            "args",
+            "{ foo: string }".to_string(),
+            "unknown".to_string(),
+        ),
+        "desc\n\nexec tool declaration:\n```ts\ndeclare const tools: { mcp__rmcp__echo_tool(args: { foo: string }): Promise<unknown>; };\n```"
     );
 }
 
@@ -79,6 +108,6 @@ fn render_json_schema_to_typescript_sorts_object_properties() {
 fn code_mode_output_type_defaults_mcp_tools_to_call_tool_result_shape() {
     assert_eq!(
         code_mode_output_type("mcp__rmcp__echo", None),
-        "{\n  _meta?: unknown;\n  content: Array<unknown>;\n  isError?: boolean;\n  structuredContent?: unknown;\n}"
+        "{ _meta?: unknown; content: Array<unknown>; isError?: boolean; structuredContent?: unknown; }"
     );
 }

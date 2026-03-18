@@ -47,10 +47,14 @@ use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
 use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
+use codex_app_server_protocol::GuardianApprovalReview;
+use codex_app_server_protocol::GuardianApprovalReviewStatus;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
 use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
+use codex_app_server_protocol::ItemGuardianApprovalReviewStartedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
@@ -110,7 +114,6 @@ use codex_core::sandboxing::intersect_permission_profiles;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
-use codex_protocol::models::PermissionProfile as CorePermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
@@ -118,6 +121,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::Op;
@@ -127,6 +131,7 @@ use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
@@ -183,6 +188,66 @@ async fn resolve_server_request_on_thread_listener(
 
     if let Err(err) = completion_rx.await {
         error!("failed to remove pending client request: {err}");
+    }
+}
+
+fn guardian_auto_approval_review_notification(
+    conversation_id: &ThreadId,
+    event_turn_id: &str,
+    assessment: &GuardianAssessmentEvent,
+) -> ServerNotification {
+    // TODO(ccunningham): Attach guardian review state to the reviewed tool
+    // item's lifecycle instead of sending standalone review notifications so
+    // the app-server API can persist and replay review state via `thread/read`.
+    let turn_id = if assessment.turn_id.is_empty() {
+        event_turn_id.to_string()
+    } else {
+        assessment.turn_id.clone()
+    };
+    let review = GuardianApprovalReview {
+        status: match assessment.status {
+            codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
+                GuardianApprovalReviewStatus::InProgress
+            }
+            codex_protocol::protocol::GuardianAssessmentStatus::Approved => {
+                GuardianApprovalReviewStatus::Approved
+            }
+            codex_protocol::protocol::GuardianAssessmentStatus::Denied => {
+                GuardianApprovalReviewStatus::Denied
+            }
+            codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
+                GuardianApprovalReviewStatus::Aborted
+            }
+        },
+        risk_score: assessment.risk_score,
+        risk_level: assessment.risk_level.map(Into::into),
+        rationale: assessment.rationale.clone(),
+    };
+    match assessment.status {
+        codex_protocol::protocol::GuardianAssessmentStatus::InProgress => {
+            ServerNotification::ItemGuardianApprovalReviewStarted(
+                ItemGuardianApprovalReviewStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id,
+                    target_item_id: assessment.id.clone(),
+                    review,
+                    action: assessment.action.clone(),
+                },
+            )
+        }
+        codex_protocol::protocol::GuardianAssessmentStatus::Approved
+        | codex_protocol::protocol::GuardianAssessmentStatus::Denied
+        | codex_protocol::protocol::GuardianAssessmentStatus::Aborted => {
+            ServerNotification::ItemGuardianApprovalReviewCompleted(
+                ItemGuardianApprovalReviewCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id,
+                    target_item_id: assessment.id.clone(),
+                    review,
+                    action: assessment.action.clone(),
+                },
+            )
+        }
     }
 }
 
@@ -248,6 +313,16 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
         }
         EventMsg::Warning(_warning_event) => {}
+        EventMsg::GuardianAssessment(assessment) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = guardian_auto_approval_review_notification(
+                    &conversation_id,
+                    &event_turn_id,
+                    &assessment,
+                );
+                outgoing.send_server_notification(notification).await;
+            }
+        }
         EventMsg::ModelReroute(event) => {
             if let ApiVersion::V2 = api_version {
                 let notification = ModelReroutedNotification {
@@ -279,6 +354,20 @@ pub(crate) async fn apply_bespoke_event_handling(
             if let ApiVersion::V2 = api_version {
                 match event.payload {
                     RealtimeEvent::SessionUpdated { .. } => {}
+                    RealtimeEvent::InputAudioSpeechStarted(event) => {
+                        let notification = ThreadRealtimeItemAddedNotification {
+                            thread_id: conversation_id.to_string(),
+                            item: serde_json::json!({
+                                "type": "input_audio_buffer.speech_started",
+                                "item_id": event.item_id,
+                            }),
+                        };
+                        outgoing
+                            .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
+                                notification,
+                            ))
+                            .await;
+                    }
                     RealtimeEvent::InputTranscriptDelta(_) => {}
                     RealtimeEvent::OutputTranscriptDelta(_) => {}
                     RealtimeEvent::AudioOut(audio) => {
@@ -290,6 +379,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                             .send_server_notification(
                                 ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
                             )
+                            .await;
+                    }
+                    RealtimeEvent::ResponseCancelled(event) => {
+                        let notification = ThreadRealtimeItemAddedNotification {
+                            thread_id: conversation_id.to_string(),
+                            item: serde_json::json!({
+                                "type": "response.cancelled",
+                                "response_id": event.response_id,
+                            }),
+                        };
+                        outgoing
+                            .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
+                                notification,
+                            ))
                             .await;
                     }
                     RealtimeEvent::ConversationItemAdded(item) => {
@@ -870,22 +973,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabAgentSpawnEnd(end_event) => {
-            let fallback_model = end_event.model.clone();
-            let fallback_reasoning_effort = end_event.reasoning_effort;
-            let call_id = end_event.call_id.clone();
-            let item = {
-                let state = thread_state.lock().await;
-                state
-                    .active_turn_snapshot()
-                    .and_then(|turn| turn.items.into_iter().find(|item| item.id() == &call_id))
-            }
-            .unwrap_or_else(|| {
-                collab_spawn_end_item(
-                    end_event,
-                    Some(fallback_model),
-                    Some(fallback_reasoning_effort),
-                )
-            });
+            let item = collab_spawn_end_item(end_event);
             let notification = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
@@ -1949,7 +2037,7 @@ async fn handle_turn_interrupted(
         conversation_id,
         event_turn_id,
         TurnStatus::Interrupted,
-        None,
+        /*error*/ None,
         outgoing,
     )
     .await;
@@ -2263,7 +2351,7 @@ fn mcp_server_elicitation_response_from_client_result(
 
 async fn on_request_permissions_response(
     call_id: String,
-    requested_permissions: CorePermissionProfile,
+    requested_permissions: CoreRequestPermissionProfile,
     pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
@@ -2291,7 +2379,7 @@ async fn on_request_permissions_response(
 }
 
 fn request_permissions_response_from_client_result(
-    requested_permissions: CorePermissionProfile,
+    requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
 ) -> Option<CoreRequestPermissionsResponse> {
     let value = match response {
@@ -2323,9 +2411,10 @@ fn request_permissions_response_from_client_result(
         });
     Some(CoreRequestPermissionsResponse {
         permissions: intersect_permission_profiles(
-            requested_permissions,
+            requested_permissions.into(),
             response.permissions.into(),
-        ),
+        )
+        .into(),
         scope: response.scope.to_core(),
     })
 }
@@ -2339,7 +2428,7 @@ fn render_review_output_text(output: &ReviewOutputEvent) -> String {
         sections.push(explanation.to_string());
     }
     if !output.findings.is_empty() {
-        let findings = format_review_findings_block(&output.findings, None);
+        let findings = format_review_findings_block(&output.findings, /*selection*/ None);
         let trimmed = findings.trim();
         if !trimmed.is_empty() {
             sections.push(trimmed.to_string());
@@ -2537,7 +2626,7 @@ async fn on_command_execution_request_approval_response(
             item_id.clone(),
             completion_item.command,
             completion_item.cwd,
-            None,
+            /*process_id*/ None,
             completion_item.command_actions,
             status,
             &outgoing,
@@ -2579,8 +2668,6 @@ fn collab_spawn_begin_item(
 
 fn collab_spawn_end_item(
     end_event: codex_protocol::protocol::CollabAgentSpawnEndEvent,
-    model: Option<String>,
-    reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
 ) -> ThreadItem {
     let has_receiver = end_event.new_thread_id.is_some();
     let status = match &end_event.status {
@@ -2623,8 +2710,8 @@ fn collab_spawn_end_item(
         receiver_thread_ids,
         receiver_agents,
         prompt: Some(end_event.prompt),
-        model,
-        reasoning_effort,
+        model: Some(end_event.model),
+        reasoning_effort: Some(end_event.reasoning_effort),
         close_result: None,
         agents_states,
         agent_statuses,
@@ -2889,13 +2976,17 @@ mod tests {
     use anyhow::Result;
     use anyhow::anyhow;
     use anyhow::bail;
+    use codex_app_server_protocol::GuardianApprovalReviewStatus;
     use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::TurnPlanStepStatus;
+    use codex_core::CodexAuth;
+    use codex_core::built_in_model_providers;
+    use codex_core::config::ConfigBuilder;
+    use codex_core::config_loader::LoaderOverrides;
+    use codex_core::test_support::thread_manager_with_models_provider_and_home;
     use codex_protocol::mcp::CallToolResult;
-    use codex_protocol::models::MacOsAutomationPermission;
-    use codex_protocol::models::MacOsContactsPermission;
-    use codex_protocol::models::MacOsPreferencesPermission;
-    use codex_protocol::models::MacOsSeatbeltProfileExtensions;
+    use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
+    use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
@@ -2909,9 +3000,11 @@ mod tests {
     use codex_protocol::protocol::RateLimitWindow;
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageInfo;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use rmcp::model::Content;
     use serde_json::Value as JsonValue;
+    use serde_json::json;
     use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
@@ -2930,6 +3023,120 @@ mod tests {
         match envelope {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
             OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
+        }
+    }
+
+    #[test]
+    fn guardian_assessment_started_uses_event_turn_id_fallback() {
+        let conversation_id = ThreadId::new();
+        let action = json!({
+            "tool": "shell",
+            "command": "rm -rf /tmp/example.sqlite",
+        });
+        let notification = guardian_auto_approval_review_notification(
+            &conversation_id,
+            "turn-from-event",
+            &GuardianAssessmentEvent {
+                id: "item-1".to_string(),
+                turn_id: String::new(),
+                status: codex_protocol::protocol::GuardianAssessmentStatus::InProgress,
+                risk_score: None,
+                risk_level: None,
+                rationale: None,
+                action: Some(action.clone()),
+            },
+        );
+
+        match notification {
+            ServerNotification::ItemGuardianApprovalReviewStarted(payload) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-from-event");
+                assert_eq!(payload.target_item_id, "item-1");
+                assert_eq!(
+                    payload.review.status,
+                    GuardianApprovalReviewStatus::InProgress
+                );
+                assert_eq!(payload.review.risk_score, None);
+                assert_eq!(payload.review.risk_level, None);
+                assert_eq!(payload.review.rationale, None);
+                assert_eq!(payload.action, Some(action));
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guardian_assessment_completed_emits_review_payload() {
+        let conversation_id = ThreadId::new();
+        let action = json!({
+            "tool": "shell",
+            "command": "rm -rf /tmp/example.sqlite",
+        });
+        let notification = guardian_auto_approval_review_notification(
+            &conversation_id,
+            "turn-from-event",
+            &GuardianAssessmentEvent {
+                id: "item-2".to_string(),
+                turn_id: "turn-from-assessment".to_string(),
+                status: codex_protocol::protocol::GuardianAssessmentStatus::Denied,
+                risk_score: Some(91),
+                risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::High),
+                rationale: Some("too risky".to_string()),
+                action: Some(action.clone()),
+            },
+        );
+
+        match notification {
+            ServerNotification::ItemGuardianApprovalReviewCompleted(payload) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-from-assessment");
+                assert_eq!(payload.target_item_id, "item-2");
+                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Denied);
+                assert_eq!(payload.review.risk_score, Some(91));
+                assert_eq!(
+                    payload.review.risk_level,
+                    Some(codex_app_server_protocol::GuardianRiskLevel::High)
+                );
+                assert_eq!(payload.review.rationale.as_deref(), Some("too risky"));
+                assert_eq!(payload.action, Some(action));
+            }
+            other => panic!("unexpected notification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guardian_assessment_aborted_emits_completed_review_payload() {
+        let conversation_id = ThreadId::new();
+        let action = json!({
+            "tool": "network_access",
+            "target": "api.openai.com:443",
+        });
+        let notification = guardian_auto_approval_review_notification(
+            &conversation_id,
+            "turn-from-event",
+            &GuardianAssessmentEvent {
+                id: "item-3".to_string(),
+                turn_id: "turn-from-assessment".to_string(),
+                status: codex_protocol::protocol::GuardianAssessmentStatus::Aborted,
+                risk_score: None,
+                risk_level: None,
+                rationale: None,
+                action: Some(action.clone()),
+            },
+        );
+
+        match notification {
+            ServerNotification::ItemGuardianApprovalReviewCompleted(payload) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-from-assessment");
+                assert_eq!(payload.target_item_id, "item-3");
+                assert_eq!(payload.review.status, GuardianApprovalReviewStatus::Aborted);
+                assert_eq!(payload.review.risk_score, None);
+                assert_eq!(payload.review.risk_level, None);
+                assert_eq!(payload.review.rationale, None);
+                assert_eq!(payload.action, Some(action));
+            }
+            other => panic!("unexpected notification: {other:?}"),
         }
     }
 
@@ -2970,7 +3177,7 @@ mod tests {
         };
 
         let response = request_permissions_response_from_client_result(
-            CorePermissionProfile::default(),
+            CoreRequestPermissionProfile::default(),
             Ok(Err(error)),
         );
 
@@ -2978,156 +3185,91 @@ mod tests {
     }
 
     #[test]
-    fn request_permissions_response_accepts_partial_macos_grants() {
-        let requested_permissions = CorePermissionProfile {
-            macos: Some(MacOsSeatbeltProfileExtensions {
-                macos_preferences: MacOsPreferencesPermission::ReadWrite,
-                macos_automation: MacOsAutomationPermission::BundleIds(vec![
-                    "com.apple.Notes".to_string(),
-                    "com.apple.Reminders".to_string(),
-                ]),
-                macos_launch_services: true,
-                macos_accessibility: true,
-                macos_calendar: true,
-                macos_reminders: true,
-                macos_contacts: MacOsContactsPermission::ReadWrite,
+    fn request_permissions_response_accepts_partial_network_and_file_system_grants() {
+        let input_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\input"
+        } else {
+            "/tmp/input"
+        };
+        let output_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\output"
+        } else {
+            "/tmp/output"
+        };
+        let ignored_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\ignored"
+        } else {
+            "/tmp/ignored"
+        };
+        let absolute_path = |path: &str| {
+            AbsolutePathBuf::try_from(std::path::PathBuf::from(path)).expect("absolute path")
+        };
+        let requested_permissions = CoreRequestPermissionProfile {
+            network: Some(CoreNetworkPermissions {
+                enabled: Some(true),
             }),
-            ..Default::default()
+            file_system: Some(CoreFileSystemPermissions {
+                read: Some(vec![absolute_path(input_path)]),
+                write: Some(vec![absolute_path(output_path)]),
+            }),
         };
         let cases = vec![
-            (serde_json::json!({}), CorePermissionProfile::default()),
             (
-                serde_json::json!({
-                    "preferences": "read_only",
-                }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::ReadOnly,
-                        macos_automation: MacOsAutomationPermission::None,
-                        macos_launch_services: false,
-                        macos_accessibility: false,
-                        macos_calendar: false,
-                        macos_reminders: false,
-                        macos_contacts: MacOsContactsPermission::None,
-                    }),
-                    ..Default::default()
-                },
+                serde_json::json!({}),
+                CoreRequestPermissionProfile::default(),
             ),
             (
                 serde_json::json!({
-                    "automations": {
-                        "bundle_ids": ["com.apple.Notes"],
+                    "network": {
+                        "enabled": true,
                     },
                 }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::None,
-                        macos_automation: MacOsAutomationPermission::BundleIds(vec![
-                            "com.apple.Notes".to_string(),
-                        ]),
-                        macos_launch_services: false,
-                        macos_accessibility: false,
-                        macos_calendar: false,
-                        macos_reminders: false,
-                        macos_contacts: MacOsContactsPermission::None,
+                CoreRequestPermissionProfile {
+                    network: Some(CoreNetworkPermissions {
+                        enabled: Some(true),
                     }),
-                    ..Default::default()
+                    ..CoreRequestPermissionProfile::default()
                 },
             ),
             (
                 serde_json::json!({
-                    "launchServices": true,
+                    "fileSystem": {
+                        "write": [output_path],
+                    },
                 }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::None,
-                        macos_automation: MacOsAutomationPermission::None,
-                        macos_launch_services: true,
-                        macos_accessibility: false,
-                        macos_calendar: false,
-                        macos_reminders: false,
-                        macos_contacts: MacOsContactsPermission::None,
+                CoreRequestPermissionProfile {
+                    file_system: Some(CoreFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![absolute_path(output_path)]),
                     }),
-                    ..Default::default()
+                    ..CoreRequestPermissionProfile::default()
                 },
             ),
             (
                 serde_json::json!({
-                    "accessibility": true,
+                    "fileSystem": {
+                        "read": [input_path],
+                        "write": [output_path, ignored_path],
+                    },
+                    "macos": {
+                        "calendar": true,
+                    },
                 }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::None,
-                        macos_automation: MacOsAutomationPermission::None,
-                        macos_launch_services: false,
-                        macos_accessibility: true,
-                        macos_calendar: false,
-                        macos_reminders: false,
-                        macos_contacts: MacOsContactsPermission::None,
+                CoreRequestPermissionProfile {
+                    file_system: Some(CoreFileSystemPermissions {
+                        read: Some(vec![absolute_path(input_path)]),
+                        write: Some(vec![absolute_path(output_path)]),
                     }),
-                    ..Default::default()
-                },
-            ),
-            (
-                serde_json::json!({
-                    "calendar": true,
-                }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::None,
-                        macos_automation: MacOsAutomationPermission::None,
-                        macos_launch_services: false,
-                        macos_accessibility: false,
-                        macos_calendar: true,
-                        macos_reminders: false,
-                        macos_contacts: MacOsContactsPermission::None,
-                    }),
-                    ..Default::default()
-                },
-            ),
-            (
-                serde_json::json!({
-                    "reminders": true,
-                }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::None,
-                        macos_automation: MacOsAutomationPermission::None,
-                        macos_launch_services: false,
-                        macos_accessibility: false,
-                        macos_calendar: false,
-                        macos_reminders: true,
-                        macos_contacts: MacOsContactsPermission::None,
-                    }),
-                    ..Default::default()
-                },
-            ),
-            (
-                serde_json::json!({
-                    "contacts": "read_only",
-                }),
-                CorePermissionProfile {
-                    macos: Some(MacOsSeatbeltProfileExtensions {
-                        macos_preferences: MacOsPreferencesPermission::None,
-                        macos_automation: MacOsAutomationPermission::None,
-                        macos_launch_services: false,
-                        macos_accessibility: false,
-                        macos_calendar: false,
-                        macos_reminders: false,
-                        macos_contacts: MacOsContactsPermission::ReadOnly,
-                    }),
-                    ..Default::default()
+                    ..CoreRequestPermissionProfile::default()
                 },
             ),
         ];
 
-        for (granted_macos, expected_permissions) in cases {
+        for (granted_permissions, expected_permissions) in cases {
             let response = request_permissions_response_from_client_result(
                 requested_permissions.clone(),
                 Ok(Ok(serde_json::json!({
-                    "permissions": {
-                        "macos": granted_macos,
-                    },
+                    "permissions": granted_permissions,
                 }))),
             )
             .expect("response should be accepted");
@@ -3145,7 +3287,7 @@ mod tests {
     #[test]
     fn request_permissions_response_preserves_session_scope() {
         let response = request_permissions_response_from_client_result(
-            CorePermissionProfile::default(),
+            CoreRequestPermissionProfile::default(),
             Ok(Ok(serde_json::json!({
                 "scope": "session",
                 "permissions": {},
@@ -3156,7 +3298,7 @@ mod tests {
         assert_eq!(
             response,
             CoreRequestPermissionsResponse {
-                permissions: CorePermissionProfile::default(),
+                permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Session,
             }
         );
@@ -3227,7 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn collab_spawn_end_maps_requested_model_and_effort() {
+    fn collab_spawn_end_maps_effective_model_and_effort() {
         let receiver_thread_id = ThreadId::new();
         let event = CollabAgentSpawnEndEvent {
             call_id: "call-spawn".to_string(),
@@ -3242,11 +3384,7 @@ mod tests {
             status: codex_protocol::protocol::AgentStatus::Completed(None),
         };
 
-        let item = collab_spawn_end_item(
-            event.clone(),
-            Some("gpt-5".to_string()),
-            Some(ReasoningEffort::High),
-        );
+        let item = collab_spawn_end_item(event.clone());
         let expected = ThreadItem::CollabAgentToolCall {
             id: event.call_id,
             tool: CollabAgentTool::SpawnAgent,
@@ -3281,6 +3419,93 @@ mod tests {
             }],
         };
         assert_eq!(item, expected);
+    }
+
+    #[tokio::test]
+    async fn collab_spawn_end_live_projection_uses_end_event_model_and_effort() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let codex_home = tempdir.path().to_path_buf();
+        let thread_manager = Arc::new(thread_manager_with_models_provider_and_home(
+            CodexAuth::from_api_key("dummy"),
+            built_in_model_providers(/* openai_base_url */ None)["openai"].clone(),
+            codex_home.clone(),
+        ));
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.clone())
+            .fallback_cwd(Some(codex_home.clone()))
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
+            .build()
+            .await?;
+        let new_thread = thread_manager.start_thread(config).await?;
+        let conversation_id = new_thread.thread_id;
+        let conversation = new_thread.thread;
+
+        let thread_state = new_thread_state();
+        let begin_event = CollabAgentSpawnBeginEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id: ThreadId::new(),
+            prompt: "new task".to_string(),
+            model: "gpt-5".to_string(),
+            reasoning_effort: ReasoningEffort::High,
+        };
+        thread_state
+            .lock()
+            .await
+            .track_current_turn_event(&EventMsg::CollabAgentSpawnBegin(begin_event));
+
+        let end_event = CollabAgentSpawnEndEvent {
+            call_id: "call-spawn".to_string(),
+            sender_thread_id: ThreadId::new(),
+            new_thread_id: Some(ThreadId::new()),
+            new_agent_nickname: Some("Robie".to_string()),
+            new_agent_role: Some("explorer".to_string()),
+            prompt: "new task".to_string(),
+            model: "gpt-5-mini".to_string(),
+            reasoning_effort: ReasoningEffort::Low,
+            spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
+            status: codex_protocol::protocol::AgentStatus::Completed(None),
+        };
+
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: EventMsg::CollabAgentSpawnEnd(end_event.clone()),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            ThreadWatchManager::new(),
+            ApiVersion::V2,
+            "openai".to_string(),
+            codex_home.as_path(),
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(n)) => {
+                assert_eq!(n.thread_id, conversation_id.to_string());
+                assert_eq!(n.turn_id, "turn-1");
+                assert_eq!(n.item, collab_spawn_end_item(end_event));
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
     }
 
     #[test]

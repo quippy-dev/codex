@@ -41,6 +41,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 pub struct MultiAgentHandler;
+pub(crate) struct SpawnAgentHandler;
+pub(crate) struct SendInputHandler;
+pub(crate) struct ResumeAgentHandler;
+pub(crate) struct WaitAgentHandler;
+pub(crate) struct CloseAgentHandler;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
@@ -96,7 +101,7 @@ impl ToolHandler for MultiAgentHandler {
                 compact_parent_context::handle(session, turn, call_id, arguments).await
             }
             "list_agents" => list_agents::handle(session, turn, call_id, arguments).await,
-            "wait" => wait::handle(session, turn, call_id, arguments).await,
+            "wait" | "wait_agent" => wait::handle(session, turn, call_id, arguments).await,
             "close_agent" => close_agent::handle(session, turn, call_id, arguments).await,
             other => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported multi-agent tool {other}"
@@ -104,6 +109,53 @@ impl ToolHandler for MultiAgentHandler {
         }
     }
 }
+
+fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
+    match payload {
+        ToolPayload::Function { arguments } => Ok(arguments),
+        _ => Err(FunctionCallError::RespondToModel(
+            "collab handler received unsupported payload".to_string(),
+        )),
+    }
+}
+
+macro_rules! impl_forwarding_handler {
+    ($handler:ident, $call:path) => {
+        #[async_trait]
+        impl ToolHandler for $handler {
+            type Output = FunctionToolOutput;
+
+            fn kind(&self) -> ToolKind {
+                ToolKind::Function
+            }
+
+            fn matches_kind(&self, payload: &ToolPayload) -> bool {
+                matches!(payload, ToolPayload::Function { .. })
+            }
+
+            async fn handle(
+                &self,
+                invocation: ToolInvocation,
+            ) -> Result<Self::Output, FunctionCallError> {
+                let ToolInvocation {
+                    session,
+                    turn,
+                    payload,
+                    call_id,
+                    ..
+                } = invocation;
+                let arguments = function_arguments(payload)?;
+                $call(session, turn, call_id, arguments).await
+            }
+        }
+    };
+}
+
+impl_forwarding_handler!(SpawnAgentHandler, spawn::handle);
+impl_forwarding_handler!(SendInputHandler, send_input::handle);
+impl_forwarding_handler!(ResumeAgentHandler, resume_agent::handle);
+impl_forwarding_handler!(WaitAgentHandler, wait::handle);
+impl_forwarding_handler!(CloseAgentHandler, close_agent::handle);
 
 mod spawn {
     use super::*;
@@ -308,6 +360,16 @@ mod spawn {
             ),
             Err(_) => (None, AgentStatus::NotFound),
         };
+        let agent_snapshot = match new_thread_id {
+            Some(thread_id) => {
+                session
+                    .services
+                    .agent_control
+                    .get_agent_config_snapshot(thread_id)
+                    .await
+            }
+            None => None,
+        };
         let (new_agent_nickname, new_agent_role) = match new_thread_id {
             Some(thread_id) => session
                 .services
@@ -317,6 +379,14 @@ mod spawn {
                 .unwrap_or((None, None)),
             None => (None, None),
         };
+        let effective_model = agent_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.model.clone())
+            .unwrap_or_else(|| requested_model.clone().unwrap_or_default());
+        let effective_reasoning_effort = agent_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.reasoning_effort)
+            .unwrap_or(requested_reasoning_effort.unwrap_or_default());
         let nickname = new_agent_nickname.clone();
         session
             .send_event(
@@ -328,8 +398,8 @@ mod spawn {
                     new_agent_nickname,
                     new_agent_role,
                     prompt,
-                    model: args.model.clone().unwrap_or_default(),
-                    reasoning_effort: args.reasoning_effort.unwrap_or_default(),
+                    model: effective_model,
+                    reasoning_effort: effective_reasoning_effort,
                     spawn_mode: spawn_mode.into(),
                     status,
                 }
@@ -966,6 +1036,9 @@ pub(crate) mod wait {
         pub(crate) status: HashMap<ThreadId, AgentStatus>,
         pub(crate) timed_out: bool,
     }
+
+    #[cfg(test)]
+    pub(crate) type WaitAgentResult = WaitResult;
 
     pub async fn handle(
         session: Arc<Session>,
@@ -1776,6 +1849,8 @@ fn apply_spawn_agent_runtime_overrides(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
+    config.permissions.file_system_sandbox_policy = turn.file_system_sandbox_policy.clone();
+    config.permissions.network_sandbox_policy = turn.network_sandbox_policy;
     Ok(())
 }
 

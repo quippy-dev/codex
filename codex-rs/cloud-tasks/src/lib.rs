@@ -183,7 +183,7 @@ async fn run_exec_command(
         &env_id,
         &prompt,
         &git_ref,
-        false,
+        /*qa_mode*/ false,
         attempts,
     )
     .await?;
@@ -869,7 +869,7 @@ pub async fn run_main(
         let backend = Arc::clone(&backend);
         let tx = tx.clone();
         tokio::spawn(async move {
-            let res = app::load_tasks(&*backend, None).await;
+            let res = app::load_tasks(&*backend, /*env*/ None).await;
             let _ = tx.send(app::AppEvent::TasksLoaded {
                 env: None,
                 result: res,
@@ -1179,7 +1179,7 @@ pub async fn run_main(
                                 ov.base_can_apply = true;
                                 ov.apply_selection_to_fields();
                             } else {
-                                let mut overlay = app::DiffOverlay::new(id.clone(), title, None);
+                                let mut overlay = app::DiffOverlay::new(id.clone(), title, /*attempt_total_hint*/ None);
                                 {
                                     let base = overlay.base_attempt_mut();
                                     base.diff_lines = diff_lines.clone();
@@ -1252,7 +1252,7 @@ pub async fn run_main(
                                         });
                                     }
                             } else {
-                                let mut overlay = app::DiffOverlay::new(id.clone(), title, None);
+                                let mut overlay = app::DiffOverlay::new(id.clone(), title, /*attempt_total_hint*/ None);
                                 {
                                     let base = overlay.base_attempt_mut();
                                     base.text_lines = conv.clone();
@@ -1290,7 +1290,7 @@ pub async fn run_main(
                                         .as_ref()
                                         .map(|d| d.lines().map(str::to_string).collect())
                                         .unwrap_or_default();
-                                    let text_lines = conversation_lines(None, &attempt.messages);
+                                    let text_lines = conversation_lines(/*prompt*/ None, &attempt.messages);
                                     ov.attempts.push(app::AttemptView {
                                         turn_id: Some(attempt.turn_id.clone()),
                                         status: attempt.status,
@@ -1337,7 +1337,7 @@ pub async fn run_main(
                                 ov.current_view = app::DetailView::Prompt;
                                 ov.apply_selection_to_fields();
                             } else {
-                                let mut overlay = app::DiffOverlay::new(id.clone(), title, None);
+                                let mut overlay = app::DiffOverlay::new(id.clone(), title, /*attempt_total_hint*/ None);
                                 {
                                     let base = overlay.base_attempt_mut();
                                     base.text_lines = pretty;
@@ -1588,9 +1588,9 @@ pub async fn run_main(
                                                 let backend = Arc::clone(&backend);
                                                 let best_of_n = page.best_of_n;
                                                 tokio::spawn(async move {
-                                                    let git_ref = resolve_git_ref(None).await;
+                                                    let git_ref = resolve_git_ref(/*branch_override*/ None).await;
 
-                                                    let result = codex_cloud_tasks_client::CloudBackend::create_task(&*backend, &env, &text, &git_ref, false, best_of_n).await;
+                                                    let result = codex_cloud_tasks_client::CloudBackend::create_task(&*backend, &env, &text, &git_ref, /*qa_mode*/ false, best_of_n).await;
                                                     let evt = match result {
                                                         Ok(ok) => app::AppEvent::NewTaskSubmitted(Ok(ok)),
                                                         Err(e) => app::AppEvent::NewTaskSubmitted(Err(format!("{e}"))),
@@ -1787,11 +1787,11 @@ pub async fn run_main(
                                     needs_redraw = true;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    if let Some(ov) = &mut app.diff_overlay { ov.sd.scroll_by(1); }
+                                    if let Some(ov) = &mut app.diff_overlay { ov.sd.scroll_by(/*delta*/ 1); }
                                     needs_redraw = true;
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    if let Some(ov) = &mut app.diff_overlay { ov.sd.scroll_by(-1); }
+                                    if let Some(ov) = &mut app.diff_overlay { ov.sd.scroll_by(/*delta*/ -1); }
                                     needs_redraw = true;
                                 }
                                 KeyCode::PageDown | KeyCode::Char(' ') => {
@@ -1823,7 +1823,7 @@ pub async fn run_main(
                                 KeyCode::PageUp => { if let Some(m) = app.env_modal.as_mut() { let step = 10usize; m.selected = m.selected.saturating_sub(step); } needs_redraw = true; }
                                 KeyCode::Char('n') => {
                                     if app.env_filter.is_none() {
-                                        app.new_task = Some(crate::new_task::NewTaskPage::new(None, app.best_of_n));
+                                        app.new_task = Some(crate::new_task::NewTaskPage::new(/*env_id*/ None, app.best_of_n));
                                     } else {
                                         app.new_task = Some(crate::new_task::NewTaskPage::new(app.env_filter.clone(), app.best_of_n));
                                     }

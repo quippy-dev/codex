@@ -296,6 +296,10 @@ client_request_definitions! {
         params: v2::PluginListParams,
         response: v2::PluginListResponse,
     },
+    PluginRead => "plugin/read" {
+        params: v2::PluginReadParams,
+        response: v2::PluginReadResponse,
+    },
     SkillsRemoteList => "skills/remote/list" {
         params: v2::SkillsRemoteReadParams,
         response: v2::SkillsRemoteReadResponse,
@@ -307,6 +311,34 @@ client_request_definitions! {
     AppsList => "app/list" {
         params: v2::AppsListParams,
         response: v2::AppsListResponse,
+    },
+    FsReadFile => "fs/readFile" {
+        params: v2::FsReadFileParams,
+        response: v2::FsReadFileResponse,
+    },
+    FsWriteFile => "fs/writeFile" {
+        params: v2::FsWriteFileParams,
+        response: v2::FsWriteFileResponse,
+    },
+    FsCreateDirectory => "fs/createDirectory" {
+        params: v2::FsCreateDirectoryParams,
+        response: v2::FsCreateDirectoryResponse,
+    },
+    FsGetMetadata => "fs/getMetadata" {
+        params: v2::FsGetMetadataParams,
+        response: v2::FsGetMetadataResponse,
+    },
+    FsReadDirectory => "fs/readDirectory" {
+        params: v2::FsReadDirectoryParams,
+        response: v2::FsReadDirectoryResponse,
+    },
+    FsRemove => "fs/remove" {
+        params: v2::FsRemoveParams,
+        response: v2::FsRemoveResponse,
+    },
+    FsCopy => "fs/copy" {
+        params: v2::FsCopyParams,
+        response: v2::FsCopyResponse,
     },
     SkillsConfigWrite => "skills/config/write" {
         params: v2::SkillsConfigWriteParams,
@@ -852,6 +884,8 @@ server_notification_definitions! {
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
     TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
     ItemStarted => "item/started" (v2::ItemStartedNotification),
+    ItemGuardianApprovalReviewStarted => "item/autoApprovalReview/started" (v2::ItemGuardianApprovalReviewStartedNotification),
+    ItemGuardianApprovalReviewCompleted => "item/autoApprovalReview/completed" (v2::ItemGuardianApprovalReviewCompletedNotification),
     ItemCompleted => "item/completed" (v2::ItemCompletedNotification),
     /// This event is internal-only. Used by Codex Cloud.
     RawResponseItemCompleted => "rawResponseItem/completed" (v2::RawResponseItemCompletedNotification),
@@ -917,8 +951,17 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
+    fn absolute_path_string(path: &str) -> String {
+        let trimmed = path.trim_start_matches('/');
+        if cfg!(windows) {
+            format!(r"C:\{}", trimmed.replace('/', "\\"))
+        } else {
+            format!("/{trimmed}")
+        }
+    }
+
     fn absolute_path(path: &str) -> AbsolutePathBuf {
-        AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
+        AbsolutePathBuf::from_absolute_path(absolute_path_string(path)).expect("absolute path")
     }
 
     #[test]
@@ -1416,6 +1459,27 @@ mod tests {
     }
 
     #[test]
+    fn serialize_fs_get_metadata() -> Result<()> {
+        let request = ClientRequest::FsGetMetadata {
+            request_id: RequestId::Integer(9),
+            params: v2::FsGetMetadataParams {
+                path: absolute_path("tmp/example"),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "fs/getMetadata",
+                "id": 9,
+                "params": {
+                    "path": absolute_path_string("tmp/example")
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn serialize_list_experimental_features() -> Result<()> {
         let request = ClientRequest::ExperimentalFeatureList {
             request_id: RequestId::Integer(8),
@@ -1513,6 +1577,7 @@ mod tests {
                     sample_rate: 24_000,
                     num_channels: 1,
                     samples_per_channel: Some(512),
+                    item_id: None,
                 },
             },
         );
@@ -1525,7 +1590,8 @@ mod tests {
                         "data": "AQID",
                         "sampleRate": 24000,
                         "numChannels": 1,
-                        "samplesPerChannel": 512
+                        "samplesPerChannel": 512,
+                        "itemId": null
                     }
                 }
             }),
@@ -1577,6 +1643,7 @@ mod tests {
                     sample_rate: 24_000,
                     num_channels: 1,
                     samples_per_channel: Some(512),
+                    item_id: None,
                 },
             },
         );

@@ -1,33 +1,56 @@
+#[cfg(test)]
 use crate::codex::Session;
+#[cfg(test)]
 use crate::exec::ExecToolCallOutput;
+#[cfg(test)]
 use crate::sandboxing::SandboxPermissions;
+#[cfg(test)]
 use crate::sandboxing::execute_env;
+#[cfg(test)]
 use crate::tools::runtimes::build_command_spec;
+#[cfg(test)]
 use crate::tools::sandboxing::Approvable;
+#[cfg(test)]
 use crate::tools::sandboxing::ApprovalCtx;
+#[cfg(test)]
 use crate::tools::sandboxing::ExecApprovalRequirement;
+#[cfg(test)]
 use crate::tools::sandboxing::SandboxAttempt;
+#[cfg(test)]
 use crate::tools::sandboxing::Sandboxable;
+#[cfg(test)]
 use crate::tools::sandboxing::SandboxablePreference;
+#[cfg(test)]
 use crate::tools::sandboxing::ToolCtx;
+#[cfg(test)]
 use crate::tools::sandboxing::ToolError;
+#[cfg(test)]
 use crate::tools::sandboxing::ToolRuntime;
+#[cfg(test)]
 use crate::tools::sandboxing::with_cached_approval;
+#[cfg(test)]
 use codex_protocol::protocol::AskForApproval;
+#[cfg(test)]
 use codex_protocol::protocol::ReviewDecision;
+#[cfg(test)]
 use futures::future::BoxFuture;
+#[cfg(test)]
 use serde::Serialize;
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct ArtifactApprovalKey {
     pub(crate) command_prefix: Vec<String>,
     pub(crate) cwd: PathBuf,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct ArtifactExecRequest {
     pub(crate) command: Vec<String>,
@@ -38,9 +61,11 @@ pub(crate) struct ArtifactExecRequest {
     pub(crate) escalation_approval_requirement: ExecApprovalRequirement,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ArtifactRuntime;
 
+#[cfg(test)]
 impl ArtifactRuntime {
     fn stdout_stream(ctx: &ToolCtx) -> Option<crate::exec::StdoutStream> {
         Some(crate::exec::StdoutStream {
@@ -51,12 +76,14 @@ impl ArtifactRuntime {
     }
 }
 
+#[cfg(test)]
 impl Sandboxable for ArtifactRuntime {
     fn sandbox_preference(&self) -> SandboxablePreference {
         SandboxablePreference::Auto
     }
 }
 
+#[cfg(test)]
 impl Approvable<ArtifactExecRequest> for ArtifactRuntime {
     type ApprovalKey = ArtifactApprovalKey;
 
@@ -125,7 +152,7 @@ impl Approvable<ArtifactExecRequest> for ArtifactRuntime {
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
         match policy {
             AskForApproval::Never => false,
-            AskForApproval::Reject(reject_config) => !reject_config.rejects_sandbox_approval(),
+            AskForApproval::Granular(granular_config) => granular_config.allows_sandbox_approval(),
             AskForApproval::OnFailure => true,
             AskForApproval::OnRequest => true,
             AskForApproval::UnlessTrusted => true,
@@ -143,6 +170,7 @@ impl Approvable<ArtifactExecRequest> for ArtifactRuntime {
     }
 }
 
+#[cfg(test)]
 impl ToolRuntime<ArtifactExecRequest, ExecToolCallOutput> for ArtifactRuntime {
     async fn run(
         &mut self,

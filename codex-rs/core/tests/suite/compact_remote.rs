@@ -69,6 +69,7 @@ fn summary_with_prefix(summary: &str) -> String {
 
 fn context_snapshot_options() -> ContextSnapshotOptions {
     ContextSnapshotOptions::default()
+        .strip_capability_instructions()
         .render_mode(ContextSnapshotRenderMode::KindWithTextPrefix { max_chars: 64 })
 }
 
@@ -2150,7 +2151,7 @@ async fn snapshot_request_shape_remote_mid_turn_realtime_end() -> Result<()> {
     let server = wiremock::MockServer::start().await;
     let realtime_server = start_remote_realtime_server().await;
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
-        let _ = config.features.enable(Feature::RequestPermissions);
+        let _ = config.features.enable(Feature::RequestPermissionsTool);
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.permissions.sandbox_policy =
             Constrained::allow_any(SandboxPolicy::new_read_only_policy());
@@ -2252,7 +2253,7 @@ async fn snapshot_request_shape_remote_resume_after_same_turn_realtime_end_uses_
     let server = wiremock::MockServer::start().await;
     let realtime_server = start_remote_realtime_server().await;
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
-        let _ = config.features.enable(Feature::RequestPermissions);
+        let _ = config.features.enable(Feature::RequestPermissionsTool);
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.permissions.sandbox_policy =
             Constrained::allow_any(SandboxPolicy::new_read_only_policy());
@@ -2334,7 +2335,7 @@ async fn snapshot_request_shape_remote_resume_after_same_turn_realtime_end_uses_
 
     let mut resume_builder =
         remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
-            let _ = config.features.enable(Feature::RequestPermissions);
+            let _ = config.features.enable(Feature::RequestPermissionsTool);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.permissions.sandbox_policy =
                 Constrained::allow_any(SandboxPolicy::new_read_only_policy());
@@ -2391,7 +2392,7 @@ async fn snapshot_request_shape_remote_compact_resume_after_same_turn_realtime_e
     let server = wiremock::MockServer::start().await;
     let realtime_server = start_remote_realtime_server().await;
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
-        let _ = config.features.enable(Feature::RequestPermissions);
+        let _ = config.features.enable(Feature::RequestPermissionsTool);
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.permissions.sandbox_policy =
             Constrained::allow_any(SandboxPolicy::new_read_only_policy());
@@ -2484,7 +2485,7 @@ async fn snapshot_request_shape_remote_compact_resume_after_same_turn_realtime_e
 
     let mut resume_builder =
         remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
-            let _ = config.features.enable(Feature::RequestPermissions);
+            let _ = config.features.enable(Feature::RequestPermissionsTool);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.permissions.sandbox_policy =
                 Constrained::allow_any(SandboxPolicy::new_read_only_policy());
@@ -2577,6 +2578,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
                 .submit(Op::OverrideTurnContext {
                     cwd: Some(PathBuf::from(PRETURN_CONTEXT_DIFF_CWD)),
                     approval_policy: None,
+                    approvals_reviewer: None,
                     sandbox_policy: None,
                     windows_sandbox_level: None,
                     model: None,
@@ -2687,6 +2689,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),

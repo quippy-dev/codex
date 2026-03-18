@@ -86,6 +86,8 @@ mod tests {
             url: None,
             cf_ray: None,
             request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
         });
 
         let should_retry = should_retry_with_sanitized_encrypted_content(false, &err);

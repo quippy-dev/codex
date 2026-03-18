@@ -14,6 +14,7 @@ use crate::agent::guards::SpawnReservation;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
+use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 #[cfg(test)]
 use crate::config::types::CollabInboxDeliveryRole;
@@ -275,7 +276,7 @@ impl AgentControl {
                             auth_manager,
                             self.clone(),
                             session_source,
-                            false,
+                            /*persist_extended_history*/ false,
                             inherited_shell_snapshot,
                         )
                         .await?
@@ -286,8 +287,8 @@ impl AgentControl {
                             auth_manager,
                             self.clone(),
                             session_source,
-                            false,
-                            None,
+                            /*persist_extended_history*/ false,
+                            /*metrics_service_name*/ None,
                             inherited_shell_snapshot,
                         )
                         .await?
@@ -897,6 +898,20 @@ impl AgentControl {
             root_thread_id = parent_thread_id;
         }
         root_thread_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn get_agent_config_snapshot(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<ThreadConfigSnapshot> {
+        let Ok(state) = self.upgrade() else {
+            return None;
+        };
+        let Ok(thread) = state.get_thread(agent_id).await else {
+            return None;
+        };
+        Some(thread.config_snapshot().await)
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.

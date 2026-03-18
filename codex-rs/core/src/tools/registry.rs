@@ -218,7 +218,7 @@ impl ToolRegistry {
                     &call_id_owned,
                     log_payload.as_ref(),
                     Duration::ZERO,
-                    false,
+                    /*success*/ false,
                     &message,
                     &metric_tags,
                     mcp_server_ref,
@@ -235,7 +235,7 @@ impl ToolRegistry {
                 &call_id_owned,
                 log_payload.as_ref(),
                 Duration::ZERO,
-                false,
+                /*success*/ false,
                 &message,
                 &metric_tags,
                 mcp_server_ref,
@@ -342,7 +342,7 @@ impl ToolRegistryBuilder {
     }
 
     pub fn push_spec(&mut self, spec: ToolSpec) {
-        self.push_spec_with_parallel_support(spec, false);
+        self.push_spec_with_parallel_support(spec, /*supports_parallel_tool_calls*/ false);
     }
 
     pub fn push_spec_with_parallel_support(

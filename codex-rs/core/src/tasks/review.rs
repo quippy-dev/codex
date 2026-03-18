@@ -51,57 +51,46 @@ impl SessionTask for ReviewTask {
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
-        initial_turn_context: Arc<TurnContext>,
+        ctx: Arc<TurnContext>,
         input: Vec<UserInput>,
         cancellation_token: CancellationToken,
     ) -> Option<String> {
-        let _ = session
-            .session
-            .services
-            .session_telemetry
-            .counter("codex.task.review", 1, &[]);
+        let _ = session.session.services.session_telemetry.counter(
+            "codex.task.review",
+            /*inc*/ 1,
+            &[],
+        );
 
         // Start sub-codex conversation and get the receiver for events.
         let output = match start_review_conversation(
             session.clone(),
-            initial_turn_context.clone(),
+            ctx.clone(),
             input,
             cancellation_token.clone(),
         )
         .await
         {
-            Some(receiver) => {
-                process_review_events(session.clone(), initial_turn_context.clone(), receiver).await
-            }
+            Some(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
             None => None,
         };
         if !cancellation_token.is_cancelled() {
-            exit_review_mode(
-                session.clone_session(),
-                output.clone(),
-                initial_turn_context.clone(),
-            )
-            .await;
+            exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
         }
         None
     }
 
-    async fn abort(
-        &self,
-        session: Arc<SessionTaskContext>,
-        initial_turn_context: Arc<TurnContext>,
-    ) {
-        exit_review_mode(session.clone_session(), None, initial_turn_context).await;
+    async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
+        exit_review_mode(session.clone_session(), /*review_output*/ None, ctx).await;
     }
 }
 
 async fn start_review_conversation(
     session: Arc<SessionTaskContext>,
-    initial_turn_context: Arc<TurnContext>,
+    ctx: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
 ) -> Option<async_channel::Receiver<Event>> {
-    let config = initial_turn_context.config.clone();
+    let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Carry over review-only feature restrictions so the delegate cannot
     // re-enable blocked tools (web search, collab tools, view image).
@@ -121,7 +110,7 @@ async fn start_review_conversation(
     let model = config
         .review_model
         .clone()
-        .unwrap_or_else(|| initial_turn_context.model_info.slug.clone());
+        .unwrap_or_else(|| ctx.model_info.slug.clone());
     sub_agent_config.model = Some(model);
     (run_codex_thread_one_shot(
         sub_agent_config,
@@ -129,11 +118,11 @@ async fn start_review_conversation(
         session.models_manager(),
         input,
         session.clone_session(),
-        initial_turn_context.clone(),
+        ctx.clone(),
         cancellation_token,
         SubAgentSource::Review,
-        None,
-        None,
+        /*final_output_json_schema*/ None,
+        /*initial_history*/ None,
     )
     .await)
         .ok()
@@ -142,7 +131,7 @@ async fn start_review_conversation(
 
 async fn process_review_events(
     session: Arc<SessionTaskContext>,
-    initial_turn_context: Arc<TurnContext>,
+    ctx: Arc<TurnContext>,
     receiver: async_channel::Receiver<Event>,
 ) -> Option<ReviewOutputEvent> {
     let mut prev_agent_message: Option<Event> = None;
@@ -152,7 +141,7 @@ async fn process_review_events(
                 if let Some(prev) = prev_agent_message.take() {
                     session
                         .clone_session()
-                        .send_event(initial_turn_context.as_ref(), prev.msg)
+                        .send_event(ctx.as_ref(), prev.msg)
                         .await;
                 }
                 prev_agent_message = Some(event);
@@ -181,7 +170,7 @@ async fn process_review_events(
             other => {
                 session
                     .clone_session()
-                    .send_event(initial_turn_context.as_ref(), other)
+                    .send_event(ctx.as_ref(), other)
                     .await;
             }
         }
@@ -217,7 +206,7 @@ fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
 pub(crate) async fn exit_review_mode(
     session: Arc<Session>,
     review_output: Option<ReviewOutputEvent>,
-    initial_turn_context: Arc<TurnContext>,
+    ctx: Arc<TurnContext>,
 ) {
     const REVIEW_USER_MESSAGE_ID: &str = "review_rollout_user";
     const REVIEW_ASSISTANT_MESSAGE_ID: &str = "review_rollout_assistant";
@@ -228,7 +217,7 @@ pub(crate) async fn exit_review_mode(
             findings_str.push_str(text);
         }
         if !out.findings.is_empty() {
-            let block = format_review_findings_block(&out.findings, None);
+            let block = format_review_findings_block(&out.findings, /*selection*/ None);
             findings_str.push_str(&format!("\n{block}"));
         }
         let rendered =
@@ -245,7 +234,7 @@ pub(crate) async fn exit_review_mode(
 
     session
         .record_conversation_items(
-            &initial_turn_context,
+            &ctx,
             &[ResponseItem::Message {
                 id: Some(REVIEW_USER_MESSAGE_ID.to_string()),
                 role: "user".to_string(),
@@ -258,13 +247,13 @@ pub(crate) async fn exit_review_mode(
 
     session
         .send_event(
-            initial_turn_context.as_ref(),
+            ctx.as_ref(),
             EventMsg::ExitedReviewMode(ExitedReviewModeEvent { review_output }),
         )
         .await;
     session
         .record_response_item_and_emit_turn_item(
-            initial_turn_context.as_ref(),
+            ctx.as_ref(),
             ResponseItem::Message {
                 id: Some(REVIEW_ASSISTANT_MESSAGE_ID.to_string()),
                 role: "assistant".to_string(),

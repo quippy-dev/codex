@@ -264,6 +264,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     "warning:".style(self.yellow).style(self.bold)
                 );
             }
+            EventMsg::GuardianAssessment(_) => {}
             EventMsg::ModelReroute(_) => {}
             EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
                 ts_msg!(
@@ -805,7 +806,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     self,
                     "{} {}",
                     "collab".style(self.magenta),
-                    format_collab_invocation("wait", &call_id, None).style(self.bold)
+                    format_collab_invocation("wait", &call_id, /*prompt*/ None).style(self.bold)
                 );
                 eprintln!(
                     "  receivers: {}",
@@ -822,7 +823,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     ts_msg!(
                         self,
                         "{} {}:",
-                        format_collab_invocation("wait", &call_id, None),
+                        format_collab_invocation("wait", &call_id, /*prompt*/ None),
                         "timed out".style(self.yellow)
                     );
                     return CodexStatus::Running;
@@ -831,7 +832,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 let title_style = if success { self.green } else { self.red };
                 let title = format!(
                     "{} {} agents complete:",
-                    format_collab_invocation("wait", &call_id, None),
+                    format_collab_invocation("wait", &call_id, /*prompt*/ None),
                     statuses.len()
                 );
                 ts_msg!(self, "{}", title.style(title_style));
@@ -857,7 +858,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     self,
                     "{} {}",
                     "collab".style(self.magenta),
-                    format_collab_invocation("close_agent", &call_id, None).style(self.bold)
+                    format_collab_invocation("close_agent", &call_id, /*prompt*/ None)
+                        .style(self.bold)
                 );
                 eprintln!(
                     "  receiver: {}",
@@ -875,7 +877,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 let title_style = if success { self.green } else { self.red };
                 let title = format!(
                     "{} {}:",
-                    format_collab_invocation("close_agent", &call_id, None),
+                    format_collab_invocation("close_agent", &call_id, /*prompt*/ None),
                     format_collab_status(&status)
                 );
                 ts_msg!(self, "{}", title.style(title_style));
@@ -1091,6 +1093,7 @@ impl EventProcessorWithHumanOutput {
                     | EventMsg::RequestPermissions(_)
                     | EventMsg::DynamicToolCallRequest(_)
                     | EventMsg::DynamicToolCallResponse(_)
+                    | EventMsg::GuardianAssessment(_)
             ),
         }
     }
@@ -1103,6 +1106,7 @@ impl EventProcessorWithHumanOutput {
             msg,
             EventMsg::Error(_)
                 | EventMsg::Warning(_)
+                | EventMsg::GuardianAssessment(_)
                 | EventMsg::DeprecationNotice(_)
                 | EventMsg::StreamError(_)
                 | EventMsg::TurnComplete(_)
@@ -1333,7 +1337,7 @@ fn format_collab_invocation(tool: &str, call_id: &str, prompt: Option<&str>) -> 
     let prompt = prompt
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
-        .map(|prompt| truncate_preview(prompt, 120));
+        .map(|prompt| truncate_preview(prompt, /*max_chars*/ 120));
     match prompt {
         Some(prompt) => format!("{tool}({call_id}, prompt=\"{prompt}\")"),
         None => format!("{tool}({call_id})"),
@@ -1346,7 +1350,7 @@ fn format_collab_status(status: &AgentStatus) -> String {
         AgentStatus::Running => "running".to_string(),
         AgentStatus::Interrupted => "interrupted".to_string(),
         AgentStatus::Completed(Some(message)) => {
-            let preview = truncate_preview(message.trim(), 120);
+            let preview = truncate_preview(message.trim(), /*max_chars*/ 120);
             if preview.is_empty() {
                 "completed".to_string()
             } else {
@@ -1355,7 +1359,7 @@ fn format_collab_status(status: &AgentStatus) -> String {
         }
         AgentStatus::Completed(None) => "completed".to_string(),
         AgentStatus::Errored(message) => {
-            let preview = truncate_preview(message.trim(), 120);
+            let preview = truncate_preview(message.trim(), /*max_chars*/ 120);
             if preview.is_empty() {
                 "errored".to_string()
             } else {

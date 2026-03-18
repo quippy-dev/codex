@@ -54,7 +54,7 @@ pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
-const TURN_ABORTED_INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes were terminated. If any tools/commands were aborted, they may have partially executed; verify current state before retrying.";
+const TURN_ABORTED_INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed; verify current state before retrying.";
 
 fn emit_turn_network_proxy_metric(
     session_telemetry: &SessionTelemetry,
@@ -66,7 +66,11 @@ fn emit_turn_network_proxy_metric(
     } else {
         "false"
     };
-    session_telemetry.counter(TURN_NETWORK_PROXY_METRIC, 1, &[("active", active), tmp_mem]);
+    session_telemetry.counter(
+        TURN_NETWORK_PROXY_METRIC,
+        /*inc*/ 1,
+        &[("active", active), tmp_mem],
+    );
 }
 
 /// Thin wrapper that exposes the parts of [`Session`] task runners need.
@@ -232,9 +236,6 @@ impl Session {
             active_turn.clear_pending().await;
             self.clear_post_turn_agent_items().await;
         }
-        if reason == TurnAbortReason::Interrupted {
-            self.close_unified_exec_processes().await;
-        }
     }
 
     pub async fn on_task_finished(
@@ -387,7 +388,6 @@ impl Session {
         turn.add_task(task);
         *active = Some(turn);
     }
-
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
         let mut active_turn = active.take()?;
@@ -404,6 +404,14 @@ impl Session {
             .unified_exec_manager
             .terminate_all_processes()
             .await;
+    }
+
+    pub(crate) async fn cleanup_after_interrupt(&self, turn_context: &Arc<TurnContext>) {
+        if let Some(manager) = turn_context.js_repl.manager_if_initialized()
+            && let Err(err) = manager.interrupt_turn_exec(&turn_context.sub_id).await
+        {
+            warn!("failed to interrupt js_repl kernel: {err}");
+        }
     }
 
     async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
@@ -435,6 +443,9 @@ impl Session {
             .await;
 
         if reason == TurnAbortReason::Interrupted {
+            self.cleanup_after_interrupt(&task.initial_turn_context)
+                .await;
+
             let marker = ResponseItem::Message {
                 id: None,
                 role: "user".to_string(),

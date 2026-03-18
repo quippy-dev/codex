@@ -325,6 +325,8 @@ impl Session {
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                     history.drop_last_n_user_turns(rollback.num_turns);
+                    latest_proposed_plan_text =
+                        retained_plan_replay::latest_proposed_plan_text(history.raw_items());
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::ForkReference(_)

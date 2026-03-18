@@ -127,6 +127,8 @@ mod tests {
             url: None,
             cf_ray: None,
             request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
         });
 
         assert_eq!(is_invalid_encrypted_content_error(&err), true);
@@ -141,6 +143,8 @@ mod tests {
             url: None,
             cf_ray: None,
             request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
         });
 
         assert_eq!(is_invalid_encrypted_content_error(&err), false);

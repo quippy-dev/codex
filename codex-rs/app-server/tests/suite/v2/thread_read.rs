@@ -237,7 +237,13 @@ async fn thread_read_include_turns_keeps_fork_history_after_parent_archive_and_u
     let ThreadReadResponse {
         thread: child_before_archive,
     } = to_response::<ThreadReadResponse>(read_child_resp)?;
-    assert_eq!(child_before_archive.turns.len(), 1);
+    let mut expected_child_turns = child.turns.clone();
+    for turn in &mut expected_child_turns {
+        if turn.status == TurnStatus::InProgress {
+            turn.status = TurnStatus::Interrupted;
+        }
+    }
+    assert_eq!(child_before_archive.turns, expected_child_turns);
 
     let archive_id = mcp
         .send_thread_archive_request(ThreadArchiveParams {

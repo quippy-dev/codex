@@ -474,6 +474,54 @@ async fn reconstruct_history_hydrates_latest_proposed_plan_text_from_plan_item_c
 }
 
 #[tokio::test]
+async fn reconstruct_history_rollback_clears_latest_proposed_plan_text_from_rolled_back_compaction()
+{
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_id = "rolled-back-compact-turn".to_string();
+    let plan_text = "- retained plan".to_string();
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "turn user".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary after compaction".to_string(),
+            retained_proposed_plan: RetainedProposedPlan::ProposedPlan { text: plan_text },
+            replacement_history: Some(vec![
+                user_message("turn user"),
+                user_message("summary after compaction"),
+            ]),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id,
+                last_agent_message: None,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.latest_proposed_plan_text, None);
+}
+
+#[tokio::test]
 async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_incomplete_turn() {
     let (session, turn_context) = make_session_and_context().await;
     let first_context_item = turn_context.to_turn_context_item();
