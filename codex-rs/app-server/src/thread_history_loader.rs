@@ -1,3 +1,5 @@
+use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnStatus;
 use codex_core::RolloutRecorder;
 use codex_core::resolve_fork_reference_rollout_path;
 use codex_protocol::items::TurnItem;
@@ -9,6 +11,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use tracing::warn;
+use uuid::Uuid;
 
 pub(crate) async fn read_rollout_items_from_rollout(
     path: &Path,
@@ -37,6 +40,54 @@ pub(crate) fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
             None => preview,
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn build_turns_from_response_history_items(items: &[RolloutItem]) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    let mut current_turn_id: Option<String> = None;
+    let mut current_turn_items = Vec::new();
+
+    for item in items {
+        let RolloutItem::ResponseItem(response_item) = item else {
+            continue;
+        };
+        let Some(turn_item) = codex_core::parse_turn_item(response_item) else {
+            continue;
+        };
+
+        let next_turn_id = match &turn_item {
+            TurnItem::UserMessage(user) => Some(user.id.clone()),
+            _ => None,
+        };
+
+        if matches!(turn_item, TurnItem::UserMessage(_)) && !current_turn_items.is_empty() {
+            turns.push(Turn {
+                id: current_turn_id
+                    .take()
+                    .unwrap_or_else(|| Uuid::now_v7().to_string()),
+                items: std::mem::take(&mut current_turn_items),
+                status: TurnStatus::Completed,
+                error: None,
+            });
+        }
+
+        if current_turn_id.is_none() {
+            current_turn_id = next_turn_id.or_else(|| Some(Uuid::now_v7().to_string()));
+        }
+
+        current_turn_items.push(turn_item.into());
+    }
+
+    if !current_turn_items.is_empty() {
+        turns.push(Turn {
+            id: current_turn_id.unwrap_or_else(|| Uuid::now_v7().to_string()),
+            items: current_turn_items,
+            status: TurnStatus::Completed,
+            error: None,
+        });
+    }
+
+    turns
 }
 
 fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
@@ -97,6 +148,59 @@ fn rollout_items_start_with(items: &[RolloutItem], prefix: &[RolloutItem]) -> bo
             .iter()
             .zip(prefix.iter())
             .all(|(item, prefix_item)| rollout_items_match(item, prefix_item))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_turns_from_response_history_items;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::RolloutItem;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn build_turns_from_response_history_items_groups_user_boundaries() {
+        let items = vec![
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some("user-1".to_string()),
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hello".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some("assistant-1".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "hi".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some("user-2".to_string()),
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "again".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+        ];
+
+        let turns = build_turns_from_response_history_items(&items);
+
+        assert_eq!(turns.len(), 2);
+        assert!(!turns[0].id.is_empty());
+        assert!(!turns[1].id.is_empty());
+        assert_ne!(turns[0].id, turns[1].id);
+        assert!(matches!(turns[0].items[0], ThreadItem::UserMessage { .. }));
+        assert!(matches!(turns[0].items[1], ThreadItem::AgentMessage { .. }));
+        assert!(matches!(turns[1].items[0], ThreadItem::UserMessage { .. }));
+    }
 }
 
 pub(crate) fn codex_home_from_rollout_path(path: &Path) -> Option<&Path> {

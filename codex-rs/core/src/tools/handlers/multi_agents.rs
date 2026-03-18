@@ -291,19 +291,18 @@ mod spawn {
             child_depth,
             config_strategy,
         )?;
+        apply_spawn_agent_model_overrides(
+            &session,
+            turn.as_ref(),
+            &mut config,
+            requested_model.as_deref(),
+            requested_reasoning_effort,
+        )
+        .await?;
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
-        if role_name.is_none() {
-            apply_spawn_agent_model_overrides(
-                &session,
-                turn.as_ref(),
-                &mut config,
-                requested_model.as_deref(),
-                requested_reasoning_effort,
-            )
-            .await?;
-        }
+        revalidate_spawn_agent_model_reasoning(&session, turn.as_ref(), &config).await?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);
         let spawn_source = thread_spawn_source_with_metadata(
@@ -1614,7 +1613,9 @@ pub mod close_agent {
             Err(err) => Err(multi_agent_tool_error(agent_id, err)),
         };
         let status = match close_result {
-            Ok(CloseAgentOutcome::Closed) => status_before,
+            Ok(CloseAgentOutcome::Closed) => {
+                session.services.agent_control.get_status(agent_id).await
+            }
             Ok(CloseAgentOutcome::AlreadyClosed) | Ok(CloseAgentOutcome::NotFound) => {
                 session.services.agent_control.get_status(agent_id).await
             }
@@ -1880,24 +1881,49 @@ async fn apply_spawn_agent_model_overrides(
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
-        let effective_model = config
-            .model
-            .clone()
-            .unwrap_or_else(|| turn.model_info.slug.clone());
-        let model_info = if effective_model == turn.model_info.slug {
-            turn.model_info.clone()
-        } else {
-            session
-                .services
-                .models_manager
-                .get_model_info(effective_model.as_str(), config)
-                .await
-        };
-        validate_reasoning_effort_for_model_info(&model_info, reasoning_effort)?;
+        validate_reasoning_effort_for_effective_model(session, turn, config, reasoning_effort)
+            .await?;
         config.model_reasoning_effort = Some(reasoning_effort);
     }
 
     Ok(())
+}
+
+async fn revalidate_spawn_agent_model_reasoning(
+    session: &Session,
+    turn: &TurnContext,
+    config: &Config,
+) -> Result<(), FunctionCallError> {
+    if let Some(reasoning_effort) = config.model_reasoning_effort {
+        validate_reasoning_effort_for_effective_model(session, turn, config, reasoning_effort)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn validate_reasoning_effort_for_effective_model(
+    session: &Session,
+    turn: &TurnContext,
+    config: &Config,
+    reasoning_effort: ReasoningEffort,
+) -> Result<(), FunctionCallError> {
+    let effective_model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| turn.model_info.slug.clone());
+    if let Ok(preset) = visible_model_preset(session, effective_model.as_str()).await {
+        return validate_reasoning_effort_for_preset(&preset, reasoning_effort);
+    }
+    let model_info = if effective_model == turn.model_info.slug {
+        turn.model_info.clone()
+    } else {
+        session
+            .services
+            .models_manager
+            .get_model_info(effective_model.as_str(), config)
+            .await
+    };
+    validate_reasoning_effort_for_model_info(&model_info, reasoning_effort)
 }
 
 async fn visible_model_preset(

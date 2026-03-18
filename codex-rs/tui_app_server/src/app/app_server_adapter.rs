@@ -37,9 +37,14 @@ use codex_protocol::items::WebSearchItem;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
 use codex_protocol::protocol::AgentReasoningRawContentDeltaEvent;
+use codex_protocol::protocol::ContextCompactedEvent;
+use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::GuardianAssessmentEvent;
+use codex_protocol::protocol::GuardianAssessmentStatus;
+use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::PlanDeltaEvent;
@@ -47,6 +52,11 @@ use codex_protocol::protocol::RealtimeConversationClosedEvent;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
 use codex_protocol::protocol::RealtimeConversationStartedEvent;
 use codex_protocol::protocol::RealtimeEvent;
+use codex_protocol::protocol::RealtimeHandoffRequested;
+use codex_protocol::protocol::RealtimeInputAudioSpeechStarted;
+use codex_protocol::protocol::RealtimeResponseCancelled;
+use codex_protocol::protocol::RealtimeTranscriptEntry;
+use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_protocol::protocol::ThreadNameUpdatedEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
@@ -54,6 +64,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use serde_json::Value;
 
@@ -94,6 +105,16 @@ impl App {
                     );
                 }
                 notification => {
+                    if let Some(events) = server_notification_global_events(&notification) {
+                        for event in events {
+                            if let Err(err) = self.enqueue_primary_event(event).await {
+                                tracing::warn!(
+                                    "failed to enqueue primary app-server server notification: {err}"
+                                );
+                            }
+                        }
+                        return;
+                    }
                     if !app_server_client.is_remote()
                         && matches!(
                             notification,
@@ -260,6 +281,19 @@ fn legacy_event_is_shadowed_by_server_notification(msg: &EventMsg) -> bool {
     )
 }
 
+fn server_notification_global_events(notification: &ServerNotification) -> Option<Vec<Event>> {
+    match notification {
+        ServerNotification::DeprecationNotice(notification) => Some(vec![Event {
+            id: String::new(),
+            msg: EventMsg::DeprecationNotice(DeprecationNoticeEvent {
+                summary: notification.summary.clone(),
+                details: notification.details.clone(),
+            }),
+        }]),
+        _ => None,
+    }
+}
+
 fn server_notification_thread_events(
     notification: ServerNotification,
 ) -> Option<(ThreadId, Vec<Event>)> {
@@ -369,6 +403,15 @@ fn server_notification_thread_events(
                 }),
             }],
         )),
+        ServerNotification::TurnDiffUpdated(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::TurnDiff(TurnDiffEvent {
+                    unified_diff: notification.diff,
+                }),
+            }],
+        )),
         ServerNotification::ReasoningSummaryTextDelta(notification) => Some((
             ThreadId::from_string(&notification.thread_id).ok()?,
             vec![Event {
@@ -401,7 +444,7 @@ fn server_notification_thread_events(
             vec![Event {
                 id: String::new(),
                 msg: EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
-                    payload: RealtimeEvent::ConversationItemAdded(notification.item),
+                    payload: realtime_event_from_app_server_item(notification.item),
                 }),
             }],
         )),
@@ -432,7 +475,138 @@ fn server_notification_thread_events(
                 }),
             }],
         )),
+        ServerNotification::TerminalInteraction(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::TerminalInteraction(TerminalInteractionEvent {
+                    call_id: notification.item_id,
+                    process_id: notification.process_id,
+                    stdin: notification.stdin,
+                }),
+            }],
+        )),
+        ServerNotification::ContextCompacted(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::ContextCompacted(ContextCompactedEvent),
+            }],
+        )),
+        ServerNotification::ItemGuardianApprovalReviewStarted(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::GuardianAssessment(guardian_assessment_event(
+                    notification.turn_id,
+                    notification.target_item_id,
+                    notification.review,
+                    notification.action,
+                )?),
+            }],
+        )),
+        ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::GuardianAssessment(guardian_assessment_event(
+                    notification.turn_id,
+                    notification.target_item_id,
+                    notification.review,
+                    notification.action,
+                )?),
+            }],
+        )),
         _ => None,
+    }
+}
+
+fn guardian_assessment_event(
+    turn_id: String,
+    id: String,
+    review: codex_app_server_protocol::GuardianApprovalReview,
+    action: Option<Value>,
+) -> Option<GuardianAssessmentEvent> {
+    Some(GuardianAssessmentEvent {
+        id,
+        turn_id,
+        status: match review.status {
+            codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
+                GuardianAssessmentStatus::InProgress
+            }
+            codex_app_server_protocol::GuardianApprovalReviewStatus::Approved => {
+                GuardianAssessmentStatus::Approved
+            }
+            codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => {
+                GuardianAssessmentStatus::Denied
+            }
+            codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
+                GuardianAssessmentStatus::Aborted
+            }
+        },
+        risk_score: review.risk_score,
+        risk_level: review.risk_level.map(|risk_level| match risk_level {
+            codex_app_server_protocol::GuardianRiskLevel::Low => GuardianRiskLevel::Low,
+            codex_app_server_protocol::GuardianRiskLevel::Medium => GuardianRiskLevel::Medium,
+            codex_app_server_protocol::GuardianRiskLevel::High => GuardianRiskLevel::High,
+        }),
+        rationale: review.rationale,
+        action,
+    })
+}
+
+fn realtime_event_from_app_server_item(item: Value) -> RealtimeEvent {
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+        return RealtimeEvent::ConversationItemAdded(item);
+    };
+
+    match item_type {
+        "input_audio_buffer.speech_started" => {
+            RealtimeEvent::InputAudioSpeechStarted(RealtimeInputAudioSpeechStarted {
+                item_id: item
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        }
+        "response.cancelled" => RealtimeEvent::ResponseCancelled(RealtimeResponseCancelled {
+            response_id: item
+                .get("response")
+                .and_then(Value::as_object)
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    item.get("response_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+        }),
+        "handoff_request" => RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
+            handoff_id: item
+                .get("handoff_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            item_id: item
+                .get("item_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            input_transcript: item
+                .get("input_transcript")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            active_transcript: item
+                .get("active_transcript")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<RealtimeTranscriptEntry>>(value).ok()
+                })
+                .unwrap_or_default(),
+        }),
+        _ => RealtimeEvent::ConversationItemAdded(item),
     }
 }
 
@@ -651,19 +825,29 @@ fn app_server_codex_error_info_to_core(
 
 #[cfg(test)]
 mod tests {
+    use super::server_notification_global_events;
     use super::server_notification_thread_events;
     use super::thread_snapshot_events;
     use super::turn_snapshot_events;
     use codex_app_server_protocol::AgentMessageDeltaNotification;
     use codex_app_server_protocol::CodexErrorInfo;
+    use codex_app_server_protocol::ContextCompactedNotification;
+    use codex_app_server_protocol::DeprecationNoticeNotification;
+    use codex_app_server_protocol::GuardianApprovalReview;
+    use codex_app_server_protocol::GuardianApprovalReviewStatus;
     use codex_app_server_protocol::ItemCompletedNotification;
+    use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
+    use codex_app_server_protocol::ItemGuardianApprovalReviewStartedNotification;
     use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::TerminalInteractionNotification;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnCompletedNotification;
+    use codex_app_server_protocol::TurnDiffUpdatedNotification;
     use codex_app_server_protocol::TurnError;
     use codex_app_server_protocol::TurnStatus;
     use codex_protocol::ThreadId;
@@ -672,6 +856,9 @@ mod tests {
     use codex_protocol::items::TurnItem;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::RealtimeEvent;
+    use codex_protocol::protocol::RealtimeHandoffRequested;
+    use codex_protocol::protocol::RealtimeTranscriptEntry;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -867,6 +1054,195 @@ mod tests {
             panic!("expected bridged reasoning delta");
         };
         assert_eq!(delta.delta, "Thinking");
+    }
+
+    #[test]
+    fn bridges_server_only_notifications_from_server_notifications() {
+        let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
+
+        let (_, terminal_events) = server_notification_thread_events(
+            ServerNotification::TerminalInteraction(TerminalInteractionNotification {
+                thread_id: thread_id.clone(),
+                turn_id: "turn".to_string(),
+                item_id: "call-1".to_string(),
+                process_id: "proc-1".to_string(),
+                stdin: "pwd\n".to_string(),
+            }),
+        )
+        .expect("terminal interaction should bridge");
+        assert!(matches!(
+            terminal_events[0].msg,
+            EventMsg::TerminalInteraction(_)
+        ));
+
+        let (_, diff_events) = server_notification_thread_events(
+            ServerNotification::TurnDiffUpdated(TurnDiffUpdatedNotification {
+                thread_id: thread_id.clone(),
+                turn_id: "turn".to_string(),
+                diff: "@@ -1 +1 @@".to_string(),
+            }),
+        )
+        .expect("turn diff should bridge");
+        let EventMsg::TurnDiff(turn_diff) = &diff_events[0].msg else {
+            panic!("expected turn diff event");
+        };
+        assert_eq!(turn_diff.unified_diff, "@@ -1 +1 @@");
+
+        let (_, compacted_events) = server_notification_thread_events(
+            ServerNotification::ContextCompacted(ContextCompactedNotification {
+                thread_id: thread_id.clone(),
+                turn_id: "turn".to_string(),
+            }),
+        )
+        .expect("context compacted should bridge");
+        assert!(matches!(
+            compacted_events[0].msg,
+            EventMsg::ContextCompacted(_)
+        ));
+
+        let deprecation_events = server_notification_global_events(
+            &ServerNotification::DeprecationNotice(DeprecationNoticeNotification {
+                summary: "old thing".to_string(),
+                details: Some("use new thing".to_string()),
+            }),
+        )
+        .expect("deprecation notice should bridge");
+        let EventMsg::DeprecationNotice(deprecation) = &deprecation_events[0].msg else {
+            panic!("expected deprecation notice event");
+        };
+        assert_eq!(deprecation.summary, "old thing");
+        assert_eq!(deprecation.details.as_deref(), Some("use new thing"));
+
+        let review = GuardianApprovalReview {
+            status: GuardianApprovalReviewStatus::Denied,
+            risk_score: Some(99),
+            risk_level: Some(codex_app_server_protocol::GuardianRiskLevel::High),
+            rationale: Some("blocked".to_string()),
+        };
+        let (_, started_events) = server_notification_thread_events(
+            ServerNotification::ItemGuardianApprovalReviewStarted(
+                ItemGuardianApprovalReviewStartedNotification {
+                    thread_id: thread_id.clone(),
+                    turn_id: "turn".to_string(),
+                    target_item_id: "tool-1".to_string(),
+                    review: review.clone(),
+                    action: Some(serde_json::json!({"tool":"shell"})),
+                },
+            ),
+        )
+        .expect("guardian started should bridge");
+        let EventMsg::GuardianAssessment(started) = &started_events[0].msg else {
+            panic!("expected guardian assessment event");
+        };
+        assert_eq!(started.id, "tool-1");
+        assert_eq!(started.turn_id, "turn");
+        assert_eq!(
+            started.status,
+            codex_protocol::protocol::GuardianAssessmentStatus::Denied
+        );
+        assert_eq!(
+            started.risk_level,
+            Some(codex_protocol::protocol::GuardianRiskLevel::High)
+        );
+
+        let (_, completed_events) = server_notification_thread_events(
+            ServerNotification::ItemGuardianApprovalReviewCompleted(
+                ItemGuardianApprovalReviewCompletedNotification {
+                    thread_id,
+                    turn_id: "turn".to_string(),
+                    target_item_id: "tool-2".to_string(),
+                    review,
+                    action: None,
+                },
+            ),
+        )
+        .expect("guardian completed should bridge");
+        assert!(matches!(
+            completed_events[0].msg,
+            EventMsg::GuardianAssessment(_)
+        ));
+    }
+
+    #[test]
+    fn preserves_typed_realtime_item_notifications() {
+        let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
+
+        let (_, speech_events) = server_notification_thread_events(
+            ServerNotification::ThreadRealtimeItemAdded(ThreadRealtimeItemAddedNotification {
+                thread_id: thread_id.clone(),
+                item: serde_json::json!({
+                    "type": "input_audio_buffer.speech_started",
+                    "item_id": "item-1",
+                }),
+            }),
+        )
+        .expect("speech started should bridge");
+        let EventMsg::RealtimeConversationRealtime(speech_event) = &speech_events[0].msg else {
+            panic!("expected realtime event");
+        };
+        assert_eq!(
+            speech_event.payload,
+            RealtimeEvent::InputAudioSpeechStarted(
+                codex_protocol::protocol::RealtimeInputAudioSpeechStarted {
+                    item_id: Some("item-1".to_string()),
+                }
+            )
+        );
+
+        let (_, cancelled_events) = server_notification_thread_events(
+            ServerNotification::ThreadRealtimeItemAdded(ThreadRealtimeItemAddedNotification {
+                thread_id: thread_id.clone(),
+                item: serde_json::json!({
+                    "type": "response.cancelled",
+                    "response_id": "resp-1",
+                }),
+            }),
+        )
+        .expect("response cancelled should bridge");
+        let EventMsg::RealtimeConversationRealtime(cancelled_event) = &cancelled_events[0].msg
+        else {
+            panic!("expected realtime event");
+        };
+        assert_eq!(
+            cancelled_event.payload,
+            RealtimeEvent::ResponseCancelled(codex_protocol::protocol::RealtimeResponseCancelled {
+                response_id: Some("resp-1".to_string()),
+            })
+        );
+
+        let (_, handoff_events) = server_notification_thread_events(
+            ServerNotification::ThreadRealtimeItemAdded(ThreadRealtimeItemAddedNotification {
+                thread_id,
+                item: serde_json::json!({
+                    "type": "handoff_request",
+                    "handoff_id": "handoff-1",
+                    "item_id": "item-2",
+                    "input_transcript": "fallback transcript",
+                    "active_transcript": [
+                        {
+                            "role": "user",
+                            "text": "live transcript",
+                        }
+                    ],
+                }),
+            }),
+        )
+        .expect("handoff request should bridge");
+        let EventMsg::RealtimeConversationRealtime(handoff_event) = &handoff_events[0].msg else {
+            panic!("expected realtime event");
+        };
+        assert_eq!(
+            handoff_event.payload,
+            RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
+                handoff_id: "handoff-1".to_string(),
+                item_id: "item-2".to_string(),
+                input_transcript: "fallback transcript".to_string(),
+                active_transcript: vec![RealtimeTranscriptEntry {
+                    role: "user".to_string(),
+                    text: "live transcript".to_string(),
+                }],
+            })
+        );
     }
 
     #[test]

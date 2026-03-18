@@ -884,6 +884,9 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
+    /// In-memory rollout log for sessions without an attached rollout recorder.
+    /// This keeps rollback/replay semantics aligned with file-backed sessions.
+    in_memory_rollout_items: Mutex<Vec<RolloutItem>>,
     js_repl: Arc<JsReplHandle>,
     next_internal_sub_id: AtomicU64,
     /// Tracks whether the current turn delivered a collab inbox message via send_input.
@@ -2050,6 +2053,7 @@ impl Session {
             active_turn: Mutex::new(None),
             guardian_review_session: GuardianReviewSessionManager::default(),
             services,
+            in_memory_rollout_items: Mutex::new(Vec::new()),
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
             turn_used_agent_send_input: AtomicBool::new(false),
@@ -4232,16 +4236,24 @@ impl Session {
             let guard = self.services.rollout.lock().await;
             guard.clone()
         };
-        if let Some(rec) = recorder
-            && let Err(e) = rec.record_items(items).await
-        {
-            error!("failed to record rollout items: {e:#}");
+        if let Some(rec) = recorder {
+            if let Err(e) = rec.record_items(items).await {
+                error!("failed to record rollout items: {e:#}");
+            }
+        } else {
+            let mut in_memory_rollout_items = self.in_memory_rollout_items.lock().await;
+            in_memory_rollout_items.extend_from_slice(items);
         }
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
+    }
+
+    async fn clone_in_memory_rollout_items(&self) -> Vec<RolloutItem> {
+        let in_memory_rollout_items = self.in_memory_rollout_items.lock().await;
+        in_memory_rollout_items.clone()
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -5997,46 +6009,29 @@ mod handlers {
         }
 
         let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-        let rollout_path = {
-            let recorder = {
-                let guard = sess.services.rollout.lock().await;
-                guard.clone()
-            };
-            let Some(recorder) = recorder else {
+        let recorder = {
+            let guard = sess.services.rollout.lock().await;
+            guard.clone()
+        };
+        let replay_items = if let Some(recorder) = recorder {
+            let rollout_path = recorder.rollout_path().to_path_buf();
+            if let Err(err) = recorder.flush().await {
                 sess.send_event_raw(Event {
                     id: turn_context.sub_id.clone(),
                     msg: EventMsg::Error(ErrorEvent {
-                        message: "thread rollback requires a persisted rollout path".to_string(),
+                        message: format!(
+                            "failed to flush rollout `{}` for rollback replay: {err}",
+                            rollout_path.display()
+                        ),
                         codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
                     }),
                 })
                 .await;
                 return;
-            };
-            recorder.rollout_path().to_path_buf()
-        };
-        if let Some(recorder) = {
-            let guard = sess.services.rollout.lock().await;
-            guard.clone()
-        } && let Err(err) = recorder.flush().await
-        {
-            sess.send_event_raw(Event {
-                id: turn_context.sub_id.clone(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: format!(
-                        "failed to flush rollout `{}` for rollback replay: {err}",
-                        rollout_path.display()
-                    ),
-                    codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-                }),
-            })
-            .await;
-            return;
-        }
+            }
 
-        let initial_history =
             match RolloutRecorder::get_rollout_history(rollout_path.as_path()).await {
-                Ok(history) => history,
+                Ok(history) => history.get_rollout_items(),
                 Err(err) => {
                     sess.send_event_raw(Event {
                         id: turn_context.sub_id.clone(),
@@ -6051,12 +6046,25 @@ mod handlers {
                     .await;
                     return;
                 }
-            };
+            }
+        } else {
+            let in_memory_rollout_items = sess.clone_in_memory_rollout_items().await;
+            if in_memory_rollout_items.is_empty() {
+                sess.clone_history()
+                    .await
+                    .raw_items()
+                    .iter()
+                    .cloned()
+                    .map(RolloutItem::ResponseItem)
+                    .collect::<Vec<_>>()
+            } else {
+                in_memory_rollout_items
+            }
+        };
 
         let rollback_event = ThreadRolledBackEvent { num_turns };
         let rollback_msg = EventMsg::ThreadRolledBack(rollback_event.clone());
-        let replay_items = initial_history
-            .get_rollout_items()
+        let replay_items = replay_items
             .into_iter()
             .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
             .collect::<Vec<_>>();

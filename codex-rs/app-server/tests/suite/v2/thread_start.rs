@@ -8,11 +8,18 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::UserInput;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_core::config::set_project_trust_level;
@@ -288,6 +295,191 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         Some(true),
         "ephemeral threads should serialize `ephemeral: true`"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_ephemeral_include_turns_works_after_first_completed_turn() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("gpt-5.1".to_string()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    assert!(thread.ephemeral);
+    assert_eq!(thread.path, None);
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "first ephemeral turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: reread } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert!(
+        reread.ephemeral,
+        "thread/read should preserve ephemeral flag"
+    );
+    assert_eq!(reread.path, None, "thread/read should keep thread pathless");
+    assert_eq!(
+        reread.preview, "first ephemeral turn",
+        "thread/read should refresh pathless preview after live turn updates"
+    );
+    assert_eq!(reread.turns.len(), 1);
+    assert_eq!(reread.turns[0].status, TurnStatus::Completed);
+    assert_eq!(reread.turns[0].items.len(), 2);
+    match &reread.turns[0].items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: "first ephemeral turn".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected user message item, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_ephemeral_thread_can_be_read_with_turns_after_first_completion() -> Result<()>
+{
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    assert!(thread.ephemeral, "ephemeral threads should stay marked");
+    assert_eq!(thread.path, None, "ephemeral threads should stay pathless");
+
+    let first_text = "First";
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: first_text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response::<TurnStartResponse>(turn_start_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: reread } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert!(
+        reread.ephemeral,
+        "thread/read should preserve ephemeral threads"
+    );
+    assert_eq!(
+        reread.path, None,
+        "thread/read should keep the thread pathless"
+    );
+    assert_eq!(
+        reread.preview, first_text,
+        "thread/read should refresh pathless preview after live turn updates"
+    );
+    let completed_turn = reread
+        .turns
+        .iter()
+        .find(|turn| turn.status == TurnStatus::Completed)
+        .expect("thread/read should surface the completed first turn");
+    assert_eq!(completed_turn.items.len(), 2);
+    match &completed_turn.items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: first_text.to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected user message item, got {other:?}"),
+    }
 
     Ok(())
 }

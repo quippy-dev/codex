@@ -666,9 +666,16 @@ async fn spawn_agent_role_model_beats_explicit_model_override() {
         .clone();
     let selected_model = visible_models
         .iter()
-        .find(|preset| preset.model != role_model.model)
-        .expect("expected second visible model")
+        .find(|preset| {
+            preset.model != role_model.model && !preset.supported_reasoning_efforts.is_empty()
+        })
+        .expect("expected second visible model with reasoning support")
         .clone();
+    let requested_reasoning_effort = selected_model
+        .supported_reasoning_efforts
+        .first()
+        .expect("expected supported reasoning effort")
+        .effort;
 
     let role_dir = tempfile::tempdir().expect("temp dir");
     let role_path = role_dir.path().join("custom-role.toml");
@@ -703,7 +710,7 @@ async fn spawn_agent_role_model_beats_explicit_model_override() {
             "message": "inspect this repo",
             "agent_type": "custom",
             "model": selected_model.model,
-            "reasoning_effort": "minimal"
+            "reasoning_effort": requested_reasoning_effort
         })),
     );
     let output = MultiAgentHandler
@@ -734,6 +741,166 @@ async fn spawn_agent_role_model_beats_explicit_model_override() {
     .expect("spawn end event should arrive");
     assert_eq!(spawn_event.model, role_model.model);
     assert_eq!(spawn_event.reasoning_effort, ReasoningEffort::High);
+}
+
+#[tokio::test]
+async fn spawn_agent_role_without_model_preserves_explicit_model_override() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn, rx) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    Arc::get_mut(&mut session)
+        .expect("no extra session refs")
+        .services
+        .agent_control = manager.agent_control();
+    Arc::get_mut(&mut session)
+        .expect("no extra session refs")
+        .services
+        .models_manager = manager.get_models_manager();
+    let selected_model = visible_models(&session)
+        .await
+        .into_iter()
+        .next()
+        .expect("expected visible model");
+
+    let mut config = (*turn.config).clone();
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: Some("Role without model override".to_string()),
+            model: None,
+            config_file: None,
+            spawn_mode: None,
+            nickname_candidates: None,
+        },
+    );
+    Arc::get_mut(&mut turn).expect("no extra turn refs").config = Arc::new(config);
+
+    let invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "agent_type": "custom",
+            "model": selected_model.model,
+        })),
+    );
+    let output = MultiAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+    let snapshot = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(snapshot.model, selected_model.model);
+    let spawn_event = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("collab event");
+            if let EventMsg::CollabAgentSpawnEnd(event) = event.msg {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("spawn end event should arrive");
+    assert_eq!(spawn_event.model, selected_model.model);
+}
+
+#[tokio::test]
+async fn spawn_agent_rejects_role_reasoning_effort_incompatible_with_selected_model() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    session.services.models_manager = manager.get_models_manager();
+    let candidate_efforts = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+    ];
+    let selected_model = visible_models(&session)
+        .await
+        .into_iter()
+        .find(|preset| {
+            candidate_efforts.iter().any(|candidate| {
+                !preset
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|effort| effort.effort == *candidate)
+            })
+        })
+        .expect("expected a visible model without full reasoning coverage");
+    let unsupported_effort = candidate_efforts
+        .into_iter()
+        .find(|candidate| {
+            !selected_model
+                .supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort.effort == *candidate)
+        })
+        .expect("expected unsupported effort");
+
+    let role_dir = tempfile::tempdir().expect("temp dir");
+    let role_path = role_dir.path().join("custom-role.toml");
+    tokio::fs::write(
+        &role_path,
+        format!("model_reasoning_effort = \"{unsupported_effort}\"\n"),
+    )
+    .await
+    .expect("write role config");
+
+    let mut config = (*turn.config).clone();
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: Some("Role overrides reasoning only".to_string()),
+            model: None,
+            config_file: Some(role_path),
+            spawn_mode: None,
+            nickname_candidates: None,
+        },
+    );
+    turn.config = Arc::new(config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "agent_type": "custom",
+            "model": selected_model.model,
+        })),
+    );
+    let Err(err) = MultiAgentHandler.handle(invocation).await else {
+        panic!("unsupported role reasoning effort should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent reasoning_effort `{unsupported_effort}` is not supported for model `{}`. Choose one of: {}",
+            selected_model.model,
+            selected_model
+                .supported_reasoning_efforts
+                .iter()
+                .map(|effort| format!("`{}`", effort.effort))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    );
 }
 
 #[tokio::test]
@@ -2461,8 +2628,6 @@ async fn close_agent_submits_shutdown_and_returns_status() {
     let config = turn.config.as_ref().clone();
     let thread = manager.start_thread(config).await.expect("start thread");
     let agent_id = thread.thread_id;
-    let status_before = manager.agent_control().get_status(agent_id).await;
-
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
@@ -2477,7 +2642,7 @@ async fn close_agent_submits_shutdown_and_returns_status() {
     let result: close_agent::CloseAgentResult =
         serde_json::from_str(&content).expect("close_agent result should be json");
     let status_after = manager.agent_control().get_status(agent_id).await;
-    assert_eq!(result.status, status_before);
+    assert_eq!(result.status, status_after);
     assert_eq!(result.close_result, close_agent::CloseAgentOutcome::Closed);
     assert_eq!(success, Some(true));
 

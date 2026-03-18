@@ -110,6 +110,21 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().cloned())
     }
 
+    pub fn turns_snapshot(&self) -> Vec<Turn> {
+        let mut turns = self.turns.clone();
+        if let Some(current_turn) = self.current_turn.as_ref() {
+            turns.push(Turn::from(current_turn));
+        }
+        turns
+    }
+
+    pub fn set_completed_turns(&mut self, turns: Vec<Turn>) {
+        let item_count: usize = turns.iter().map(|turn| turn.items.len()).sum();
+        self.turns = turns;
+        self.current_turn = None;
+        self.next_item_index = i64::try_from(item_count.saturating_add(1)).unwrap_or(i64::MAX);
+    }
+
     pub fn has_active_turn(&self) -> bool {
         self.current_turn.is_some()
     }
@@ -1030,7 +1045,7 @@ impl ThreadHistoryBuilder {
 
     fn finish_current_turn(&mut self) {
         if let Some(turn) = self.current_turn.take() {
-            if turn.items.is_empty() && !turn.opened_explicitly && !turn.saw_compaction {
+            if turn.items.is_empty() && !turn.saw_compaction {
                 return;
             }
             self.turns.push(turn.into());

@@ -4,12 +4,14 @@ use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::server_request_error::is_turn_transition_server_request_error;
+use crate::thread_history_loader::build_turns_from_response_history_items;
 use crate::thread_history_loader::read_rollout_items_from_rollout;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
+use crate::thread_summary::build_thread_from_snapshot;
 use crate::thread_summary::read_summary_from_rollout;
 use crate::thread_summary::summary_to_thread;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
@@ -1745,67 +1747,100 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
 
             if let Some(request_id) = pending {
-                let Some(rollout_path) = conversation.rollout_path() else {
-                    let error = JSONRPCErrorError {
-                        code: INVALID_REQUEST_ERROR_CODE,
-                        message: "thread has no persisted rollout".to_string(),
-                        data: None,
-                    };
-                    outgoing.send_error(request_id, error).await;
-                    return;
-                };
-                let response = match read_summary_from_rollout(
-                    rollout_path.as_path(),
-                    fallback_model_provider.as_str(),
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        let mut thread = summary_to_thread(summary);
-                        match read_rollout_items_from_rollout(rollout_path.as_path()).await {
-                            Ok(items) => {
-                                thread.turns = build_turns_from_rollout_items(&items);
-                                thread.status = thread_watch_manager
-                                    .loaded_status_for_thread(&thread.id)
-                                    .await;
-                                match find_thread_name_by_id(codex_home, &conversation_id).await {
-                                    Ok(name) => {
-                                        thread.name = name;
+                let response = if let Some(rollout_path) = conversation.rollout_path() {
+                    match read_summary_from_rollout(
+                        rollout_path.as_path(),
+                        fallback_model_provider.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            let mut thread = summary_to_thread(summary);
+                            match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+                                Ok(items) => {
+                                    thread.turns = build_turns_from_rollout_items(&items);
+                                    thread.status = thread_watch_manager
+                                        .loaded_status_for_thread(&thread.id)
+                                        .await;
+                                    match find_thread_name_by_id(codex_home, &conversation_id).await
+                                    {
+                                        Ok(name) => {
+                                            thread.name = name;
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                "Failed to read thread name for {conversation_id}: {err}"
+                                            );
+                                        }
                                     }
-                                    Err(err) => {
-                                        warn!(
-                                            "Failed to read thread name for {conversation_id}: {err}"
-                                        );
-                                    }
+                                    ThreadRollbackResponse { thread }
                                 }
-                                ThreadRollbackResponse { thread }
-                            }
-                            Err(err) => {
-                                let error = JSONRPCErrorError {
-                                    code: INTERNAL_ERROR_CODE,
-                                    message: format!(
-                                        "failed to load rollout `{}`: {err}",
-                                        rollout_path.display()
-                                    ),
-                                    data: None,
-                                };
-                                outgoing.send_error(request_id.clone(), error).await;
-                                return;
+                                Err(err) => {
+                                    let error = JSONRPCErrorError {
+                                        code: INTERNAL_ERROR_CODE,
+                                        message: format!(
+                                            "failed to load rollout `{}`: {err}",
+                                            rollout_path.display()
+                                        ),
+                                        data: None,
+                                    };
+                                    outgoing.send_error(request_id.clone(), error).await;
+                                    return;
+                                }
                             }
                         }
+                        Err(err) => {
+                            let error = JSONRPCErrorError {
+                                code: INTERNAL_ERROR_CODE,
+                                message: format!(
+                                    "failed to load rollout `{}`: {err}",
+                                    rollout_path.display()
+                                ),
+                                data: None,
+                            };
+                            outgoing.send_error(request_id.clone(), error).await;
+                            return;
+                        }
                     }
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INTERNAL_ERROR_CODE,
-                            message: format!(
-                                "failed to load rollout `{}`: {err}",
-                                rollout_path.display()
-                            ),
-                            data: None,
-                        };
-                        outgoing.send_error(request_id.clone(), error).await;
-                        return;
+                } else {
+                    let config_snapshot = conversation.config_snapshot().await;
+                    let response_history_items = conversation
+                        .response_history_items()
+                        .await
+                        .into_iter()
+                        .map(codex_protocol::protocol::RolloutItem::ResponseItem)
+                        .collect::<Vec<_>>();
+                    let (cached_preview, cached_turns) = {
+                        let state = thread_state.lock().await;
+                        (
+                            state.pathless_thread_preview().map(str::to_string),
+                            state.pathless_thread_turns(),
+                        )
+                    };
+                    let mut thread =
+                        build_thread_from_snapshot(conversation_id, &config_snapshot, None);
+                    thread.preview = cached_preview.unwrap_or_else(|| {
+                        crate::thread_history_loader::preview_from_rollout_items(
+                            &response_history_items,
+                        )
+                    });
+                    thread.turns = if cached_turns.is_empty() {
+                        build_turns_from_response_history_items(&response_history_items)
+                    } else {
+                        cached_turns
+                    };
+                    thread.status = thread_watch_manager
+                        .loaded_status_for_thread(&thread.id)
+                        .await;
+                    match find_thread_name_by_id(codex_home, &conversation_id).await {
+                        Ok(name) => {
+                            thread.name = name;
+                        }
+                        Err(err) => {
+                            warn!("Failed to read thread name for {conversation_id}: {err}");
+                        }
                     }
+                    ThreadRollbackResponse { thread }
                 };
 
                 outgoing.send_response(request_id, response).await;

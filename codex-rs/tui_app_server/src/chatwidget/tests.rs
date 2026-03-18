@@ -18,6 +18,8 @@ use crate::model_catalog::ModelCatalog;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use codex_core::AuthManager;
+use codex_core::auth::login_with_api_key;
 use codex_core::config::ApprovalsReviewer;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -63,6 +65,7 @@ use codex_protocol::protocol::AgentMessageDeltaEvent;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
 use codex_protocol::protocol::AgentReasoningEvent;
+use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
@@ -1747,6 +1750,11 @@ async fn helpers_are_available_and_do_not_panic() {
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
         config: cfg.clone(),
+        auth_manager: AuthManager::shared(
+            cfg.codex_home.clone(),
+            false,
+            cfg.cli_auth_credentials_store_mode,
+        ),
         frame_requester: FrameRequester::test_dummy(),
         app_event_tx: tx,
         initial_user_message: None,
@@ -1839,6 +1847,11 @@ async fn make_chatwidget_manual(
     };
     let current_collaboration_mode = base_mode;
     let active_collaboration_mask = collaboration_modes::default_mask(model_catalog.as_ref());
+    let auth_manager = AuthManager::shared(
+        cfg.codex_home.clone(),
+        false,
+        cfg.cli_auth_credentials_store_mode,
+    );
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_target: super::CodexOpTarget::Direct(op_tx),
@@ -1846,6 +1859,7 @@ async fn make_chatwidget_manual(
         active_cell: None,
         active_cell_revision: 0,
         config: cfg,
+        auth_manager,
         current_collaboration_mode,
         active_collaboration_mask,
         has_chatgpt_account: false,
@@ -2060,6 +2074,7 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             prompt: "Explore the repo".to_string(),
             model: "gpt-5".to_string(),
             reasoning_effort: ReasoningEffortConfig::High,
+            spawn_mode: AgentSpawnMode::Spawn,
             status: AgentStatus::PendingInit,
         }),
     });
@@ -5575,6 +5590,11 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
         config: cfg.clone(),
+        auth_manager: AuthManager::shared(
+            cfg.codex_home.clone(),
+            false,
+            cfg.cli_auth_credentials_store_mode,
+        ),
         frame_requester: FrameRequester::test_dummy(),
         app_event_tx: AppEventSender::new(unbounded_channel::<AppEvent>().0),
         initial_user_message: None,
@@ -5619,6 +5639,11 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
         config: cfg.clone(),
+        auth_manager: AuthManager::shared(
+            cfg.codex_home.clone(),
+            false,
+            cfg.cli_auth_credentials_store_mode,
+        ),
         frame_requester: FrameRequester::test_dummy(),
         app_event_tx: AppEventSender::new(unbounded_channel::<AppEvent>().0),
         initial_user_message: None,
@@ -5769,6 +5794,46 @@ async fn slash_quit_requests_exit() {
     chat.dispatch_command(SlashCommand::Quit);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
+}
+
+#[tokio::test]
+async fn slash_logout_uses_auth_manager_storage_home() {
+    let default_home = tempdir().expect("tempdir");
+    let override_home = tempdir().expect("tempdir");
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let default_auth = default_home.path().join("auth.json");
+    let override_auth = override_home.path().join("auth.json");
+    login_with_api_key(
+        default_home.path(),
+        "default-key",
+        chat.config.cli_auth_credentials_store_mode,
+    )
+    .expect("default auth");
+    login_with_api_key(
+        override_home.path(),
+        "override-key",
+        chat.config.cli_auth_credentials_store_mode,
+    )
+    .expect("override auth");
+
+    chat.config.codex_home = default_home.path().to_path_buf();
+    chat.auth_manager = AuthManager::shared(
+        override_home.path().to_path_buf(),
+        false,
+        chat.config.cli_auth_credentials_store_mode,
+    );
+
+    chat.dispatch_command(SlashCommand::Logout);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
+    assert!(
+        default_auth.exists(),
+        "logout should not delete the default auth store when an override is active"
+    );
+    assert!(
+        !override_auth.exists(),
+        "logout should delete the auth managed by the active auth manager"
+    );
 }
 
 #[tokio::test]

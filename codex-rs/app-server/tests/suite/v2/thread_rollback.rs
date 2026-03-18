@@ -6,6 +6,8 @@ use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
@@ -13,7 +15,9 @@ use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -170,6 +174,246 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
         }
         other => panic!("expected user message item, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_rollback_succeeds_for_pathless_ephemeral_threads() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("Done")?,
+        create_final_assistant_message_sse_response("Done")?,
+        create_final_assistant_message_sse_response("Done")?,
+    ])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    for text in ["First", "Second"] {
+        let turn_start_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let turn_start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+        )
+        .await??;
+        let _: JSONRPCResponse = turn_start_resp;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+    }
+
+    let rollback_id = mcp
+        .send_thread_rollback_request(ThreadRollbackParams {
+            thread_id: thread.id.clone(),
+            num_turns: 1,
+        })
+        .await?;
+    let rollback_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(rollback_id)),
+    )
+    .await??;
+    let ThreadRollbackResponse {
+        thread: rolled_back_thread,
+    } = to_response::<ThreadRollbackResponse>(rollback_resp)?;
+
+    assert!(
+        rolled_back_thread.ephemeral,
+        "rollback should preserve ephemeral threads"
+    );
+    assert_eq!(
+        rolled_back_thread.path, None,
+        "rollback should keep pathless threads pathless"
+    );
+    assert_eq!(rolled_back_thread.status, ThreadStatus::Idle);
+    assert_eq!(
+        rolled_back_thread.preview, "First",
+        "rollback should refresh the pathless preview when dropping the latest turn"
+    );
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: reread } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert!(
+        reread.ephemeral,
+        "thread/read should preserve ephemeral threads"
+    );
+    assert_eq!(
+        reread.path, None,
+        "thread/read should keep the thread pathless"
+    );
+    assert_eq!(reread.status, ThreadStatus::Idle);
+    assert_eq!(
+        reread.preview, "First",
+        "thread/read should reflect the refreshed pathless preview after rollback"
+    );
+    let completed_turns: Vec<_> = reread
+        .turns
+        .iter()
+        .filter(|turn| turn.status == TurnStatus::Completed)
+        .collect();
+    assert_eq!(
+        completed_turns.len(),
+        1,
+        "rollback should prune the last completed cached turn"
+    );
+    match &completed_turns[0].items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![V2UserInput::Text {
+                    text: "First".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected user message item, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_rollback_to_zero_turns_keeps_pathless_include_turns_readable() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("Done")?,
+    ])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "Only turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let rollback_id = mcp
+        .send_thread_rollback_request(ThreadRollbackParams {
+            thread_id: thread.id.clone(),
+            num_turns: 1,
+        })
+        .await?;
+    let rollback_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(rollback_id)),
+    )
+    .await??;
+    let ThreadRollbackResponse {
+        thread: rolled_back_thread,
+    } = to_response::<ThreadRollbackResponse>(rollback_resp)?;
+
+    assert!(rolled_back_thread.ephemeral);
+    assert_eq!(rolled_back_thread.path, None);
+    assert!(
+        rolled_back_thread.preview.is_empty(),
+        "rollback should clear the pathless preview when no turns remain"
+    );
+    assert_eq!(rolled_back_thread.turns, Vec::<Turn>::new());
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: true,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: reread } = to_response::<ThreadReadResponse>(read_resp)?;
+
+    assert!(
+        reread.ephemeral,
+        "thread/read should preserve ephemeral threads"
+    );
+    assert_eq!(
+        reread.path, None,
+        "thread/read should keep the thread pathless"
+    );
+    assert_eq!(reread.status, ThreadStatus::Idle);
+    assert!(
+        reread.preview.is_empty(),
+        "thread/read should not keep a stale preview after rollback to zero turns"
+    );
+    assert_eq!(
+        reread.turns,
+        Vec::<Turn>::new(),
+        "thread/read includeTurns should return an empty turn list after rollback to zero"
+    );
 
     Ok(())
 }

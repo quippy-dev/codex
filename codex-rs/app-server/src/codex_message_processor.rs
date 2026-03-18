@@ -15,6 +15,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotification;
 use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::thread_history_loader::build_turns_from_response_history_items;
 use crate::thread_history_loader::codex_home_from_rollout_path;
 use crate::thread_history_loader::materialize_rollout_items_for_replay;
 use crate::thread_history_loader::preview_from_rollout_items;
@@ -2088,6 +2089,16 @@ impl CodexMessageProcessor {
                     ))
                     .await;
 
+                if thread.path.is_none() {
+                    let thread_state = listener_task_context
+                        .thread_state_manager
+                        .thread_state(thread_id)
+                        .await;
+                    let mut thread_state = thread_state.lock().await;
+                    thread_state
+                        .set_pathless_thread_history(thread.preview.clone(), thread.turns.clone());
+                }
+
                 thread.status = resolve_thread_status(
                     listener_task_context
                         .thread_watch_manager
@@ -3227,24 +3238,41 @@ impl CodexMessageProcessor {
         } else {
             None
         };
-        let (cached_pathless_preview, cached_pathless_turns) =
-            if loaded_thread.is_some() && loaded_rollout_path.is_none() {
-                let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
-                let thread_state = thread_state.lock().await;
-                (
-                    thread_state.pathless_thread_preview().map(str::to_string),
-                    thread_state.pathless_thread_turns(),
-                )
-            } else {
-                (None, Vec::new())
-            };
+        let (
+            cached_pathless_preview,
+            cached_pathless_turns,
+            pathless_thread_has_materialized_turns,
+        ) = if loaded_thread.is_some() && loaded_rollout_path.is_none() {
+            let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
+            let thread_state = thread_state.lock().await;
+            (
+                thread_state.pathless_thread_preview().map(str::to_string),
+                thread_state.pathless_thread_turns(),
+                thread_state.pathless_thread_has_materialized_turns(),
+            )
+        } else {
+            (None, Vec::new(), false)
+        };
+        let live_history_pathless_turns = if cached_pathless_turns.is_empty() {
+            loaded_history_items
+                .as_ref()
+                .map(|items| build_turns_from_response_history_items(items))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let has_pathless_turns =
+            !cached_pathless_turns.is_empty() || !live_history_pathless_turns.is_empty();
 
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
         } else if let Some(ref thread) = loaded_thread {
             let config_snapshot = thread.config_snapshot().await;
-            let has_cached_pathless_turns = !cached_pathless_turns.is_empty();
-            if include_turns && loaded_rollout_path.is_none() && !has_cached_pathless_turns {
+            if include_turns
+                && loaded_rollout_path.is_none()
+                && !has_pathless_turns
+                && !pathless_thread_has_materialized_turns
+            {
                 self.send_invalid_request_error(
                     request_id,
                     "ephemeral threads do not support includeTurns".to_string(),
@@ -3309,8 +3337,11 @@ impl CodexMessageProcessor {
                 return;
             };
             let config_snapshot = thread.config_snapshot().await;
-            let has_cached_pathless_turns = !cached_pathless_turns.is_empty();
-            if include_turns && loaded_rollout_path.is_none() && !has_cached_pathless_turns {
+            if include_turns
+                && loaded_rollout_path.is_none()
+                && !has_pathless_turns
+                && !pathless_thread_has_materialized_turns
+            {
                 self.send_invalid_request_error(
                     request_id,
                     "ephemeral threads do not support includeTurns".to_string(),
@@ -3363,7 +3394,11 @@ impl CodexMessageProcessor {
                     }
                 }
             } else {
-                thread.turns = cached_pathless_turns.clone();
+                thread.turns = if cached_pathless_turns.is_empty() {
+                    live_history_pathless_turns.clone()
+                } else {
+                    cached_pathless_turns.clone()
+                };
             }
         }
 

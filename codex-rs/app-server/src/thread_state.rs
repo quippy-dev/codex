@@ -2,8 +2,10 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadHistoryBuilder;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
+use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
 use codex_protocol::ThreadId;
@@ -61,7 +63,32 @@ pub(crate) struct ThreadState {
     current_turn_history: ThreadHistoryBuilder,
     pathless_thread_preview: Option<String>,
     pathless_thread_turns: Vec<Turn>,
+    pathless_thread_has_materialized_turns: bool,
     listener_thread: Option<Weak<CodexThread>>,
+}
+
+fn preview_from_turns(turns: &[Turn]) -> String {
+    turns
+        .iter()
+        .flat_map(|turn| turn.items.iter())
+        .find_map(|item| match item {
+            ThreadItem::UserMessage { content, .. } => {
+                content.iter().find_map(|input| match input {
+                    V2UserInput::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn turns_have_materialized_user_message(turns: &[Turn]) -> bool {
+    turns.iter().any(|turn| {
+        turn.items
+            .iter()
+            .any(|item| matches!(item, ThreadItem::UserMessage { .. }))
+    })
 }
 
 impl ThreadState {
@@ -95,6 +122,7 @@ impl ThreadState {
         self.current_turn_history.reset();
         self.pathless_thread_preview = None;
         self.pathless_thread_turns.clear();
+        self.pathless_thread_has_materialized_turns = false;
         self.listener_thread = None;
     }
 
@@ -113,8 +141,14 @@ impl ThreadState {
     }
 
     pub(crate) fn set_pathless_thread_history(&mut self, preview: String, turns: Vec<Turn>) {
-        self.pathless_thread_preview = Some(preview);
-        self.pathless_thread_turns = turns;
+        self.pathless_thread_preview = Some(if turns.is_empty() {
+            preview
+        } else {
+            preview_from_turns(&turns)
+        });
+        self.pathless_thread_turns = turns.clone();
+        self.pathless_thread_has_materialized_turns = turns_have_materialized_user_message(&turns);
+        self.current_turn_history.set_completed_turns(turns);
     }
 
     pub(crate) fn pathless_thread_preview(&self) -> Option<&str> {
@@ -125,17 +159,27 @@ impl ThreadState {
         self.pathless_thread_turns.clone()
     }
 
+    pub(crate) fn pathless_thread_has_materialized_turns(&self) -> bool {
+        self.pathless_thread_has_materialized_turns
+    }
+
     pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {
         self.current_turn_history.handle_event(event);
-        if self.pathless_thread_preview.is_some()
-            && let Some(turn) = self.current_turn_history.active_turn_snapshot()
-        {
-            self.pathless_thread_turns
-                .retain(|existing| existing.id != turn.id);
-            self.pathless_thread_turns.push(turn);
+        let pathless_tracking_enabled = self.pathless_thread_preview.is_some();
+        if pathless_tracking_enabled {
+            self.pathless_thread_turns = self.current_turn_history.turns_snapshot();
+            self.pathless_thread_preview = Some(preview_from_turns(&self.pathless_thread_turns));
+            if turns_have_materialized_user_message(&self.pathless_thread_turns) {
+                self.pathless_thread_has_materialized_turns = true;
+            }
         }
         if !self.current_turn_history.has_active_turn() {
-            self.current_turn_history.reset();
+            if pathless_tracking_enabled {
+                self.current_turn_history
+                    .set_completed_turns(self.pathless_thread_turns.clone());
+            } else {
+                self.current_turn_history.reset();
+            }
         }
     }
 }
@@ -383,5 +427,109 @@ impl ThreadStateManager {
                 "retaining thread listener after connection disconnect left zero subscribers"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadState;
+    use codex_protocol::protocol::AgentMessageEvent;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ThreadRolledBackEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    use codex_protocol::protocol::TurnStartedEvent;
+    use codex_protocol::protocol::UserMessageEvent;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn track_current_turn_event_rebuilds_pathless_turn_cache_after_rollback() {
+        let mut state = ThreadState::default();
+        state.set_pathless_thread_history("preview".to_string(), Vec::new());
+
+        for (turn_id, text) in [("turn-1", "first"), ("turn-2", "second")] {
+            state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }));
+            state.track_current_turn_event(&EventMsg::UserMessage(UserMessageEvent {
+                message: text.to_string(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }));
+            state.track_current_turn_event(&EventMsg::AgentMessage(AgentMessageEvent {
+                message: format!("{text} reply"),
+                phase: None,
+            }));
+            state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_id.to_string(),
+                last_agent_message: None,
+            }));
+        }
+
+        assert_eq!(state.pathless_thread_turns().len(), 2);
+
+        state.track_current_turn_event(&EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        }));
+
+        let turns = state.pathless_thread_turns();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "turn-1");
+        assert_eq!(state.pathless_thread_preview(), Some("first"));
+    }
+
+    #[test]
+    fn track_current_turn_event_waits_for_user_message_before_materializing_pathless_turns() {
+        let mut state = ThreadState::default();
+        state.set_pathless_thread_history("preview".to_string(), Vec::new());
+
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+
+        assert_eq!(state.pathless_thread_preview(), Some(""));
+        assert_eq!(state.pathless_thread_turns().len(), 1);
+        assert!(!state.pathless_thread_has_materialized_turns());
+    }
+
+    #[test]
+    fn track_current_turn_event_clears_pathless_preview_when_rollback_drops_all_turns() {
+        let mut state = ThreadState::default();
+        state.set_pathless_thread_history("preview".to_string(), Vec::new());
+
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        state.track_current_turn_event(&EventMsg::UserMessage(UserMessageEvent {
+            message: "first".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }));
+        state.track_current_turn_event(&EventMsg::AgentMessage(AgentMessageEvent {
+            message: "first reply".to_string(),
+            phase: None,
+        }));
+        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+        }));
+
+        assert_eq!(state.pathless_thread_preview(), Some("first"));
+        assert!(state.pathless_thread_has_materialized_turns());
+
+        state.track_current_turn_event(&EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        }));
+
+        assert_eq!(state.pathless_thread_turns(), Vec::new());
+        assert_eq!(state.pathless_thread_preview(), Some(""));
+        assert!(state.pathless_thread_has_materialized_turns());
     }
 }
