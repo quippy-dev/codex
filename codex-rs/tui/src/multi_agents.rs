@@ -155,7 +155,7 @@ fn next_agent_word_motion_fallback(
 
 pub(crate) fn spawn_end(
     ev: CollabAgentSpawnEndEvent,
-    request: Option<&SpawnRequestSummary>,
+    _request: Option<&SpawnRequestSummary>,
 ) -> PlainHistoryCell {
     let CollabAgentSpawnEndEvent {
         call_id: _,
@@ -164,10 +164,19 @@ pub(crate) fn spawn_end(
         new_agent_nickname,
         new_agent_role,
         prompt,
+        model,
+        reasoning_effort,
         spawn_mode,
         status: _,
         ..
     } = ev;
+    // Branch divergence: prefer effective spawn-end metadata so omitted request-time model slugs
+    // still render the actual child config in the TUI. Revert to upstream's canonical shape if
+    // upstream lands its own fix for this display path.
+    let effective_request = SpawnRequestSummary {
+        model,
+        reasoning_effort,
+    };
 
     let title = match new_thread_id {
         Some(thread_id) => {
@@ -180,12 +189,10 @@ pub(crate) fn spawn_end(
                     spawn_mode: Some(spawn_mode),
                 },
             );
-            if let Some(summary) = request {
-                title.spans.push(Span::from(format!(
-                    " ({})",
-                    format_spawn_request_summary(summary)
-                )));
-            }
+            title.spans.push(Span::from(format!(
+                " ({})",
+                format_spawn_request_summary(&effective_request)
+            )));
             title
         }
         None => title_text("Agent spawn failed"),
