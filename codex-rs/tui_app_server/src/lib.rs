@@ -353,6 +353,7 @@ async fn connect_remote_app_server(websocket_url: String) -> color_eyre::Result<
     Ok(AppServerClient::Remote(app_server))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_app_server(
     target: &AppServerTarget,
     arg0_paths: Arg0DispatchPaths,
@@ -406,6 +407,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
     start_app_server_for_picker(config, &AppServerTarget::Embedded).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_embedded_app_server_with<F, Fut>(
     arg0_paths: Arg0DispatchPaths,
     config: Config,
@@ -1825,7 +1827,7 @@ mod tests {
             CloudRequirementsLoader::default(),
             codex_feedback::CodexFeedback::new(),
             |args| {
-                observed_auth_storage_home = Some(args.auth_storage_home.clone());
+                observed_auth_storage_home = Some(args.auth_storage_home);
                 async { Err(std::io::Error::other("stop after capture")) }
             },
         )

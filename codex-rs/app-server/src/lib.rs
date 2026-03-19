@@ -338,6 +338,7 @@ pub async fn run_main(
         default_analytics_enabled,
         None,
         AppServerTransport::Stdio,
+        SessionSource::VSCode,
     )
     .await
 }
@@ -349,6 +350,7 @@ pub async fn run_main_with_transport(
     default_analytics_enabled: bool,
     auth_file: Option<PathBuf>,
     transport: AppServerTransport,
+    session_source: SessionSource,
 ) -> IoResult<()> {
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
@@ -568,7 +570,7 @@ pub async fn run_main_with_transport(
             feedback: feedback.clone(),
             log_db,
             config_warnings,
-            session_source: SessionSource::VSCode,
+            session_source,
             enable_codex_api_key_env: false,
         });
         let mut thread_created_rx = processor.thread_created_receiver();
