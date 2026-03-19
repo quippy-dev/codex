@@ -50,7 +50,10 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +65,15 @@ use std::time::Instant;
 use toml_edit::value;
 use tracing::info;
 use tracing::warn;
+
+#[derive(Clone)]
+struct CachedEnabledPlugins {
+    key: EnabledPluginsCacheKey,
+    outcome: PluginLoadOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EnabledPluginsCacheKey(u64);
 
 const DEFAULT_SKILLS_DIR_NAME: &str = "skills";
 const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
@@ -460,7 +472,7 @@ pub struct PluginsManager {
     codex_home: PathBuf,
     store: PluginStore,
     featured_plugin_ids_cache: RwLock<Option<CachedFeaturedPluginIds>>,
-    cached_enabled_outcome: RwLock<Option<PluginLoadOutcome>>,
+    cached_enabled_outcome: RwLock<Option<CachedEnabledPlugins>>,
     analytics_events_client: RwLock<Option<AnalyticsEventsClient>>,
 }
 
@@ -496,8 +508,12 @@ impl PluginsManager {
             return PluginLoadOutcome::default();
         }
 
-        if !force_reload && let Some(outcome) = self.cached_enabled_outcome() {
-            return outcome;
+        let cache_key = enabled_plugins_cache_key(config);
+        if !force_reload
+            && let Some(cached) = self.cached_enabled_outcome()
+            && cached.key == cache_key
+        {
+            return cached.outcome;
         }
 
         let outcome = load_plugins_from_layer_stack(&config.config_layer_stack, &self.store);
@@ -506,7 +522,10 @@ impl PluginsManager {
             Ok(cache) => cache,
             Err(err) => err.into_inner(),
         };
-        *cache = Some(outcome.clone());
+        *cache = Some(CachedEnabledPlugins {
+            key: cache_key,
+            outcome: outcome.clone(),
+        });
         outcome
     }
 
@@ -523,7 +542,7 @@ impl PluginsManager {
         *cached_enabled_outcome = None;
     }
 
-    fn cached_enabled_outcome(&self) -> Option<PluginLoadOutcome> {
+    fn cached_enabled_outcome(&self) -> Option<CachedEnabledPlugins> {
         match self.cached_enabled_outcome.read() {
             Ok(cache) => cache.clone(),
             Err(err) => err.into_inner().clone(),
@@ -1168,6 +1187,18 @@ impl PluginsManager {
         roots.dedup();
         roots
     }
+}
+
+fn enabled_plugins_cache_key(config: &Config) -> EnabledPluginsCacheKey {
+    let mut hasher = DefaultHasher::new();
+    for layer in config.config_layer_stack.get_layers(
+        crate::config_loader::ConfigLayerStackOrdering::LowestPrecedenceFirst,
+        /*include_disabled*/ true,
+    ) {
+        format!("{:?}", layer.name).hash(&mut hasher);
+        layer.config.to_string().hash(&mut hasher);
+    }
+    EnabledPluginsCacheKey(hasher.finish())
 }
 
 #[derive(Debug, thiserror::Error)]

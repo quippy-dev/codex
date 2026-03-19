@@ -27,7 +27,6 @@ use crate::skills::SkillsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::protocol::ForkReferenceItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
@@ -733,32 +732,12 @@ impl ThreadManagerState {
         parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
         let history = RolloutRecorder::get_fork_history(&path).await?;
-        let mut history = truncate_before_nth_user_message(
+        let history = truncate_before_nth_user_message(
             config.codex_home.as_path(),
             history,
             nth_user_message,
         )
         .await;
-        if let InitialHistory::Forked(items) = &mut history {
-            let source_session_meta = items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(meta_line.clone()),
-                RolloutItem::ForkReference(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::EventMsg(_) => None,
-            });
-            *items = source_session_meta
-                .into_iter()
-                .map(RolloutItem::SessionMeta)
-                .chain(std::iter::once(RolloutItem::ForkReference(
-                    ForkReferenceItem {
-                        rollout_path: path.clone(),
-                        nth_user_message,
-                    },
-                )))
-                .collect();
-        }
         self.spawn_thread_with_source(
             config,
             history,
