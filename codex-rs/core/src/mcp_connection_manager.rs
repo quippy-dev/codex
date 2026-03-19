@@ -1185,30 +1185,6 @@ fn filter_tools(tools: Vec<ToolInfo>, filter: &ToolFilter) -> Vec<ToolInfo> {
         .collect()
 }
 
-pub(crate) fn filter_codex_apps_mcp_tools_only(
-    mcp_tools: &HashMap<String, ToolInfo>,
-    connectors: &[crate::connectors::AppInfo],
-) -> HashMap<String, ToolInfo> {
-    let allowed: HashSet<&str> = connectors
-        .iter()
-        .map(|connector| connector.id.as_str())
-        .collect();
-
-    mcp_tools
-        .iter()
-        .filter(|(_, tool)| {
-            if tool.server_name != CODEX_APPS_MCP_SERVER_NAME {
-                return false;
-            }
-            let Some(connector_id) = tool.connector_id.as_deref() else {
-                return false;
-            };
-            allowed.contains(connector_id)
-        })
-        .map(|(name, tool)| (name.clone(), tool.clone()))
-        .collect()
-}
-
 pub(crate) fn filter_non_codex_apps_mcp_tools_only(
     mcp_tools: &HashMap<String, ToolInfo>,
 ) -> HashMap<String, ToolInfo> {
@@ -1220,6 +1196,7 @@ pub(crate) fn filter_non_codex_apps_mcp_tools_only(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn filter_mcp_tools_by_name(
     mcp_tools: &HashMap<String, ToolInfo>,
     selected_tools: &[String],

@@ -272,6 +272,10 @@ impl ThreadManager {
         self.state.session_source.clone()
     }
 
+    pub fn auth_manager(&self) -> Arc<AuthManager> {
+        self.state.auth_manager.clone()
+    }
+
     pub fn skills_manager(&self) -> Arc<SkillsManager> {
         self.state.skills_manager.clone()
     }
@@ -383,6 +387,7 @@ impl ThreadManager {
             persist_extended_history,
             metrics_service_name,
             parent_trace,
+            /*user_shell_override*/ None,
         ))
         .await
     }
@@ -422,6 +427,48 @@ impl ThreadManager {
             persist_extended_history,
             /*metrics_service_name*/ None,
             parent_trace,
+            /*user_shell_override*/ None,
+        ))
+        .await
+    }
+
+    pub(crate) async fn start_thread_with_user_shell_override_for_tests(
+        &self,
+        config: Config,
+        user_shell_override: crate::shell::Shell,
+    ) -> CodexResult<NewThread> {
+        Box::pin(self.state.spawn_thread(
+            config,
+            InitialHistory::New,
+            Arc::clone(&self.state.auth_manager),
+            self.agent_control(),
+            Vec::new(),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*parent_trace*/ None,
+            /*user_shell_override*/ Some(user_shell_override),
+        ))
+        .await
+    }
+
+    pub(crate) async fn resume_thread_from_rollout_with_user_shell_override_for_tests(
+        &self,
+        config: Config,
+        rollout_path: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        user_shell_override: crate::shell::Shell,
+    ) -> CodexResult<NewThread> {
+        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        Box::pin(self.state.spawn_thread(
+            config,
+            initial_history,
+            auth_manager,
+            self.agent_control(),
+            Vec::new(),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*parent_trace*/ None,
+            /*user_shell_override*/ Some(user_shell_override),
         ))
         .await
     }
@@ -506,31 +553,6 @@ impl ThreadManager {
                 path,
                 self.state.session_source.clone(),
                 None,
-                parent_trace,
-            )
-            .await
-    }
-
-    /// Fork an existing thread while explicitly controlling the session source of the
-    /// forked thread.
-    pub async fn fork_thread_with_source(
-        &self,
-        nth_user_message: usize,
-        config: Config,
-        path: PathBuf,
-        session_source: SessionSource,
-        persist_extended_history: bool,
-        parent_trace: Option<W3cTraceContext>,
-    ) -> CodexResult<NewThread> {
-        self.state
-            .fork_thread_with_source(
-                nth_user_message,
-                config,
-                Arc::clone(&self.state.auth_manager),
-                self.agent_control(),
-                persist_extended_history,
-                path,
-                session_source,
                 None,
                 parent_trace,
             )
@@ -604,10 +626,12 @@ impl ThreadManagerState {
             /*persist_extended_history*/ false,
             /*metrics_service_name*/ None,
             /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
         ))
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_new_thread_with_source(
         &self,
         config: Config,
@@ -617,6 +641,7 @@ impl ThreadManagerState {
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -628,11 +653,14 @@ impl ThreadManagerState {
             persist_extended_history,
             metrics_service_name,
             inherited_shell_snapshot,
+            inherited_exec_policy,
             /*parent_trace*/ None,
+            /*user_shell_override*/ None,
         ))
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resume_thread_from_rollout_with_source(
         &self,
         config: Config,
@@ -641,6 +669,7 @@ impl ThreadManagerState {
         agent_control: AgentControl,
         session_source: SessionSource,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     ) -> CodexResult<NewThread> {
         let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
         Box::pin(self.spawn_thread_with_source(
@@ -653,11 +682,14 @@ impl ThreadManagerState {
             /*persist_extended_history*/ false,
             /*metrics_service_name*/ None,
             inherited_shell_snapshot,
+            inherited_exec_policy,
             /*parent_trace*/ None,
+            /*user_shell_override*/ None,
         ))
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_thread_from_history_with_source(
         &self,
         config: Config,
@@ -667,6 +699,7 @@ impl ThreadManagerState {
         session_source: SessionSource,
         persist_extended_history: bool,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -678,10 +711,71 @@ impl ThreadManagerState {
             persist_extended_history,
             /*metrics_service_name*/ None,
             inherited_shell_snapshot,
+            inherited_exec_policy,
             /*parent_trace*/ None,
+            /*user_shell_override*/ None,
         ))
         .await
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fork_thread_with_source(
+        &self,
+        nth_user_message: usize,
+        config: Config,
+        auth_manager: Arc<AuthManager>,
+        agent_control: AgentControl,
+        persist_extended_history: bool,
+        path: PathBuf,
+        session_source: SessionSource,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread> {
+        let history = RolloutRecorder::get_fork_history(&path).await?;
+        let mut history = truncate_before_nth_user_message(
+            config.codex_home.as_path(),
+            history,
+            nth_user_message,
+        )
+        .await;
+        if let InitialHistory::Forked(items) = &mut history {
+            let source_session_meta = items.iter().find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => Some(meta_line.clone()),
+                RolloutItem::ForkReference(_)
+                | RolloutItem::ResponseItem(_)
+                | RolloutItem::Compacted(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::EventMsg(_) => None,
+            });
+            *items = source_session_meta
+                .into_iter()
+                .map(RolloutItem::SessionMeta)
+                .chain(std::iter::once(RolloutItem::ForkReference(
+                    ForkReferenceItem {
+                        rollout_path: path.clone(),
+                        nth_user_message,
+                    },
+                )))
+                .collect();
+        }
+        self.spawn_thread_with_source(
+            config,
+            history,
+            auth_manager,
+            agent_control,
+            session_source,
+            Vec::new(),
+            persist_extended_history,
+            /*metrics_service_name*/ None,
+            inherited_shell_snapshot,
+            inherited_exec_policy,
+            parent_trace,
+            /*user_shell_override*/ None,
+        )
+        .await
+    }
+
     /// Spawn a new thread with optional history and register it with the manager.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_thread(
@@ -694,6 +788,7 @@ impl ThreadManagerState {
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
         parent_trace: Option<W3cTraceContext>,
+        user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -705,7 +800,9 @@ impl ThreadManagerState {
             persist_extended_history,
             metrics_service_name,
             /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
             parent_trace,
+            user_shell_override,
         ))
         .await
     }
@@ -722,7 +819,9 @@ impl ThreadManagerState {
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         parent_trace: Option<W3cTraceContext>,
+        user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
         let watch_registration = self
             .file_watcher
@@ -744,6 +843,8 @@ impl ThreadManagerState {
             persist_extended_history,
             metrics_service_name,
             inherited_shell_snapshot,
+            inherited_exec_policy,
+            user_shell_override,
             parent_trace,
         })
         .await?;
@@ -789,60 +890,6 @@ impl ThreadManagerState {
 
     pub(crate) fn default_auth_manager(&self) -> Arc<AuthManager> {
         Arc::clone(&self.auth_manager)
-    }
-
-    pub(crate) async fn fork_thread_with_source(
-        &self,
-        nth_user_message: usize,
-        config: Config,
-        auth_manager: Arc<AuthManager>,
-        agent_control: AgentControl,
-        persist_extended_history: bool,
-        path: PathBuf,
-        session_source: SessionSource,
-        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
-        parent_trace: Option<W3cTraceContext>,
-    ) -> CodexResult<NewThread> {
-        let history = RolloutRecorder::get_fork_history(&path).await?;
-        let mut history = truncate_before_nth_user_message(
-            config.codex_home.as_path(),
-            history,
-            nth_user_message,
-        )
-        .await;
-        if let InitialHistory::Forked(items) = &mut history {
-            let source_session_meta = items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(meta_line.clone()),
-                RolloutItem::ForkReference(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::EventMsg(_) => None,
-            });
-            *items = source_session_meta
-                .into_iter()
-                .map(RolloutItem::SessionMeta)
-                .chain(std::iter::once(RolloutItem::ForkReference(
-                    ForkReferenceItem {
-                        rollout_path: path.clone(),
-                        nth_user_message,
-                    },
-                )))
-                .collect();
-        }
-        self.spawn_thread_with_source(
-            config,
-            history,
-            auth_manager,
-            agent_control,
-            session_source,
-            Vec::new(),
-            persist_extended_history,
-            None,
-            inherited_shell_snapshot,
-            parent_trace,
-        )
-        .await
     }
 }
 

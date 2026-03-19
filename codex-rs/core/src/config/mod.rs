@@ -23,6 +23,8 @@ use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
 use crate::config::types::SkillsConfig;
+use crate::config::types::ToolSuggestConfig;
+use crate::config::types::ToolSuggestDiscoverable;
 use crate::config::types::Tui;
 use crate::config::types::UriBasedFileOpener;
 use crate::config::types::WindowsSandboxModeToml;
@@ -31,6 +33,7 @@ use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigLayerStackOrdering;
 use crate::config_loader::ConfigRequirements;
+use crate::config_loader::ConfigRequirementsToml;
 use crate::config_loader::ConstrainedWithSource;
 use crate::config_loader::LoaderOverrides;
 use crate::config_loader::McpServerIdentity;
@@ -38,8 +41,6 @@ use crate::config_loader::McpServerRequirement;
 use crate::config_loader::ResidencyRequirement;
 use crate::config_loader::Sourced;
 use crate::config_loader::load_config_layers_state;
-use crate::config_loader::load_default_config_layers_state;
-use crate::config_loader::merge_toml_values;
 use crate::features::Feature;
 use crate::features::FeatureOverrides;
 use crate::features::Features;
@@ -88,6 +89,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 use similar::DiffableStr;
 use std::collections::BTreeMap;
@@ -143,11 +145,29 @@ pub(crate) const DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS: Option<u64> = None;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 const OPENAI_BASE_URL_ENV_VAR: &str = "OPENAI_BASE_URL";
+#[cfg(target_os = "linux")]
+const SYSTEM_BWRAP_PATH: &str = "/usr/bin/bwrap";
 const RESERVED_MODEL_PROVIDER_IDS: [&str; 3] = [
     OPENAI_PROVIDER_ID,
     OLLAMA_OSS_PROVIDER_ID,
     LMSTUDIO_OSS_PROVIDER_ID,
 ];
+
+#[cfg(target_os = "linux")]
+pub fn missing_system_bwrap_warning() -> Option<String> {
+    if Path::new(SYSTEM_BWRAP_PATH).is_file() {
+        None
+    } else {
+        Some(format!(
+            "Codex could not find system bubblewrap at {SYSTEM_BWRAP_PATH}. Please install bubblewrap with your package manager. Codex will use the vendored bubblewrap in the meantime."
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn missing_system_bwrap_warning() -> Option<String> {
+    None
+}
 
 fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
     let raw = std::env::var(codex_state::SQLITE_HOME_ENV).ok()?;
@@ -273,6 +293,9 @@ pub struct Config {
 
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
+
+    /// Guardian-specific developer instructions override from requirements.toml.
+    pub guardian_developer_instructions: Option<String>,
 
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
@@ -402,6 +425,7 @@ pub struct Config {
 
     /// How inbound collaboration messages are delivered to non-subagent threads.
     pub collab_inbox_delivery_role: CollabInboxDeliveryRole,
+
     /// Maximum nesting depth allowed for spawned agent threads.
     pub agent_max_depth: i32,
 
@@ -489,9 +513,6 @@ pub struct Config {
     /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
-    /// Experimental / do not use. Overrides the synthesized startup
-    /// instructions injected when realtime mode becomes active.
-    pub experimental_realtime_start_instructions: Option<String>,
     /// Experimental / do not use. Selects the realtime websocket model/snapshot
     /// used for the `Op::RealtimeConversation` connection.
     pub experimental_realtime_ws_model: Option<String>,
@@ -506,6 +527,10 @@ pub struct Config {
     /// context appended to websocket session instructions. An empty string
     /// disables startup context injection entirely.
     pub experimental_realtime_ws_startup_context: Option<String>,
+    /// Experimental / do not use. Replaces the built-in realtime start
+    /// instructions inserted into developer messages when realtime becomes
+    /// active.
+    pub experimental_realtime_start_instructions: Option<String>,
     /// When set, restricts ChatGPT login to a specific workspace identifier.
     pub forced_chatgpt_workspace_id: Option<String>,
 
@@ -569,6 +594,9 @@ pub struct Config {
     /// When `false`, disables feedback collection across Codex product surfaces.
     /// Defaults to `true`.
     pub feedback_enabled: bool,
+
+    /// Configured discoverable tools for tool suggestions.
+    pub tool_suggest: ToolSuggestConfig,
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config::types::OtelConfig,
@@ -813,26 +841,34 @@ impl Config {
         )
     }
 
+    /// Load a default configuration when user config files are invalid, while
+    /// preserving loader overrides in the reported layer stack.
     pub async fn load_default_with_cli_overrides_and_loader_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
         loader_overrides: LoaderOverrides,
         cloud_requirements: CloudRequirementsLoader,
     ) -> std::io::Result<Self> {
         let codex_home = find_codex_home()?;
-        let mut merged = toml::Value::try_from(ConfigToml::default()).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to serialize default config: {e}"),
-            )
-        })?;
-        let config_layer_stack = load_default_config_layers_state(
+        if let Err(err) = maybe_migrate_smart_approvals_alias(&codex_home).await {
+            tracing::warn!(error = %err, "failed to migrate smart_approvals feature alias");
+        }
+        let config_layer_stack = crate::config_loader::load_default_config_layers_state(
             &codex_home,
             &cli_overrides,
             loader_overrides,
             cloud_requirements,
         )
         .await?;
-        merge_toml_values(&mut merged, &config_layer_stack.effective_config());
+        let mut merged = toml::Value::try_from(ConfigToml::default()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to serialize default config: {e}"),
+            )
+        })?;
+        crate::config_loader::merge_toml_values(
+            &mut merged,
+            &config_layer_stack.effective_config(),
+        );
         let config_toml = deserialize_config_toml_with_base(merged, &codex_home)?;
         Self::load_config_with_layer_stack(
             config_toml,
@@ -1415,9 +1451,6 @@ pub struct ConfigToml {
     /// `/v1/realtime`
     /// connection) without changing normal provider HTTP requests.
     pub experimental_realtime_ws_base_url: Option<String>,
-    /// Experimental / do not use. Overrides the synthesized startup
-    /// instructions injected when realtime mode becomes active.
-    pub experimental_realtime_start_instructions: Option<String>,
     /// Experimental / do not use. Selects the realtime websocket model/snapshot
     /// used for the `Op::RealtimeConversation` connection.
     pub experimental_realtime_ws_model: Option<String>,
@@ -1433,6 +1466,10 @@ pub struct ConfigToml {
     /// context appended to websocket session instructions. An empty string
     /// disables startup context injection entirely.
     pub experimental_realtime_ws_startup_context: Option<String>,
+    /// Experimental / do not use. Replaces the built-in realtime start
+    /// instructions inserted into developer messages when realtime becomes
+    /// active.
+    pub experimental_realtime_start_instructions: Option<String>,
     pub projects: Option<HashMap<String, ProjectConfig>>,
 
     /// Controls the web search tool mode: disabled, cached, or live.
@@ -1440,6 +1477,9 @@ pub struct ConfigToml {
 
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
+
+    /// Additional discoverable tools that can be suggested for installation.
+    pub tool_suggest: Option<ToolSuggestConfig>,
 
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
@@ -1577,13 +1617,7 @@ pub enum RealtimeWsMode {
     Transcription,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RealtimeWsVersion {
-    #[default]
-    V1,
-    V2,
-}
+pub use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -1611,12 +1645,62 @@ pub struct RealtimeAudioToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ToolsToml {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_web_search_tool_config"
+    )]
     pub web_search: Option<WebSearchToolConfig>,
 
     /// Enable the `view_image` tool that lets the agent attach local images.
     #[serde(default)]
     pub view_image: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WebSearchToolConfigInput {
+    Enabled(bool),
+    Config(WebSearchToolConfig),
+}
+
+fn deserialize_optional_web_search_tool_config<'de, D>(
+    deserializer: D,
+) -> Result<Option<WebSearchToolConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<WebSearchToolConfigInput>::deserialize(deserializer)?;
+
+    Ok(match value {
+        None => None,
+        Some(WebSearchToolConfigInput::Enabled(enabled)) => {
+            let _ = enabled;
+            None
+        }
+        Some(WebSearchToolConfigInput::Config(config)) => Some(config),
+    })
+}
+
+fn resolve_tool_suggest_config(config_toml: &ConfigToml) -> ToolSuggestConfig {
+    let discoverables = config_toml
+        .tool_suggest
+        .as_ref()
+        .into_iter()
+        .flat_map(|tool_suggest| tool_suggest.discoverables.iter())
+        .filter_map(|discoverable| {
+            let trimmed = discoverable.id.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(ToolSuggestDiscoverable {
+                    kind: discoverable.kind,
+                    id: trimmed.to_string(),
+                })
+            }
+        })
+        .collect();
+
+    ToolSuggestConfig { discoverables }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
@@ -1626,7 +1710,6 @@ pub struct AgentsToml {
     /// When unset, no limit is enforced.
     #[schemars(range(min = 1))]
     pub max_threads: Option<usize>,
-
     /// How inbound collaboration messages are delivered to non-subagent threads.
     pub inbox_delivery_role: Option<CollabInboxDeliveryRole>,
     /// Maximum nesting depth allowed for spawned agent threads.
@@ -1661,6 +1744,7 @@ pub enum AgentRoleSpawnMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRoleConfig {
     /// Human-facing role documentation used in spawn tool guidance.
+    /// Required for loaded user-defined roles after deprecated/new metadata precedence resolves.
     pub description: Option<String>,
     /// Optional model override applied by this role.
     pub model: Option<String>,
@@ -1676,6 +1760,7 @@ pub struct AgentRoleConfig {
 #[schemars(deny_unknown_fields)]
 pub struct AgentRoleToml {
     /// Human-facing role documentation used in spawn tool guidance.
+    /// Required unless supplied by the referenced agent role file.
     pub description: Option<String>,
 
     /// Optional model override applied by this role.
@@ -2157,6 +2242,7 @@ impl Config {
                 .clone(),
             None => ConfigProfile::default(),
         };
+        let tool_suggest = resolve_tool_suggest_config(&cfg);
         let feature_overrides = FeatureOverrides {
             include_apply_patch_tool: include_apply_patch_tool_override,
             web_search_request: override_tools_web_search_request,
@@ -2335,6 +2421,7 @@ impl Config {
         let web_search_mode = resolve_web_search_mode(&cfg, &config_profile, &features)
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
+
         let agent_roles =
             agent_roles::load_agent_roles(&cfg, &config_layer_stack, &mut startup_warnings)?;
 
@@ -2520,6 +2607,9 @@ impl Config {
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
         let base_instructions = base_instructions.or(file_base_instructions);
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
+        let guardian_developer_instructions = guardian_developer_instructions_from_requirements(
+            config_layer_stack.requirements_toml(),
+        );
         let personality = personality
             .or(config_profile.personality)
             .or(cfg.personality)
@@ -2646,7 +2736,6 @@ impl Config {
             } else {
                 NetworkSandboxPolicy::from(&effective_sandbox_policy)
             };
-
         let config = Self {
             model,
             service_tier,
@@ -2729,6 +2818,7 @@ impl Config {
                 .show_raw_agent_reasoning
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
+            guardian_developer_instructions,
             model_reasoning_effort: config_profile
                 .model_reasoning_effort
                 .or(cfg.model_reasoning_effort),
@@ -2752,7 +2842,6 @@ impl Config {
                     speaker: audio.speaker,
                 }),
             experimental_realtime_ws_base_url: cfg.experimental_realtime_ws_base_url,
-            experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
             experimental_realtime_ws_model: cfg.experimental_realtime_ws_model,
             realtime: cfg
                 .realtime
@@ -2762,6 +2851,7 @@ impl Config {
                 }),
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             experimental_realtime_ws_startup_context: cfg.experimental_realtime_ws_startup_context,
+            experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
             forced_chatgpt_workspace_id,
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
@@ -2790,6 +2880,7 @@ impl Config {
                 .as_ref()
                 .and_then(|feedback| feedback.enabled)
                 .unwrap_or(true),
+            tool_suggest,
             tui_notifications: cfg
                 .tui
                 .as_ref()
@@ -2924,6 +3015,18 @@ pub(crate) fn uses_deprecated_instructions_file(config_layer_stack: &ConfigLayer
         .any(|layer| toml_uses_deprecated_instructions_file(&layer.config))
 }
 
+fn guardian_developer_instructions_from_requirements(
+    requirements_toml: &ConfigRequirementsToml,
+) -> Option<String> {
+    requirements_toml
+        .guardian_developer_instructions
+        .as_deref()
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+}
+
 fn toml_uses_deprecated_instructions_file(value: &TomlValue) -> bool {
     let Some(table) = value.as_table() else {
         return false;
@@ -2962,59 +3065,3 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod notifications_tests {
-    use crate::config::types::NotificationMethod;
-    use crate::config::types::Notifications;
-    use assert_matches::assert_matches;
-    use serde::Deserialize;
-
-    #[derive(Deserialize, Debug, PartialEq)]
-    struct TuiTomlTest {
-        #[serde(default)]
-        notifications: Notifications,
-        #[serde(default)]
-        notification_method: NotificationMethod,
-    }
-
-    #[derive(Deserialize, Debug, PartialEq)]
-    struct RootTomlTest {
-        tui: TuiTomlTest,
-    }
-
-    #[test]
-    fn test_tui_notifications_true() {
-        let toml = r#"
-            [tui]
-            notifications = true
-        "#;
-        let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=true");
-        assert_matches!(parsed.tui.notifications, Notifications::Enabled(true));
-    }
-
-    #[test]
-    fn test_tui_notifications_custom_array() {
-        let toml = r#"
-            [tui]
-            notifications = ["foo"]
-        "#;
-        let parsed: RootTomlTest =
-            toml::from_str(toml).expect("deserialize notifications=[\"foo\"]");
-        assert_matches!(
-            parsed.tui.notifications,
-            Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_tui_notification_method() {
-        let toml = r#"
-            [tui]
-            notification_method = "bel"
-        "#;
-        let parsed: RootTomlTest =
-            toml::from_str(toml).expect("deserialize notification_method=\"bel\"");
-        assert_eq!(parsed.tui.notification_method, NotificationMethod::Bel);
-    }
-}

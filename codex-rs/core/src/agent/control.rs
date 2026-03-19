@@ -197,6 +197,9 @@ impl AgentControl {
             .await;
         let session_source =
             self.maybe_reserve_thread_spawn_identity(&config, &mut reservation, session_source)?;
+        let inherited_exec_policy = self
+            .inherited_exec_policy_for_source(&state, session_source.as_ref(), &config)
+            .await;
         let notification_source = session_source.clone();
         let auth_manager = self
             .auth_manager_for_source(&config, &state, session_source.as_ref())
@@ -278,6 +281,7 @@ impl AgentControl {
                             session_source,
                             /*persist_extended_history*/ false,
                             inherited_shell_snapshot,
+                            inherited_exec_policy,
                         )
                         .await?
                 } else {
@@ -290,6 +294,7 @@ impl AgentControl {
                             /*persist_extended_history*/ false,
                             /*metrics_service_name*/ None,
                             inherited_shell_snapshot,
+                            inherited_exec_policy,
                         )
                         .await?
                 }
@@ -328,6 +333,9 @@ impl AgentControl {
         let inherited_shell_snapshot = self
             .inherited_shell_snapshot_for_source(&state, session_source.as_ref())
             .await;
+        let inherited_exec_policy = self
+            .inherited_exec_policy_for_source(&state, session_source.as_ref(), &config)
+            .await;
         let auth_manager = self
             .auth_manager_for_source(&config, &state, session_source.as_ref())
             .await;
@@ -343,6 +351,7 @@ impl AgentControl {
                         false,
                         None,
                         inherited_shell_snapshot,
+                        inherited_exec_policy,
                     )
                     .await?
             }
@@ -375,6 +384,9 @@ impl AgentControl {
         let notification_source = Some(session_source.clone());
         let inherited_shell_snapshot = self
             .inherited_shell_snapshot_for_source(&state, Some(&session_source))
+            .await;
+        let inherited_exec_policy = self
+            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
             .await;
         let auth_manager = self
             .auth_manager_for_parent_thread(&config, &state, parent_thread_id)
@@ -412,6 +424,7 @@ impl AgentControl {
                 rollout_path,
                 session_source,
                 inherited_shell_snapshot,
+                inherited_exec_policy,
                 None,
             )
             .await?;
@@ -482,6 +495,9 @@ impl AgentControl {
         let inherited_shell_snapshot = self
             .inherited_shell_snapshot_for_source(&state, Some(&session_source))
             .await;
+        let inherited_exec_policy = self
+            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
+            .await;
         let auth_manager = self
             .auth_manager_for_source(&config, &state, Some(&session_source))
             .await;
@@ -498,6 +514,7 @@ impl AgentControl {
                 self.clone(),
                 session_source,
                 inherited_shell_snapshot,
+                inherited_exec_policy,
             )
             .await?;
         reservation.commit(resumed_thread.thread_id);
@@ -1571,6 +1588,30 @@ impl AgentControl {
             Some(auth_file),
         )
         .ok()
+    }
+
+    async fn inherited_exec_policy_for_source(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        session_source: Option<&SessionSource>,
+        child_config: &crate::config::Config,
+    ) -> Option<Arc<crate::exec_policy::ExecPolicyManager>> {
+        let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id, ..
+        })) = session_source
+        else {
+            return None;
+        };
+
+        let parent_thread = state.get_thread(*parent_thread_id).await.ok()?;
+        let parent_config = parent_thread.codex.session.get_config().await;
+        if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, child_config) {
+            return None;
+        }
+
+        Some(Arc::clone(
+            &parent_thread.codex.session.services.exec_policy,
+        ))
     }
 }
 

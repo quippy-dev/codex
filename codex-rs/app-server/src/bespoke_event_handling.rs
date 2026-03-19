@@ -344,6 +344,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let notification = ThreadRealtimeStartedNotification {
                     thread_id: conversation_id.to_string(),
                     session_id: event.session_id,
+                    version: event.version,
                 };
                 outgoing
                     .send_server_notification(ServerNotification::ThreadRealtimeStarted(
@@ -2884,7 +2885,7 @@ fn wait_end_receiver_agents(agent_statuses: &[CollabAgentStatusEntry]) -> Vec<Co
             thread_id: entry.thread_id.to_string(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
-            spawn_mode: entry.spawn_mode.map(V2CollabAgentSpawnMode::from),
+            spawn_mode: entry.spawn_mode,
         })
         .collect()
 }

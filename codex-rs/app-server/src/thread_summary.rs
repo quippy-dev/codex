@@ -26,6 +26,7 @@ use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 pub(crate) async fn read_summary_from_state_db_by_thread_id(
     config: &Config,
     thread_id: ThreadId,
@@ -34,6 +35,7 @@ pub(crate) async fn read_summary_from_state_db_by_thread_id(
     read_summary_from_state_db_context_by_thread_id(state_db_ctx.as_ref(), thread_id).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn read_summary_from_state_db_context_by_thread_id(
     state_db_ctx: Option<&StateDbHandle>,
     thread_id: ThreadId,
@@ -66,6 +68,7 @@ pub(crate) async fn read_summary_from_state_db_context_by_thread_id(
     ))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn summary_from_thread_list_item(
     it: codex_core::ThreadItem,
     fallback_provider: &str,
@@ -116,6 +119,7 @@ pub(crate) async fn summary_from_thread_list_item(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn summary_from_state_db_metadata(
     conversation_id: ThreadId,
     path: PathBuf,
@@ -294,6 +298,7 @@ fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn load_thread_summary_for_rollout(
     config: &Config,
     thread_id: ThreadId,
@@ -315,10 +320,12 @@ pub(crate) async fn load_thread_summary_for_rollout(
     Ok(thread)
 }
 
+#[allow(dead_code)]
 fn merge_mutable_thread_metadata(thread: &mut Thread, persisted_thread: Thread) {
     thread.git_info = persisted_thread.git_info;
 }
 
+#[allow(dead_code)]
 fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
     let file_name = path.file_name()?.to_str()?;
     let stem = file_name.strip_suffix(".jsonl")?;
@@ -403,6 +410,7 @@ pub(crate) fn build_thread_from_snapshot(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn merge_loaded_thread_rollout_summary(
     thread: &mut Thread,
     summary: ConversationSummary,

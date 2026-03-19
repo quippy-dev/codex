@@ -150,59 +150,6 @@ fn rollout_items_start_with(items: &[RolloutItem], prefix: &[RolloutItem]) -> bo
             .all(|(item, prefix_item)| rollout_items_match(item, prefix_item))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::build_turns_from_response_history_items;
-    use codex_app_server_protocol::ThreadItem;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
-    use codex_protocol::protocol::RolloutItem;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn build_turns_from_response_history_items_groups_user_boundaries() {
-        let items = vec![
-            RolloutItem::ResponseItem(ResponseItem::Message {
-                id: Some("user-1".to_string()),
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "hello".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            }),
-            RolloutItem::ResponseItem(ResponseItem::Message {
-                id: Some("assistant-1".to_string()),
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "hi".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            }),
-            RolloutItem::ResponseItem(ResponseItem::Message {
-                id: Some("user-2".to_string()),
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: "again".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            }),
-        ];
-
-        let turns = build_turns_from_response_history_items(&items);
-
-        assert_eq!(turns.len(), 2);
-        assert!(!turns[0].id.is_empty());
-        assert!(!turns[1].id.is_empty());
-        assert_ne!(turns[0].id, turns[1].id);
-        assert!(matches!(turns[0].items[0], ThreadItem::UserMessage { .. }));
-        assert!(matches!(turns[0].items[1], ThreadItem::AgentMessage { .. }));
-        assert!(matches!(turns[1].items[0], ThreadItem::UserMessage { .. }));
-    }
-}
-
 pub(crate) fn codex_home_from_rollout_path(path: &Path) -> Option<&Path> {
     path.ancestors().find_map(|ancestor| {
         let name = ancestor.file_name().and_then(OsStr::to_str)?;
@@ -325,4 +272,57 @@ pub(crate) async fn materialize_rollout_items_for_replay(
     rollout_items: &[RolloutItem],
 ) -> Vec<RolloutItem> {
     materialize_rollout_items_for_replay_at_depth(codex_home, rollout_items, 0).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_turns_from_response_history_items;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::RolloutItem;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn build_turns_from_response_history_items_groups_user_boundaries() {
+        let items = vec![
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some("user-1".to_string()),
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hello".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some("assistant-1".to_string()),
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "hi".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: Some("user-2".to_string()),
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "again".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+        ];
+
+        let turns = build_turns_from_response_history_items(&items);
+
+        assert_eq!(turns.len(), 2);
+        assert!(!turns[0].id.is_empty());
+        assert!(!turns[1].id.is_empty());
+        assert_ne!(turns[0].id, turns[1].id);
+        assert!(matches!(turns[0].items[0], ThreadItem::UserMessage { .. }));
+        assert!(matches!(turns[0].items[1], ThreadItem::AgentMessage { .. }));
+        assert!(matches!(turns[1].items[0], ThreadItem::UserMessage { .. }));
+    }
 }

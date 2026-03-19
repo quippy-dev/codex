@@ -195,7 +195,7 @@ pub(crate) async fn load_default_config_layers_state(
     if !ignore_system_config || managed_preferences_base64.is_some() {
         layers.push(ConfigLayerEntry::new(
             ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
-            empty_config.clone(),
+            empty_config,
         ));
     }
 

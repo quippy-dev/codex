@@ -25,7 +25,7 @@
           "description": "Path to a role-specific config layer. Relative paths are resolved relative to the `config.toml` that defines them."
         },
         "description": {
-          "description": "Human-facing role documentation used in spawn tool guidance.",
+          "description": "Human-facing role documentation used in spawn tool guidance. Required unless supplied by the referenced agent role file.",
           "type": "string"
         },
         "model": {
@@ -1403,6 +1403,13 @@
       },
       "type": "object"
     },
+    "RealtimeConversationVersion": {
+      "enum": [
+        "v1",
+        "v2"
+      ],
+      "type": "string"
+    },
     "RealtimeToml": {
       "additionalProperties": false,
       "properties": {
@@ -1410,7 +1417,7 @@
           "$ref": "#/definitions/RealtimeWsMode"
         },
         "version": {
-          "$ref": "#/definitions/RealtimeWsVersion"
+          "$ref": "#/definitions/RealtimeConversationVersion"
         }
       },
       "type": "object"
@@ -1419,13 +1426,6 @@
       "enum": [
         "conversational",
         "transcription"
-      ],
-      "type": "string"
-    },
-    "RealtimeWsVersion": {
-      "enum": [
-        "v1",
-        "v2"
       ],
       "type": "string"
     },
@@ -1592,6 +1592,42 @@
         }
       },
       "type": "object"
+    },
+    "ToolSuggestConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "discoverables": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ToolSuggestDiscoverable"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ToolSuggestDiscoverable": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/ToolSuggestDiscoverableType"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ToolSuggestDiscoverableType": {
+      "enum": [
+        "connector",
+        "plugin"
+      ],
+      "type": "string"
     },
     "ToolsToml": {
       "additionalProperties": false,
@@ -1904,7 +1940,7 @@
       "$ref": "#/definitions/AbsolutePathBuf"
     },
     "experimental_realtime_start_instructions": {
-      "description": "Experimental / do not use. Overrides the synthesized startup instructions injected when realtime mode becomes active.",
+      "description": "Experimental / do not use. Replaces the built-in realtime start instructions inserted into developer messages when realtime becomes active.",
       "type": "string"
     },
     "experimental_realtime_ws_backend_prompt": {
@@ -2483,6 +2519,14 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "tool_suggest": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ToolSuggestConfig"
+        }
+      ],
+      "description": "Additional discoverable tools that can be suggested for installation."
     },
     "tools": {
       "allOf": [

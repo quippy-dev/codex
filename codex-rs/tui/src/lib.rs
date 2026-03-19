@@ -68,6 +68,19 @@ mod app_server_tui_dispatch;
 mod ascii_animation;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 mod audio_device;
+#[cfg(all(not(target_os = "linux"), not(feature = "voice-input")))]
+mod audio_device {
+    use crate::app_event::RealtimeAudioDeviceKind;
+
+    pub(crate) fn list_realtime_audio_device_names(
+        kind: RealtimeAudioDeviceKind,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "Failed to load realtime {} devices: voice input is unavailable in this build",
+            kind.noun()
+        ))
+    }
+}
 mod bottom_pane;
 mod chatwidget;
 mod cli;
@@ -158,6 +171,14 @@ mod voice {
     ) {
     }
 
+    #[derive(Clone)]
+    pub(crate) enum RealtimeInputBehavior {
+        Ungated,
+        PlaybackAware {
+            playback_queued_samples: Arc<AtomicUsize>,
+        },
+    }
+
     impl VoiceCapture {
         pub fn start() -> Result<Self, String> {
             Err("voice input is unavailable in this build".to_string())
@@ -166,7 +187,7 @@ mod voice {
         pub fn start_realtime(
             _config: &Config,
             _tx: AppEventSender,
-            _playback_queued_samples: Arc<AtomicUsize>,
+            _input_behavior: RealtimeInputBehavior,
         ) -> Result<Self, String> {
             Err("voice input is unavailable in this build".to_string())
         }

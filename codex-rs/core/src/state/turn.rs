@@ -247,6 +247,25 @@ impl TurnState {
         self.sampling_completed
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepend_pending_input(&mut self, mut input: Vec<ResponseInputItem>) {
+        if input.is_empty() {
+            return;
+        }
+
+        let pending_input = input.drain(..).map(PendingInputItem::queued).collect();
+        self.prepend_pending_input_entries(pending_input);
+    }
+
+    pub(crate) fn prepend_pending_input_entries(&mut self, mut input: Vec<PendingInputItem>) {
+        if input.is_empty() {
+            return;
+        }
+
+        input.append(&mut self.pending_input);
+        self.pending_input = input;
+    }
+
     pub(crate) fn take_pending_input(&mut self) -> Vec<ResponseInputItem> {
         self.take_pending_input_entries()
             .into_iter()

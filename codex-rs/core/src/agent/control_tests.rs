@@ -773,14 +773,14 @@ async fn send_agent_message_after_sampling_completed_queues_post_turn_flush() {
             .is_empty()
     );
 
-    let inject_ops: Vec<Op> = harness
-        .manager
-        .captured_ops()
-        .into_iter()
-        .filter_map(|(thread_id, op)| (thread_id == receiver_thread_id).then_some(op))
-        .filter(|op| matches!(op, Op::InjectResponseItems { .. }))
-        .collect();
-    assert!(inject_ops.is_empty());
+    assert!(
+        harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .filter_map(|(thread_id, op)| (thread_id == receiver_thread_id).then_some(op))
+            .all(|op| !matches!(op, Op::InjectResponseItems { .. }))
+    );
 
     receiver_thread
         .codex
@@ -1287,8 +1287,8 @@ async fn root_watchdog_helper_completed_without_final_body_after_send_input_does
                 if matches!(
                     event.msg,
                     EventMsg::RawResponseItem(RawResponseItemEvent { item })
-                        if history_contains_text(&[item.clone()], "without calling send_input")
-                            || history_contains_text(&[item.clone()], "before calling send_input")
+                        if history_contains_text(std::slice::from_ref(&item), "without calling send_input")
+                            || history_contains_text(std::slice::from_ref(&item), "before calling send_input")
                 ) {
                     return true;
                 }
@@ -3671,7 +3671,7 @@ async fn completion_watcher_suppresses_duplicate_terminal_message_already_forwar
             if matches!(
                 event.msg,
                 EventMsg::RawResponseItem(RawResponseItemEvent { item })
-                    if history_contains_text(&[item.clone()], "same final message")
+                    if history_contains_text(std::slice::from_ref(&item), "same final message")
             ) {
                 return true;
             }

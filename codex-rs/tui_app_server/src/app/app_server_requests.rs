@@ -380,12 +380,8 @@ mod tests {
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::ToolRequestUserInputResponse;
     use codex_protocol::approvals::ElicitationAction;
-    use codex_protocol::approvals::ElicitationRequest;
-    use codex_protocol::approvals::ElicitationRequestEvent;
     use codex_protocol::approvals::ExecPolicyAmendment;
     use codex_protocol::mcp::RequestId as McpRequestId;
-    use codex_protocol::protocol::Event;
-    use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::Op;
     use codex_protocol::protocol::ReviewDecision;
     use pretty_assertions::assert_eq;
@@ -521,25 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn correlates_mcp_elicitation_between_legacy_event_and_server_request() {
+    fn correlates_mcp_elicitation_server_request_with_resolution() {
         let mut pending = PendingAppServerRequests::default();
-
-        pending.note_legacy_event(&Event {
-            id: "event-1".to_string(),
-            msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                turn_id: Some("turn-1".to_string()),
-                server_name: "example".to_string(),
-                id: McpRequestId::String("mcp-1".to_string()),
-                request: ElicitationRequest::Form {
-                    meta: None,
-                    message: "Need input".to_string(),
-                    requested_schema: json!({
-                        "type": "object",
-                        "properties": {},
-                    }),
-                },
-            }),
-        });
 
         assert_eq!(
             pending.note_server_request(&ServerRequest::McpServerElicitationRequest {
@@ -566,7 +545,7 @@ mod tests {
         let resolution = pending
             .take_resolution(&Op::ResolveElicitation {
                 server_name: "example".to_string(),
-                request_id: McpRequestId::String("mcp-1".to_string()),
+                request_id: McpRequestId::Integer(12),
                 decision: ElicitationAction::Accept,
                 content: Some(json!({ "answer": "yes" })),
                 meta: Some(json!({ "source": "tui" })),
@@ -605,6 +584,22 @@ mod tests {
         assert_eq!(
             unsupported.message,
             "Dynamic tool calls are not available in app-server TUI yet."
+        );
+    }
+
+    #[test]
+    fn does_not_mark_chatgpt_auth_refresh_as_unsupported() {
+        let mut pending = PendingAppServerRequests::default();
+
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::ChatgptAuthTokensRefresh {
+                request_id: AppServerRequestId::Integer(100),
+                params: codex_app_server_protocol::ChatgptAuthTokensRefreshParams {
+                    reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                    previous_account_id: Some("workspace-1".to_string()),
+                },
+            }),
+            None
         );
     }
 

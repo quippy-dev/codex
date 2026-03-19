@@ -15,21 +15,12 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotification;
 use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
-use crate::thread_history_loader::build_turns_from_response_history_items;
 use crate::thread_history_loader::codex_home_from_rollout_path;
 use crate::thread_history_loader::materialize_rollout_items_for_replay;
-use crate::thread_history_loader::preview_from_rollout_items;
-use crate::thread_history_loader::read_rollout_items_from_rollout;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
-use crate::thread_summary::build_thread_from_snapshot;
-use crate::thread_summary::load_thread_summary_for_rollout;
-use crate::thread_summary::merge_loaded_thread_rollout_summary;
-use crate::thread_summary::read_summary_from_rollout;
-use crate::thread_summary::read_summary_from_state_db_by_thread_id;
-use crate::thread_summary::read_summary_from_state_db_context_by_thread_id;
-use crate::thread_summary::summary_from_thread_list_item;
-use crate::thread_summary::summary_to_thread;
+use chrono::DateTime;
+use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
@@ -49,6 +40,7 @@ use codex_app_server_protocol::CommandExecParams;
 use codex_app_server_protocol::CommandExecResizeParams;
 use codex_app_server_protocol::CommandExecTerminateParams;
 use codex_app_server_protocol::CommandExecWriteParams;
+use codex_app_server_protocol::ConversationGitInfo;
 use codex_app_server_protocol::ConversationSummary;
 use codex_app_server_protocol::DynamicToolSpec as ApiDynamicToolSpec;
 use codex_app_server_protocol::ExperimentalFeature as ApiExperimentalFeature;
@@ -73,7 +65,7 @@ use codex_app_server_protocol::GetAuthStatusResponse;
 use codex_app_server_protocol::GetConversationSummaryParams;
 use codex_app_server_protocol::GetConversationSummaryResponse;
 use codex_app_server_protocol::GitDiffToRemoteResponse;
-use codex_app_server_protocol::HazelnutScope as ApiHazelnutScope;
+use codex_app_server_protocol::GitInfo as ApiGitInfo;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
@@ -104,7 +96,6 @@ use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::PluginUninstallResponse;
-use codex_app_server_protocol::ProductSurface as ApiProductSurface;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
@@ -118,10 +109,6 @@ use codex_app_server_protocol::SkillsConfigWriteParams;
 use codex_app_server_protocol::SkillsConfigWriteResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
-use codex_app_server_protocol::SkillsRemoteReadParams;
-use codex_app_server_protocol::SkillsRemoteReadResponse;
-use codex_app_server_protocol::SkillsRemoteWriteParams;
-use codex_app_server_protocol::SkillsRemoteWriteResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
@@ -196,6 +183,7 @@ use codex_core::CodexThread;
 use codex_core::Cursor as RolloutCursor;
 use codex_core::NewThread;
 use codex_core::RolloutRecorder;
+use codex_core::SessionMeta;
 use codex_core::SteerInputError;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::ThreadManager;
@@ -223,7 +211,6 @@ use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::features::Stage;
 use codex_core::find_archived_thread_path_by_id_str;
-use codex_core::find_or_unarchive_thread_path_by_id_str;
 use codex_core::find_thread_name_by_id;
 use codex_core::find_thread_names_by_ids;
 use codex_core::find_thread_path_by_id_str;
@@ -235,17 +222,18 @@ use codex_core::mcp::group_tools_by_server;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::parse_cursor;
 use codex_core::plugins::MarketplaceError;
-use codex_core::plugins::MarketplacePluginSourceSummary;
+use codex_core::plugins::MarketplacePluginSource;
+use codex_core::plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
 use codex_core::plugins::PluginInstallRequest;
 use codex_core::plugins::PluginReadRequest;
 use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
 use codex_core::plugins::load_plugin_apps;
+use codex_core::read_head_for_summary;
 use codex_core::read_session_meta_line;
 use codex_core::rollout_date_parts;
 use codex_core::sandboxing::SandboxPermissions;
-use codex_core::skills::remote::export_remote_skill;
-use codex_core::skills::remote::list_remote_skills;
+use codex_core::state_db::StateDbHandle;
 use codex_core::state_db::get_state_db;
 use codex_core::state_db::reconcile_rollout;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -261,29 +249,32 @@ use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::dynamic_tools::DynamicToolSpec as CoreDynamicToolSpec;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
-use codex_protocol::protocol::RemoteSkillHazelnutScope;
-use codex_protocol::protocol::RemoteSkillProductSurface;
 use codex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget as CoreReviewTarget;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url;
 use codex_state::StateRuntime;
+use codex_state::ThreadMetadata;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::log_db::LogDbLayer;
 use codex_utils_json_to_toml::json_to_toml;
@@ -293,6 +284,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
+use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -359,24 +351,6 @@ enum ThreadShutdownResult {
     Complete,
     SubmitFailed,
     TimedOut,
-}
-
-fn convert_remote_scope(scope: ApiHazelnutScope) -> RemoteSkillHazelnutScope {
-    match scope {
-        ApiHazelnutScope::WorkspaceShared => RemoteSkillHazelnutScope::WorkspaceShared,
-        ApiHazelnutScope::AllShared => RemoteSkillHazelnutScope::AllShared,
-        ApiHazelnutScope::Personal => RemoteSkillHazelnutScope::Personal,
-        ApiHazelnutScope::Example => RemoteSkillHazelnutScope::Example,
-    }
-}
-
-fn convert_remote_product_surface(product_surface: ApiProductSurface) -> RemoteSkillProductSurface {
-    match product_surface {
-        ApiProductSurface::Chatgpt => RemoteSkillProductSurface::Chatgpt,
-        ApiProductSurface::Codex => RemoteSkillProductSurface::Codex,
-        ApiProductSurface::Api => RemoteSkillProductSurface::Api,
-        ApiProductSurface::Atlas => RemoteSkillProductSurface::Atlas,
-    }
 }
 
 impl Drop for ActiveLogin {
@@ -453,7 +427,10 @@ impl CodexMessageProcessor {
             Ok(config) => self
                 .thread_manager
                 .plugins_manager()
-                .maybe_start_curated_repo_sync_for_config(&config),
+                .maybe_start_curated_repo_sync_for_config(
+                    &config,
+                    self.thread_manager.auth_manager(),
+                ),
             Err(err) => warn!("failed to load latest config for curated plugin sync: {err:?}"),
         }
     }
@@ -730,14 +707,6 @@ impl CodexMessageProcessor {
             }
             ClientRequest::PluginRead { request_id, params } => {
                 self.plugin_read(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsRemoteList { request_id, params } => {
-                self.skills_remote_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsRemoteExport { request_id, params } => {
-                self.skills_remote_export(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::AppsList { request_id, params } => {
@@ -1981,6 +1950,7 @@ impl CodexMessageProcessor {
             config_overrides,
             typesafe_overrides,
             &cloud_requirements,
+            &listener_task_context.codex_home,
         )
         .await
         {
@@ -2088,16 +2058,6 @@ impl CodexMessageProcessor {
                         otel.name = "app_server.thread_start.upsert_thread",
                     ))
                     .await;
-
-                if thread.path.is_none() {
-                    let thread_state = listener_task_context
-                        .thread_state_manager
-                        .thread_state(thread_id)
-                        .await;
-                    let mut thread_state = thread_state.lock().await;
-                    thread_state
-                        .set_pathless_thread_history(thread.preview.clone(), thread.turns.clone());
-                }
 
                 thread.status = resolve_thread_status(
                     listener_task_context
@@ -3178,18 +3138,8 @@ impl CodexMessageProcessor {
         } else {
             read_summary_from_state_db_by_thread_id(&self.config, thread_uuid).await
         };
-        let loaded_rollout_path = loaded_thread
-            .as_ref()
-            .and_then(|thread| thread.rollout_path());
         let mut rollout_path = db_summary.as_ref().map(|summary| summary.path.clone());
-        if rollout_path.is_none()
-            && let Some(path) = loaded_rollout_path.as_ref()
-            && tokio::fs::try_exists(path).await.unwrap_or(false)
-        {
-            rollout_path = Some(path.clone());
-        }
-        let should_lookup_rollout = rollout_path.is_none() && loaded_thread.is_none();
-        if should_lookup_rollout {
+        if rollout_path.is_none() || include_turns {
             rollout_path =
                 match find_thread_path_by_id_str(&self.config.codex_home, &thread_uuid.to_string())
                     .await
@@ -3222,95 +3172,8 @@ impl CodexMessageProcessor {
             return;
         }
 
-        let loaded_history_items = if let Some(thread) = loaded_thread.as_ref() {
-            if loaded_rollout_path.is_none() {
-                Some(
-                    thread
-                        .response_history_items()
-                        .await
-                        .into_iter()
-                        .map(RolloutItem::ResponseItem)
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let (
-            cached_pathless_preview,
-            cached_pathless_turns,
-            pathless_thread_has_materialized_turns,
-        ) = if loaded_thread.is_some() && loaded_rollout_path.is_none() {
-            let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
-            let thread_state = thread_state.lock().await;
-            (
-                thread_state.pathless_thread_preview().map(str::to_string),
-                thread_state.pathless_thread_turns(),
-                thread_state.pathless_thread_has_materialized_turns(),
-            )
-        } else {
-            (None, Vec::new(), false)
-        };
-        let live_history_pathless_turns = if cached_pathless_turns.is_empty() {
-            loaded_history_items
-                .as_ref()
-                .map(|items| build_turns_from_response_history_items(items))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let has_pathless_turns =
-            !cached_pathless_turns.is_empty() || !live_history_pathless_turns.is_empty();
-
         let mut thread = if let Some(summary) = db_summary {
             summary_to_thread(summary)
-        } else if let Some(ref thread) = loaded_thread {
-            let config_snapshot = thread.config_snapshot().await;
-            if include_turns
-                && loaded_rollout_path.is_none()
-                && !has_pathless_turns
-                && !pathless_thread_has_materialized_turns
-            {
-                self.send_invalid_request_error(
-                    request_id,
-                    "ephemeral threads do not support includeTurns".to_string(),
-                )
-                .await;
-                return;
-            }
-            if include_turns {
-                rollout_path = loaded_rollout_path.clone();
-            }
-
-            let mut thread =
-                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path);
-            if let Some(rollout_path) = rollout_path.as_ref() {
-                let fallback_provider = self.config.model_provider_id.as_str();
-                match read_summary_from_rollout(rollout_path, fallback_provider).await {
-                    Ok(summary) => merge_loaded_thread_rollout_summary(&mut thread, summary),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        self.send_internal_error(
-                            request_id,
-                            format!(
-                                "failed to load rollout `{}` for thread {thread_uuid}: {err}",
-                                rollout_path.display()
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            } else if let Some(preview) = cached_pathless_preview.as_ref() {
-                thread.preview = preview.clone();
-            } else if let Some(history_items) = loaded_history_items.as_ref()
-                && !history_items.is_empty()
-            {
-                thread.preview = preview_from_rollout_items(history_items);
-            }
-            thread
         } else if let Some(rollout_path) = rollout_path.as_ref() {
             let fallback_provider = self.config.model_provider_id.as_str();
             match read_summary_from_rollout(rollout_path, fallback_provider).await {
@@ -3337,11 +3200,8 @@ impl CodexMessageProcessor {
                 return;
             };
             let config_snapshot = thread.config_snapshot().await;
-            if include_turns
-                && loaded_rollout_path.is_none()
-                && !has_pathless_turns
-                && !pathless_thread_has_materialized_turns
-            {
+            let loaded_rollout_path = thread.rollout_path();
+            if include_turns && loaded_rollout_path.is_none() {
                 self.send_invalid_request_error(
                     request_id,
                     "ephemeral threads do not support includeTurns".to_string(),
@@ -3352,53 +3212,36 @@ impl CodexMessageProcessor {
             if include_turns {
                 rollout_path = loaded_rollout_path.clone();
             }
-            let mut thread =
-                build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path);
-            if let Some(preview) = cached_pathless_preview.as_ref() {
-                thread.preview = preview.clone();
-            } else if let Some(history_items) = loaded_history_items.as_ref()
-                && !history_items.is_empty()
-            {
-                thread.preview = preview_from_rollout_items(history_items);
-            }
-            thread
+            build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
         };
         self.attach_thread_name(thread_uuid, &mut thread).await;
 
-        if include_turns {
-            if let Some(rollout_path) = rollout_path.as_ref() {
-                match read_rollout_items_from_rollout(rollout_path).await {
-                    Ok(items) => {
-                        thread.turns = build_turns_from_rollout_items(&items);
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        self.send_invalid_request_error(
-                            request_id,
-                            format!(
-                                "thread {thread_uuid} is not materialized yet; includeTurns is unavailable before first user message"
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        self.send_internal_error(
-                            request_id,
-                            format!(
-                                "failed to load rollout `{}` for thread {thread_uuid}: {err}",
-                                rollout_path.display()
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
+        if include_turns && let Some(rollout_path) = rollout_path.as_ref() {
+            match read_rollout_items_from_rollout(rollout_path).await {
+                Ok(items) => {
+                    thread.turns = build_turns_from_rollout_items(&items);
                 }
-            } else {
-                thread.turns = if cached_pathless_turns.is_empty() {
-                    live_history_pathless_turns.clone()
-                } else {
-                    cached_pathless_turns.clone()
-                };
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!(
+                            "thread {thread_uuid} is not materialized yet; includeTurns is unavailable before first user message"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!(
+                            "failed to load rollout `{}` for thread {thread_uuid}: {err}",
+                            rollout_path.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
         }
 
@@ -3510,7 +3353,7 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
-            config: request_overrides,
+            config: mut request_overrides,
             base_instructions,
             developer_instructions,
             personality,
@@ -3536,7 +3379,7 @@ impl CodexMessageProcessor {
         };
 
         let history_cwd = thread_history.session_cwd();
-        let typesafe_overrides = self.build_thread_config_overrides(
+        let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
             service_tier,
@@ -3548,6 +3391,13 @@ impl CodexMessageProcessor {
             developer_instructions,
             personality,
         );
+        let persisted_resume_metadata = self
+            .load_and_apply_persisted_resume_metadata(
+                &thread_history,
+                &mut request_overrides,
+                &mut typesafe_overrides,
+            )
+            .await;
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
@@ -3557,6 +3407,7 @@ impl CodexMessageProcessor {
             typesafe_overrides,
             history_cwd,
             &cloud_requirements,
+            &self.config.codex_home,
         )
         .await
         {
@@ -3610,18 +3461,22 @@ impl CodexMessageProcessor {
                     "thread",
                 );
 
-                let Some(mut thread) = self
+                let mut thread = match self
                     .load_thread_from_resume_source_or_send_internal(
-                        request_id.clone(),
                         thread_id,
                         thread.as_ref(),
                         &response_history,
                         rollout_path.as_path(),
                         fallback_model_provider.as_str(),
+                        persisted_resume_metadata.as_ref(),
                     )
                     .await
-                else {
-                    return;
+                {
+                    Ok(thread) => thread,
+                    Err(message) => {
+                        self.send_internal_error(request_id, message).await;
+                        return;
+                    }
                 };
 
                 self.thread_watch_manager
@@ -3664,6 +3519,25 @@ impl CodexMessageProcessor {
         }
     }
 
+    async fn load_and_apply_persisted_resume_metadata(
+        &self,
+        thread_history: &InitialHistory,
+        request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: &mut ConfigOverrides,
+    ) -> Option<ThreadMetadata> {
+        let InitialHistory::Resumed(resumed_history) = thread_history else {
+            return None;
+        };
+        let state_db_ctx = get_state_db(&self.config).await?;
+        let persisted_metadata = state_db_ctx
+            .get_thread(resumed_history.conversation_id)
+            .await
+            .ok()
+            .flatten()?;
+        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
+        Some(persisted_metadata)
+    }
+
     async fn resume_running_thread(
         &mut self,
         request_id: ConnectionRequestId,
@@ -3687,7 +3561,7 @@ impl CodexMessageProcessor {
                 if path.exists() {
                     path
                 } else {
-                    match find_or_unarchive_thread_path_by_id_str(
+                    match find_thread_path_by_id_str(
                         &self.config.codex_home,
                         &existing_thread_id.to_string(),
                     )
@@ -3713,7 +3587,7 @@ impl CodexMessageProcessor {
                     }
                 }
             } else {
-                match find_or_unarchive_thread_path_by_id_str(
+                match find_thread_path_by_id_str(
                     &self.config.codex_home,
                     &existing_thread_id.to_string(),
                 )
@@ -3780,6 +3654,7 @@ impl CodexMessageProcessor {
                 existing_thread_id,
                 rollout_path.as_path(),
                 config_snapshot.model_provider_id.as_str(),
+                /*persisted_metadata*/ None,
             )
             .await
             {
@@ -3870,7 +3745,7 @@ impl CodexMessageProcessor {
                 }
             };
 
-            match find_or_unarchive_thread_path_by_id_str(
+            match find_thread_path_by_id_str(
                 &self.config.codex_home,
                 &existing_thread_id.to_string(),
             )
@@ -3911,13 +3786,13 @@ impl CodexMessageProcessor {
 
     async fn load_thread_from_resume_source_or_send_internal(
         &self,
-        request_id: ConnectionRequestId,
         thread_id: ThreadId,
         thread: &CodexThread,
         thread_history: &InitialHistory,
         rollout_path: &Path,
         fallback_provider: &str,
-    ) -> Option<Thread> {
+        persisted_resume_metadata: Option<&ThreadMetadata>,
+    ) -> std::result::Result<Thread, String> {
         let thread_history_items = thread_history.get_rollout_items();
         let history_items = materialize_rollout_items_for_replay(
             codex_home_from_rollout_path(rollout_path),
@@ -3931,10 +3806,11 @@ impl CodexMessageProcessor {
                     resumed.conversation_id,
                     resumed.rollout_path.as_path(),
                     fallback_provider,
+                    persisted_resume_metadata,
                 )
                 .await
             }
-            InitialHistory::Forked(_items) => {
+            InitialHistory::Forked(_) => {
                 let config_snapshot = thread.config_snapshot().await;
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
@@ -3948,27 +3824,17 @@ impl CodexMessageProcessor {
                 "failed to build resume response for thread {thread_id}: initial history missing"
             )),
         };
-        let mut thread = match thread {
-            Ok(thread) => thread,
-            Err(message) => {
-                self.send_internal_error(request_id, message).await;
-                return None;
-            }
-        };
+        let mut thread = thread?;
         thread.id = thread_id.to_string();
         thread.path = Some(rollout_path.to_path_buf());
-        if let Err(message) = populate_resume_turns(
+        populate_thread_turns(
             &mut thread,
-            ResumeTurnSource::HistoryItems(&history_items),
-            None,
+            ThreadTurnSource::HistoryItems(&history_items),
+            /*active_turn*/ None,
         )
-        .await
-        {
-            self.send_internal_error(request_id, message).await;
-            return None;
-        }
+        .await?;
         self.attach_thread_name(thread_id, &mut thread).await;
-        Some(thread)
+        Ok(thread)
     }
 
     async fn attach_thread_name(&self, thread_id: ThreadId, thread: &mut Thread) {
@@ -4000,18 +3866,17 @@ impl CodexMessageProcessor {
             persist_extended_history,
         } = params;
 
-        let (source_rollout_path, source_thread_id) = if let Some(path) = path {
+        let (rollout_path, source_thread_id) = if let Some(path) = path {
             (path, None)
         } else {
             let existing_thread_id = match ThreadId::from_string(&thread_id) {
                 Ok(id) => id,
                 Err(err) => {
-                    let error = JSONRPCErrorError {
-                        code: INVALID_REQUEST_ERROR_CODE,
-                        message: format!("invalid thread id: {err}"),
-                        data: None,
-                    };
-                    self.outgoing.send_error(request_id, error).await;
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!("invalid thread id: {err}"),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -4042,12 +3907,9 @@ impl CodexMessageProcessor {
             }
         };
 
-        let history_cwd = read_history_cwd_from_state_db(
-            &self.config,
-            source_thread_id,
-            source_rollout_path.as_path(),
-        )
-        .await;
+        let history_cwd =
+            read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
+                .await;
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -4092,6 +3954,7 @@ impl CodexMessageProcessor {
             typesafe_overrides,
             history_cwd,
             &cloud_requirements,
+            &self.config.codex_home,
         )
         .await
         {
@@ -4116,7 +3979,7 @@ impl CodexMessageProcessor {
             .fork_thread(
                 usize::MAX,
                 config,
-                source_rollout_path.clone(),
+                rollout_path.clone(),
                 persist_extended_history,
                 self.request_trace_context(&request_id).await,
             )
@@ -4124,32 +3987,29 @@ impl CodexMessageProcessor {
         {
             Ok(thread) => thread,
             Err(err) => {
-                let (code, message) = match err {
-                    CodexErr::Io(_) | CodexErr::Json(_) => (
-                        INVALID_REQUEST_ERROR_CODE,
-                        format!(
-                            "failed to load rollout `{}`: {err}",
-                            source_rollout_path.display()
-                        ),
-                    ),
-                    CodexErr::InvalidRequest(message) => (INVALID_REQUEST_ERROR_CODE, message),
-                    _ => (INTERNAL_ERROR_CODE, format!("error forking thread: {err}")),
-                };
-                let error = JSONRPCErrorError {
-                    code,
-                    message,
-                    data: None,
-                };
-                self.outgoing.send_error(request_id, error).await;
+                match err {
+                    CodexErr::Io(_) | CodexErr::Json(_) => {
+                        self.send_invalid_request_error(
+                            request_id,
+                            format!("failed to load rollout `{}`: {err}", rollout_path.display()),
+                        )
+                        .await;
+                    }
+                    CodexErr::InvalidRequest(message) => {
+                        self.send_invalid_request_error(request_id, message).await;
+                    }
+                    _ => {
+                        self.send_internal_error(
+                            request_id,
+                            format!("error forking thread: {err}"),
+                        )
+                        .await;
+                    }
+                }
                 return;
             }
         };
-        let config_snapshot = forked_thread.config_snapshot().await;
 
-        let SessionConfiguredEvent {
-            rollout_path: fork_rollout_path,
-            ..
-        } = session_configured;
         // Auto-attach a conversation listener when forking a thread.
         Self::log_listener_attach_result(
             self.ensure_conversation_listener(
@@ -4164,8 +4024,10 @@ impl CodexMessageProcessor {
             "thread",
         );
 
-        let mut thread = if let Some(fork_rollout_path) = fork_rollout_path {
-            let mut thread = match read_summary_from_rollout(
+        // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
+        // pathless, so they rebuild their visible history from the copied source rollout instead.
+        let mut thread = if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref() {
+            match read_summary_from_rollout(
                 fork_rollout_path.as_path(),
                 fallback_model_provider.as_str(),
             )
@@ -4183,69 +4045,51 @@ impl CodexMessageProcessor {
                     .await;
                     return;
                 }
-            };
+            }
+        } else {
+            let config_snapshot = forked_thread.config_snapshot().await;
             // forked thread names do not inherit the source thread name
-            match read_rollout_items_from_rollout(fork_rollout_path.as_path()).await {
-                Ok(items) => {
-                    thread.turns = build_turns_from_rollout_items(&items);
-                }
+            let mut thread =
+                build_thread_from_snapshot(thread_id, &config_snapshot, /*path*/ None);
+            let history_items = match read_rollout_items_from_rollout(rollout_path.as_path()).await
+            {
+                Ok(items) => items,
                 Err(err) => {
                     self.send_internal_error(
                         request_id,
                         format!(
-                            "failed to load rollout `{}` for thread {thread_id}: {err}",
-                            fork_rollout_path.display()
+                            "failed to load source rollout `{}` for thread {thread_id}: {err}",
+                            rollout_path.display()
                         ),
                     )
                     .await;
                     return;
                 }
+            };
+            thread.preview = preview_from_rollout_items(&history_items);
+            if let Err(message) = populate_thread_turns(
+                &mut thread,
+                ThreadTurnSource::HistoryItems(&history_items),
+                /*active_turn*/ None,
+            )
+            .await
+            {
+                self.send_internal_error(request_id, message).await;
+                return;
             }
             thread
-        } else {
-            build_thread_from_snapshot(thread_id, &config_snapshot, None)
         };
-        if thread.turns.is_empty() && (thread.path.is_none() || !persist_extended_history) {
-            match read_rollout_items_from_rollout(source_rollout_path.as_path()).await {
-                Ok(source_items) => {
-                    let source_turns = build_turns_from_rollout_items(&source_items);
-                    if !source_turns.is_empty() {
-                        if thread.preview.is_empty()
-                            && let Some(first_user_text) = source_turns
-                                .iter()
-                                .flat_map(|turn| turn.items.iter())
-                                .find_map(|item| match item {
-                                    ThreadItem::UserMessage { content, .. } => {
-                                        content.iter().find_map(|input| match input {
-                                            V2UserInput::Text { text, .. } => Some(text.as_str()),
-                                            _ => None,
-                                        })
-                                    }
-                                    _ => None,
-                                })
-                        {
-                            thread.preview = first_user_text.to_string();
-                        }
-                        thread.turns = source_turns;
-                    }
-                }
-                Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to load rollout `{}` for thread {thread_id}: {err}",
-                            source_rollout_path.display()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-        if thread.path.is_none() && !thread.turns.is_empty() {
-            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-            let mut thread_state = thread_state.lock().await;
-            thread_state.set_pathless_thread_history(thread.preview.clone(), thread.turns.clone());
+
+        if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref()
+            && let Err(message) = populate_thread_turns(
+                &mut thread,
+                ThreadTurnSource::RolloutPath(fork_rollout_path.as_path()),
+                /*active_turn*/ None,
+            )
+            .await
+        {
+            self.send_internal_error(request_id, message).await;
+            return;
         }
 
         self.thread_watch_manager
@@ -5009,6 +4853,7 @@ impl CodexMessageProcessor {
             MarketplaceError::InvalidMarketplaceFile { .. }
             | MarketplaceError::PluginNotFound { .. }
             | MarketplaceError::PluginNotAvailable { .. }
+            | MarketplaceError::PluginsDisabled
             | MarketplaceError::InvalidPlugin(_) => {
                 self.send_invalid_request_error(request_id, err.to_string())
                     .await;
@@ -5530,6 +5375,13 @@ impl CodexMessageProcessor {
                 .extend(valid_extra_roots);
         }
 
+        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
+            Ok(config) => config,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
         let skills_manager = self.thread_manager.skills_manager();
         let mut data = Vec::new();
         for cwd in cwds {
@@ -5537,7 +5389,7 @@ impl CodexMessageProcessor {
                 .get(&cwd)
                 .map_or(&[][..], std::vec::Vec::as_slice);
             let outcome = skills_manager
-                .skills_for_cwd_with_extra_user_roots(&cwd, force_reload, extra_roots)
+                .skills_for_cwd_with_extra_user_roots(&cwd, &config, force_reload, extra_roots)
                 .await;
             let errors = errors_to_info(&outcome.errors);
             let skills = skills_to_info(&outcome.skills, &outcome.disabled_paths);
@@ -5568,9 +5420,9 @@ impl CodexMessageProcessor {
             }
         };
         let mut remote_sync_error = None;
+        let auth = self.auth_manager.auth().await;
 
         if force_remote_sync {
-            let auth = self.auth_manager.auth().await;
             match plugins_manager
                 .sync_plugins_from_remote(&config, auth.as_ref())
                 .await
@@ -5602,8 +5454,11 @@ impl CodexMessageProcessor {
             };
         }
 
+        let config_for_marketplace_listing = config.clone();
+        let plugins_manager_for_marketplace_listing = plugins_manager.clone();
         let data = match tokio::task::spawn_blocking(move || {
-            let marketplaces = plugins_manager.list_marketplaces_for_config(&config, &roots)?;
+            let marketplaces = plugins_manager_for_marketplace_listing
+                .list_marketplaces_for_config(&config_for_marketplace_listing, &roots)?;
             Ok::<Vec<PluginMarketplaceEntry>, MarketplaceError>(
                 marketplaces
                     .into_iter()
@@ -5622,8 +5477,8 @@ impl CodexMessageProcessor {
                                 enabled: plugin.enabled,
                                 name: plugin.name,
                                 source: marketplace_plugin_source_to_info(plugin.source),
-                                install_policy: Some(plugin.install_policy.into()),
-                                auth_policy: Some(plugin.auth_policy.into()),
+                                install_policy: Some(plugin.policy.installation.into()),
+                                auth_policy: Some(plugin.policy.authentication.into()),
                                 interface: plugin.interface.map(plugin_interface_to_info),
                             })
                             .collect(),
@@ -5649,12 +5504,34 @@ impl CodexMessageProcessor {
             }
         };
 
+        let featured_plugin_ids = if data
+            .iter()
+            .any(|marketplace| marketplace.name == OPENAI_CURATED_MARKETPLACE_NAME)
+        {
+            match plugins_manager
+                .featured_plugin_ids_for_config(&config, auth.as_ref())
+                .await
+            {
+                Ok(featured_plugin_ids) => featured_plugin_ids,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "plugin/list featured plugin fetch failed; returning empty featured ids"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         self.outgoing
             .send_response(
                 request_id,
                 PluginListResponse {
                     marketplaces: data,
                     remote_sync_error,
+                    featured_plugin_ids,
                 },
             )
             .await;
@@ -5712,8 +5589,8 @@ impl CodexMessageProcessor {
                 source: marketplace_plugin_source_to_info(outcome.plugin.source),
                 installed: outcome.plugin.installed,
                 enabled: outcome.plugin.enabled,
-                install_policy: Some(outcome.plugin.install_policy.into()),
-                auth_policy: Some(outcome.plugin.auth_policy.into()),
+                install_policy: Some(outcome.plugin.policy.installation.into()),
+                auth_policy: Some(outcome.plugin.policy.authentication.into()),
                 interface: outcome.plugin.interface.map(plugin_interface_to_info),
             },
             description: outcome.plugin.description,
@@ -5725,79 +5602,6 @@ impl CodexMessageProcessor {
         self.outgoing
             .send_response(request_id, PluginReadResponse { plugin })
             .await;
-    }
-
-    async fn skills_remote_list(
-        &self,
-        request_id: ConnectionRequestId,
-        params: SkillsRemoteReadParams,
-    ) {
-        let hazelnut_scope = convert_remote_scope(params.hazelnut_scope);
-        let product_surface = convert_remote_product_surface(params.product_surface);
-        let enabled = if params.enabled { Some(true) } else { None };
-
-        let auth = self.auth_manager.auth().await;
-        match list_remote_skills(
-            &self.config,
-            auth.as_ref(),
-            hazelnut_scope,
-            product_surface,
-            enabled,
-        )
-        .await
-        {
-            Ok(skills) => {
-                let data = skills
-                    .into_iter()
-                    .map(|skill| codex_app_server_protocol::RemoteSkillSummary {
-                        id: skill.id,
-                        name: skill.name,
-                        description: skill.description,
-                    })
-                    .collect();
-                self.outgoing
-                    .send_response(request_id, SkillsRemoteReadResponse { data })
-                    .await;
-            }
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!("failed to list remote skills: {err}"),
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn skills_remote_export(
-        &self,
-        request_id: ConnectionRequestId,
-        params: SkillsRemoteWriteParams,
-    ) {
-        let SkillsRemoteWriteParams { hazelnut_id } = params;
-        let auth = self.auth_manager.auth().await;
-        let response = export_remote_skill(&self.config, auth.as_ref(), hazelnut_id.as_str()).await;
-
-        match response {
-            Ok(downloaded) => {
-                self.outgoing
-                    .send_response(
-                        request_id,
-                        SkillsRemoteWriteResponse {
-                            id: downloaded.id,
-                            path: downloaded.path,
-                        },
-                    )
-                    .await;
-            }
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!("failed to download remote skill: {err}"),
-                )
-                .await;
-            }
-        }
     }
 
     async fn skills_config_write(
@@ -6870,9 +6674,17 @@ impl CodexMessageProcessor {
                         };
 
                         // For now, we send a notification for every event,
-                        // JSON-serializing the `Event` as-is, but these should
-                        // be migrated to be variants of `ServerNotification`
-                        // instead.
+                        // Legacy `codex/event/*` notifications are still
+                        // produced here because the in-process app-server lane
+                        // (`codex exec` and other in-process consumers) still
+                        // depends on them. External transports now drop
+                        // `OutgoingMessage::Notification` in `transport.rs`,
+                        // so stdio/websocket clients only observe the typed
+                        // `ServerNotification` translations emitted below.
+                        //
+                        // TODO: remove this raw legacy-notification emission
+                        // entirely once the remaining in-process consumers are
+                        // migrated off `codex/event/*`.
                         let event_formatted = match &event.msg {
                             EventMsg::TurnStarted(_) => "task_started",
                             EventMsg::TurnComplete(_) => "task_complete",
@@ -7275,6 +7087,7 @@ impl CodexMessageProcessor {
                 },
                 Some(command_cwd.clone()),
                 &cloud_requirements,
+                &config.codex_home,
             )
             .await;
             let setup_result = match derived_config {
@@ -7390,9 +7203,9 @@ async fn handle_pending_thread_resume_request(
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
-    if let Err(message) = populate_resume_turns(
+    if let Err(message) = populate_thread_turns(
         &mut thread,
-        ResumeTurnSource::RolloutPath(pending.rollout_path.as_path()),
+        ThreadTurnSource::RolloutPath(pending.rollout_path.as_path()),
         active_turn.as_ref(),
     )
     .await
@@ -7456,18 +7269,18 @@ async fn handle_pending_thread_resume_request(
         .await;
 }
 
-enum ResumeTurnSource<'a> {
+enum ThreadTurnSource<'a> {
     RolloutPath(&'a Path),
     HistoryItems(&'a [RolloutItem]),
 }
 
-async fn populate_resume_turns(
+async fn populate_thread_turns(
     thread: &mut Thread,
-    turn_source: ResumeTurnSource<'_>,
+    turn_source: ThreadTurnSource<'_>,
     active_turn: Option<&Turn>,
 ) -> std::result::Result<(), String> {
     let mut turns = match turn_source {
-        ResumeTurnSource::RolloutPath(rollout_path) => {
+        ThreadTurnSource::RolloutPath(rollout_path) => {
             read_rollout_items_from_rollout(rollout_path)
                 .await
                 .map(|items| build_turns_from_rollout_items(&items))
@@ -7479,7 +7292,7 @@ async fn populate_resume_turns(
                     )
                 })?
         }
-        ResumeTurnSource::HistoryItems(items) => build_turns_from_rollout_items(items),
+        ThreadTurnSource::HistoryItems(items) => build_turns_from_rollout_items(items),
     };
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn.clone());
@@ -7646,6 +7459,36 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
+fn merge_persisted_resume_metadata(
+    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+    persisted_metadata: &ThreadMetadata,
+) {
+    if has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+        return;
+    }
+
+    typesafe_overrides.model = persisted_metadata.model.clone();
+
+    if let Some(reasoning_effort) = persisted_metadata.reasoning_effort {
+        request_overrides.get_or_insert_with(HashMap::new).insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(reasoning_effort.to_string()),
+        );
+    }
+}
+
+fn has_model_resume_override(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &ConfigOverrides,
+) -> bool {
+    typesafe_overrides.model.is_some()
+        || typesafe_overrides.model_provider.is_some()
+        || request_overrides.is_some_and(|overrides| overrides.contains_key("model"))
+        || request_overrides
+            .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
+}
+
 fn skills_to_info(
     skills: &[codex_core::skills::SkillMetadata],
     disabled_paths: &std::collections::HashSet<PathBuf>,
@@ -7715,7 +7558,7 @@ fn plugin_skills_to_info(skills: &[codex_core::skills::SkillMetadata]) -> Vec<Sk
 }
 
 fn plugin_interface_to_info(
-    interface: codex_core::plugins::PluginManifestInterfaceSummary,
+    interface: codex_core::plugins::PluginManifestInterface,
 ) -> PluginInterface {
     PluginInterface {
         display_name: interface.display_name,
@@ -7735,9 +7578,9 @@ fn plugin_interface_to_info(
     }
 }
 
-fn marketplace_plugin_source_to_info(source: MarketplacePluginSourceSummary) -> PluginSource {
+fn marketplace_plugin_source_to_info(source: MarketplacePluginSource) -> PluginSource {
     match source {
-        MarketplacePluginSourceSummary::Local { path } => PluginSource::Local { path },
+        MarketplacePluginSource::Local { path } => PluginSource::Local { path },
     }
 }
 
@@ -7869,6 +7712,7 @@ async fn derive_config_from_params(
     request_overrides: Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: ConfigOverrides,
     cloud_requirements: &CloudRequirementsLoader,
+    codex_home: &Path,
 ) -> std::io::Result<Config> {
     let merged_cli_overrides = cli_overrides
         .iter()
@@ -7882,6 +7726,7 @@ async fn derive_config_from_params(
         .collect::<Vec<_>>();
 
     codex_core::config::ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
         .cli_overrides(merged_cli_overrides)
         .harness_overrides(typesafe_overrides)
         .cloud_requirements(cloud_requirements.clone())
@@ -7895,6 +7740,7 @@ async fn derive_config_for_cwd(
     typesafe_overrides: ConfigOverrides,
     cwd: Option<PathBuf>,
     cloud_requirements: &CloudRequirementsLoader,
+    codex_home: &Path,
 ) -> std::io::Result<Config> {
     let merged_cli_overrides = cli_overrides
         .iter()
@@ -7908,6 +7754,7 @@ async fn derive_config_for_cwd(
         .collect::<Vec<_>>();
 
     codex_core::config::ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
         .cli_overrides(merged_cli_overrides)
         .harness_overrides(typesafe_overrides)
         .fallback_cwd(cwd)
@@ -7938,6 +7785,465 @@ async fn read_history_cwd_from_state_db(
     }
 }
 
+async fn read_summary_from_state_db_by_thread_id(
+    config: &Config,
+    thread_id: ThreadId,
+) -> Option<ConversationSummary> {
+    let state_db_ctx = get_state_db(config).await;
+    read_summary_from_state_db_context_by_thread_id(state_db_ctx.as_ref(), thread_id).await
+}
+
+async fn read_summary_from_state_db_context_by_thread_id(
+    state_db_ctx: Option<&StateDbHandle>,
+    thread_id: ThreadId,
+) -> Option<ConversationSummary> {
+    let state_db_ctx = state_db_ctx?;
+
+    let metadata = match state_db_ctx.get_thread(thread_id).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) | Err(_) => return None,
+    };
+    Some(summary_from_thread_metadata(&metadata))
+}
+
+async fn summary_from_thread_list_item(
+    it: codex_core::ThreadItem,
+    fallback_provider: &str,
+    state_db_ctx: Option<&StateDbHandle>,
+) -> Option<ConversationSummary> {
+    if let Some(thread_id) = it.thread_id {
+        let timestamp = it.created_at.clone();
+        let updated_at = it.updated_at.clone().or_else(|| timestamp.clone());
+        let model_provider = it
+            .model_provider
+            .clone()
+            .unwrap_or_else(|| fallback_provider.to_string());
+        let cwd = it.cwd?;
+        let cli_version = it.cli_version.unwrap_or_default();
+        let source = with_thread_spawn_agent_metadata(
+            it.source
+                .unwrap_or(codex_protocol::protocol::SessionSource::Unknown),
+            it.agent_nickname.clone(),
+            it.agent_role.clone(),
+        );
+        return Some(ConversationSummary {
+            conversation_id: thread_id,
+            path: it.path,
+            preview: it.first_user_message.unwrap_or_default(),
+            timestamp,
+            updated_at,
+            model_provider,
+            cwd,
+            cli_version,
+            source,
+            git_info: if it.git_sha.is_none()
+                && it.git_branch.is_none()
+                && it.git_origin_url.is_none()
+            {
+                None
+            } else {
+                Some(ConversationGitInfo {
+                    sha: it.git_sha,
+                    branch: it.git_branch,
+                    origin_url: it.git_origin_url,
+                })
+            },
+        });
+    }
+    if let Some(thread_id) = thread_id_from_rollout_path(it.path.as_path()) {
+        return read_summary_from_state_db_context_by_thread_id(state_db_ctx, thread_id).await;
+    }
+    None
+}
+
+fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
+    let file_name = path.file_name()?.to_str()?;
+    let stem = file_name.strip_suffix(".jsonl")?;
+    if stem.len() < 37 {
+        return None;
+    }
+    let uuid_start = stem.len().saturating_sub(36);
+    if !stem[..uuid_start].ends_with('-') {
+        return None;
+    }
+    ThreadId::from_string(&stem[uuid_start..]).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn summary_from_state_db_metadata(
+    conversation_id: ThreadId,
+    path: PathBuf,
+    first_user_message: Option<String>,
+    timestamp: String,
+    updated_at: String,
+    model_provider: String,
+    cwd: PathBuf,
+    cli_version: String,
+    source: String,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+    git_sha: Option<String>,
+    git_branch: Option<String>,
+    git_origin_url: Option<String>,
+) -> ConversationSummary {
+    let preview = first_user_message.unwrap_or_default();
+    let source = serde_json::from_str(&source)
+        .or_else(|_| serde_json::from_value(serde_json::Value::String(source.clone())))
+        .unwrap_or(codex_protocol::protocol::SessionSource::Unknown);
+    let source = with_thread_spawn_agent_metadata(source, agent_nickname, agent_role);
+    let git_info = if git_sha.is_none() && git_branch.is_none() && git_origin_url.is_none() {
+        None
+    } else {
+        Some(ConversationGitInfo {
+            sha: git_sha,
+            branch: git_branch,
+            origin_url: git_origin_url,
+        })
+    };
+    ConversationSummary {
+        conversation_id,
+        path,
+        preview,
+        timestamp: Some(timestamp),
+        updated_at: Some(updated_at),
+        model_provider,
+        cwd,
+        cli_version,
+        source,
+        git_info,
+    }
+}
+
+fn summary_from_thread_metadata(metadata: &ThreadMetadata) -> ConversationSummary {
+    summary_from_state_db_metadata(
+        metadata.id,
+        metadata.rollout_path.clone(),
+        metadata.first_user_message.clone(),
+        metadata
+            .created_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        metadata
+            .updated_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        metadata.model_provider.clone(),
+        metadata.cwd.clone(),
+        metadata.cli_version.clone(),
+        metadata.source.clone(),
+        metadata.agent_nickname.clone(),
+        metadata.agent_role.clone(),
+        metadata.git_sha.clone(),
+        metadata.git_branch.clone(),
+        metadata.git_origin_url.clone(),
+    )
+}
+
+pub(crate) async fn read_summary_from_rollout(
+    path: &Path,
+    fallback_provider: &str,
+) -> std::io::Result<ConversationSummary> {
+    let head = read_head_for_summary(path).await?;
+
+    let Some(first) = head.first() else {
+        return Err(IoError::other(format!(
+            "rollout at {} is empty",
+            path.display()
+        )));
+    };
+
+    let session_meta_line =
+        serde_json::from_value::<SessionMetaLine>(first.clone()).map_err(|_| {
+            IoError::other(format!(
+                "rollout at {} does not start with session metadata",
+                path.display()
+            ))
+        })?;
+    let SessionMetaLine {
+        meta: session_meta,
+        git,
+    } = session_meta_line;
+    let mut session_meta = session_meta;
+    session_meta.source = with_thread_spawn_agent_metadata(
+        session_meta.source.clone(),
+        session_meta.agent_nickname.clone(),
+        session_meta.agent_role.clone(),
+    );
+
+    let created_at = if session_meta.timestamp.is_empty() {
+        None
+    } else {
+        Some(session_meta.timestamp.as_str())
+    };
+    let updated_at = read_updated_at(path, created_at).await;
+    if let Some(summary) = extract_conversation_summary(
+        path.to_path_buf(),
+        &head,
+        &session_meta,
+        git.as_ref(),
+        fallback_provider,
+        updated_at.clone(),
+    ) {
+        return Ok(summary);
+    }
+
+    let timestamp = if session_meta.timestamp.is_empty() {
+        None
+    } else {
+        Some(session_meta.timestamp.clone())
+    };
+    let model_provider = session_meta
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| fallback_provider.to_string());
+    let git_info = git.as_ref().map(map_git_info);
+    let updated_at = updated_at.or_else(|| timestamp.clone());
+
+    Ok(ConversationSummary {
+        conversation_id: session_meta.id,
+        timestamp,
+        updated_at,
+        path: path.to_path_buf(),
+        preview: String::new(),
+        model_provider,
+        cwd: session_meta.cwd,
+        cli_version: session_meta.cli_version,
+        source: session_meta.source,
+        git_info,
+    })
+}
+
+pub(crate) async fn read_rollout_items_from_rollout(
+    path: &Path,
+) -> std::io::Result<Vec<RolloutItem>> {
+    let items = match RolloutRecorder::get_rollout_history(path).await? {
+        InitialHistory::New => Vec::new(),
+        InitialHistory::Forked(items) => items,
+        InitialHistory::Resumed(resumed) => resumed.history,
+    };
+
+    Ok(items)
+}
+
+fn extract_conversation_summary(
+    path: PathBuf,
+    head: &[serde_json::Value],
+    session_meta: &SessionMeta,
+    git: Option<&CoreGitInfo>,
+    fallback_provider: &str,
+    updated_at: Option<String>,
+) -> Option<ConversationSummary> {
+    let preview = head
+        .iter()
+        .filter_map(|value| serde_json::from_value::<ResponseItem>(value.clone()).ok())
+        .find_map(|item| match codex_core::parse_turn_item(&item) {
+            Some(TurnItem::UserMessage(user)) => Some(user.message()),
+            _ => None,
+        })?;
+
+    let preview = match preview.find(USER_MESSAGE_BEGIN) {
+        Some(idx) => preview[idx + USER_MESSAGE_BEGIN.len()..].trim(),
+        None => preview.as_str(),
+    };
+
+    let timestamp = if session_meta.timestamp.is_empty() {
+        None
+    } else {
+        Some(session_meta.timestamp.clone())
+    };
+    let conversation_id = session_meta.id;
+    let model_provider = session_meta
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| fallback_provider.to_string());
+    let git_info = git.map(map_git_info);
+    let updated_at = updated_at.or_else(|| timestamp.clone());
+
+    Some(ConversationSummary {
+        conversation_id,
+        timestamp,
+        updated_at,
+        path,
+        preview: preview.to_string(),
+        model_provider,
+        cwd: session_meta.cwd.clone(),
+        cli_version: session_meta.cli_version.clone(),
+        source: session_meta.source.clone(),
+        git_info,
+    })
+}
+
+fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
+    ConversationGitInfo {
+        sha: git_info.commit_hash.clone(),
+        branch: git_info.branch.clone(),
+        origin_url: git_info.repository_url.clone(),
+    }
+}
+
+async fn load_thread_summary_for_rollout(
+    config: &Config,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    fallback_provider: &str,
+    persisted_metadata: Option<&ThreadMetadata>,
+) -> std::result::Result<Thread, String> {
+    let mut thread = read_summary_from_rollout(rollout_path, fallback_provider)
+        .await
+        .map(summary_to_thread)
+        .map_err(|err| {
+            format!(
+                "failed to load rollout `{}` for thread {thread_id}: {err}",
+                rollout_path.display()
+            )
+        })?;
+    if let Some(persisted_metadata) = persisted_metadata {
+        merge_mutable_thread_metadata(
+            &mut thread,
+            summary_to_thread(summary_from_thread_metadata(persisted_metadata)),
+        );
+    } else if let Some(summary) = read_summary_from_state_db_by_thread_id(config, thread_id).await {
+        merge_mutable_thread_metadata(&mut thread, summary_to_thread(summary));
+    }
+    Ok(thread)
+}
+
+fn merge_mutable_thread_metadata(thread: &mut Thread, persisted_thread: Thread) {
+    thread.git_info = persisted_thread.git_info;
+}
+
+fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
+    items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(item) => match codex_core::parse_turn_item(item) {
+                Some(codex_protocol::items::TurnItem::UserMessage(user)) => Some(user.message()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|preview| match preview.find(USER_MESSAGE_BEGIN) {
+            Some(idx) => preview[idx + USER_MESSAGE_BEGIN.len()..].trim().to_string(),
+            None => preview,
+        })
+        .unwrap_or_default()
+}
+
+fn with_thread_spawn_agent_metadata(
+    source: codex_protocol::protocol::SessionSource,
+    agent_nickname: Option<String>,
+    agent_role: Option<String>,
+) -> codex_protocol::protocol::SessionSource {
+    if agent_nickname.is_none() && agent_role.is_none() {
+        return source;
+    }
+
+    match source {
+        codex_protocol::protocol::SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_nickname: existing_agent_nickname,
+                agent_role: existing_agent_role,
+            },
+        ) => codex_protocol::protocol::SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_nickname: agent_nickname.or(existing_agent_nickname),
+                agent_role: agent_role.or(existing_agent_role),
+            },
+        ),
+        _ => source,
+    }
+}
+
+fn parse_datetime(timestamp: Option<&str>) -> Option<DateTime<Utc>> {
+    timestamp.and_then(|ts| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+    })
+}
+
+async fn read_updated_at(path: &Path, created_at: Option<&str>) -> Option<String> {
+    let updated_at = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .map(|modified| {
+            let updated_at: DateTime<Utc> = modified.into();
+            updated_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+        });
+    updated_at.or_else(|| created_at.map(str::to_string))
+}
+
+fn build_thread_from_snapshot(
+    thread_id: ThreadId,
+    config_snapshot: &ThreadConfigSnapshot,
+    path: Option<PathBuf>,
+) -> Thread {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    Thread {
+        id: thread_id.to_string(),
+        preview: String::new(),
+        ephemeral: config_snapshot.ephemeral,
+        model_provider: config_snapshot.model_provider_id.clone(),
+        created_at: now,
+        updated_at: now,
+        status: ThreadStatus::NotLoaded,
+        path,
+        cwd: config_snapshot.cwd.clone(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_nickname: config_snapshot.session_source.get_nickname(),
+        agent_role: config_snapshot.session_source.get_agent_role(),
+        source: config_snapshot.session_source.clone().into(),
+        git_info: None,
+        name: None,
+        turns: Vec::new(),
+    }
+}
+
+pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
+    let ConversationSummary {
+        conversation_id,
+        path,
+        preview,
+        timestamp,
+        updated_at,
+        model_provider,
+        cwd,
+        cli_version,
+        source,
+        git_info,
+    } = summary;
+
+    let created_at = parse_datetime(timestamp.as_deref());
+    let updated_at = parse_datetime(updated_at.as_deref()).or(created_at);
+    let git_info = git_info.map(|info| ApiGitInfo {
+        sha: info.sha,
+        branch: info.branch,
+        origin_url: info.origin_url,
+    });
+
+    Thread {
+        id: conversation_id.to_string(),
+        preview,
+        ephemeral: false,
+        model_provider,
+        created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
+        updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
+        status: ThreadStatus::NotLoaded,
+        path: Some(path),
+        cwd,
+        cli_version,
+        agent_nickname: source.get_nickname(),
+        agent_role: source.get_agent_role(),
+        source: source.into(),
+        git_info,
+        name: None,
+        turns: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7946,10 +8252,13 @@ mod tests {
     use anyhow::Result;
     use codex_app_server_protocol::ServerRequestPayload;
     use codex_app_server_protocol::ToolRequestUserInputParams;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[test]
     fn validate_dynamic_tools_rejects_unsupported_input_schema() {
@@ -8077,6 +8386,342 @@ mod tests {
         );
     }
 
+    fn test_thread_metadata(
+        model: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<ThreadMetadata> {
+        let thread_id = ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?;
+        let mut builder = ThreadMetadataBuilder::new(
+            thread_id,
+            PathBuf::from("/tmp/rollout.jsonl"),
+            Utc::now(),
+            codex_protocol::protocol::SessionSource::default(),
+        );
+        builder.model_provider = Some("mock_provider".to_string());
+        let mut metadata = builder.build("mock_provider");
+        metadata.model = model.map(ToString::to_string);
+        metadata.reasoning_effort = reasoning_effort;
+        Ok(metadata)
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_prefers_persisted_model_and_reasoning_effort() -> Result<()>
+    {
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(
+            typesafe_overrides.model,
+            Some("gpt-5.1-codex-max".to_string())
+        );
+        assert_eq!(
+            request_overrides,
+            Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String("high".to_string()),
+            )]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_preserves_explicit_overrides() -> Result<()> {
+        let mut request_overrides = Some(HashMap::from([(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String("low".to_string()),
+        )]));
+        let mut typesafe_overrides = ConfigOverrides {
+            model: Some("gpt-5.2-codex".to_string()),
+            ..Default::default()
+        };
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(typesafe_overrides.model, Some("gpt-5.2-codex".to_string()));
+        assert_eq!(
+            request_overrides,
+            Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String("low".to_string()),
+            )]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_skips_persisted_values_when_model_overridden() -> Result<()>
+    {
+        let mut request_overrides = Some(HashMap::from([(
+            "model".to_string(),
+            serde_json::Value::String("gpt-5.2-codex".to_string()),
+        )]));
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(
+            request_overrides,
+            Some(HashMap::from([(
+                "model".to_string(),
+                serde_json::Value::String("gpt-5.2-codex".to_string()),
+            )]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_skips_persisted_values_when_provider_overridden()
+    -> Result<()> {
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides {
+            model_provider: Some("oss".to_string()),
+            ..Default::default()
+        };
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(typesafe_overrides.model_provider, Some("oss".to_string()));
+        assert_eq!(request_overrides, None);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_skips_persisted_values_when_reasoning_effort_overridden()
+    -> Result<()> {
+        let mut request_overrides = Some(HashMap::from([(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String("low".to_string()),
+        )]));
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(
+            request_overrides,
+            Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String("low".to_string()),
+            )]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_skips_missing_values() -> Result<()> {
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let persisted_metadata = test_thread_metadata(None, None)?;
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(request_overrides, None);
+        Ok(())
+    }
+
+    #[test]
+    fn extract_conversation_summary_prefers_plain_user_messages() -> Result<()> {
+        let conversation_id = ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0")?;
+        let timestamp = Some("2025-09-05T16:53:11.850Z".to_string());
+        let path = PathBuf::from("rollout.jsonl");
+
+        let head = vec![
+            json!({
+                "id": conversation_id.to_string(),
+                "timestamp": timestamp,
+                "cwd": "/",
+                "originator": "codex",
+                "cli_version": "0.0.0",
+                "model_provider": "test-provider"
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "# AGENTS.md instructions for project\n\n<INSTRUCTIONS>\n<AGENTS.md contents>\n</INSTRUCTIONS>".to_string(),
+                }],
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("<prior context> {USER_MESSAGE_BEGIN}Count to 5"),
+                }],
+            }),
+        ];
+
+        let session_meta = serde_json::from_value::<SessionMeta>(head[0].clone())?;
+
+        let summary = extract_conversation_summary(
+            path.clone(),
+            &head,
+            &session_meta,
+            None,
+            "test-provider",
+            timestamp.clone(),
+        )
+        .expect("summary");
+
+        let expected = ConversationSummary {
+            conversation_id,
+            timestamp: timestamp.clone(),
+            updated_at: timestamp,
+            path,
+            preview: "Count to 5".to_string(),
+            model_provider: "test-provider".to_string(),
+            cwd: PathBuf::from("/"),
+            cli_version: "0.0.0".to_string(),
+            source: SessionSource::VSCode,
+            git_info: None,
+        };
+
+        assert_eq!(summary, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
+        use codex_protocol::protocol::RolloutItem;
+        use codex_protocol::protocol::RolloutLine;
+        use codex_protocol::protocol::SessionMetaLine;
+        use std::fs;
+        use std::fs::FileTimes;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("rollout.jsonl");
+
+        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
+        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
+
+        let session_meta = SessionMeta {
+            id: conversation_id,
+            timestamp: timestamp.clone(),
+            model_provider: None,
+            ..SessionMeta::default()
+        };
+
+        let line = RolloutLine {
+            timestamp: timestamp.clone(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: session_meta.clone(),
+                git: None,
+            }),
+        };
+
+        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
+        let parsed = chrono::DateTime::parse_from_rfc3339(&timestamp)?.with_timezone(&Utc);
+        let times = FileTimes::new().set_modified(parsed.into());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .set_times(times)?;
+
+        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
+
+        let expected = ConversationSummary {
+            conversation_id,
+            timestamp: Some(timestamp.clone()),
+            updated_at: Some("2025-09-05T16:53:11Z".to_string()),
+            path: path.clone(),
+            preview: String::new(),
+            model_provider: "fallback".to_string(),
+            cwd: PathBuf::new(),
+            cli_version: String::new(),
+            source: SessionSource::VSCode,
+            git_info: None,
+        };
+
+        assert_eq!(summary, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()> {
+        use codex_protocol::protocol::RolloutItem;
+        use codex_protocol::protocol::RolloutLine;
+        use codex_protocol::protocol::SessionMetaLine;
+        use std::fs;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("rollout.jsonl");
+
+        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
+        let parent_thread_id = ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?;
+        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
+
+        let session_meta = SessionMeta {
+            id: conversation_id,
+            timestamp: timestamp.clone(),
+            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            agent_nickname: Some("atlas".to_string()),
+            agent_role: Some("explorer".to_string()),
+            model_provider: Some("test-provider".to_string()),
+            ..SessionMeta::default()
+        };
+
+        let line = RolloutLine {
+            timestamp,
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: session_meta,
+                git: None,
+            }),
+        };
+        fs::write(&path, format!("{}\n", serde_json::to_string(&line)?))?;
+
+        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
+        let thread = summary_to_thread(summary);
+
+        assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
+        assert_eq!(thread.agent_role, Some("explorer".to_string()));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn aborting_pending_request_clears_pending_state() -> Result<()> {
         let thread_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
@@ -8133,6 +8778,41 @@ mod tests {
                 .is_empty()
         );
         assert!(outgoing_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn summary_from_state_db_metadata_preserves_agent_nickname() -> Result<()> {
+        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
+        let source =
+            serde_json::to_string(&SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?,
+                depth: 1,
+                agent_nickname: None,
+                agent_role: None,
+            }))?;
+
+        let summary = summary_from_state_db_metadata(
+            conversation_id,
+            PathBuf::from("/tmp/rollout.jsonl"),
+            Some("hi".to_string()),
+            "2025-09-05T16:53:11Z".to_string(),
+            "2025-09-05T16:53:12Z".to_string(),
+            "test-provider".to_string(),
+            PathBuf::from("/"),
+            "0.0.0".to_string(),
+            source,
+            Some("atlas".to_string()),
+            Some("explorer".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        let thread = summary_to_thread(summary);
+
+        assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
+        assert_eq!(thread.agent_role, Some("explorer".to_string()));
         Ok(())
     }
 

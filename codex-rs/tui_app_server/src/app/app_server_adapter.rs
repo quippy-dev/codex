@@ -19,6 +19,7 @@ use crate::app_server_session::status_account_display_from_auth_mode;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ServerNotification;
+#[cfg(test)]
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
@@ -228,6 +229,7 @@ impl App {
 /// Each turn is expanded into `TurnStarted`, zero or more `ItemCompleted`,
 /// and a terminal event that matches the turn's `TurnStatus`. Returns an
 /// empty vec (with a warning log) if the thread ID is not a valid UUID.
+#[cfg(test)]
 pub(super) fn thread_snapshot_events(
     thread: &Thread,
     show_raw_agent_reasoning: bool,
@@ -436,6 +438,7 @@ fn server_notification_thread_events(
                 id: String::new(),
                 msg: EventMsg::RealtimeConversationStarted(RealtimeConversationStartedEvent {
                     session_id: notification.session_id,
+                    version: notification.version,
                 }),
             }],
         )),
@@ -629,6 +632,7 @@ fn token_usage_from_app_server(
 /// agent-message items, while replaying the legacy events that still
 /// drive rendering for reasoning, web-search, image-generation, and
 /// context-compaction history cells.
+#[cfg(test)]
 fn turn_snapshot_events(
     thread_id: ThreadId,
     turn: &Turn,
@@ -742,13 +746,33 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
                 .map(codex_app_server_protocol::UserInput::into_core)
                 .collect(),
         })),
-        ThreadItem::AgentMessage { id, text, phase } => {
-            Some(TurnItem::AgentMessage(AgentMessageItem {
-                id: id.clone(),
-                content: vec![AgentMessageContent::Text { text: text.clone() }],
-                phase: phase.clone(),
-            }))
-        }
+        ThreadItem::AgentMessage {
+            id,
+            text,
+            phase,
+            memory_citation,
+        } => Some(TurnItem::AgentMessage(AgentMessageItem {
+            id: id.clone(),
+            content: vec![AgentMessageContent::Text { text: text.clone() }],
+            phase: phase.clone(),
+            memory_citation: memory_citation.clone().map(|citation| {
+                codex_protocol::memory_citation::MemoryCitation {
+                    entries: citation
+                        .entries
+                        .into_iter()
+                        .map(
+                            |entry| codex_protocol::memory_citation::MemoryCitationEntry {
+                                path: entry.path,
+                                line_start: entry.line_start,
+                                line_end: entry.line_end,
+                                note: entry.note,
+                            },
+                        )
+                        .collect(),
+                    rollout_ids: citation.thread_ids,
+                }
+            }),
+        })),
         ThreadItem::Plan { id, text } => Some(TurnItem::Plan(PlanItem {
             id: id.clone(),
             text: text.clone(),
@@ -877,6 +901,7 @@ mod tests {
                     id: item_id,
                     text: "Hello from your coding assistant.".to_string(),
                     phase: Some(MessagePhase::FinalAnswer),
+                    memory_citation: None,
                 },
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -901,7 +926,9 @@ mod tests {
         );
         assert_eq!(completed.turn_id, turn_id);
         match &completed.item {
-            TurnItem::AgentMessage(AgentMessageItem { id, content, phase }) => {
+            TurnItem::AgentMessage(AgentMessageItem {
+                id, content, phase, ..
+            }) => {
                 assert_eq!(id, "msg_123");
                 let [AgentMessageContent::Text { text }] = content.as_slice() else {
                     panic!("expected a single text content item");
@@ -1280,6 +1307,7 @@ mod tests {
                                 id: "assistant-1".to_string(),
                                 text: "hi".to_string(),
                                 phase: Some(MessagePhase::FinalAnswer),
+                                memory_citation: None,
                             },
                         ],
                         status: TurnStatus::Completed,

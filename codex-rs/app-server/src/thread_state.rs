@@ -140,6 +140,7 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_pathless_thread_history(&mut self, preview: String, turns: Vec<Turn>) {
         self.pathless_thread_preview = Some(if turns.is_empty() {
             preview
@@ -159,6 +160,7 @@ impl ThreadState {
         self.pathless_thread_turns.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn pathless_thread_has_materialized_turns(&self) -> bool {
         self.pathless_thread_has_materialized_turns
     }
@@ -461,6 +463,7 @@ mod tests {
             state.track_current_turn_event(&EventMsg::AgentMessage(AgentMessageEvent {
                 message: format!("{text} reply"),
                 phase: None,
+                memory_citation: None,
             }));
             state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_id.to_string(),
@@ -515,6 +518,7 @@ mod tests {
         state.track_current_turn_event(&EventMsg::AgentMessage(AgentMessageEvent {
             message: "first reply".to_string(),
             phase: None,
+            memory_citation: None,
         }));
         state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
