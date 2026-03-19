@@ -443,7 +443,10 @@ mod tests {
             text: String::new(),
         };
         let mut trimmed_history = ContextManager::new();
-        trimmed_history.record_items([&first_user, &latest_user], TruncationPolicy::Tokens(10_000));
+        trimmed_history.record_items(
+            [&first_user, &latest_user],
+            TruncationPolicy::Tokens(10_000),
+        );
         let trimmed_tokens = trimmed_history
             .estimate_token_count_with_base_instructions(&base_instructions)
             .expect("history should estimate");

@@ -73,6 +73,7 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
 fn custom_tool_call_output(call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::CustomToolCallOutput {
         call_id: call_id.to_string(),
+        name: None,
         output: FunctionCallOutputPayload::from_text(output.to_string()),
     }
 }
@@ -296,6 +297,7 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
         },
         ResponseItem::CustomToolCallOutput {
             call_id: "tool-1".to_string(),
+            name: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "js repl result".to_string(),
@@ -358,6 +360,7 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
         },
         ResponseItem::CustomToolCallOutput {
             call_id: "tool-1".to_string(),
+            name: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "js repl result".to_string(),
@@ -929,6 +932,7 @@ fn remove_first_item_handles_custom_tool_pair() {
         },
         ResponseItem::CustomToolCallOutput {
             call_id: "tool-1".to_string(),
+            name: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
         },
     ];
@@ -1008,6 +1012,7 @@ fn record_items_truncates_custom_tool_call_output_content() {
     let long_output = line.repeat(2_500);
     let item = ResponseItem::CustomToolCallOutput {
         call_id: "tool-200".to_string(),
+        name: None,
         output: FunctionCallOutputPayload::from_text(long_output.clone()),
     };
 
@@ -1210,6 +1215,7 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
             },
             ResponseItem::CustomToolCallOutput {
                 call_id: "tool-x".to_string(),
+                name: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
             },
         ]
@@ -1277,6 +1283,7 @@ fn normalize_removes_orphan_function_call_output() {
 fn normalize_removes_orphan_custom_tool_call_output() {
     let items = vec![ResponseItem::CustomToolCallOutput {
         call_id: "orphan-2".to_string(),
+        name: None,
         output: FunctionCallOutputPayload::from_text("ok".to_string()),
     }];
     let mut h = create_history_with_items(items);
@@ -1352,6 +1359,7 @@ fn normalize_mixed_inserts_and_removals() {
             },
             ResponseItem::CustomToolCallOutput {
                 call_id: "t1".to_string(),
+                name: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
             },
             ResponseItem::LocalShellCall {
@@ -1489,6 +1497,7 @@ fn normalize_removes_orphan_function_call_output_panics_in_debug() {
 fn normalize_removes_orphan_custom_tool_call_output_panics_in_debug() {
     let items = vec![ResponseItem::CustomToolCallOutput {
         call_id: "orphan-2".to_string(),
+        name: None,
         output: FunctionCallOutputPayload::from_text("ok".to_string()),
     }];
     let mut h = create_history_with_items(items);
@@ -1655,6 +1664,7 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
     let image_url = format!("data:image/png;base64,{payload}");
     let item = ResponseItem::CustomToolCallOutput {
         call_id: "call-js-repl".to_string(),
+        name: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputText {
                 text: "Screenshot captured".to_string(),

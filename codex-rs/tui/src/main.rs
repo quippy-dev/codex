@@ -41,6 +41,7 @@ fn into_app_server_cli(cli: Cli) -> codex_tui_app_server::Cli {
         web_search: cli.web_search,
         add_dir: cli.add_dir,
         no_alt_screen: cli.no_alt_screen,
+        auth_file: cli.auth_file,
         config_overrides: cli.config_overrides,
     }
 }
