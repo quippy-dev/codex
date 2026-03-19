@@ -15,6 +15,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotification;
 use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::thread_history_loader::build_turns_from_response_history_items;
 use crate::thread_history_loader::codex_home_from_rollout_path;
 use crate::thread_history_loader::materialize_rollout_items_for_replay;
 use crate::thread_status::ThreadWatchManager;
@@ -2061,6 +2062,17 @@ impl CodexMessageProcessor {
                     "thread",
                 );
 
+                if session_configured.rollout_path.is_none() {
+                    let thread_state = listener_task_context
+                        .thread_state_manager
+                        .thread_state(thread_id)
+                        .await;
+                    thread_state
+                        .lock()
+                        .await
+                        .set_pathless_thread_history(thread.preview.clone(), thread.turns.clone());
+                }
+
                 listener_task_context
                     .thread_watch_manager
                     .upsert_thread_silently(thread.clone())
@@ -3269,7 +3281,7 @@ impl CodexMessageProcessor {
                 }
             }
         } else {
-            let Some(thread) = loaded_thread.as_ref() else {
+            let Some(loaded_thread) = loaded_thread.as_ref() else {
                 self.send_invalid_request_error(
                     request_id,
                     format!("thread not loaded: {thread_uuid}"),
@@ -3277,20 +3289,47 @@ impl CodexMessageProcessor {
                 .await;
                 return;
             };
-            let config_snapshot = thread.config_snapshot().await;
-            let loaded_rollout_path = thread.rollout_path();
-            if include_turns && loaded_rollout_path.is_none() {
-                self.send_invalid_request_error(
-                    request_id,
-                    "ephemeral threads do not support includeTurns".to_string(),
-                )
-                .await;
-                return;
+            let config_snapshot = loaded_thread.config_snapshot().await;
+            let loaded_rollout_path = loaded_thread.rollout_path();
+            let mut thread = build_thread_from_snapshot(
+                thread_uuid,
+                &config_snapshot,
+                loaded_rollout_path.clone(),
+            );
+            if let Some(loaded_rollout_path) = loaded_rollout_path {
+                if include_turns {
+                    rollout_path = Some(loaded_rollout_path);
+                }
+            } else {
+                let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
+                let (cached_preview, cached_turns) = {
+                    let state = thread_state.lock().await;
+                    (
+                        state.pathless_thread_preview().map(str::to_string),
+                        state.pathless_thread_turns(),
+                    )
+                };
+                let needs_pathless_history =
+                    cached_preview.is_some() || !cached_turns.is_empty() || include_turns;
+                if needs_pathless_history {
+                    let response_history_items = loaded_thread
+                        .response_history_items()
+                        .await
+                        .into_iter()
+                        .map(RolloutItem::ResponseItem)
+                        .collect::<Vec<_>>();
+                    thread.preview = cached_preview
+                        .unwrap_or_else(|| preview_from_rollout_items(&response_history_items));
+                    if include_turns {
+                        thread.turns = if cached_turns.is_empty() {
+                            build_turns_from_response_history_items(&response_history_items)
+                        } else {
+                            cached_turns
+                        };
+                    }
+                }
             }
-            if include_turns {
-                rollout_path = loaded_rollout_path.clone();
-            }
-            build_thread_from_snapshot(thread_uuid, &config_snapshot, loaded_rollout_path)
+            thread
         };
         self.attach_thread_name(thread_uuid, &mut thread).await;
 
@@ -4257,6 +4296,14 @@ impl CodexMessageProcessor {
         {
             self.send_internal_error(request_id, message).await;
             return;
+        }
+
+        if session_configured.rollout_path.is_none() {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            thread_state
+                .lock()
+                .await
+                .set_pathless_thread_history(thread.preview.clone(), thread.turns.clone());
         }
 
         self.thread_watch_manager

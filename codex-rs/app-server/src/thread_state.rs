@@ -140,7 +140,6 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
-    #[cfg(test)]
     pub(crate) fn set_pathless_thread_history(&mut self, preview: String, turns: Vec<Turn>) {
         self.pathless_thread_preview = Some(if turns.is_empty() {
             preview

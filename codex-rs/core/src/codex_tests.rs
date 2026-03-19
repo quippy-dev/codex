@@ -1305,25 +1305,36 @@ async fn thread_rollback_clears_history_when_num_turns_exceeds_existing_turns() 
 }
 
 #[tokio::test]
-async fn thread_rollback_fails_without_persisted_rollout_path() {
+async fn thread_rollback_replays_in_memory_history_without_persisted_rollout_path() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
     let initial_context = sess.build_initial_context(tc.as_ref()).await;
-    sess.record_into_history(&initial_context, tc.as_ref())
+    let turn_1 = vec![user_message("turn 1 user")];
+    let turn_2 = vec![user_message("turn 2 user")];
+    let mut full_history = Vec::new();
+    full_history.extend(initial_context.clone());
+    full_history.extend(turn_1.clone());
+    full_history.extend(turn_2);
+    sess.replace_history(full_history, Some(tc.to_turn_context_item()))
         .await;
+    sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+        model: "stale-model".to_string(),
+        realtime_active: Some(tc.realtime_active),
+    }))
+    .await;
 
     handlers::thread_rollback(&sess, "sub-1".to_string(), 1).await;
 
-    let error_event = wait_for_thread_rollback_failed(&rx).await;
-    assert_eq!(
-        error_event.message,
-        "thread rollback requires a persisted rollout path"
-    );
-    assert_eq!(
-        error_event.codex_error_info,
-        Some(CodexErrorInfo::ThreadRollbackFailed)
-    );
-    assert_eq!(sess.clone_history().await.raw_items(), initial_context);
+    let rollback_event = wait_for_thread_rolled_back(&rx).await;
+    assert_eq!(rollback_event.num_turns, 1);
+
+    let mut expected = Vec::new();
+    expected.extend(initial_context);
+    expected.extend(turn_1);
+    let history = sess.clone_history().await;
+    assert_eq!(history.raw_items(), expected);
+    assert_eq!(sess.previous_turn_settings().await, None);
+    assert!(sess.reference_context_item().await.is_none());
 }
 
 #[tokio::test]
