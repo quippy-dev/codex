@@ -34,12 +34,16 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadUnarchivedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_core::find_archived_thread_path_by_id_str;
+use codex_core::find_thread_path_by_id_str;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
@@ -220,6 +224,154 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         }
         other => panic!("expected user message item, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_unarchives_archived_rollout_by_thread_id() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = app_test_support::create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let original_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::create_dir_all(&archived_dir)?;
+    let archived_path = archived_dir.join(
+        original_path
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    std::fs::rename(&original_path, &archived_path)?;
+    assert!(
+        find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_none(),
+        "archived thread should not remain discoverable in sessions/"
+    );
+    assert!(
+        find_archived_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_some(),
+        "archived thread should be discoverable in archived_sessions/"
+    );
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    let unarchived_notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/unarchived"),
+    )
+    .await??;
+    let unarchived: ThreadUnarchivedNotification = serde_json::from_value(
+        unarchived_notification
+            .params
+            .expect("thread/unarchived notification params"),
+    )?;
+
+    let restored_path = find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+        .await?
+        .expect("resume should restore archived rollout into sessions/");
+    assert_eq!(thread.id, conversation_id);
+    assert_eq!(unarchived.thread_id, thread.id);
+    assert_eq!(thread.preview, preview);
+    assert_eq!(thread.turns.len(), 1, "expected resumed archived history");
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert_eq!(
+        thread.path.as_ref().expect("thread path").canonicalize()?,
+        restored_path.canonicalize()?,
+    );
+    assert!(
+        !archived_path.exists(),
+        "resume should move the archived rollout back into sessions/"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_failure_keeps_archived_rollout_archived() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let conversation_id = app_test_support::create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let original_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::create_dir_all(&archived_dir)?;
+    let archived_path = archived_dir.join(
+        original_path
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    std::fs::rename(&original_path, &archived_path)?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            model_provider: Some("missing-provider".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+
+    assert!(
+        resume_err.error.message.contains("missing-provider")
+            || resume_err
+                .error
+                .message
+                .contains("failed to load configuration"),
+        "unexpected resume error: {}",
+        resume_err.error.message
+    );
+    assert!(
+        archived_path.exists(),
+        "failed resume should leave archived rollout in archived_sessions/"
+    );
+    assert!(
+        find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_none(),
+        "failed resume should not restore the rollout into sessions/"
+    );
 
     Ok(())
 }

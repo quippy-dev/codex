@@ -3,6 +3,7 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::McpProcess;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::rollout_path;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::JSONRPCError;
@@ -24,11 +25,14 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_core::find_thread_path_by_id_str;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -217,6 +221,79 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
             .contains("no rollout found for thread id"),
         "unexpected fork error: {}",
         fork_err.error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_finds_archived_rollout_by_thread_id() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let original_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir_all(&archived_dir)?;
+    let archived_path = archived_dir.join(
+        original_path
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    let archived_contents = fs::read_to_string(&original_path)?;
+    fs::rename(&original_path, &archived_path)?;
+    assert!(
+        find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_none(),
+        "archived source thread should not remain discoverable in sessions/"
+    );
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+
+    assert_ne!(thread.id, conversation_id);
+    assert_eq!(thread.preview, preview);
+    assert_eq!(thread.turns.len(), 1, "expected archived fork history");
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert!(
+        archived_path.exists(),
+        "forking an archived source should not unarchive it"
+    );
+    assert_eq!(
+        fs::read_to_string(&archived_path)?,
+        archived_contents,
+        "fork should not mutate the archived source rollout"
+    );
+    assert!(
+        thread
+            .path
+            .as_ref()
+            .is_some_and(|path| path != &archived_path),
+        "forked thread should materialize at a new rollout path"
     );
 
     Ok(())

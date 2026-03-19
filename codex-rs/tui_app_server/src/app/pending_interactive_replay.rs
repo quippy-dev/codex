@@ -54,6 +54,7 @@ enum PendingInteractiveRequest {
     ExecApproval {
         turn_id: String,
         approval_id: String,
+        item_id: String,
     },
     PatchApproval {
         turn_id: String,
@@ -190,6 +191,7 @@ impl PendingInteractiveReplayState {
                             .approval_id
                             .clone()
                             .unwrap_or_else(|| params.item_id.clone()),
+                        item_id: params.item_id.clone(),
                     },
                 );
             }
@@ -256,11 +258,7 @@ impl PendingInteractiveReplayState {
         match notification {
             ServerNotification::ItemStarted(notification) => match &notification.item {
                 ThreadItem::CommandExecution { id, .. } => {
-                    self.exec_approval_call_ids.remove(id);
-                    Self::remove_call_id_from_turn_map(
-                        &mut self.exec_approval_call_ids_by_turn_id,
-                        id,
-                    );
+                    self.clear_started_exec_approval(id);
                 }
                 ThreadItem::FileChange { id, .. } => {
                     self.patch_approval_call_ids.remove(id);
@@ -437,6 +435,29 @@ impl PendingInteractiveReplayState {
         );
     }
 
+    fn clear_started_exec_approval(&mut self, started_item_id: &str) {
+        let mut matched_approval_ids = Vec::new();
+        self.pending_requests_by_request_id
+            .retain(|_, pending| match pending {
+                PendingInteractiveRequest::ExecApproval {
+                    approval_id,
+                    item_id,
+                    ..
+                } if approval_id == started_item_id || item_id == started_item_id => {
+                    matched_approval_ids.push(approval_id.clone());
+                    false
+                }
+                _ => true,
+            });
+        for approval_id in matched_approval_ids {
+            self.exec_approval_call_ids.remove(&approval_id);
+            Self::remove_call_id_from_turn_map(
+                &mut self.exec_approval_call_ids_by_turn_id,
+                &approval_id,
+            );
+        }
+    }
+
     fn remove_call_id_from_turn_map(
         call_ids_by_turn_id: &mut HashMap<String, Vec<String>>,
         call_id: &str,
@@ -485,6 +506,7 @@ impl PendingInteractiveReplayState {
             PendingInteractiveRequest::ExecApproval {
                 turn_id,
                 approval_id,
+                ..
             } => {
                 self.exec_approval_call_ids.remove(&approval_id);
                 Self::remove_call_id_from_turn_map_entry(
@@ -532,6 +554,7 @@ impl PendingInteractiveReplayState {
                 PendingInteractiveRequest::ExecApproval {
                     turn_id,
                     approval_id,
+                    ..
                 },
                 ServerRequest::CommandExecutionRequestApproval { params, .. },
             ) => {
@@ -586,6 +609,7 @@ mod tests {
     use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::ServerRequestResolvedNotification;
     use codex_app_server_protocol::ThreadClosedNotification;
+    use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnCompletedNotification;
@@ -792,6 +816,47 @@ mod tests {
                 )
             }),
             "server-resolved exec approval prompt should not replay on thread switch"
+        );
+    }
+
+    #[test]
+    fn thread_event_snapshot_drops_started_exec_approval_after_item_started_uses_item_id() {
+        let mut store = ThreadEventStore::new(8);
+        store.push_request(exec_approval_request(
+            "call-1",
+            Some("approval-1"),
+            "turn-1",
+        ));
+
+        store.push_notification(ServerNotification::ItemStarted(
+            codex_app_server_protocol::ItemStartedNotification {
+                thread_id: codex_protocol::ThreadId::new().to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ThreadItem::CommandExecution {
+                    id: "call-1".to_string(),
+                    command: "echo hi".to_string(),
+                    cwd: std::path::PathBuf::from("/"),
+                    process_id: None,
+                    status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+                    command_actions: Vec::new(),
+                    aggregated_output: None,
+                    exit_code: None,
+                    duration_ms: None,
+                },
+            },
+        ));
+
+        let snapshot = store.snapshot();
+        assert!(
+            snapshot.events.iter().all(|event| {
+                !matches!(
+                    event,
+                    ThreadBufferedEvent::Request(
+                        ServerRequest::CommandExecutionRequestApproval { .. }
+                    )
+                )
+            }),
+            "started exec approval prompt should not replay on thread switch"
         );
     }
 

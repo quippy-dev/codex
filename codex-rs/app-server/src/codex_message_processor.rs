@@ -351,6 +351,17 @@ enum ThreadShutdownResult {
     TimedOut,
 }
 
+struct RestoredArchivedThread {
+    thread_id: ThreadId,
+    archived_path: PathBuf,
+    restored_path: PathBuf,
+}
+
+struct ResumeThreadSource {
+    initial_history: InitialHistory,
+    restored_archived_thread: Option<RestoredArchivedThread>,
+}
+
 impl Drop for ActiveLogin {
     fn drop(&mut self) {
         self.shutdown_handle.shutdown();
@@ -2701,114 +2712,12 @@ impl CodexMessageProcessor {
             }
         };
 
-        let rollout_path_display = archived_path.display().to_string();
         let fallback_provider = self.config.model_provider_id.clone();
-        let state_db_ctx = get_state_db(&self.config).await;
-        let archived_folder = self
-            .config
-            .codex_home
-            .join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
 
         let result: Result<Thread, JSONRPCErrorError> = async {
-            let canonical_archived_dir = tokio::fs::canonicalize(&archived_folder).await.map_err(
-                |err| JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!(
-                        "failed to unarchive thread: unable to resolve archived directory: {err}"
-                    ),
-                    data: None,
-                },
-            )?;
-            let canonical_rollout_path = tokio::fs::canonicalize(&archived_path).await;
-            let canonical_rollout_path = if let Ok(path) = canonical_rollout_path
-                && path.starts_with(&canonical_archived_dir)
-            {
-                path
-            } else {
-                return Err(JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!(
-                        "rollout path `{rollout_path_display}` must be in archived directory"
-                    ),
-                    data: None,
-                });
-            };
-
-            let required_suffix = format!("{thread_id}.jsonl");
-            let Some(file_name) = canonical_rollout_path.file_name().map(OsStr::to_owned) else {
-                return Err(JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!("rollout path `{rollout_path_display}` missing file name"),
-                    data: None,
-                });
-            };
-            if !file_name
-                .to_string_lossy()
-                .ends_with(required_suffix.as_str())
-            {
-                return Err(JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!(
-                        "rollout path `{rollout_path_display}` does not match thread id {thread_id}"
-                    ),
-                    data: None,
-                });
-            }
-
-            let Some((year, month, day)) = rollout_date_parts(&file_name) else {
-                return Err(JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!(
-                        "rollout path `{rollout_path_display}` missing filename timestamp"
-                    ),
-                    data: None,
-                });
-            };
-
-            let sessions_folder = self.config.codex_home.join(codex_core::SESSIONS_SUBDIR);
-            let dest_dir = sessions_folder.join(year).join(month).join(day);
-            let restored_path = dest_dir.join(&file_name);
-            tokio::fs::create_dir_all(&dest_dir)
-                .await
-                .map_err(|err| JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to unarchive thread: {err}"),
-                    data: None,
-                })?;
-            tokio::fs::rename(&canonical_rollout_path, &restored_path)
-                .await
-                .map_err(|err| JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to unarchive thread: {err}"),
-                    data: None,
-                })?;
-            tokio::task::spawn_blocking({
-                let restored_path = restored_path.clone();
-                move || -> std::io::Result<()> {
-                    let times = FileTimes::new().set_modified(SystemTime::now());
-                    OpenOptions::new()
-                        .append(true)
-                        .open(&restored_path)?
-                        .set_times(times)?;
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|err| JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to update unarchived thread timestamp: {err}"),
-                data: None,
-            })?
-            .map_err(|err| JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to update unarchived thread timestamp: {err}"),
-                data: None,
-            })?;
-            if let Some(ctx) = state_db_ctx {
-                let _ = ctx
-                    .mark_unarchived(thread_id, restored_path.as_path())
-                    .await;
-            }
+            let restored_path = self
+                .unarchive_thread_common(thread_id, archived_path.as_path())
+                .await?;
             let summary =
                 read_summary_from_rollout(restored_path.as_path(), fallback_provider.as_str())
                     .await
@@ -2842,6 +2751,175 @@ impl CodexMessageProcessor {
                 self.outgoing.send_error(request_id, err).await;
             }
         }
+    }
+
+    async fn unarchive_thread_common(
+        &self,
+        thread_id: ThreadId,
+        archived_path: &Path,
+    ) -> Result<PathBuf, JSONRPCErrorError> {
+        let rollout_path_display = archived_path.display().to_string();
+        let state_db_ctx = get_state_db(&self.config).await;
+        let archived_folder = self
+            .config
+            .codex_home
+            .join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
+
+        let canonical_archived_dir =
+            tokio::fs::canonicalize(&archived_folder)
+                .await
+                .map_err(|err| JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!(
+                        "failed to unarchive thread: unable to resolve archived directory: {err}"
+                    ),
+                    data: None,
+                })?;
+        let canonical_rollout_path = tokio::fs::canonicalize(archived_path).await;
+        let canonical_rollout_path = if let Ok(path) = canonical_rollout_path
+            && path.starts_with(&canonical_archived_dir)
+        {
+            path
+        } else {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!(
+                    "rollout path `{rollout_path_display}` must be in archived directory"
+                ),
+                data: None,
+            });
+        };
+
+        let required_suffix = format!("{thread_id}.jsonl");
+        let Some(file_name) = canonical_rollout_path.file_name().map(OsStr::to_owned) else {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!("rollout path `{rollout_path_display}` missing file name"),
+                data: None,
+            });
+        };
+        if !file_name
+            .to_string_lossy()
+            .ends_with(required_suffix.as_str())
+        {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!(
+                    "rollout path `{rollout_path_display}` does not match thread id {thread_id}"
+                ),
+                data: None,
+            });
+        }
+
+        let Some((year, month, day)) = rollout_date_parts(&file_name) else {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: format!(
+                    "rollout path `{rollout_path_display}` missing filename timestamp"
+                ),
+                data: None,
+            });
+        };
+
+        let sessions_folder = self.config.codex_home.join(codex_core::SESSIONS_SUBDIR);
+        let dest_dir = sessions_folder.join(year).join(month).join(day);
+        let restored_path = dest_dir.join(&file_name);
+        tokio::fs::create_dir_all(&dest_dir)
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to unarchive thread: {err}"),
+                data: None,
+            })?;
+        tokio::fs::rename(&canonical_rollout_path, &restored_path)
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to unarchive thread: {err}"),
+                data: None,
+            })?;
+        tokio::task::spawn_blocking({
+            let restored_path = restored_path.clone();
+            move || -> std::io::Result<()> {
+                let times = FileTimes::new().set_modified(SystemTime::now());
+                OpenOptions::new()
+                    .append(true)
+                    .open(&restored_path)?
+                    .set_times(times)?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to update unarchived thread timestamp: {err}"),
+            data: None,
+        })?
+        .map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to update unarchived thread timestamp: {err}"),
+            data: None,
+        })?;
+        if let Some(ctx) = state_db_ctx {
+            let _ = ctx
+                .mark_unarchived(thread_id, restored_path.as_path())
+                .await;
+        }
+
+        Ok(restored_path)
+    }
+
+    async fn rollback_failed_archived_thread_resume(
+        &self,
+        restored_archived_thread: &RestoredArchivedThread,
+    ) {
+        if let Err(err) = self
+            .rearchive_thread_common(
+                restored_archived_thread.thread_id,
+                restored_archived_thread.restored_path.as_path(),
+                restored_archived_thread.archived_path.as_path(),
+            )
+            .await
+        {
+            warn!(
+                thread_id = %restored_archived_thread.thread_id,
+                archived_path = %restored_archived_thread.archived_path.display(),
+                restored_path = %restored_archived_thread.restored_path.display(),
+                error = %err.message,
+                "failed to restore archived thread after resume error"
+            );
+        }
+    }
+
+    async fn rearchive_thread_common(
+        &self,
+        thread_id: ThreadId,
+        restored_path: &Path,
+        archived_path: &Path,
+    ) -> Result<(), JSONRPCErrorError> {
+        let state_db_ctx = get_state_db(&self.config).await;
+        if let Some(parent) = archived_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to restore archived thread state: {err}"),
+                    data: None,
+                })?;
+        }
+        tokio::fs::rename(restored_path, archived_path)
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to restore archived thread state: {err}"),
+                data: None,
+            })?;
+        if let Some(ctx) = state_db_ctx {
+            let _ = ctx
+                .mark_archived(thread_id, archived_path, Utc::now())
+                .await;
+        }
+        Ok(())
     }
 
     async fn thread_rollback(
@@ -3358,14 +3436,20 @@ impl CodexMessageProcessor {
             persist_extended_history,
         } = params;
 
-        let thread_history = if let Some(history) = history {
+        let ResumeThreadSource {
+            initial_history: thread_history,
+            restored_archived_thread,
+        } = if let Some(history) = history {
             let Some(thread_history) = self
                 .resume_thread_from_history(request_id.clone(), history.as_slice())
                 .await
             else {
                 return;
             };
-            thread_history
+            ResumeThreadSource {
+                initial_history: thread_history,
+                restored_archived_thread: None,
+            }
         } else {
             let Some(thread_history) = self
                 .resume_thread_from_rollout(request_id.clone(), &thread_id, path.as_ref())
@@ -3411,6 +3495,10 @@ impl CodexMessageProcessor {
         {
             Ok(config) => config,
             Err(err) => {
+                if let Some(restored_archived_thread) = restored_archived_thread.as_ref() {
+                    self.rollback_failed_archived_thread_resume(restored_archived_thread)
+                        .await;
+                }
                 let error = config_load_error(&err);
                 self.outgoing.send_error(request_id, error).await;
                 return;
@@ -3505,8 +3593,22 @@ impl CodexMessageProcessor {
                 };
 
                 self.outgoing.send_response(request_id, response).await;
+                if let Some(restored_archived_thread) = restored_archived_thread {
+                    let notification = ThreadUnarchivedNotification {
+                        thread_id: restored_archived_thread.thread_id.to_string(),
+                    };
+                    self.outgoing
+                        .send_server_notification(ServerNotification::ThreadUnarchived(
+                            notification,
+                        ))
+                        .await;
+                }
             }
             Err(err) => {
+                if let Some(restored_archived_thread) = restored_archived_thread.as_ref() {
+                    self.rollback_failed_archived_thread_resume(restored_archived_thread)
+                        .await;
+                }
                 let error = JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: format!("error resuming thread: {err}"),
@@ -3726,9 +3828,9 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         thread_id: &str,
         path: Option<&PathBuf>,
-    ) -> Option<InitialHistory> {
-        let rollout_path = if let Some(path) = path {
-            path.clone()
+    ) -> Option<ResumeThreadSource> {
+        let (rollout_path, restored_archived_thread) = if let Some(path) = path {
+            (path.clone(), None)
         } else {
             let existing_thread_id = match ThreadId::from_string(thread_id) {
                 Ok(id) => id,
@@ -3749,15 +3851,51 @@ impl CodexMessageProcessor {
             )
             .await
             {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("no rollout found for thread id {existing_thread_id}"),
-                    )
-                    .await;
-                    return None;
-                }
+                Ok(Some(path)) => (path, None),
+                Ok(None) => match find_archived_thread_path_by_id_str(
+                    &self.config.codex_home,
+                    &existing_thread_id.to_string(),
+                )
+                .await
+                {
+                    Ok(Some(archived_path)) => {
+                        match self
+                            .unarchive_thread_common(existing_thread_id, archived_path.as_path())
+                            .await
+                        {
+                            Ok(restored_path) => (
+                                restored_path.clone(),
+                                Some(RestoredArchivedThread {
+                                    thread_id: existing_thread_id,
+                                    archived_path,
+                                    restored_path,
+                                }),
+                            ),
+                            Err(err) => {
+                                self.outgoing.send_error(request_id, err).await;
+                                return None;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        self.send_invalid_request_error(
+                            request_id,
+                            format!("no rollout found for thread id {existing_thread_id}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                    Err(err) => {
+                        self.send_invalid_request_error(
+                            request_id,
+                            format!(
+                                "failed to locate archived thread id {existing_thread_id}: {err}"
+                            ),
+                        )
+                        .await;
+                        return None;
+                    }
+                },
                 Err(err) => {
                     self.send_invalid_request_error(
                         request_id,
@@ -3770,8 +3908,15 @@ impl CodexMessageProcessor {
         };
 
         match RolloutRecorder::get_rollout_history(&rollout_path).await {
-            Ok(initial_history) => Some(initial_history),
+            Ok(initial_history) => Some(ResumeThreadSource {
+                initial_history,
+                restored_archived_thread,
+            }),
             Err(err) => {
+                if let Some(restored_archived_thread) = restored_archived_thread.as_ref() {
+                    self.rollback_failed_archived_thread_resume(restored_archived_thread)
+                        .await;
+                }
                 self.send_invalid_request_error(
                     request_id,
                     format!("failed to load rollout `{}`: {err}", rollout_path.display()),
@@ -3882,12 +4027,30 @@ impl CodexMessageProcessor {
             {
                 Ok(Some(p)) => (p, Some(existing_thread_id)),
                 Ok(None) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("no rollout found for thread id {existing_thread_id}"),
+                    match find_archived_thread_path_by_id_str(
+                        &self.config.codex_home,
+                        &existing_thread_id.to_string(),
                     )
-                    .await;
-                    return;
+                    .await
+                    {
+                        Ok(Some(path)) => (path, Some(existing_thread_id)),
+                        Ok(None) => {
+                            self.send_invalid_request_error(
+                                request_id,
+                                format!("no rollout found for thread id {existing_thread_id}"),
+                            )
+                            .await;
+                            return;
+                        }
+                        Err(err) => {
+                            self.send_invalid_request_error(
+                            request_id,
+                            format!("failed to locate archived thread id {existing_thread_id}: {err}"),
+                        )
+                        .await;
+                            return;
+                        }
+                    }
                 }
                 Err(err) => {
                     self.send_invalid_request_error(

@@ -1302,6 +1302,10 @@ impl AuthManager {
         )?))
     }
 
+    pub fn storage_home(&self) -> &Path {
+        &self.codex_home
+    }
+
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
     }

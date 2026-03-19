@@ -205,12 +205,14 @@ impl App {
         request_id: RequestId,
         params: ChatgptAuthTokensRefreshParams,
     ) {
-        let config = self.config.clone();
+        let auth_storage_home = self.chat_widget.auth_manager.storage_home().to_path_buf();
+        let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
+        let forced_chatgpt_workspace_id = self.config.forced_chatgpt_workspace_id.clone();
         let result = tokio::task::spawn_blocking(move || {
             resolve_chatgpt_auth_tokens_refresh_response(
-                &config.codex_home,
-                config.cli_auth_credentials_store_mode,
-                config.forced_chatgpt_workspace_id.as_deref(),
+                &auth_storage_home,
+                auth_credentials_store_mode,
+                forced_chatgpt_workspace_id.as_deref(),
                 &params,
             )
         })
@@ -489,15 +491,69 @@ mod tests {
     use super::LegacyThreadNotification;
     use super::ServerNotificationThreadTarget;
     use super::legacy_thread_notification;
+    use super::resolve_chatgpt_auth_tokens_refresh_response;
     use super::server_notification_thread_target;
+    use base64::Engine as _;
+    use chrono::Utc;
+    use codex_app_server_protocol::AuthMode;
+    use codex_app_server_protocol::ChatgptAuthTokensRefreshParams;
     use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStartedNotification;
     use codex_app_server_protocol::TurnStatus;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use codex_core::auth::AuthDotJson;
+    use codex_core::auth::save_auth;
+    use codex_core::token_data::TokenData;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
+    use serde::Serialize;
     use serde_json::json;
+    use tempfile::TempDir;
+
+    fn fake_jwt(email: &str, account_id: &str, plan_type: &str) -> String {
+        #[derive(Serialize)]
+        struct Header {
+            alg: &'static str,
+            typ: &'static str,
+        }
+
+        let header = Header {
+            alg: "none",
+            typ: "JWT",
+        };
+        let payload = json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": plan_type,
+            },
+        });
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = encode(&serde_json::to_vec(&header).expect("serialize header"));
+        let payload_b64 = encode(&serde_json::to_vec(&payload).expect("serialize payload"));
+        let signature_b64 = encode(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
+
+    fn write_chatgpt_auth(codex_home: &std::path::Path, account_id: &str, access_token: &str) {
+        let id_token = fake_jwt("user@example.com", account_id, "business");
+        let auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: codex_core::token_data::parse_chatgpt_jwt_claims(&id_token)
+                    .expect("id token should parse"),
+                access_token: access_token.to_string(),
+                refresh_token: "refresh-token".to_string(),
+                account_id: Some(account_id.to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        };
+        save_auth(codex_home, &auth, AuthCredentialsStoreMode::File)
+            .expect("chatgpt auth should save");
+    }
 
     #[test]
     fn legacy_warning_notification_extracts_thread_id_and_message() {
@@ -579,5 +635,27 @@ mod tests {
             server_notification_thread_target(&notification),
             ServerNotificationThreadTarget::InvalidThreadId("not-a-thread-id".to_string())
         );
+    }
+
+    #[test]
+    fn chatgpt_auth_refresh_reads_from_resolved_auth_storage_home() {
+        let default_home = TempDir::new().expect("tempdir");
+        let override_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(default_home.path(), "workspace-default", "default-token");
+        write_chatgpt_auth(override_home.path(), "workspace-override", "override-token");
+
+        let response = resolve_chatgpt_auth_tokens_refresh_response(
+            override_home.path(),
+            AuthCredentialsStoreMode::File,
+            Some("workspace-override"),
+            &ChatgptAuthTokensRefreshParams {
+                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-override".to_string()),
+            },
+        )
+        .expect("chatgpt auth refresh should load from override home");
+
+        assert_eq!(response.chatgpt_account_id, "workspace-override");
+        assert_eq!(response.access_token, "override-token");
     }
 }

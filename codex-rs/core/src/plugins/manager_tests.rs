@@ -38,6 +38,13 @@ fn write_plugin(root: &Path, dir_name: &str, manifest_name: &str) {
 }
 
 fn plugin_config_toml(enabled: bool, plugins_feature_enabled: bool) -> String {
+    plugin_config_toml_for_plugins(&[("sample@test", enabled)], plugins_feature_enabled)
+}
+
+fn plugin_config_toml_for_plugins(
+    plugins_with_enabled_state: &[(&str, bool)],
+    plugins_feature_enabled: bool,
+) -> String {
     let mut root = toml::map::Map::new();
 
     let mut features = toml::map::Map::new();
@@ -47,11 +54,12 @@ fn plugin_config_toml(enabled: bool, plugins_feature_enabled: bool) -> String {
     );
     root.insert("features".to_string(), Value::Table(features));
 
-    let mut plugin = toml::map::Map::new();
-    plugin.insert("enabled".to_string(), Value::Boolean(enabled));
-
     let mut plugins = toml::map::Map::new();
-    plugins.insert("sample@test".to_string(), Value::Table(plugin));
+    for (plugin_id, enabled) in plugins_with_enabled_state {
+        let mut plugin = toml::map::Map::new();
+        plugin.insert("enabled".to_string(), Value::Boolean(*enabled));
+        plugins.insert((*plugin_id).to_string(), Value::Table(plugin));
+    }
     root.insert("plugins".to_string(), Value::Table(plugins));
 
     toml::to_string(&Value::Table(root)).expect("plugin test config should serialize")
@@ -1843,4 +1851,53 @@ fn load_plugins_ignores_project_config_files() {
         load_plugins_from_layer_stack(&stack, &PluginStore::new(codex_home.path().to_path_buf()));
 
     assert_eq!(outcome, PluginLoadOutcome::default());
+}
+
+#[test]
+fn plugins_for_config_cache_is_keyed_by_config_layer_stack() {
+    let codex_home = TempDir::new().unwrap();
+    let manager = PluginsManager::new(codex_home.path().to_path_buf());
+
+    write_plugin(
+        &codex_home.path().join("plugins/cache"),
+        "test/sample/local",
+        "sample",
+    );
+    write_plugin(
+        &codex_home.path().join("plugins/cache"),
+        "test/other/local",
+        "other",
+    );
+
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        &plugin_config_toml_for_plugins(&[("sample@test", true)], true),
+    );
+    let sample_config = load_config_blocking(codex_home.path(), codex_home.path());
+    let sample_outcome = manager.plugins_for_config(&sample_config);
+    assert_eq!(
+        sample_outcome
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.enabled)
+            .map(|plugin| plugin.config_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sample@test"],
+    );
+
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        &plugin_config_toml_for_plugins(&[("other@test", true)], true),
+    );
+    let other_config = load_config_blocking(codex_home.path(), codex_home.path());
+    let other_outcome = manager.plugins_for_config(&other_config);
+    assert_eq!(
+        other_outcome
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.enabled)
+            .map(|plugin| plugin.config_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["other@test"],
+    );
 }
