@@ -1609,12 +1609,7 @@ pub mod close_agent {
                 .shutdown_agent(helper_id)
                 .await;
         }
-        let close_result = match session
-            .services
-            .agent_control
-            .shutdown_agent(agent_id)
-            .await
-        {
+        let close_result = match session.services.agent_control.close_agent(agent_id).await {
             Ok(_) => Ok(CloseAgentOutcome::Closed),
             Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {
                 Ok(not_found_outcome(was_known))

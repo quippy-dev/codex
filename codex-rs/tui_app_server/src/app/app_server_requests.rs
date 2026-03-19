@@ -125,6 +125,7 @@ impl PendingAppServerRequests {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn note_legacy_event(&mut self, event: &Event) {
         let EventMsg::ElicitationRequest(request) = &event.msg else {
             return;
@@ -306,6 +307,7 @@ impl McpServerMatcher {
         }
     }
 
+    #[allow(dead_code)]
     fn from_core(server_name: &str, turn_id: Option<&str>, request: &ElicitationRequest) -> Self {
         let request = match request {
             ElicitationRequest::Form {

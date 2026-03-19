@@ -119,7 +119,7 @@ pub(crate) fn progress_status_line(update: &AgentJobProgressUpdate) -> String {
         message.push_str(&format!(", {} failed", update.failed_items));
     }
     if let Some(eta_seconds) = update.eta_seconds {
-        message.push_str(&format!(", ETA {}s", eta_seconds));
+        message.push_str(&format!(", ETA {eta_seconds}s"));
     }
     message
 }

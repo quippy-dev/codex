@@ -2057,6 +2057,12 @@ impl App {
                 app_server.thread_realtime_stop(thread_id).await?;
                 Ok(true)
             }
+            AppCommandView::RunUserShellCommand { command } => {
+                app_server
+                    .thread_shell_command(thread_id, command.to_string())
+                    .await?;
+                Ok(true)
+            }
             AppCommandView::OverrideTurnContext { .. } => Ok(true),
             _ => Ok(false),
         }
@@ -2418,8 +2424,6 @@ impl App {
         Ok(())
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     async fn enqueue_primary_thread_legacy_warning(&mut self, message: String) -> Result<()> {
         if let Some(thread_id) = self.primary_thread_id {
             return self.enqueue_thread_legacy_warning(thread_id, message).await;
@@ -2429,8 +2433,6 @@ impl App {
         Ok(())
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     async fn enqueue_primary_thread_legacy_rollback(&mut self, num_turns: u32) -> Result<()> {
         if let Some(thread_id) = self.primary_thread_id {
             return self
@@ -2442,6 +2444,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn enqueue_primary_event(&mut self, event: Event) -> Result<()> {
         if let Some(thread_id) = self.primary_thread_id {
             return self.enqueue_thread_event(thread_id, event).await;
@@ -2507,8 +2510,6 @@ impl App {
         Ok(())
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     async fn enqueue_primary_thread_notification(
         &mut self,
         notification: ServerNotification,
@@ -2523,7 +2524,6 @@ impl App {
         Ok(())
     }
 
-    #[cfg(test)]
     async fn enqueue_primary_thread_request(&mut self, request: ServerRequest) -> Result<()> {
         if let Some(thread_id) = self.primary_thread_id {
             return self.enqueue_thread_request(thread_id, request).await;

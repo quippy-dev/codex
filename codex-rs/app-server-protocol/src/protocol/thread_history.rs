@@ -361,6 +361,7 @@ impl ThreadHistoryBuilder {
             command,
             cwd: payload.cwd.clone(),
             process_id: payload.process_id.clone(),
+            source: payload.source.into(),
             status: CommandExecutionStatus::InProgress,
             command_actions,
             aggregated_output: None,
@@ -391,6 +392,7 @@ impl ThreadHistoryBuilder {
             command,
             cwd: payload.cwd.clone(),
             process_id: payload.process_id.clone(),
+            source: payload.source.into(),
             status,
             command_actions,
             aggregated_output,
@@ -1205,7 +1207,7 @@ fn wait_end_receiver_agents(
             thread_id: entry.thread_id.clone(),
             agent_nickname: entry.agent_nickname.clone(),
             agent_role: entry.agent_role.clone(),
-            spawn_mode: entry.spawn_mode.clone(),
+            spawn_mode: entry.spawn_mode,
         })
         .collect()
 }
@@ -1358,6 +1360,7 @@ impl From<&PendingTurn> for Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::v2::CommandExecutionSource;
     use codex_protocol::ThreadId;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
     use codex_protocol::items::TurnItem as CoreTurnItem;
@@ -1961,6 +1964,7 @@ mod tests {
                 command: "echo 'hello world'".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("pid-1".into()),
+                source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
                     command: "echo hello world".into(),
@@ -2109,6 +2113,7 @@ mod tests {
                 command: "ls".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("pid-2".into()),
+                source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
                     command: "ls".into(),
@@ -2203,6 +2208,7 @@ mod tests {
                 command: "echo done".into(),
                 cwd: PathBuf::from("/tmp"),
                 process_id: Some("pid-42".into()),
+                source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
                     command: "echo done".into(),

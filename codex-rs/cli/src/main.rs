@@ -674,6 +674,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     app_server_cli.analytics_default_enabled,
                     auth_file_dispatch.clone_path(),
                     transport,
+                    codex_protocol::protocol::SessionSource::VSCode,
                 )
                 .await?;
             }

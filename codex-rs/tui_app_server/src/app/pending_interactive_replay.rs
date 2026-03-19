@@ -837,6 +837,7 @@ mod tests {
                     command: "echo hi".to_string(),
                     cwd: std::path::PathBuf::from("/"),
                     process_id: None,
+                    source: codex_app_server_protocol::CommandExecutionSource::UserShell,
                     status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
                     command_actions: Vec::new(),
                     aggregated_output: None,

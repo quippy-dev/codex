@@ -799,7 +799,7 @@ mod tests {
     fn cell_to_text(cell: &dyn HistoryCell) -> String {
         cell.display_lines(200)
             .iter()
-            .map(|line| line.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
     }

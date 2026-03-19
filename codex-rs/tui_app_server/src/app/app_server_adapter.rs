@@ -18,60 +18,103 @@ use crate::app_server_session::app_server_rate_limit_snapshot_to_core;
 use crate::app_server_session::status_account_display_from_auth_mode;
 use crate::local_chatgpt_auth::load_local_chatgpt_auth;
 use codex_app_server_client::AppServerEvent;
+use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshParams;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 #[cfg(test)]
 use codex_app_server_protocol::Thread;
+#[cfg(test)]
 use codex_app_server_protocol::ThreadItem;
+#[cfg(test)]
 use codex_app_server_protocol::Turn;
+#[cfg(test)]
 use codex_app_server_protocol::TurnStatus;
 use codex_protocol::ThreadId;
+#[cfg(test)]
 use codex_protocol::config_types::ModeKind;
+#[cfg(test)]
 use codex_protocol::items::AgentMessageContent;
+#[cfg(test)]
 use codex_protocol::items::AgentMessageItem;
+#[cfg(test)]
 use codex_protocol::items::ContextCompactionItem;
+#[cfg(test)]
 use codex_protocol::items::ImageGenerationItem;
+#[cfg(test)]
 use codex_protocol::items::PlanItem;
+#[cfg(test)]
 use codex_protocol::items::ReasoningItem;
+#[cfg(test)]
 use codex_protocol::items::TurnItem;
+#[cfg(test)]
 use codex_protocol::items::UserMessageItem;
+#[cfg(test)]
 use codex_protocol::items::WebSearchItem;
+#[cfg(test)]
 use codex_protocol::protocol::AgentMessageDeltaEvent;
+#[cfg(test)]
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
+#[cfg(test)]
 use codex_protocol::protocol::AgentReasoningRawContentDeltaEvent;
-use codex_protocol::protocol::ContextCompactedEvent;
-use codex_protocol::protocol::DeprecationNoticeEvent;
+#[cfg(test)]
 use codex_protocol::protocol::ErrorEvent;
+#[cfg(test)]
 use codex_protocol::protocol::Event;
+#[cfg(test)]
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::GuardianAssessmentEvent;
-use codex_protocol::protocol::GuardianAssessmentStatus;
-use codex_protocol::protocol::GuardianRiskLevel;
+#[cfg(test)]
+use codex_protocol::protocol::ExecCommandBeginEvent;
+#[cfg(test)]
+use codex_protocol::protocol::ExecCommandEndEvent;
+#[cfg(test)]
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+#[cfg(test)]
+use codex_protocol::protocol::ExecCommandStatus;
+#[cfg(test)]
+use codex_protocol::protocol::ExecOutputStream;
+#[cfg(test)]
 use codex_protocol::protocol::ItemCompletedEvent;
+#[cfg(test)]
 use codex_protocol::protocol::ItemStartedEvent;
+#[cfg(test)]
 use codex_protocol::protocol::PlanDeltaEvent;
+#[cfg(test)]
 use codex_protocol::protocol::RealtimeConversationClosedEvent;
+#[cfg(test)]
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
+#[cfg(test)]
 use codex_protocol::protocol::RealtimeConversationStartedEvent;
+#[cfg(test)]
 use codex_protocol::protocol::RealtimeEvent;
-use codex_protocol::protocol::RealtimeHandoffRequested;
-use codex_protocol::protocol::RealtimeInputAudioSpeechStarted;
-use codex_protocol::protocol::RealtimeResponseCancelled;
-use codex_protocol::protocol::RealtimeTranscriptEntry;
-use codex_protocol::protocol::TerminalInteractionEvent;
+#[cfg(test)]
 use codex_protocol::protocol::ThreadNameUpdatedEvent;
+#[cfg(test)]
 use codex_protocol::protocol::TokenCountEvent;
+#[cfg(test)]
 use codex_protocol::protocol::TokenUsage;
+#[cfg(test)]
 use codex_protocol::protocol::TokenUsageInfo;
+#[cfg(test)]
 use codex_protocol::protocol::TurnAbortReason;
+#[cfg(test)]
 use codex_protocol::protocol::TurnAbortedEvent;
+#[cfg(test)]
 use codex_protocol::protocol::TurnCompleteEvent;
-use codex_protocol::protocol::TurnDiffEvent;
+#[cfg(test)]
 use codex_protocol::protocol::TurnStartedEvent;
 use serde_json::Value;
+#[cfg(test)]
+use std::time::Duration;
+
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyThreadNotification {
+    Warning(String),
+    Rollback { num_turns: u32 },
+}
 
 impl App {
     pub(super) async fn handle_app_server_event(
@@ -86,93 +129,40 @@ impl App {
                     "app-server event consumer lagged; dropping ignored events"
                 );
             }
-            AppServerEvent::ServerNotification(notification) => match notification {
-                ServerNotification::ServerRequestResolved(notification) => {
-                    self.pending_app_server_requests
-                        .resolve_notification(&notification.request_id);
-                }
-                ServerNotification::AccountRateLimitsUpdated(notification) => {
-                    self.chat_widget.on_rate_limit_snapshot(Some(
-                        app_server_rate_limit_snapshot_to_core(notification.rate_limits),
-                    ));
-                }
-                ServerNotification::AccountUpdated(notification) => {
-                    self.chat_widget.update_account_state(
-                        status_account_display_from_auth_mode(
-                            notification.auth_mode,
-                            notification.plan_type,
-                        ),
-                        notification.plan_type,
-                        matches!(
-                            notification.auth_mode,
-                            Some(codex_app_server_protocol::AuthMode::Chatgpt)
-                        ),
-                    );
-                }
-                notification => {
-                    if let Some(events) = server_notification_global_events(&notification) {
-                        for event in events {
-                            if let Err(err) = self.enqueue_primary_event(event).await {
-                                tracing::warn!(
-                                    "failed to enqueue primary app-server server notification: {err}"
-                                );
-                            }
-                        }
-                        return;
-                    }
-                    if !app_server_client.is_remote()
-                        && matches!(
-                            notification,
-                            ServerNotification::TurnCompleted(_)
-                                | ServerNotification::ThreadRealtimeItemAdded(_)
-                                | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
-                                | ServerNotification::ThreadRealtimeError(_)
-                        )
-                    {
-                        return;
-                    }
-                    if let Some((thread_id, events)) =
-                        server_notification_thread_events(notification)
-                    {
-                        for event in events {
-                            if self.primary_thread_id.is_none()
-                                || matches!(event.msg, EventMsg::SessionConfigured(_))
-                                    && self.primary_thread_id == Some(thread_id)
-                            {
-                                if let Err(err) = self.enqueue_primary_event(event).await {
-                                    tracing::warn!(
-                                        "failed to enqueue primary app-server server notification: {err}"
-                                    );
-                                }
-                            } else if let Err(err) =
-                                self.enqueue_thread_event(thread_id, event).await
-                            {
-                                tracing::warn!(
-                                    "failed to enqueue app-server server notification for {thread_id}: {err}"
-                                );
-                            }
-                        }
-                    }
-                }
-            },
+            AppServerEvent::ServerNotification(notification) => {
+                self.handle_server_notification_event(app_server_client, notification)
+                    .await;
+            }
             AppServerEvent::LegacyNotification(notification) => {
-                if let Some((thread_id, event)) = legacy_thread_event(notification.params) {
-                    self.pending_app_server_requests.note_legacy_event(&event);
-                    if legacy_event_is_shadowed_by_server_notification(&event.msg) {
-                        return;
-                    }
-                    if self.primary_thread_id.is_none()
-                        || matches!(event.msg, EventMsg::SessionConfigured(_))
-                            && self.primary_thread_id == Some(thread_id)
-                    {
-                        if let Err(err) = self.enqueue_primary_event(event).await {
-                            tracing::warn!("failed to enqueue primary app-server event: {err}");
+                if let Some((thread_id, legacy_notification)) =
+                    legacy_thread_notification(notification)
+                {
+                    let result = match legacy_notification {
+                        LegacyThreadNotification::Warning(message) => {
+                            if self.primary_thread_id == Some(thread_id)
+                                || self.primary_thread_id.is_none()
+                            {
+                                self.enqueue_primary_thread_legacy_warning(message).await
+                            } else {
+                                self.enqueue_thread_legacy_warning(thread_id, message).await
+                            }
                         }
-                    } else if let Err(err) = self.enqueue_thread_event(thread_id, event).await {
-                        tracing::warn!(
-                            "failed to enqueue app-server thread event for {thread_id}: {err}"
-                        );
+                        LegacyThreadNotification::Rollback { num_turns } => {
+                            if self.primary_thread_id == Some(thread_id)
+                                || self.primary_thread_id.is_none()
+                            {
+                                self.enqueue_primary_thread_legacy_rollback(num_turns).await
+                            } else {
+                                self.enqueue_thread_legacy_rollback(thread_id, num_turns)
+                                    .await
+                            }
+                        }
+                    };
+                    if let Err(err) = result {
+                        tracing::warn!("failed to enqueue app-server legacy notification: {err}");
                     }
+                } else {
+                    tracing::debug!("ignoring legacy app-server notification in tui_app_server");
                 }
             }
             AppServerEvent::ServerRequest(request) => {
@@ -185,34 +175,122 @@ impl App {
                     .await;
                     return;
                 }
-                if let Some(unsupported) = self
-                    .pending_app_server_requests
-                    .note_server_request(&request)
-                {
-                    tracing::warn!(
-                        request_id = ?unsupported.request_id,
-                        message = unsupported.message,
-                        "rejecting unsupported app-server request"
-                    );
-                    self.chat_widget
-                        .add_error_message(unsupported.message.clone());
-                    if let Err(err) = self
-                        .reject_app_server_request(
-                            app_server_client,
-                            unsupported.request_id,
-                            unsupported.message,
-                        )
-                        .await
-                    {
-                        tracing::warn!("{err}");
-                    }
-                }
+                self.handle_server_request_event(app_server_client, request)
+                    .await;
             }
             AppServerEvent::Disconnected { message } => {
                 tracing::warn!("app-server event stream disconnected: {message}");
                 self.chat_widget.add_error_message(message.clone());
                 self.app_event_tx.send(AppEvent::FatalExitRequest(message));
             }
+        }
+    }
+
+    async fn handle_server_notification_event(
+        &mut self,
+        _app_server_client: &AppServerSession,
+        notification: ServerNotification,
+    ) {
+        match &notification {
+            ServerNotification::ServerRequestResolved(notification) => {
+                self.pending_app_server_requests
+                    .resolve_notification(&notification.request_id);
+            }
+            ServerNotification::AccountRateLimitsUpdated(notification) => {
+                self.chat_widget.on_rate_limit_snapshot(Some(
+                    app_server_rate_limit_snapshot_to_core(notification.rate_limits.clone()),
+                ));
+                return;
+            }
+            ServerNotification::AccountUpdated(notification) => {
+                self.chat_widget.update_account_state(
+                    status_account_display_from_auth_mode(
+                        notification.auth_mode,
+                        notification.plan_type,
+                    ),
+                    notification.plan_type,
+                    matches!(
+                        notification.auth_mode,
+                        Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens)
+                    ),
+                );
+                return;
+            }
+            _ => {}
+        }
+
+        match server_notification_thread_target(&notification) {
+            ServerNotificationThreadTarget::Thread(thread_id) => {
+                let result = if self.primary_thread_id == Some(thread_id)
+                    || self.primary_thread_id.is_none()
+                {
+                    self.enqueue_primary_thread_notification(notification).await
+                } else {
+                    self.enqueue_thread_notification(thread_id, notification)
+                        .await
+                };
+
+                if let Err(err) = result {
+                    tracing::warn!("failed to enqueue app-server notification: {err}");
+                }
+                return;
+            }
+            ServerNotificationThreadTarget::InvalidThreadId(thread_id) => {
+                tracing::warn!(
+                    thread_id,
+                    "ignoring app-server notification with invalid thread_id"
+                );
+                return;
+            }
+            ServerNotificationThreadTarget::Global => {}
+        }
+
+        self.chat_widget
+            .handle_server_notification(notification, /*replay_kind*/ None);
+    }
+
+    async fn handle_server_request_event(
+        &mut self,
+        app_server_client: &AppServerSession,
+        request: ServerRequest,
+    ) {
+        if let Some(unsupported) = self
+            .pending_app_server_requests
+            .note_server_request(&request)
+        {
+            tracing::warn!(
+                request_id = ?unsupported.request_id,
+                message = unsupported.message,
+                "rejecting unsupported app-server request"
+            );
+            self.chat_widget
+                .add_error_message(unsupported.message.clone());
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    unsupported.request_id,
+                    unsupported.message,
+                )
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
+        }
+
+        let Some(thread_id) = server_request_thread_id(&request) else {
+            tracing::warn!("ignoring threadless app-server request");
+            return;
+        };
+
+        let result =
+            if self.primary_thread_id == Some(thread_id) || self.primary_thread_id.is_none() {
+                self.enqueue_primary_thread_request(request).await
+            } else {
+                self.enqueue_thread_request(thread_id, request).await
+            };
+        if let Err(err) = result {
+            tracing::warn!("failed to enqueue app-server request: {err}");
         }
     }
 
@@ -302,6 +380,143 @@ impl App {
     }
 }
 
+fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {
+    match request {
+        ServerRequest::CommandExecutionRequestApproval { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
+        ServerRequest::FileChangeRequestApproval { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
+        ServerRequest::ToolRequestUserInput { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
+        ServerRequest::McpServerElicitationRequest { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
+        ServerRequest::PermissionsRequestApproval { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
+        ServerRequest::DynamicToolCall { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
+        ServerRequest::ChatgptAuthTokensRefresh { .. }
+        | ServerRequest::ApplyPatchApproval { .. }
+        | ServerRequest::ExecCommandApproval { .. } => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServerNotificationThreadTarget {
+    Thread(ThreadId),
+    InvalidThreadId(String),
+    Global,
+}
+
+fn server_notification_thread_target(
+    notification: &ServerNotification,
+) -> ServerNotificationThreadTarget {
+    let thread_id = match notification {
+        ServerNotification::Error(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadStarted(notification) => Some(notification.thread.id.as_str()),
+        ServerNotification::ThreadStatusChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadArchived(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadUnarchived(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadClosed(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadNameUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadTokenUsageUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::TurnStarted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::HookStarted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::TurnCompleted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::HookCompleted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::TurnDiffUpdated(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::TurnPlanUpdated(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ItemStarted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ItemCompleted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::RawResponseItemCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::AgentMessageDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::PlanDelta(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::CommandExecutionOutputDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::TerminalInteraction(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::FileChangeOutputDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ServerRequestResolved(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::McpToolCallProgress(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ReasoningSummaryTextDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ReasoningSummaryPartAdded(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ReasoningTextDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ContextCompacted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ModelRerouted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::ThreadRealtimeStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemAdded(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeOutputAudioDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeError(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeClosed(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::SkillsChanged(_)
+        | ServerNotification::McpServerOauthLoginCompleted(_)
+        | ServerNotification::AccountUpdated(_)
+        | ServerNotification::AccountRateLimitsUpdated(_)
+        | ServerNotification::AppListUpdated(_)
+        | ServerNotification::DeprecationNotice(_)
+        | ServerNotification::ConfigWarning(_)
+        | ServerNotification::FuzzyFileSearchSessionUpdated(_)
+        | ServerNotification::FuzzyFileSearchSessionCompleted(_)
+        | ServerNotification::CommandExecOutputDelta(_)
+        | ServerNotification::WindowsWorldWritableWarning(_)
+        | ServerNotification::WindowsSandboxSetupCompleted(_)
+        | ServerNotification::AccountLoginCompleted(_) => None,
+    };
+
+    match thread_id {
+        Some(thread_id) => match ThreadId::from_string(thread_id) {
+            Ok(thread_id) => ServerNotificationThreadTarget::Thread(thread_id),
+            Err(_) => ServerNotificationThreadTarget::InvalidThreadId(thread_id.to_string()),
+        },
+        None => ServerNotificationThreadTarget::Global,
+    }
+}
+
 fn resolve_chatgpt_auth_tokens_refresh_response(
     codex_home: &std::path::Path,
     auth_credentials_store_mode: codex_core::auth::AuthCredentialsStoreMode,
@@ -330,13 +545,13 @@ fn resolve_chatgpt_auth_tokens_refresh_response(
     )
 }
 
+#[cfg(test)]
 /// Convert a `Thread` snapshot into a flat sequence of protocol `Event`s
 /// suitable for replaying into the TUI event store.
 ///
 /// Each turn is expanded into `TurnStarted`, zero or more `ItemCompleted`,
 /// and a terminal event that matches the turn's `TurnStatus`. Returns an
 /// empty vec (with a warning log) if the thread ID is not a valid UUID.
-#[cfg(test)]
 pub(super) fn thread_snapshot_events(
     thread: &Thread,
     show_raw_agent_reasoning: bool,
@@ -356,53 +571,50 @@ pub(super) fn thread_snapshot_events(
         .collect()
 }
 
-fn legacy_thread_event(params: Option<Value>) -> Option<(ThreadId, Event)> {
-    let Value::Object(mut params) = params? else {
+fn legacy_thread_notification(
+    notification: JSONRPCNotification,
+) -> Option<(ThreadId, LegacyThreadNotification)> {
+    let method = notification
+        .method
+        .strip_prefix("codex/event/")
+        .unwrap_or(&notification.method);
+
+    let Value::Object(mut params) = notification.params? else {
         return None;
     };
     let thread_id = params
         .remove("conversationId")
         .and_then(|value| serde_json::from_value::<String>(value).ok())
-        .and_then(|value| ThreadId::from_string(&value).ok());
-    let event = serde_json::from_value::<Event>(Value::Object(params)).ok()?;
-    let thread_id = thread_id.or(match &event.msg {
-        EventMsg::SessionConfigured(session) => Some(session.session_id),
-        _ => None,
-    })?;
-    Some((thread_id, event))
-}
+        .and_then(|value| ThreadId::from_string(&value).ok())?;
+    let msg = params.get("msg").and_then(Value::as_object)?;
 
-fn legacy_event_is_shadowed_by_server_notification(msg: &EventMsg) -> bool {
-    matches!(
-        msg,
-        EventMsg::TokenCount(_)
-            | EventMsg::Error(_)
-            | EventMsg::ThreadNameUpdated(_)
-            | EventMsg::TurnStarted(_)
-            | EventMsg::ItemStarted(_)
-            | EventMsg::ItemCompleted(_)
-            | EventMsg::AgentMessageDelta(_)
-            | EventMsg::PlanDelta(_)
-            | EventMsg::AgentReasoningDelta(_)
-            | EventMsg::AgentReasoningRawContentDelta(_)
-            | EventMsg::RealtimeConversationStarted(_)
-            | EventMsg::RealtimeConversationClosed(_)
-    )
-}
-
-fn server_notification_global_events(notification: &ServerNotification) -> Option<Vec<Event>> {
-    match notification {
-        ServerNotification::DeprecationNotice(notification) => Some(vec![Event {
-            id: String::new(),
-            msg: EventMsg::DeprecationNotice(DeprecationNoticeEvent {
-                summary: notification.summary.clone(),
-                details: notification.details.clone(),
-            }),
-        }]),
+    match method {
+        "warning" => {
+            let message = msg
+                .get("type")
+                .and_then(Value::as_str)
+                .zip(msg.get("message"))
+                .and_then(|(kind, message)| (kind == "warning").then_some(message))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)?;
+            Some((thread_id, LegacyThreadNotification::Warning(message)))
+        }
+        "thread_rolled_back" => {
+            let num_turns = msg
+                .get("type")
+                .and_then(Value::as_str)
+                .zip(msg.get("num_turns"))
+                .and_then(|(kind, num_turns)| (kind == "thread_rolled_back").then_some(num_turns))
+                .and_then(Value::as_u64)
+                .and_then(|num_turns| u32::try_from(num_turns).ok())?;
+            Some((thread_id, LegacyThreadNotification::Rollback { num_turns }))
+        }
         _ => None,
     }
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn server_notification_thread_events(
     notification: ServerNotification,
 ) -> Option<(ThreadId, Vec<Event>)> {
@@ -471,23 +683,42 @@ fn server_notification_thread_events(
         }
         ServerNotification::ItemStarted(notification) => Some((
             ThreadId::from_string(&notification.thread_id).ok()?,
-            vec![Event {
-                id: String::new(),
-                msg: EventMsg::ItemStarted(ItemStartedEvent {
-                    thread_id: ThreadId::from_string(&notification.thread_id).ok()?,
-                    turn_id: notification.turn_id,
-                    item: thread_item_to_core(&notification.item)?,
-                }),
-            }],
+            command_execution_started_event(&notification.turn_id, &notification.item).or_else(
+                || {
+                    Some(vec![Event {
+                        id: String::new(),
+                        msg: EventMsg::ItemStarted(ItemStartedEvent {
+                            thread_id: ThreadId::from_string(&notification.thread_id).ok()?,
+                            turn_id: notification.turn_id.clone(),
+                            item: thread_item_to_core(&notification.item)?,
+                        }),
+                    }])
+                },
+            )?,
         )),
         ServerNotification::ItemCompleted(notification) => Some((
             ThreadId::from_string(&notification.thread_id).ok()?,
+            command_execution_completed_event(&notification.turn_id, &notification.item).or_else(
+                || {
+                    Some(vec![Event {
+                        id: String::new(),
+                        msg: EventMsg::ItemCompleted(ItemCompletedEvent {
+                            thread_id: ThreadId::from_string(&notification.thread_id).ok()?,
+                            turn_id: notification.turn_id.clone(),
+                            item: thread_item_to_core(&notification.item)?,
+                        }),
+                    }])
+                },
+            )?,
+        )),
+        ServerNotification::CommandExecutionOutputDelta(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
             vec![Event {
                 id: String::new(),
-                msg: EventMsg::ItemCompleted(ItemCompletedEvent {
-                    thread_id: ThreadId::from_string(&notification.thread_id).ok()?,
-                    turn_id: notification.turn_id,
-                    item: thread_item_to_core(&notification.item)?,
+                msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: notification.item_id,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: notification.delta.into_bytes(),
                 }),
             }],
         )),
@@ -509,15 +740,6 @@ fn server_notification_thread_events(
                     turn_id: notification.turn_id,
                     item_id: notification.item_id,
                     delta: notification.delta,
-                }),
-            }],
-        )),
-        ServerNotification::TurnDiffUpdated(notification) => Some((
-            ThreadId::from_string(&notification.thread_id).ok()?,
-            vec![Event {
-                id: String::new(),
-                msg: EventMsg::TurnDiff(TurnDiffEvent {
-                    unified_diff: notification.diff,
                 }),
             }],
         )),
@@ -554,7 +776,7 @@ fn server_notification_thread_events(
             vec![Event {
                 id: String::new(),
                 msg: EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
-                    payload: realtime_event_from_app_server_item(notification.item),
+                    payload: RealtimeEvent::ConversationItemAdded(notification.item),
                 }),
             }],
         )),
@@ -585,141 +807,11 @@ fn server_notification_thread_events(
                 }),
             }],
         )),
-        ServerNotification::TerminalInteraction(notification) => Some((
-            ThreadId::from_string(&notification.thread_id).ok()?,
-            vec![Event {
-                id: String::new(),
-                msg: EventMsg::TerminalInteraction(TerminalInteractionEvent {
-                    call_id: notification.item_id,
-                    process_id: notification.process_id,
-                    stdin: notification.stdin,
-                }),
-            }],
-        )),
-        ServerNotification::ContextCompacted(notification) => Some((
-            ThreadId::from_string(&notification.thread_id).ok()?,
-            vec![Event {
-                id: String::new(),
-                msg: EventMsg::ContextCompacted(ContextCompactedEvent),
-            }],
-        )),
-        ServerNotification::ItemGuardianApprovalReviewStarted(notification) => Some((
-            ThreadId::from_string(&notification.thread_id).ok()?,
-            vec![Event {
-                id: String::new(),
-                msg: EventMsg::GuardianAssessment(guardian_assessment_event(
-                    notification.turn_id,
-                    notification.target_item_id,
-                    notification.review,
-                    notification.action,
-                )?),
-            }],
-        )),
-        ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => Some((
-            ThreadId::from_string(&notification.thread_id).ok()?,
-            vec![Event {
-                id: String::new(),
-                msg: EventMsg::GuardianAssessment(guardian_assessment_event(
-                    notification.turn_id,
-                    notification.target_item_id,
-                    notification.review,
-                    notification.action,
-                )?),
-            }],
-        )),
         _ => None,
     }
 }
 
-fn guardian_assessment_event(
-    turn_id: String,
-    id: String,
-    review: codex_app_server_protocol::GuardianApprovalReview,
-    action: Option<Value>,
-) -> Option<GuardianAssessmentEvent> {
-    Some(GuardianAssessmentEvent {
-        id,
-        turn_id,
-        status: match review.status {
-            codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
-                GuardianAssessmentStatus::InProgress
-            }
-            codex_app_server_protocol::GuardianApprovalReviewStatus::Approved => {
-                GuardianAssessmentStatus::Approved
-            }
-            codex_app_server_protocol::GuardianApprovalReviewStatus::Denied => {
-                GuardianAssessmentStatus::Denied
-            }
-            codex_app_server_protocol::GuardianApprovalReviewStatus::Aborted => {
-                GuardianAssessmentStatus::Aborted
-            }
-        },
-        risk_score: review.risk_score,
-        risk_level: review.risk_level.map(|risk_level| match risk_level {
-            codex_app_server_protocol::GuardianRiskLevel::Low => GuardianRiskLevel::Low,
-            codex_app_server_protocol::GuardianRiskLevel::Medium => GuardianRiskLevel::Medium,
-            codex_app_server_protocol::GuardianRiskLevel::High => GuardianRiskLevel::High,
-        }),
-        rationale: review.rationale,
-        action,
-    })
-}
-
-fn realtime_event_from_app_server_item(item: Value) -> RealtimeEvent {
-    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
-        return RealtimeEvent::ConversationItemAdded(item);
-    };
-
-    match item_type {
-        "input_audio_buffer.speech_started" => {
-            RealtimeEvent::InputAudioSpeechStarted(RealtimeInputAudioSpeechStarted {
-                item_id: item
-                    .get("item_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            })
-        }
-        "response.cancelled" => RealtimeEvent::ResponseCancelled(RealtimeResponseCancelled {
-            response_id: item
-                .get("response")
-                .and_then(Value::as_object)
-                .and_then(|response| response.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    item.get("response_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                }),
-        }),
-        "handoff_request" => RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
-            handoff_id: item
-                .get("handoff_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            item_id: item
-                .get("item_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            input_transcript: item
-                .get("input_transcript")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            active_transcript: item
-                .get("active_transcript")
-                .cloned()
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<RealtimeTranscriptEntry>>(value).ok()
-                })
-                .unwrap_or_default(),
-        }),
-        _ => RealtimeEvent::ConversationItemAdded(item),
-    }
-}
-
+#[cfg(test)]
 fn token_usage_from_app_server(
     value: codex_app_server_protocol::TokenUsageBreakdown,
 ) -> TokenUsage {
@@ -755,6 +847,11 @@ fn turn_snapshot_events(
     }];
 
     for item in &turn.items {
+        if let Some(command_events) = command_execution_snapshot_events(&turn.id, item) {
+            events.extend(command_events);
+            continue;
+        }
+
         let Some(item) = thread_item_to_core(item) else {
             continue;
         };
@@ -800,6 +897,7 @@ fn turn_snapshot_events(
 /// - `Interrupted` → `TurnAborted { reason: Interrupted }`
 /// - `Failed` → `Error` (if present) then `TurnComplete`
 /// - `InProgress` → no events (the turn is still running)
+#[cfg(test)]
 fn append_terminal_turn_events(events: &mut Vec<Event>, turn: &Turn, include_failed_error: bool) {
     match turn.status {
         TurnStatus::Completed => events.push(Event {
@@ -843,6 +941,7 @@ fn append_terminal_turn_events(events: &mut Vec<Event>, turn: &Turn, include_fai
     }
 }
 
+#[cfg(test)]
 fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
     match item {
         ThreadItem::UserMessage { id, content } => Some(TurnItem::UserMessage(UserMessageItem {
@@ -929,6 +1028,241 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
     }
 }
 
+#[cfg(test)]
+fn command_execution_started_event(turn_id: &str, item: &ThreadItem) -> Option<Vec<Event>> {
+    let ThreadItem::CommandExecution {
+        id,
+        command,
+        cwd,
+        process_id,
+        source,
+        command_actions,
+        ..
+    } = item
+    else {
+        return None;
+    };
+
+    Some(vec![Event {
+        id: String::new(),
+        msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: id.clone(),
+            process_id: process_id.clone(),
+            turn_id: turn_id.to_string(),
+            command: split_command_string(command),
+            cwd: cwd.clone(),
+            parsed_cmd: command_actions
+                .iter()
+                .cloned()
+                .map(codex_app_server_protocol::CommandAction::into_core)
+                .collect(),
+            source: source.to_core(),
+            interaction_input: None,
+        }),
+    }])
+}
+
+#[cfg(test)]
+fn command_execution_completed_event(turn_id: &str, item: &ThreadItem) -> Option<Vec<Event>> {
+    let ThreadItem::CommandExecution {
+        id,
+        command,
+        cwd,
+        process_id,
+        source,
+        status,
+        command_actions,
+        aggregated_output,
+        exit_code,
+        duration_ms,
+    } = item
+    else {
+        return None;
+    };
+
+    if matches!(
+        status,
+        codex_app_server_protocol::CommandExecutionStatus::InProgress
+    ) {
+        return Some(Vec::new());
+    }
+
+    let status = match status {
+        codex_app_server_protocol::CommandExecutionStatus::InProgress => return Some(Vec::new()),
+        codex_app_server_protocol::CommandExecutionStatus::Completed => {
+            ExecCommandStatus::Completed
+        }
+        codex_app_server_protocol::CommandExecutionStatus::Failed => ExecCommandStatus::Failed,
+        codex_app_server_protocol::CommandExecutionStatus::Declined => ExecCommandStatus::Declined,
+    };
+
+    let duration = Duration::from_millis(
+        duration_ms
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+    );
+    let aggregated_output = aggregated_output.clone().unwrap_or_default();
+
+    Some(vec![Event {
+        id: String::new(),
+        msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: id.clone(),
+            process_id: process_id.clone(),
+            turn_id: turn_id.to_string(),
+            command: split_command_string(command),
+            cwd: cwd.clone(),
+            parsed_cmd: command_actions
+                .iter()
+                .cloned()
+                .map(codex_app_server_protocol::CommandAction::into_core)
+                .collect(),
+            source: source.to_core(),
+            interaction_input: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            aggregated_output: aggregated_output.clone(),
+            exit_code: exit_code.unwrap_or(-1),
+            duration,
+            formatted_output: aggregated_output,
+            status,
+        }),
+    }])
+}
+
+#[cfg(test)]
+fn command_execution_snapshot_events(turn_id: &str, item: &ThreadItem) -> Option<Vec<Event>> {
+    let mut events = command_execution_started_event(turn_id, item)?;
+    if let Some(end_events) = command_execution_completed_event(turn_id, item) {
+        events.extend(end_events);
+    }
+    Some(events)
+}
+
+#[cfg(test)]
+fn split_command_string(command: &str) -> Vec<String> {
+    let Some(parts) = shlex::split(command) else {
+        return vec![command.to_string()];
+    };
+    match shlex::try_join(parts.iter().map(String::as_str)) {
+        Ok(round_trip)
+            if round_trip == command
+                || (!command.contains(":\\")
+                    && shlex::split(&round_trip).as_ref() == Some(&parts)) =>
+        {
+            parts
+        }
+        _ => vec![command.to_string()],
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    use base64::Engine;
+    use chrono::Utc;
+    use codex_app_server_protocol::AuthMode;
+    use codex_core::auth::AuthCredentialsStoreMode;
+    use codex_core::auth::AuthDotJson;
+    use codex_core::auth::save_auth;
+    use codex_core::token_data::TokenData;
+    use pretty_assertions::assert_eq;
+    use serde::Serialize;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn fake_jwt(account_id: &str, plan_type: &str) -> String {
+        #[derive(Serialize)]
+        struct Header {
+            alg: &'static str,
+            typ: &'static str,
+        }
+
+        let header = Header {
+            alg: "none",
+            typ: "JWT",
+        };
+        let payload = json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": plan_type,
+            },
+        });
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = encode(&serde_json::to_vec(&header).expect("serialize header"));
+        let payload_b64 = encode(&serde_json::to_vec(&payload).expect("serialize payload"));
+        let signature_b64 = encode(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
+
+    fn write_chatgpt_auth(codex_home: &std::path::Path) {
+        let id_token = fake_jwt("workspace-1", "business");
+        let access_token = fake_jwt("workspace-1", "business");
+        save_auth(
+            codex_home,
+            &AuthDotJson {
+                auth_mode: Some(AuthMode::Chatgpt),
+                openai_api_key: None,
+                tokens: Some(TokenData {
+                    id_token: codex_core::token_data::parse_chatgpt_jwt_claims(&id_token)
+                        .expect("id token should parse"),
+                    access_token,
+                    refresh_token: "refresh-token".to_string(),
+                    account_id: Some("workspace-1".to_string()),
+                }),
+                last_refresh: Some(Utc::now()),
+            },
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("chatgpt auth should save");
+    }
+
+    #[test]
+    fn refresh_request_uses_local_chatgpt_auth() {
+        let codex_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(codex_home.path());
+
+        let response = resolve_chatgpt_auth_tokens_refresh_response(
+            codex_home.path(),
+            AuthCredentialsStoreMode::File,
+            Some("workspace-1"),
+            &ChatgptAuthTokensRefreshParams {
+                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-1".to_string()),
+            },
+        )
+        .expect("refresh response should resolve");
+
+        assert_eq!(response.chatgpt_account_id, "workspace-1");
+        assert_eq!(response.chatgpt_plan_type.as_deref(), Some("business"));
+        assert!(!response.access_token.is_empty());
+    }
+
+    #[test]
+    fn refresh_request_rejects_account_mismatch() {
+        let codex_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(codex_home.path());
+
+        let err = resolve_chatgpt_auth_tokens_refresh_response(
+            codex_home.path(),
+            AuthCredentialsStoreMode::File,
+            Some("workspace-1"),
+            &ChatgptAuthTokensRefreshParams {
+                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-2".to_string()),
+            },
+        )
+        .expect_err("mismatched account should fail");
+
+        assert_eq!(
+            err,
+            "local ChatGPT auth refresh account mismatch: expected `workspace-2`, got `workspace-1`"
+        );
+    }
+}
+
+#[cfg(test)]
 fn app_server_web_search_action_to_core(
     action: codex_app_server_protocol::WebSearchAction,
 ) -> Option<codex_protocol::models::WebSearchAction> {
@@ -948,6 +1282,7 @@ fn app_server_web_search_action_to_core(
     }
 }
 
+#[cfg(test)]
 fn app_server_codex_error_info_to_core(
     value: codex_app_server_protocol::CodexErrorInfo,
 ) -> Option<codex_protocol::protocol::CodexErrorInfo> {
@@ -956,8 +1291,10 @@ fn app_server_codex_error_info_to_core(
 
 #[cfg(test)]
 mod tests {
+    use super::LegacyThreadNotification;
+    use super::command_execution_started_event;
+    use super::legacy_thread_notification;
     use super::resolve_chatgpt_auth_tokens_refresh_response;
-    use super::server_notification_global_events;
     use super::server_notification_thread_events;
     use super::thread_snapshot_events;
     use super::turn_snapshot_events;
@@ -967,23 +1304,20 @@ mod tests {
     use codex_app_server_protocol::AuthMode;
     use codex_app_server_protocol::ChatgptAuthTokensRefreshParams;
     use codex_app_server_protocol::CodexErrorInfo;
-    use codex_app_server_protocol::ContextCompactedNotification;
-    use codex_app_server_protocol::DeprecationNoticeNotification;
-    use codex_app_server_protocol::GuardianApprovalReview;
-    use codex_app_server_protocol::GuardianApprovalReviewStatus;
+    use codex_app_server_protocol::CommandAction;
+    use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
+    use codex_app_server_protocol::CommandExecutionSource;
+    use codex_app_server_protocol::CommandExecutionStatus;
     use codex_app_server_protocol::ItemCompletedNotification;
-    use codex_app_server_protocol::ItemGuardianApprovalReviewCompletedNotification;
-    use codex_app_server_protocol::ItemGuardianApprovalReviewStartedNotification;
+    use codex_app_server_protocol::ItemStartedNotification;
+    use codex_app_server_protocol::JSONRPCNotification;
     use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
     use codex_app_server_protocol::ServerNotification;
-    use codex_app_server_protocol::TerminalInteractionNotification;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadItem;
-    use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnCompletedNotification;
-    use codex_app_server_protocol::TurnDiffUpdatedNotification;
     use codex_app_server_protocol::TurnError;
     use codex_app_server_protocol::TurnStatus;
     use codex_core::auth::AuthCredentialsStoreMode;
@@ -996,9 +1330,7 @@ mod tests {
     use codex_protocol::items::TurnItem;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::RealtimeEvent;
-    use codex_protocol::protocol::RealtimeHandoffRequested;
-    use codex_protocol::protocol::RealtimeTranscriptEntry;
+    use codex_protocol::protocol::ExecCommandSource;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -1049,6 +1381,54 @@ mod tests {
         };
         save_auth(codex_home, &auth, AuthCredentialsStoreMode::File)
             .expect("chatgpt auth should save");
+    }
+
+    #[test]
+    fn legacy_warning_notification_extracts_thread_id_and_message() {
+        let thread_id = ThreadId::new();
+        let warning = legacy_thread_notification(JSONRPCNotification {
+            method: "codex/event/warning".to_string(),
+            params: Some(json!({
+                "conversationId": thread_id.to_string(),
+                "id": "event-1",
+                "msg": {
+                    "type": "warning",
+                    "message": "legacy warning message",
+                },
+            })),
+        });
+
+        assert_eq!(
+            warning,
+            Some((
+                thread_id,
+                LegacyThreadNotification::Warning("legacy warning message".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_thread_rollback_notification_extracts_thread_id_and_turn_count() {
+        let thread_id = ThreadId::new();
+        let rollback = legacy_thread_notification(JSONRPCNotification {
+            method: "codex/event/thread_rolled_back".to_string(),
+            params: Some(json!({
+                "conversationId": thread_id.to_string(),
+                "id": "event-1",
+                "msg": {
+                    "type": "thread_rolled_back",
+                    "num_turns": 2,
+                },
+            })),
+        });
+
+        assert_eq!(
+            rollback,
+            Some((
+                thread_id,
+                LegacyThreadNotification::Rollback { num_turns: 2 }
+            ))
+        );
     }
 
     #[test]
@@ -1133,6 +1513,206 @@ mod tests {
         };
         assert_eq!(completed.turn_id, turn_id);
         assert_eq!(completed.last_agent_message, None);
+    }
+
+    #[test]
+    fn bridges_command_execution_notifications_into_legacy_exec_events() {
+        let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
+        let turn_id = "019cee8c-b9b4-7f10-a1b0-38caa876a012".to_string();
+        let item = ThreadItem::CommandExecution {
+            id: "cmd-1".to_string(),
+            command: "printf 'hello world\\n'".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            process_id: None,
+            source: CommandExecutionSource::UserShell,
+            status: CommandExecutionStatus::InProgress,
+            command_actions: vec![CommandAction::Unknown {
+                command: "printf hello world".to_string(),
+            }],
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        };
+
+        let (_, started_events) = server_notification_thread_events(
+            ServerNotification::ItemStarted(ItemStartedNotification {
+                item,
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+            }),
+        )
+        .expect("command execution start should bridge");
+        let [started] = started_events.as_slice() else {
+            panic!("expected one started event");
+        };
+        let EventMsg::ExecCommandBegin(begin) = &started.msg else {
+            panic!("expected exec begin event");
+        };
+        assert_eq!(begin.call_id, "cmd-1");
+        assert_eq!(
+            begin.command,
+            vec!["printf".to_string(), "hello world\\n".to_string()]
+        );
+        assert_eq!(begin.cwd, PathBuf::from("/tmp"));
+        assert_eq!(begin.source, ExecCommandSource::UserShell);
+
+        let (_, delta_events) =
+            server_notification_thread_events(ServerNotification::CommandExecutionOutputDelta(
+                CommandExecutionOutputDeltaNotification {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    item_id: "cmd-1".to_string(),
+                    delta: "hello world\n".to_string(),
+                },
+            ))
+            .expect("command execution delta should bridge");
+        let [delta] = delta_events.as_slice() else {
+            panic!("expected one delta event");
+        };
+        let EventMsg::ExecCommandOutputDelta(delta) = &delta.msg else {
+            panic!("expected exec output delta event");
+        };
+        assert_eq!(delta.call_id, "cmd-1");
+        assert_eq!(delta.chunk, b"hello world\n");
+
+        let completed_item = ThreadItem::CommandExecution {
+            id: "cmd-1".to_string(),
+            command: "printf 'hello world\\n'".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            process_id: None,
+            source: CommandExecutionSource::UserShell,
+            status: CommandExecutionStatus::Completed,
+            command_actions: vec![CommandAction::Unknown {
+                command: "printf hello world".to_string(),
+            }],
+            aggregated_output: Some("hello world\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        };
+        let (_, completed_events) = server_notification_thread_events(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                item: completed_item,
+                thread_id,
+                turn_id,
+            }),
+        )
+        .expect("command execution completion should bridge");
+        let [completed] = completed_events.as_slice() else {
+            panic!("expected one completed event");
+        };
+        let EventMsg::ExecCommandEnd(end) = &completed.msg else {
+            panic!("expected exec end event");
+        };
+        assert_eq!(end.call_id, "cmd-1");
+        assert_eq!(end.exit_code, 0);
+        assert_eq!(end.formatted_output, "hello world\n");
+        assert_eq!(end.aggregated_output, "hello world\n");
+        assert_eq!(end.source, ExecCommandSource::UserShell);
+    }
+
+    #[test]
+    fn command_execution_snapshot_preserves_non_roundtrippable_command_strings() {
+        let item = ThreadItem::CommandExecution {
+            id: "cmd-1".to_string(),
+            command: r#"C:\Program Files\Git\bin\bash.exe -lc "echo hi""#.to_string(),
+            cwd: PathBuf::from("C:\\repo"),
+            process_id: None,
+            source: CommandExecutionSource::UserShell,
+            status: CommandExecutionStatus::InProgress,
+            command_actions: vec![],
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        };
+
+        let events =
+            command_execution_started_event("turn-1", &item).expect("command execution start");
+        let [started] = events.as_slice() else {
+            panic!("expected one started event");
+        };
+        let EventMsg::ExecCommandBegin(begin) = &started.msg else {
+            panic!("expected exec begin event");
+        };
+        assert_eq!(
+            begin.command,
+            vec![r#"C:\Program Files\Git\bin\bash.exe -lc "echo hi""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn chatgpt_auth_refresh_reads_from_resolved_auth_storage_home() {
+        let default_home = TempDir::new().expect("tempdir");
+        let override_home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(default_home.path(), "workspace-default", "default-token");
+        write_chatgpt_auth(override_home.path(), "workspace-override", "override-token");
+
+        let response = resolve_chatgpt_auth_tokens_refresh_response(
+            override_home.path(),
+            AuthCredentialsStoreMode::File,
+            Some("workspace-override"),
+            &ChatgptAuthTokensRefreshParams {
+                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-override".to_string()),
+            },
+        )
+        .expect("chatgpt auth refresh should load from override home");
+
+        assert_eq!(response.chatgpt_account_id, "workspace-override");
+        assert_eq!(response.access_token, "override-token");
+    }
+
+    #[test]
+    fn replays_command_execution_items_from_thread_snapshots() {
+        let thread = Thread {
+            id: "019cee8c-b993-7e33-88c0-014d4e62612d".to_string(),
+            preview: String::new(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            status: ThreadStatus::Idle,
+            path: None,
+            cwd: PathBuf::from("/tmp"),
+            cli_version: "test".to_string(),
+            source: SessionSource::Cli.into(),
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: vec![Turn {
+                id: "turn-1".to_string(),
+                items: vec![ThreadItem::CommandExecution {
+                    id: "cmd-1".to_string(),
+                    command: "printf 'hello world\\n'".to_string(),
+                    cwd: PathBuf::from("/tmp"),
+                    process_id: None,
+                    source: CommandExecutionSource::UserShell,
+                    status: CommandExecutionStatus::Completed,
+                    command_actions: vec![CommandAction::Unknown {
+                        command: "printf hello world".to_string(),
+                    }],
+                    aggregated_output: Some("hello world\n".to_string()),
+                    exit_code: Some(0),
+                    duration_ms: Some(5),
+                }],
+                status: TurnStatus::Completed,
+                error: None,
+            }],
+        };
+
+        let events = thread_snapshot_events(&thread, /*show_raw_agent_reasoning*/ false);
+        assert!(matches!(events[0].msg, EventMsg::TurnStarted(_)));
+        let EventMsg::ExecCommandBegin(begin) = &events[1].msg else {
+            panic!("expected exec begin event");
+        };
+        assert_eq!(begin.call_id, "cmd-1");
+        assert_eq!(begin.source, ExecCommandSource::UserShell);
+        let EventMsg::ExecCommandEnd(end) = &events[2].msg else {
+            panic!("expected exec end event");
+        };
+        assert_eq!(end.call_id, "cmd-1");
+        assert_eq!(end.formatted_output, "hello world\n");
+        assert!(matches!(events[3].msg, EventMsg::TurnComplete(_)));
     }
 
     #[test]
@@ -1243,195 +1823,6 @@ mod tests {
             panic!("expected bridged reasoning delta");
         };
         assert_eq!(delta.delta, "Thinking");
-    }
-
-    #[test]
-    fn bridges_server_only_notifications_from_server_notifications() {
-        let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
-
-        let (_, terminal_events) = server_notification_thread_events(
-            ServerNotification::TerminalInteraction(TerminalInteractionNotification {
-                thread_id: thread_id.clone(),
-                turn_id: "turn".to_string(),
-                item_id: "call-1".to_string(),
-                process_id: "proc-1".to_string(),
-                stdin: "pwd\n".to_string(),
-            }),
-        )
-        .expect("terminal interaction should bridge");
-        assert!(matches!(
-            terminal_events[0].msg,
-            EventMsg::TerminalInteraction(_)
-        ));
-
-        let (_, diff_events) = server_notification_thread_events(
-            ServerNotification::TurnDiffUpdated(TurnDiffUpdatedNotification {
-                thread_id: thread_id.clone(),
-                turn_id: "turn".to_string(),
-                diff: "@@ -1 +1 @@".to_string(),
-            }),
-        )
-        .expect("turn diff should bridge");
-        let EventMsg::TurnDiff(turn_diff) = &diff_events[0].msg else {
-            panic!("expected turn diff event");
-        };
-        assert_eq!(turn_diff.unified_diff, "@@ -1 +1 @@");
-
-        let (_, compacted_events) = server_notification_thread_events(
-            ServerNotification::ContextCompacted(ContextCompactedNotification {
-                thread_id: thread_id.clone(),
-                turn_id: "turn".to_string(),
-            }),
-        )
-        .expect("context compacted should bridge");
-        assert!(matches!(
-            compacted_events[0].msg,
-            EventMsg::ContextCompacted(_)
-        ));
-
-        let deprecation_events = server_notification_global_events(
-            &ServerNotification::DeprecationNotice(DeprecationNoticeNotification {
-                summary: "old thing".to_string(),
-                details: Some("use new thing".to_string()),
-            }),
-        )
-        .expect("deprecation notice should bridge");
-        let EventMsg::DeprecationNotice(deprecation) = &deprecation_events[0].msg else {
-            panic!("expected deprecation notice event");
-        };
-        assert_eq!(deprecation.summary, "old thing");
-        assert_eq!(deprecation.details.as_deref(), Some("use new thing"));
-
-        let review = GuardianApprovalReview {
-            status: GuardianApprovalReviewStatus::Denied,
-            risk_score: Some(99),
-            risk_level: Some(codex_app_server_protocol::GuardianRiskLevel::High),
-            rationale: Some("blocked".to_string()),
-        };
-        let (_, started_events) = server_notification_thread_events(
-            ServerNotification::ItemGuardianApprovalReviewStarted(
-                ItemGuardianApprovalReviewStartedNotification {
-                    thread_id: thread_id.clone(),
-                    turn_id: "turn".to_string(),
-                    target_item_id: "tool-1".to_string(),
-                    review: review.clone(),
-                    action: Some(serde_json::json!({"tool":"shell"})),
-                },
-            ),
-        )
-        .expect("guardian started should bridge");
-        let EventMsg::GuardianAssessment(started) = &started_events[0].msg else {
-            panic!("expected guardian assessment event");
-        };
-        assert_eq!(started.id, "tool-1");
-        assert_eq!(started.turn_id, "turn");
-        assert_eq!(
-            started.status,
-            codex_protocol::protocol::GuardianAssessmentStatus::Denied
-        );
-        assert_eq!(
-            started.risk_level,
-            Some(codex_protocol::protocol::GuardianRiskLevel::High)
-        );
-
-        let (_, completed_events) = server_notification_thread_events(
-            ServerNotification::ItemGuardianApprovalReviewCompleted(
-                ItemGuardianApprovalReviewCompletedNotification {
-                    thread_id,
-                    turn_id: "turn".to_string(),
-                    target_item_id: "tool-2".to_string(),
-                    review,
-                    action: None,
-                },
-            ),
-        )
-        .expect("guardian completed should bridge");
-        assert!(matches!(
-            completed_events[0].msg,
-            EventMsg::GuardianAssessment(_)
-        ));
-    }
-
-    #[test]
-    fn preserves_typed_realtime_item_notifications() {
-        let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
-
-        let (_, speech_events) = server_notification_thread_events(
-            ServerNotification::ThreadRealtimeItemAdded(ThreadRealtimeItemAddedNotification {
-                thread_id: thread_id.clone(),
-                item: serde_json::json!({
-                    "type": "input_audio_buffer.speech_started",
-                    "item_id": "item-1",
-                }),
-            }),
-        )
-        .expect("speech started should bridge");
-        let EventMsg::RealtimeConversationRealtime(speech_event) = &speech_events[0].msg else {
-            panic!("expected realtime event");
-        };
-        assert_eq!(
-            speech_event.payload,
-            RealtimeEvent::InputAudioSpeechStarted(
-                codex_protocol::protocol::RealtimeInputAudioSpeechStarted {
-                    item_id: Some("item-1".to_string()),
-                }
-            )
-        );
-
-        let (_, cancelled_events) = server_notification_thread_events(
-            ServerNotification::ThreadRealtimeItemAdded(ThreadRealtimeItemAddedNotification {
-                thread_id: thread_id.clone(),
-                item: serde_json::json!({
-                    "type": "response.cancelled",
-                    "response_id": "resp-1",
-                }),
-            }),
-        )
-        .expect("response cancelled should bridge");
-        let EventMsg::RealtimeConversationRealtime(cancelled_event) = &cancelled_events[0].msg
-        else {
-            panic!("expected realtime event");
-        };
-        assert_eq!(
-            cancelled_event.payload,
-            RealtimeEvent::ResponseCancelled(codex_protocol::protocol::RealtimeResponseCancelled {
-                response_id: Some("resp-1".to_string()),
-            })
-        );
-
-        let (_, handoff_events) = server_notification_thread_events(
-            ServerNotification::ThreadRealtimeItemAdded(ThreadRealtimeItemAddedNotification {
-                thread_id,
-                item: serde_json::json!({
-                    "type": "handoff_request",
-                    "handoff_id": "handoff-1",
-                    "item_id": "item-2",
-                    "input_transcript": "fallback transcript",
-                    "active_transcript": [
-                        {
-                            "role": "user",
-                            "text": "live transcript",
-                        }
-                    ],
-                }),
-            }),
-        )
-        .expect("handoff request should bridge");
-        let EventMsg::RealtimeConversationRealtime(handoff_event) = &handoff_events[0].msg else {
-            panic!("expected realtime event");
-        };
-        assert_eq!(
-            handoff_event.payload,
-            RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
-                handoff_id: "handoff-1".to_string(),
-                item_id: "item-2".to_string(),
-                input_transcript: "fallback transcript".to_string(),
-                active_transcript: vec![RealtimeTranscriptEntry {
-                    role: "user".to_string(),
-                    text: "live transcript".to_string(),
-                }],
-            })
-        );
     }
 
     #[test]
@@ -1606,27 +1997,5 @@ mod tests {
         };
         assert_eq!(raw_reasoning.text, "hidden chain");
         assert!(matches!(events[3].msg, EventMsg::TurnComplete(_)));
-    }
-
-    #[test]
-    fn chatgpt_auth_refresh_reads_from_resolved_auth_storage_home() {
-        let default_home = TempDir::new().expect("tempdir");
-        let override_home = TempDir::new().expect("tempdir");
-        write_chatgpt_auth(default_home.path(), "workspace-default", "default-token");
-        write_chatgpt_auth(override_home.path(), "workspace-override", "override-token");
-
-        let response = resolve_chatgpt_auth_tokens_refresh_response(
-            override_home.path(),
-            AuthCredentialsStoreMode::File,
-            Some("workspace-override"),
-            &ChatgptAuthTokensRefreshParams {
-                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
-                previous_account_id: Some("workspace-override".to_string()),
-            },
-        )
-        .expect("chatgpt auth refresh should load from override home");
-
-        assert_eq!(response.chatgpt_account_id, "workspace-override");
-        assert_eq!(response.access_token, "override-token");
     }
 }

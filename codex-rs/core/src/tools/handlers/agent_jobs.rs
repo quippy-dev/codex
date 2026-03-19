@@ -733,7 +733,7 @@ async fn run_agent_job_loop(
                     let _ = session
                         .services
                         .agent_control
-                        .shutdown_agent(thread_id)
+                        .shutdown_live_agent(thread_id)
                         .await;
                     continue;
                 }
@@ -893,7 +893,7 @@ async fn recover_running_items(
                 let _ = session
                     .services
                     .agent_control
-                    .shutdown_agent(thread_id)
+                    .shutdown_live_agent(thread_id)
                     .await;
             }
             continue;
@@ -1015,7 +1015,7 @@ async fn reap_stale_active_items(
         let _ = session
             .services
             .agent_control
-            .shutdown_agent(thread_id)
+            .shutdown_live_agent(thread_id)
             .await;
         active_items.remove(&thread_id);
     }
@@ -1051,7 +1051,7 @@ async fn finalize_finished_item(
     let _ = session
         .services
         .agent_control
-        .shutdown_agent(thread_id)
+        .shutdown_live_agent(thread_id)
         .await;
     Ok(())
 }
