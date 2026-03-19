@@ -240,10 +240,19 @@ mod spawn {
             AgentRoleSpawnMode::Spawn => SpawnMode::Spawn,
             AgentRoleSpawnMode::Fork => SpawnMode::Fork,
         };
-        let spawn_mode = args
-            .spawn_mode
-            .or_else(|| args.fork_context.then_some(SpawnMode::Fork))
-            .unwrap_or(default_spawn_mode);
+        let requested_spawn_mode = args.spawn_mode.unwrap_or(default_spawn_mode);
+        let spawn_mode = if args.fork_context {
+            match requested_spawn_mode {
+                SpawnMode::Watchdog => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "fork_context cannot be used with spawn_mode = \"watchdog\"".to_string(),
+                    ));
+                }
+                _ => SpawnMode::Fork,
+            }
+        } else {
+            requested_spawn_mode
+        };
         let input_items = parse_multi_agent_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
         let session_source = turn.session_source.clone();
@@ -1776,9 +1785,10 @@ pub(crate) fn build_agent_spawn_config(
         SpawnConfigStrategy::ContextFreeSpawn => {
             // Context-free subagents should use base config instructions.
             config.developer_instructions = base_config.developer_instructions.clone();
-            // At max depth, a freshly spawned context-free child cannot spawn further descendants.
-            // Hide multi-agent tools to match that capability boundary.
-            if crate::agent::exceeds_thread_spawn_depth_limit(child_depth, config.agent_max_depth) {
+            // At or past max depth, a freshly spawned context-free child cannot expose
+            // fanout tools for further descendants. Hide them at the capability boundary.
+            if child_depth >= config.agent_max_depth {
+                let _ = config.features.disable(Feature::SpawnCsv);
                 let _ = config.features.disable(Feature::Collab);
             }
         }
@@ -1856,7 +1866,8 @@ fn apply_spawn_agent_runtime_overrides(
 }
 
 fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
-    if crate::agent::exceeds_thread_spawn_depth_limit(child_depth, config.agent_max_depth) {
+    if child_depth >= config.agent_max_depth {
+        let _ = config.features.disable(Feature::SpawnCsv);
         let _ = config.features.disable(Feature::Collab);
     }
 }

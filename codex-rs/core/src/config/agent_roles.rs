@@ -4,7 +4,6 @@ use super::AgentsToml;
 use super::ConfigToml;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigLayerStackOrdering;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::Deserialize;
@@ -67,9 +66,7 @@ pub(crate) fn load_agent_roles(
             }
         }
 
-        if !matches!(layer.name, ConfigLayerSource::System { .. })
-            && let Some(config_folder) = layer.config_folder()
-        {
+        if let Some(config_folder) = layer.config_folder() {
             for (role_name, role) in discover_agent_roles_in_dir(
                 config_folder.as_path().join("agents").as_path(),
                 &declared_role_files,
@@ -528,4 +525,56 @@ fn collect_agent_role_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> s
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_loader::ConfigLayerEntry;
+    use crate::config_loader::ConfigLayerStack;
+    use codex_app_server_protocol::ConfigLayerSource;
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_agent_roles_discovers_system_layer_agent_files() -> std::io::Result<()> {
+        let system_root = TempDir::new()?;
+        let system_config = system_root.path().join("config.toml");
+        let agents_dir = system_root.path().join("agents");
+        std::fs::create_dir_all(&agents_dir)?;
+        std::fs::write(
+            agents_dir.join("researcher.toml"),
+            r#"
+name = "researcher"
+description = "System role"
+developer_instructions = "Research carefully"
+"#,
+        )?;
+
+        let system_layer = ConfigLayerEntry::new(
+            ConfigLayerSource::System {
+                file: AbsolutePathBuf::from_absolute_path(&system_config)?,
+            },
+            TomlValue::Table(toml::map::Map::new()),
+        );
+        let config_layer_stack =
+            ConfigLayerStack::new(vec![system_layer], Default::default(), Default::default())?;
+        let mut startup_warnings = Vec::new();
+
+        let roles = load_agent_roles(
+            &ConfigToml::default(),
+            &config_layer_stack,
+            &mut startup_warnings,
+        )?;
+
+        let role = roles.get("researcher").expect("system role should load");
+        assert_eq!(role.description.as_deref(), Some("System role"));
+        assert_eq!(
+            role.config_file.as_ref(),
+            Some(&agents_dir.join("researcher.toml"))
+        );
+        assert!(startup_warnings.is_empty(), "{startup_warnings:?}");
+
+        Ok(())
+    }
 }

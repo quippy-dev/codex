@@ -185,7 +185,11 @@ impl ContextManager {
         };
 
         let remove_idx = first_user_idx.saturating_add(1);
-        if remove_idx >= last_user_idx {
+        if first_user_idx == last_user_idx {
+            if remove_idx >= self.items.len() {
+                return false;
+            }
+        } else if remove_idx >= last_user_idx {
             return false;
         }
 

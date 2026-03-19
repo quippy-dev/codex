@@ -38,6 +38,8 @@ use crate::config_loader::McpServerRequirement;
 use crate::config_loader::ResidencyRequirement;
 use crate::config_loader::Sourced;
 use crate::config_loader::load_config_layers_state;
+use crate::config_loader::load_default_config_layers_state;
+use crate::config_loader::merge_toml_values;
 use crate::features::Feature;
 use crate::features::FeatureOverrides;
 use crate::features::Features;
@@ -808,6 +810,35 @@ impl Config {
             ConfigOverrides::default(),
             codex_home,
             ConfigLayerStack::default(),
+        )
+    }
+
+    pub async fn load_default_with_cli_overrides_and_loader_overrides(
+        cli_overrides: Vec<(String, TomlValue)>,
+        loader_overrides: LoaderOverrides,
+        cloud_requirements: CloudRequirementsLoader,
+    ) -> std::io::Result<Self> {
+        let codex_home = find_codex_home()?;
+        let mut merged = toml::Value::try_from(ConfigToml::default()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to serialize default config: {e}"),
+            )
+        })?;
+        let config_layer_stack = load_default_config_layers_state(
+            &codex_home,
+            &cli_overrides,
+            loader_overrides,
+            cloud_requirements,
+        )
+        .await?;
+        merge_toml_values(&mut merged, &config_layer_stack.effective_config());
+        let config_toml = deserialize_config_toml_with_base(merged, &codex_home)?;
+        Self::load_config_with_layer_stack(
+            config_toml,
+            ConfigOverrides::default(),
+            codex_home,
+            config_layer_stack,
         )
     }
 

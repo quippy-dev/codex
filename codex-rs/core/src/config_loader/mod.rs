@@ -130,6 +130,78 @@ pub async fn load_config_layers_state(
     .await
 }
 
+pub(crate) async fn load_default_config_layers_state(
+    codex_home: &Path,
+    cli_overrides: &[(String, TomlValue)],
+    overrides: LoaderOverrides,
+    _cloud_requirements: CloudRequirementsLoader,
+) -> io::Result<ConfigLayerStack> {
+    let mut layers = Vec::<ConfigLayerEntry>::new();
+    let empty_config = TomlValue::Table(toml::map::Map::new());
+
+    #[cfg(target_os = "macos")]
+    let LoaderOverrides {
+        managed_config_path,
+        managed_preferences_base64,
+        ignore_system_config,
+        ..
+    } = overrides;
+
+    #[cfg(not(target_os = "macos"))]
+    let LoaderOverrides {
+        managed_config_path,
+        ignore_system_config,
+        ..
+    } = overrides;
+
+    let cli_overrides_layer = if cli_overrides.is_empty() {
+        None
+    } else {
+        Some(build_cli_overrides_layer(cli_overrides))
+    };
+
+    if !ignore_system_config {
+        let system_config_toml_file = system_config_toml_file()?;
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::System {
+                file: system_config_toml_file,
+            },
+            empty_config.clone(),
+        ));
+    }
+
+    if let Some(cli_overrides_layer) = cli_overrides_layer {
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            cli_overrides_layer,
+        ));
+    }
+
+    let managed_config_path = match managed_config_path {
+        Some(path) => Some(AbsolutePathBuf::from_absolute_path(path)?),
+        None if ignore_system_config => None,
+        None => Some(AbsolutePathBuf::from_absolute_path(
+            layer_io::managed_config_default_path(codex_home),
+        )?),
+    };
+    if let Some(file) = managed_config_path {
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile { file },
+            empty_config.clone(),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    if !ignore_system_config || managed_preferences_base64.is_some() {
+        layers.push(ConfigLayerEntry::new(
+            ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
+            empty_config.clone(),
+        ));
+    }
+
+    ConfigLayerStack::new(layers, Default::default(), Default::default())
+}
+
 async fn load_config_layers_state_with_system_requirements_toml_file(
     codex_home: &Path,
     cwd: Option<AbsolutePathBuf>,

@@ -560,6 +560,85 @@ mod tests {
     }
 
     #[test]
+    fn trim_history_continues_trimming_past_single_real_user_anchor() {
+        let mut history = ContextManager::new();
+        let prefix = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "session prefix".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let only_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "single goal".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let oldest_tail = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "older response".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let middle_tail = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "middle response".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let newest_tail = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "newest response".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        history.record_items(
+            [
+                &prefix,
+                &only_user,
+                &oldest_tail,
+                &middle_tail,
+                &newest_tail,
+            ],
+            TruncationPolicy::Tokens(10_000),
+        );
+
+        let base_instructions = BaseInstructions {
+            text: String::new(),
+        };
+        let mut trimmed_history = ContextManager::new();
+        trimmed_history.record_items([&prefix, &only_user], TruncationPolicy::Tokens(10_000));
+        let trimmed_tokens = trimmed_history
+            .estimate_token_count_with_base_instructions(&base_instructions)
+            .expect("trimmed history should estimate");
+
+        let deleted_items = trim_history_to_fit_token_budget_for_remote_compaction(
+            &mut history,
+            trimmed_tokens,
+            &base_instructions,
+            0,
+        );
+
+        assert_eq!(deleted_items, 3);
+        assert_eq!(history.raw_items(), &[prefix, only_user]);
+    }
+
+    #[test]
     fn trim_history_without_real_user_messages_falls_back_to_oldest_items() {
         let mut history = ContextManager::new();
         let developer = ResponseItem::Message {

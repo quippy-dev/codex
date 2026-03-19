@@ -472,7 +472,10 @@ async fn spawn_agent_rejects_when_depth_limit_exceeded() {
         Arc::new(session),
         Arc::new(turn),
         "spawn_agent",
-        function_payload(json!({"message": "hello"})),
+        function_payload(json!({
+            "message": "hello",
+            "spawn_mode": "spawn"
+        })),
     );
     let Err(err) = SpawnAgentHandler.handle(invocation).await else {
         panic!("spawn should fail when depth limit exceeded");
@@ -484,7 +487,7 @@ async fn spawn_agent_rejects_when_depth_limit_exceeded() {
 }
 
 #[tokio::test]
-async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
+async fn spawn_agent_hides_multi_agent_tools_at_configured_max_depth() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -494,6 +497,16 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::Collab)
+        .expect("collab feature enable");
+    config
+        .features
+        .enable(Feature::SpawnCsv)
+        .expect("spawn csv feature enable");
+    turn.config = Arc::new(config);
     let current_max_depth = turn.config.agent_max_depth;
 
     let mut config = (*turn.config).clone();
@@ -527,6 +540,70 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
             .is_some_and(|nickname| !nickname.is_empty())
     );
     assert_eq!(success, Some(true));
+    let spawned_thread = manager
+        .get_thread(agent_id(&result.agent_id).expect("agent_id should be valid"))
+        .await
+        .expect("spawned agent thread should exist");
+    assert!(!spawned_thread.enabled(Feature::Collab));
+    assert!(!spawned_thread.enabled(Feature::SpawnCsv));
+}
+
+#[tokio::test]
+async fn spawn_agent_config_backed_role_hides_multi_agent_tools_at_configured_max_depth() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::Collab)
+        .expect("collab feature enable");
+    config
+        .features
+        .enable(Feature::SpawnCsv)
+        .expect("spawn csv feature enable");
+    turn.config = Arc::new(config);
+    let current_max_depth = turn.config.agent_max_depth;
+
+    let mut config = (*turn.config).clone();
+    config.agent_max_depth = current_max_depth + 1;
+    turn.config = Arc::new(config);
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: session.conversation_id,
+        depth: current_max_depth,
+        agent_nickname: None,
+        agent_role: None,
+    });
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "await this command",
+            "agent_type": "awaiter",
+            "spawn_mode": "spawn"
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn should succeed within configured depth");
+    let (content, success) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    assert_eq!(success, Some(true));
+    let spawned_thread = manager
+        .get_thread(agent_id(&result.agent_id).expect("agent_id should be valid"))
+        .await
+        .expect("spawned agent thread should exist");
+    assert!(!spawned_thread.enabled(Feature::Collab));
+    assert!(!spawned_thread.enabled(Feature::SpawnCsv));
 }
 
 #[tokio::test]
@@ -1040,6 +1117,100 @@ async fn spawn_agent_fork_context_defaults_spawn_mode_to_fork() {
         .shutdown_agent(owner_thread.thread_id)
         .await
         .expect("shutdown owner thread");
+}
+
+#[tokio::test]
+async fn spawn_agent_fork_context_overrides_explicit_spawn_mode_to_fork() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    let owner_thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start owner thread");
+    Arc::get_mut(&mut session)
+        .expect("no extra session refs")
+        .services
+        .agent_control = manager.agent_control();
+    Arc::get_mut(&mut session)
+        .expect("no extra session refs")
+        .conversation_id = owner_thread.thread_id;
+
+    let invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "spawn_mode": "spawn",
+            "fork_context": true
+        })),
+    );
+    let output = MultiAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+    let spawn_event = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("collab event");
+            if let EventMsg::CollabAgentSpawnEnd(event) = event.msg {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("spawn end event should arrive");
+
+    assert_eq!(spawn_event.spawn_mode, AgentSpawnMode::Fork);
+
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(agent_id)
+        .await
+        .expect("shutdown spawned agent");
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(owner_thread.thread_id)
+        .await
+        .expect("shutdown owner thread");
+}
+
+#[tokio::test]
+async fn spawn_agent_fork_context_rejects_watchdog_spawn_mode() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let mut config = (*turn.config).clone();
+    let _ = config.features.enable(Feature::AgentWatchdog);
+    turn.config = Arc::new(config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "watchdog check-in",
+            "spawn_mode": "watchdog",
+            "fork_context": true
+        })),
+    );
+    let Err(err) = MultiAgentHandler.handle(invocation).await else {
+        panic!("watchdog spawn with fork_context should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "fork_context cannot be used with spawn_mode = \"watchdog\"".to_string()
+        )
+    );
 }
 
 #[tokio::test]
@@ -2979,13 +3150,17 @@ async fn build_agent_spawn_config_fork_like_uses_turn_developer_instructions() {
 }
 
 #[tokio::test]
-async fn build_agent_spawn_config_context_free_keeps_multi_agent_tools_at_max_depth() {
+async fn build_agent_spawn_config_context_free_hides_multi_agent_tools_at_max_depth() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
     base_config
         .features
         .enable(Feature::Collab)
         .expect("collab feature enable");
+    base_config
+        .features
+        .enable(Feature::SpawnCsv)
+        .expect("spawn csv feature enable");
     turn.config = Arc::new(base_config);
     let base_instructions = BaseInstructions {
         text: "base".to_string(),
@@ -2999,17 +3174,22 @@ async fn build_agent_spawn_config_context_free_keeps_multi_agent_tools_at_max_de
     )
     .expect("context-free spawn config");
 
-    assert!(config.features.enabled(Feature::Collab));
+    assert_eq!(config.features.enabled(Feature::Collab), false);
+    assert_eq!(config.features.enabled(Feature::SpawnCsv), false);
 }
 
 #[tokio::test]
-async fn build_agent_spawn_config_context_free_disables_multi_agent_tools_past_max_depth() {
+async fn build_agent_spawn_config_context_free_hides_multi_agent_tools_past_max_depth() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
     base_config
         .features
         .enable(Feature::Collab)
         .expect("collab feature enable");
+    base_config
+        .features
+        .enable(Feature::SpawnCsv)
+        .expect("spawn csv feature enable");
     turn.config = Arc::new(base_config);
     let base_instructions = BaseInstructions {
         text: "base".to_string(),
@@ -3024,4 +3204,5 @@ async fn build_agent_spawn_config_context_free_disables_multi_agent_tools_past_m
     .expect("context-free spawn config");
 
     assert_eq!(config.features.enabled(Feature::Collab), false);
+    assert_eq!(config.features.enabled(Feature::SpawnCsv), false);
 }
