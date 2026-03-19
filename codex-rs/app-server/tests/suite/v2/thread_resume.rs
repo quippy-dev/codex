@@ -377,6 +377,74 @@ async fn thread_resume_failure_keeps_archived_rollout_archived() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_summary_failure_rearchives_restored_rollout() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let conversation_id = app_test_support::create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let original_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let original_contents = std::fs::read_to_string(&original_path)?;
+    let mut lines: Vec<&str> = original_contents.lines().collect();
+    let session_meta = lines.remove(0);
+    lines.insert(1, session_meta);
+    std::fs::write(&original_path, format!("{}\n", lines.join("\n")))?;
+
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::create_dir_all(&archived_dir)?;
+    let archived_path = archived_dir.join(
+        original_path
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    std::fs::rename(&original_path, &archived_path)?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+
+    assert!(
+        resume_err
+            .error
+            .message
+            .contains("does not start with session metadata"),
+        "unexpected resume error: {}",
+        resume_err.error.message
+    );
+    assert!(
+        archived_path.exists(),
+        "failed resume should rearchive the restored rollout"
+    );
+    assert!(
+        find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_none(),
+        "failed resume should not leave the rollout restored in sessions/"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

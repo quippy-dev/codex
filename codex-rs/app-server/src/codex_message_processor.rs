@@ -3560,6 +3560,10 @@ impl CodexMessageProcessor {
                 {
                     Ok(thread) => thread,
                     Err(message) => {
+                        if let Some(restored_archived_thread) = restored_archived_thread.as_ref() {
+                            self.rollback_failed_archived_thread_resume(restored_archived_thread)
+                                .await;
+                        }
                         self.send_internal_error(request_id, message).await;
                         return;
                     }
