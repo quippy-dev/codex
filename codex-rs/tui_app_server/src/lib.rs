@@ -155,8 +155,10 @@ mod voice;
 mod voice {
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
+    use codex_core::auth::AuthCredentialsStoreMode;
     use codex_core::config::Config;
     use codex_protocol::protocol::RealtimeAudioFrame;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
@@ -240,6 +242,13 @@ mod voice {
             id,
             error: "voice input is unavailable in this build".to_string(),
         });
+    }
+
+    pub(crate) fn set_transcription_runtime_context(
+        _auth_storage_home: PathBuf,
+        _auth_credentials_store_mode: AuthCredentialsStoreMode,
+        _chatgpt_base_url: String,
+    ) {
     }
 }
 
@@ -1009,6 +1018,11 @@ async fn run_ratatui_app(
 
     let config = if should_show_onboarding {
         let show_login_screen = should_show_login_screen(login_status, &initial_config);
+        let onboarding_auth_storage_home = resolve_auth_storage_home(
+            initial_config.codex_home.clone(),
+            auth_file.as_deref(),
+            initial_config.cli_auth_credentials_store_mode,
+        )?;
         let onboarding_result = run_onboarding_app(
             OnboardingScreenArgs {
                 show_login_screen,
@@ -1018,6 +1032,7 @@ async fn run_ratatui_app(
                     .as_ref()
                     .map(AppServerSession::request_handle),
                 config: initial_config.clone(),
+                auth_storage_home: onboarding_auth_storage_home.clone(),
             },
             if show_login_screen {
                 onboarding_app_server.take()
@@ -1045,7 +1060,7 @@ async fn run_ratatui_app(
         // status detection edge cases.
         if show_login_screen && !remote_mode {
             cloud_requirements = cloud_requirements_loader_for_storage(
-                initial_config.codex_home.clone(),
+                onboarding_auth_storage_home,
                 /*enable_codex_api_key_env*/ false,
                 initial_config.cli_auth_credentials_store_mode,
                 initial_config.chatgpt_base_url.clone(),

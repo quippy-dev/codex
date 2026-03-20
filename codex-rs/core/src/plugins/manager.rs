@@ -487,13 +487,8 @@ impl PluginsManager {
         codex_home: PathBuf,
         restriction_product: Option<Product>,
     ) -> Self {
-        // Product restrictions are enforced at marketplace admission time for a given CODEX_HOME:
-        // listing, install, and curated refresh all consult this restriction context before new
-        // plugins enter local config or cache. After admission, runtime plugin loading trusts the
-        // contents of that CODEX_HOME and does not re-filter configured plugins by product, so
-        // already-admitted plugins may continue exposing MCP servers/tools from shared local state.
-        //
-        // This assumes a single CODEX_HOME is only used by one product.
+        // Product restrictions are enforced at marketplace admission time and reapplied at runtime
+        // from local marketplace policy metadata when available.
         Self {
             codex_home: codex_home.clone(),
             store: PluginStore::new(codex_home),
@@ -540,7 +535,14 @@ impl PluginsManager {
             return cached.outcome;
         }
 
-        let outcome = load_plugins_from_layer_stack(&config.config_layer_stack, &self.store);
+        let runtime_plugin_product_policies =
+            runtime_plugin_product_policies(self.codex_home.as_path());
+        let outcome = load_plugins_from_layer_stack(
+            &config.config_layer_stack,
+            &self.store,
+            self.restriction_product,
+            &runtime_plugin_product_policies,
+        );
         log_plugin_load_errors(&outcome);
         let mut cache = match self.cached_enabled_outcome.write() {
             Ok(cache) => cache,
@@ -1360,6 +1362,8 @@ struct PluginAppConfig {
 pub(crate) fn load_plugins_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     store: &PluginStore,
+    restriction_product: Option<Product>,
+    plugin_products_by_key: &HashMap<String, Vec<Product>>,
 ) -> PluginLoadOutcome {
     let mut configured_plugins: Vec<_> = configured_plugins_from_stack(config_layer_stack)
         .into_iter()
@@ -1369,7 +1373,20 @@ pub(crate) fn load_plugins_from_layer_stack(
     let mut plugins = Vec::with_capacity(configured_plugins.len());
     let mut seen_mcp_server_names = HashMap::<String, String>::new();
     for (configured_name, plugin) in configured_plugins {
-        let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store);
+        let mut loaded_plugin = load_plugin(configured_name.clone(), &plugin, store);
+        if !runtime_plugin_matches_product_restriction(
+            plugin_products_by_key
+                .get(&configured_name)
+                .map(Vec::as_slice),
+            restriction_product,
+        ) {
+            loaded_plugin.enabled = false;
+            loaded_plugin.manifest_name = None;
+            loaded_plugin.manifest_description = None;
+            loaded_plugin.skill_roots.clear();
+            loaded_plugin.mcp_servers.clear();
+            loaded_plugin.apps.clear();
+        }
         for name in loaded_plugin.mcp_servers.keys() {
             if let Some(previous_plugin) =
                 seen_mcp_server_names.insert(name.clone(), configured_name.clone())
@@ -1386,6 +1403,67 @@ pub(crate) fn load_plugins_from_layer_stack(
     }
 
     PluginLoadOutcome::from_plugins(plugins)
+}
+
+fn runtime_plugin_matches_product_restriction(
+    products: Option<&[Product]>,
+    restriction_product: Option<Product>,
+) -> bool {
+    let Some(products) = products else {
+        return true;
+    };
+
+    products.is_empty()
+        || restriction_product.is_some_and(|product| product.matches_product_restriction(products))
+}
+
+fn runtime_plugin_product_policies(codex_home: &Path) -> HashMap<String, Vec<Product>> {
+    let mut plugin_products_by_key = HashMap::new();
+
+    for marketplace_path in runtime_marketplace_paths(codex_home) {
+        let marketplace = match load_marketplace(&marketplace_path) {
+            Ok(marketplace) => marketplace,
+            Err(err) => {
+                warn!(
+                    path = %marketplace_path.display(),
+                    error = %err,
+                    "failed to load runtime marketplace policy metadata"
+                );
+                continue;
+            }
+        };
+        let marketplace_name = marketplace.name;
+        for plugin in marketplace.plugins {
+            let plugin_key = format!("{}@{marketplace_name}", plugin.name);
+            plugin_products_by_key
+                .entry(plugin_key)
+                .or_insert(plugin.policy.products);
+        }
+    }
+
+    plugin_products_by_key
+}
+
+fn runtime_marketplace_paths(codex_home: &Path) -> Vec<AbsolutePathBuf> {
+    let mut paths = Vec::new();
+    let codex_home_marketplace = codex_home.join(".agents/plugins/marketplace.json");
+    if codex_home_marketplace.is_file()
+        && let Ok(path) = AbsolutePathBuf::try_from(codex_home_marketplace)
+    {
+        paths.push(path);
+    }
+
+    let curated_marketplace =
+        curated_plugins_repo_path(codex_home).join(".agents/plugins/marketplace.json");
+    if curated_marketplace.is_file()
+        && let Ok(path) = AbsolutePathBuf::try_from(curated_marketplace)
+    {
+        paths.push(path);
+    }
+
+    paths.sort_unstable_by(|left, right| left.as_path().cmp(right.as_path()));
+    paths.dedup();
+    paths
 }
 
 pub(crate) fn plugin_namespace_for_skill_path(path: &Path) -> Option<String> {
