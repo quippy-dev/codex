@@ -1332,17 +1332,27 @@ async fn spawn_agent_applies_explicit_reasoning_effort_override() {
 }
 
 #[tokio::test]
-async fn spawn_agent_rejects_unknown_model_override() {
+async fn spawn_agent_accepts_fallback_resolvable_model_override() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
     session.services.models_manager = manager.get_models_manager();
-    let expected_visible_models = visible_models(&session)
+    let selected_model = visible_models(&session)
         .await
         .into_iter()
-        .map(|preset| format!("`{}`", preset.model))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .next()
+        .expect("expected at least one visible model");
+    let requested_model = format!("custom/{}", selected_model.model);
+    let expected_model_info = session
+        .services
+        .models_manager
+        .get_model_info(requested_model.as_str(), turn.config.as_ref())
+        .await;
 
     let invocation = invocation(
         Arc::new(session),
@@ -1350,17 +1360,26 @@ async fn spawn_agent_rejects_unknown_model_override() {
         "spawn_agent",
         function_payload(json!({
             "message": "inspect this repo",
-            "model": "definitely-not-a-real-model"
+            "model": requested_model.clone()
         })),
     );
-    let Err(err) = MultiAgentHandler.handle(invocation).await else {
-        panic!("unknown model should be rejected");
-    };
+    let output = MultiAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let snapshot = manager
+        .get_thread(agent_id(&result.agent_id).expect("agent_id should be valid"))
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(snapshot.model, requested_model);
     assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(format!(
-            "spawn_agent model `definitely-not-a-real-model` is not available. Choose one of: {expected_visible_models}"
-        ))
+        snapshot.reasoning_effort,
+        expected_model_info.default_reasoning_level
     );
 }
 

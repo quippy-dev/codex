@@ -518,11 +518,47 @@ async fn thread_read_loaded_rollout_preserves_summary_when_state_db_entry_missin
     let ThreadReadResponse { thread: read } = to_response::<ThreadReadResponse>(read_resp)?;
 
     assert_eq!(read.id, resumed.id);
-    assert_eq!(read.path, Some(external_rollout_path));
+    assert_eq!(read.path, Some(external_rollout_path.clone()));
     assert_eq!(read.preview, preview);
     assert_eq!(read.cwd, override_cwd);
     assert_eq!(read.model_provider, "mock_provider");
     assert_eq!(read.status, ThreadStatus::Idle);
+
+    let read_with_turns_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: resumed.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_with_turns_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_with_turns_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: read_with_turns,
+    } = to_response::<ThreadReadResponse>(read_with_turns_resp)?;
+
+    assert_eq!(read_with_turns.id, resumed.id);
+    assert_eq!(read_with_turns.path, Some(external_rollout_path));
+    assert_eq!(read_with_turns.preview, preview);
+    assert_eq!(read_with_turns.cwd, override_cwd);
+    assert_eq!(read_with_turns.model_provider, "mock_provider");
+    assert_eq!(read_with_turns.turns.len(), 1);
+
+    let turn = read_with_turns.turns.first().expect("thread/read turn");
+    match &turn.items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: preview.to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected user message item, got {other:?}"),
+    }
 
     Ok(())
 }

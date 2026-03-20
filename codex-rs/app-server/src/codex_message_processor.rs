@@ -3281,6 +3281,13 @@ impl CodexMessageProcessor {
 
         let loaded_thread = self.thread_manager.get_thread(thread_uuid).await.ok();
         let loaded_thread_state_db = loaded_thread.as_ref().and_then(|thread| thread.state_db());
+        let loaded_rollout_path = loaded_thread
+            .as_ref()
+            .and_then(|thread| thread.rollout_path());
+        let materialized_loaded_rollout_path = loaded_rollout_path
+            .as_ref()
+            .filter(|path| path.exists())
+            .cloned();
         let db_summary = if let Some(state_db_ctx) = loaded_thread_state_db.as_ref() {
             read_summary_from_state_db_context_by_thread_id(Some(state_db_ctx), thread_uuid).await
         } else {
@@ -3310,6 +3317,9 @@ impl CodexMessageProcessor {
                     }
                 };
         }
+        if rollout_path.is_none() && db_summary.is_none() {
+            rollout_path = materialized_loaded_rollout_path;
+        }
 
         if include_turns && rollout_path.is_none() && db_summary.is_some() {
             self.send_internal_error(
@@ -3325,7 +3335,22 @@ impl CodexMessageProcessor {
         } else if let Some(rollout_path) = rollout_path.as_ref() {
             let fallback_provider = self.config.model_provider_id.as_str();
             match read_summary_from_rollout(rollout_path, fallback_provider).await {
-                Ok(summary) => summary_to_thread(summary),
+                Ok(summary) => {
+                    let mut thread = summary_to_thread(summary);
+                    if let Some(loaded_thread) = loaded_thread.as_ref()
+                        && loaded_thread.rollout_path().as_ref() == Some(rollout_path)
+                    {
+                        let config_snapshot = loaded_thread.config_snapshot().await;
+                        let session_source = config_snapshot.session_source;
+                        thread.cwd = config_snapshot.cwd;
+                        thread.model_provider = config_snapshot.model_provider_id;
+                        thread.ephemeral = config_snapshot.ephemeral;
+                        thread.agent_nickname = session_source.get_nickname();
+                        thread.agent_role = session_source.get_agent_role();
+                        thread.source = session_source.into();
+                    }
+                    thread
+                }
                 Err(err) => {
                     self.send_internal_error(
                         request_id,
@@ -4330,8 +4355,9 @@ impl CodexMessageProcessor {
 
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so they rebuild their visible history from the copied source rollout instead.
+        let mut materialized_fork_history = None;
         let mut thread = if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref() {
-            match read_summary_from_rollout(
+            let mut thread = match read_summary_from_rollout(
                 fork_rollout_path.as_path(),
                 fallback_model_provider.as_str(),
             )
@@ -4349,7 +4375,27 @@ impl CodexMessageProcessor {
                     .await;
                     return;
                 }
+            };
+            if thread.preview.is_empty() {
+                let history_items =
+                    match read_rollout_items_from_rollout(fork_rollout_path.as_path()).await {
+                        Ok(items) => items,
+                        Err(err) => {
+                            self.send_internal_error(
+                                request_id,
+                                format!(
+                                    "failed to load rollout `{}` for thread {thread_id}: {err}",
+                                    fork_rollout_path.display()
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                thread.preview = preview_from_rollout_items(&history_items);
+                materialized_fork_history = Some(history_items);
             }
+            thread
         } else {
             let config_snapshot = forked_thread.config_snapshot().await;
             // forked thread names do not inherit the source thread name
@@ -4384,7 +4430,18 @@ impl CodexMessageProcessor {
             thread
         };
 
-        if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref()
+        if let Some(history_items) = materialized_fork_history.as_ref() {
+            if let Err(message) = populate_thread_turns(
+                &mut thread,
+                ThreadTurnSource::HistoryItems(history_items),
+                /*active_turn*/ None,
+            )
+            .await
+            {
+                self.send_internal_error(request_id, message).await;
+                return;
+            }
+        } else if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref()
             && let Err(message) = populate_thread_turns(
                 &mut thread,
                 ThreadTurnSource::RolloutPath(fork_rollout_path.as_path()),
@@ -8343,7 +8400,7 @@ pub(crate) async fn read_rollout_items_from_rollout(
         InitialHistory::Resumed(resumed) => resumed.history,
     };
 
-    Ok(items)
+    Ok(materialize_rollout_items_for_replay(codex_home_from_rollout_path(path), &items).await)
 }
 
 fn extract_conversation_summary(

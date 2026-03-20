@@ -1875,14 +1875,16 @@ async fn apply_spawn_agent_model_overrides(
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
     if let Some(model) = requested_model {
-        let preset = visible_model_preset(session, model).await?;
+        let model_selection = resolve_spawn_agent_model_selection(session, config, model).await;
         let reasoning_effort =
-            requested_reasoning_effort.unwrap_or(preset.default_reasoning_effort);
-        validate_reasoning_effort_for_preset(&preset, reasoning_effort)?;
+            requested_reasoning_effort.or_else(|| model_selection.default_reasoning_effort());
+        if let Some(reasoning_effort) = reasoning_effort {
+            model_selection.validate_reasoning_effort(reasoning_effort)?;
+        }
         config.model_provider_id = turn.config.model_provider_id.clone();
         config.model_provider = turn.provider.clone();
-        config.model = Some(preset.model);
-        config.model_reasoning_effort = Some(reasoning_effort);
+        config.model = Some(model_selection.model().to_string());
+        config.model_reasoning_effort = reasoning_effort;
         return Ok(());
     }
 
@@ -1893,6 +1895,55 @@ async fn apply_spawn_agent_model_overrides(
     }
 
     Ok(())
+}
+
+enum SpawnAgentModelSelection {
+    Preset(ModelPreset),
+    ModelInfo(ModelInfo),
+}
+
+impl SpawnAgentModelSelection {
+    fn model(&self) -> &str {
+        match self {
+            Self::Preset(preset) => preset.model.as_str(),
+            Self::ModelInfo(model_info) => model_info.slug.as_str(),
+        }
+    }
+
+    fn default_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::Preset(preset) => Some(preset.default_reasoning_effort),
+            Self::ModelInfo(model_info) => model_info.default_reasoning_level,
+        }
+    }
+
+    fn validate_reasoning_effort(
+        &self,
+        reasoning_effort: ReasoningEffort,
+    ) -> Result<(), FunctionCallError> {
+        match self {
+            Self::Preset(preset) => validate_reasoning_effort_for_preset(preset, reasoning_effort),
+            Self::ModelInfo(model_info) => {
+                validate_reasoning_effort_for_model_info(model_info, reasoning_effort)
+            }
+        }
+    }
+}
+
+async fn resolve_spawn_agent_model_selection(
+    session: &Session,
+    config: &Config,
+    model: &str,
+) -> SpawnAgentModelSelection {
+    if let Some(preset) = model_preset(session, model).await {
+        return SpawnAgentModelSelection::Preset(preset);
+    }
+    let model_info = session
+        .services
+        .models_manager
+        .get_model_info(model, config)
+        .await;
+    SpawnAgentModelSelection::ModelInfo(model_info)
 }
 
 async fn revalidate_spawn_agent_model_reasoning(
@@ -1955,6 +2006,16 @@ async fn visible_model_preset(
                 "spawn_agent model `{model}` is not available. Choose one of: {visible_models}"
             ))
         })
+}
+
+async fn model_preset(session: &Session, model: &str) -> Option<ModelPreset> {
+    session
+        .services
+        .models_manager
+        .list_models(crate::models_manager::manager::RefreshStrategy::Offline)
+        .await
+        .into_iter()
+        .find(|preset| preset.model == model)
 }
 
 fn validate_reasoning_effort_for_preset(

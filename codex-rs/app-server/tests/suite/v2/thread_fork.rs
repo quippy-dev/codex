@@ -300,6 +300,82 @@ async fn thread_fork_finds_archived_rollout_by_thread_id() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_fork_nested_fork_materializes_inherited_preview_and_turns() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let first_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id,
+            ..Default::default()
+        })
+        .await?;
+    let first_fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(first_fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: first_fork, ..
+    } = to_response::<ThreadForkResponse>(first_fork_resp)?;
+
+    let nested_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: first_fork.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let nested_fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(nested_fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: nested_fork,
+        ..
+    } = to_response::<ThreadForkResponse>(nested_fork_resp)?;
+
+    assert_ne!(nested_fork.id, first_fork.id);
+    assert_eq!(nested_fork.preview, preview);
+    assert_eq!(nested_fork.status, ThreadStatus::Idle);
+    assert_eq!(
+        nested_fork.turns.len(),
+        1,
+        "expected inherited nested fork history"
+    );
+
+    let turn = nested_fork.turns.first().expect("nested fork turn");
+    match &turn.items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: preview.to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected user message item, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_fork_surfaces_cloud_requirements_load_errors() -> Result<()> {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
