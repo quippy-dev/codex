@@ -8376,13 +8376,17 @@ pub(crate) async fn read_summary_from_rollout(
         .unwrap_or_else(|| fallback_provider.to_string());
     let git_info = git.as_ref().map(map_git_info);
     let updated_at = updated_at.or_else(|| timestamp.clone());
+    let preview = read_rollout_items_from_rollout(path)
+        .await
+        .map(|items| preview_from_rollout_items(&items))
+        .unwrap_or_default();
 
     Ok(ConversationSummary {
         conversation_id: session_meta.id,
         timestamp,
         updated_at,
         path: path.to_path_buf(),
-        preview: String::new(),
+        preview,
         model_provider,
         cwd: session_meta.cwd,
         cli_version: session_meta.cli_version,
@@ -9053,6 +9057,86 @@ mod tests {
         };
 
         assert_eq!(summary, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_summary_from_rollout_uses_materialized_history_when_head_preview_is_missing()
+    -> Result<()> {
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::ResponseItem;
+        use codex_protocol::protocol::RolloutItem;
+        use codex_protocol::protocol::RolloutLine;
+        use codex_protocol::protocol::SessionMetaLine;
+        use std::fs;
+        use std::fs::FileTimes;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("rollout.jsonl");
+
+        let conversation_id = ThreadId::from_string("bfd12a78-5900-467b-9bc5-d3d35df08191")?;
+        let timestamp = "2025-09-05T16:53:11.850Z".to_string();
+
+        let mut lines = vec![RolloutLine {
+            timestamp: timestamp.clone(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id: conversation_id,
+                    timestamp: timestamp.clone(),
+                    model_provider: None,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        }];
+
+        for idx in 0..10 {
+            lines.push(RolloutLine {
+                timestamp: timestamp.clone(),
+                item: RolloutItem::ResponseItem(ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: format!("assistant {idx}"),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                }),
+            });
+        }
+
+        lines.push(RolloutLine {
+            timestamp: timestamp.clone(),
+            item: RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{USER_MESSAGE_BEGIN}Count to 5"),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+        });
+
+        fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| serde_json::to_string(&line))
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n")
+                + "\n",
+        )?;
+        let parsed = chrono::DateTime::parse_from_rfc3339(&timestamp)?.with_timezone(&Utc);
+        let times = FileTimes::new().set_modified(parsed.into());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .set_times(times)?;
+
+        let summary = read_summary_from_rollout(path.as_path(), "fallback").await?;
+
+        assert_eq!(summary.preview, "Count to 5");
         Ok(())
     }
 
