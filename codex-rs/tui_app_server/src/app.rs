@@ -2977,6 +2977,11 @@ impl App {
             config.cli_auth_credentials_store_mode,
             auth_file,
         )?;
+        crate::voice::set_transcription_runtime_context(
+            auth_manager.storage_home().to_path_buf(),
+            config.cli_auth_credentials_store_mode,
+            config.chatgpt_base_url.clone(),
+        );
         if config
             .tui_status_line
             .as_ref()

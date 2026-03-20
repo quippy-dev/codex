@@ -4,7 +4,6 @@ use base64::Engine;
 use codex_client::build_reqwest_client_with_custom_ca;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::Config;
-use codex_core::config::find_codex_home;
 use codex_core::default_client::get_codex_user_agent;
 use codex_login::AuthMode;
 use codex_login::CodexAuth;
@@ -18,8 +17,11 @@ use hound::WavSpec;
 use hound::WavWriter;
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
@@ -36,6 +38,48 @@ struct TranscriptionAuthContext {
     bearer_token: String,
     chatgpt_account_id: Option<String>,
     chatgpt_base_url: String,
+}
+
+#[derive(Clone)]
+struct TranscriptionRuntimeContext {
+    auth_storage_home: PathBuf,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    chatgpt_base_url: String,
+}
+
+static TRANSCRIPTION_RUNTIME_CONTEXT: OnceLock<RwLock<Option<TranscriptionRuntimeContext>>> =
+    OnceLock::new();
+
+fn transcription_runtime_context_store() -> &'static RwLock<Option<TranscriptionRuntimeContext>> {
+    TRANSCRIPTION_RUNTIME_CONTEXT.get_or_init(|| RwLock::new(None))
+}
+
+pub(crate) fn set_transcription_runtime_context(
+    auth_storage_home: PathBuf,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    chatgpt_base_url: String,
+) {
+    match transcription_runtime_context_store().write() {
+        Ok(mut guard) => {
+            *guard = Some(TranscriptionRuntimeContext {
+                auth_storage_home,
+                auth_credentials_store_mode,
+                chatgpt_base_url,
+            });
+        }
+        Err(_) => {
+            error!("failed to set voice transcription runtime context");
+        }
+    }
+}
+
+fn transcription_runtime_context() -> Result<TranscriptionRuntimeContext, String> {
+    let guard = transcription_runtime_context_store()
+        .read()
+        .map_err(|_| "failed to read voice transcription runtime context".to_string())?;
+    guard
+        .clone()
+        .ok_or_else(|| "voice transcription auth context is not initialized".to_string())
 }
 
 pub struct RecordedAudio {
@@ -763,24 +807,24 @@ fn normalize_chatgpt_base_url(input: &str) -> String {
 }
 
 async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
-    let codex_home = find_codex_home().map_err(|e| format!("failed to find codex home: {e}"))?;
-    let auth = CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Auto)
-        .map_err(|e| format!("failed to read auth.json: {e}"))?
-        .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
+    let runtime_context = transcription_runtime_context()?;
+    let auth = CodexAuth::from_auth_storage(
+        &runtime_context.auth_storage_home,
+        runtime_context.auth_credentials_store_mode,
+    )
+    .map_err(|e| format!("failed to read auth.json: {e}"))?
+    .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
 
     let chatgpt_account_id = auth.get_account_id();
 
     let token = auth
         .get_token()
         .map_err(|e| format!("failed to get auth token: {e}"))?;
-    let config = Config::load_with_cli_overrides(Vec::new())
-        .await
-        .map_err(|e| format!("failed to load config: {e}"))?;
     Ok(TranscriptionAuthContext {
         mode: auth.api_auth_mode(),
         bearer_token: token,
         chatgpt_account_id,
-        chatgpt_base_url: normalize_chatgpt_base_url(&config.chatgpt_base_url),
+        chatgpt_base_url: normalize_chatgpt_base_url(&runtime_context.chatgpt_base_url),
     })
 }
 
@@ -872,11 +916,17 @@ async fn transcribe_bytes(
 
 #[cfg(test)]
 mod tests {
+    use super::AuthCredentialsStoreMode;
+    use super::AuthMode;
     use super::RecordedAudio;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
+    use super::resolve_auth;
+    use super::set_transcription_runtime_context;
+    use codex_core::auth::login_with_api_key;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
+    use tempfile::TempDir;
 
     #[test]
     fn convert_pcm16_downmixes_and_resamples_for_model_input() {
@@ -904,5 +954,36 @@ mod tests {
         assert_eq!(spec.channels, 1);
         assert_eq!(spec.sample_rate, 24_000);
         assert_eq!(samples, vec![8_426, 29_490]);
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_uses_configured_storage_home_for_transcription() {
+        let default_home = TempDir::new().expect("default auth home");
+        let override_home = TempDir::new().expect("override auth home");
+        login_with_api_key(
+            default_home.path(),
+            "sk-default",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("default auth should save");
+        login_with_api_key(
+            override_home.path(),
+            "sk-override",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("override auth should save");
+
+        set_transcription_runtime_context(
+            override_home.path().to_path_buf(),
+            AuthCredentialsStoreMode::File,
+            "https://chatgpt.com/".to_string(),
+        );
+
+        let auth = resolve_auth()
+            .await
+            .expect("transcription auth should load from configured home");
+        assert_eq!(auth.mode, AuthMode::ApiKey);
+        assert_eq!(auth.bearer_token, "sk-override");
+        assert_eq!(auth.chatgpt_base_url, "https://chatgpt.com/backend-api");
     }
 }

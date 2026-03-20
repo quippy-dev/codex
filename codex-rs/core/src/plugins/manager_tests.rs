@@ -37,6 +37,51 @@ fn write_plugin(root: &Path, dir_name: &str, manifest_name: &str) {
     fs::write(plugin_root.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
 }
 
+fn write_plugin_with_runtime_capabilities(
+    root: &Path,
+    dir_name: &str,
+    manifest_name: &str,
+    mcp_server_name: &str,
+    app_id: &str,
+) {
+    let plugin_root = root.join(dir_name);
+    fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
+    fs::create_dir_all(plugin_root.join("skills")).unwrap();
+    fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        format!(r#"{{"name":"{manifest_name}"}}"#),
+    )
+    .unwrap();
+    fs::write(plugin_root.join("skills/SKILL.md"), "skill").unwrap();
+    fs::write(
+        plugin_root.join(".mcp.json"),
+        format!(
+            r#"{{
+  "mcpServers": {{
+    "{mcp_server_name}": {{
+      "type": "http",
+      "url": "https://{mcp_server_name}.example/mcp"
+    }}
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        plugin_root.join(".app.json"),
+        format!(
+            r#"{{
+  "apps": {{
+    "example": {{
+      "id": "{app_id}"
+    }}
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+}
+
 fn plugin_config_toml(enabled: bool, plugins_feature_enabled: bool) -> String {
     plugin_config_toml_for_plugins(&[("sample@test", enabled)], plugins_feature_enabled)
 }
@@ -803,6 +848,107 @@ fn load_plugins_rejects_invalid_plugin_keys() {
     );
     assert!(outcome.effective_skill_roots().is_empty());
     assert!(outcome.effective_mcp_servers().is_empty());
+}
+
+#[test]
+fn plugins_for_config_reapplies_runtime_product_restriction() {
+    let codex_home = TempDir::new().unwrap();
+    let curated_root = curated_plugins_repo_path(codex_home.path());
+
+    write_plugin(&curated_root, "plugins/codex-only", "codex-only");
+    write_plugin(&curated_root, "plugins/chatgpt-only", "chatgpt-only");
+    write_file(
+        &curated_root.join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "openai-curated",
+  "plugins": [
+    {
+      "name": "codex-only",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-only"
+      },
+      "policy": {
+        "products": ["CODEX"]
+      }
+    },
+    {
+      "name": "chatgpt-only",
+      "source": {
+        "source": "local",
+        "path": "./plugins/chatgpt-only"
+      },
+      "policy": {
+        "products": ["CHATGPT"]
+      }
+    }
+  ]
+}"#,
+    );
+
+    let cache_root = codex_home.path().join("plugins/cache/openai-curated");
+    let codex_plugin_root = cache_root.join("codex-only/local");
+    write_plugin_with_runtime_capabilities(
+        &cache_root,
+        "codex-only/local",
+        "codex-only",
+        "codex-mcp",
+        "connector_codex",
+    );
+    write_plugin_with_runtime_capabilities(
+        &cache_root,
+        "chatgpt-only/local",
+        "chatgpt-only",
+        "chatgpt-mcp",
+        "connector_chatgpt",
+    );
+
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        &plugin_config_toml_for_plugins(
+            &[
+                ("codex-only@openai-curated", true),
+                ("chatgpt-only@openai-curated", true),
+            ],
+            true,
+        ),
+    );
+
+    let config = load_config_blocking(codex_home.path(), codex_home.path());
+    let outcome = PluginsManager::new(codex_home.path().to_path_buf()).plugins_for_config(&config);
+
+    assert_eq!(
+        outcome
+            .capability_summaries()
+            .iter()
+            .map(|summary| summary.config_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["codex-only@openai-curated"],
+    );
+    assert_eq!(
+        outcome.effective_skill_roots(),
+        vec![codex_plugin_root.join("skills")]
+    );
+    assert_eq!(
+        outcome.effective_apps(),
+        vec![AppConnectorId("connector_codex".to_string())]
+    );
+    let mut mcp_server_names = outcome
+        .effective_mcp_servers()
+        .into_keys()
+        .collect::<Vec<_>>();
+    mcp_server_names.sort_unstable();
+    assert_eq!(mcp_server_names, vec!["codex-mcp".to_string()]);
+
+    let chatgpt_plugin = outcome
+        .plugins()
+        .iter()
+        .find(|plugin| plugin.config_name == "chatgpt-only@openai-curated")
+        .expect("chatgpt-only plugin should be present");
+    assert!(!chatgpt_plugin.enabled);
+    assert!(chatgpt_plugin.skill_roots.is_empty());
+    assert!(chatgpt_plugin.mcp_servers.is_empty());
+    assert!(chatgpt_plugin.apps.is_empty());
 }
 
 #[tokio::test]
@@ -1847,8 +1993,12 @@ fn load_plugins_ignores_project_config_files() {
     )
     .expect("config layer stack should build");
 
-    let outcome =
-        load_plugins_from_layer_stack(&stack, &PluginStore::new(codex_home.path().to_path_buf()));
+    let outcome = load_plugins_from_layer_stack(
+        &stack,
+        &PluginStore::new(codex_home.path().to_path_buf()),
+        None,
+        &HashMap::new(),
+    );
 
     assert_eq!(outcome, PluginLoadOutcome::default());
 }

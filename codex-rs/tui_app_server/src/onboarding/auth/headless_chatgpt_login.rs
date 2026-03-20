@@ -33,7 +33,7 @@ use super::onboarding_request_id;
 
 pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
     let mut opts = ServerOptions::new(
-        widget.codex_home.clone(),
+        widget.auth_storage_home.clone(),
         CLIENT_ID.to_string(),
         widget.forced_chatgpt_workspace_id.clone(),
         widget.cli_auth_credentials_store_mode,
@@ -44,7 +44,7 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
     let request_frame = widget.request_frame.clone();
     let error = widget.error.clone();
     let request_handle = widget.app_server_request_handle.clone();
-    let codex_home = widget.codex_home.clone();
+    let auth_storage_home = widget.auth_storage_home.clone();
     let cli_auth_credentials_store_mode = widget.cli_auth_credentials_store_mode;
     let forced_chatgpt_workspace_id = widget.forced_chatgpt_workspace_id.clone();
     let cancel = begin_device_code_attempt(&sign_in_state, &request_frame);
@@ -93,7 +93,7 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget) {
                 match result {
                     Ok(()) => {
                         let local_auth = load_local_chatgpt_auth(
-                            &codex_home,
+                            &auth_storage_home,
                             cli_auth_credentials_store_mode,
                             forced_chatgpt_workspace_id.as_deref(),
                         );

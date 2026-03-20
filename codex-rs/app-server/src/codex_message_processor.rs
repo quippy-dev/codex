@@ -3892,7 +3892,47 @@ impl CodexMessageProcessor {
         path: Option<&PathBuf>,
     ) -> Option<ResumeThreadSource> {
         let (rollout_path, restored_archived_thread) = if let Some(path) = path {
-            (path.clone(), None)
+            let archived_dir = self
+                .config
+                .codex_home
+                .join(codex_core::ARCHIVED_SESSIONS_SUBDIR);
+            let canonical_archived_dir = tokio::fs::canonicalize(&archived_dir).await.ok();
+            let canonical_rollout_path = tokio::fs::canonicalize(path).await.ok();
+            if let (Some(canonical_archived_dir), Some(canonical_rollout_path)) =
+                (canonical_archived_dir, canonical_rollout_path)
+                && canonical_rollout_path.starts_with(&canonical_archived_dir)
+            {
+                let Some(path_thread_id) = thread_id_from_rollout_path(path.as_path()) else {
+                    self.send_invalid_request_error(
+                        request_id,
+                        format!(
+                            "rollout path `{}` does not include a valid thread id",
+                            path.display()
+                        ),
+                    )
+                    .await;
+                    return None;
+                };
+                match self
+                    .unarchive_thread_common(path_thread_id, path.as_path())
+                    .await
+                {
+                    Ok(restored_path) => (
+                        restored_path.clone(),
+                        Some(RestoredArchivedThread {
+                            thread_id: path_thread_id,
+                            archived_path: canonical_rollout_path,
+                            restored_path,
+                        }),
+                    ),
+                    Err(err) => {
+                        self.outgoing.send_error(request_id, err).await;
+                        return None;
+                    }
+                }
+            } else {
+                (path.clone(), None)
+            }
         } else {
             let existing_thread_id = match ThreadId::from_string(thread_id) {
                 Ok(id) => id,

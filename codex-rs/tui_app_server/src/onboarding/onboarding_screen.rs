@@ -30,6 +30,7 @@ use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use color_eyre::eyre::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -69,6 +70,7 @@ pub(crate) struct OnboardingScreenArgs {
     pub login_status: LoginStatus,
     pub app_server_request_handle: Option<AppServerRequestHandle>,
     pub config: Config,
+    pub auth_storage_home: PathBuf,
 }
 
 pub(crate) struct OnboardingResult {
@@ -84,6 +86,7 @@ impl OnboardingScreen {
             login_status,
             app_server_request_handle,
             config,
+            auth_storage_home,
         } = args;
         let cwd = config.cwd.clone();
         let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
@@ -107,7 +110,7 @@ impl OnboardingScreen {
                     highlighted_mode,
                     error: Arc::new(RwLock::new(None)),
                     sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
-                    codex_home: codex_home.clone(),
+                    auth_storage_home: auth_storage_home.clone(),
                     cli_auth_credentials_store_mode,
                     login_status,
                     app_server_request_handle,

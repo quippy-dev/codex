@@ -313,6 +313,91 @@ async fn thread_resume_unarchives_archived_rollout_by_thread_id() -> Result<()> 
 }
 
 #[tokio::test]
+async fn thread_resume_unarchives_archived_rollout_by_path() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let preview = "Saved user message";
+    let conversation_id = app_test_support::create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        preview,
+        Some("mock_provider"),
+        None,
+    )?;
+
+    let original_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+    let archived_dir = codex_home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::create_dir_all(&archived_dir)?;
+    let archived_path = archived_dir.join(
+        original_path
+            .file_name()
+            .expect("archived rollout should have a file name"),
+    );
+    std::fs::rename(&original_path, &archived_path)?;
+    assert!(
+        find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_none(),
+        "archived thread should not remain discoverable in sessions/"
+    );
+    assert!(
+        find_archived_thread_path_by_id_str(codex_home.path(), &conversation_id)
+            .await?
+            .is_some(),
+        "archived thread should be discoverable in archived_sessions/"
+    );
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: "not-a-valid-thread-id".to_string(),
+            path: Some(archived_path.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    let unarchived_notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/unarchived"),
+    )
+    .await??;
+    let unarchived: ThreadUnarchivedNotification = serde_json::from_value(
+        unarchived_notification
+            .params
+            .expect("thread/unarchived notification params"),
+    )?;
+
+    let restored_path = find_thread_path_by_id_str(codex_home.path(), &conversation_id)
+        .await?
+        .expect("resume should restore archived rollout into sessions/");
+    assert_eq!(thread.id, conversation_id);
+    assert_eq!(unarchived.thread_id, thread.id);
+    assert_eq!(thread.preview, preview);
+    assert_eq!(thread.turns.len(), 1, "expected resumed archived history");
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert_eq!(
+        thread.path.as_ref().expect("thread path").canonicalize()?,
+        restored_path.canonicalize()?,
+    );
+    assert!(
+        !archived_path.exists(),
+        "resume should move the archived rollout back into sessions/"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_failure_keeps_archived_rollout_archived() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -412,7 +497,8 @@ async fn thread_resume_summary_failure_rearchives_restored_rollout() -> Result<(
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: conversation_id.clone(),
+            thread_id: "not-a-valid-thread-id".to_string(),
+            path: Some(archived_path.clone()),
             ..Default::default()
         })
         .await?;
