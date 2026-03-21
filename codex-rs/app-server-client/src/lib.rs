@@ -47,6 +47,7 @@ use codex_core::config::Config;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use serde::de::DeserializeOwned;
@@ -217,7 +218,7 @@ impl InProcessClientStartArgs {
                 default_mode_request_user_input: self
                     .config
                     .features
-                    .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
+                    .enabled(Feature::RequestUserInputOutsidePlanMode),
             },
         ));
 
@@ -1542,7 +1543,7 @@ mod tests {
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features
-                    .enabled(codex_core::features::Feature::RequestUserInputOutsidePlanMode),
+                    .enabled(Feature::RequestUserInputOutsidePlanMode),
             },
         ));
         event_tx

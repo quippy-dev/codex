@@ -3977,6 +3977,26 @@
           "properties": {
             "method": {
               "enum": [
+                "mcpServer/startupStatus/updated"
+              ],
+              "title": "McpServer/startupStatus/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/McpServerStatusUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "McpServer/startupStatus/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "account/updated"
               ],
               "title": "Account/updatedNotificationMethod",
@@ -4252,6 +4272,26 @@
             "params"
           ],
           "title": "Thread/realtime/itemAddedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/realtime/transcriptUpdated"
+              ],
+              "title": "Thread/realtime/transcriptUpdatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadRealtimeTranscriptUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/realtime/transcriptUpdatedNotification",
           "type": "object"
         },
         {
@@ -4879,6 +4919,9 @@
         "title": "AgentMessageDeltaNotification",
         "type": "object"
       },
+      "AgentPath": {
+        "type": "string"
+      },
       "AnalyticsConfig": {
         "additionalProperties": true,
         "properties": {
@@ -5232,11 +5275,15 @@
           },
           "name": {
             "type": "string"
+          },
+          "needsAuth": {
+            "type": "boolean"
           }
         },
         "required": [
           "id",
-          "name"
+          "name",
+          "needsAuth"
         ],
         "type": "object"
       },
@@ -7971,6 +8018,21 @@
         ],
         "type": "string"
       },
+      "HookPromptFragment": {
+        "properties": {
+          "hookRunId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hookRunId",
+          "text"
+        ],
+        "type": "object"
+      },
       "HookRunStatus": {
         "enum": [
           "running",
@@ -8551,6 +8613,15 @@
         "title": "McpServerRefreshResponse",
         "type": "object"
       },
+      "McpServerStartupState": {
+        "enum": [
+          "starting",
+          "ready",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
       "McpServerStatus": {
         "properties": {
           "authStatus": {
@@ -8585,6 +8656,29 @@
           "resources",
           "tools"
         ],
+        "type": "object"
+      },
+      "McpServerStatusUpdatedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/definitions/v2/McpServerStartupState"
+          }
+        },
+        "required": [
+          "name",
+          "status"
+        ],
+        "title": "McpServerStatusUpdatedNotification",
         "type": "object"
       },
       "McpToolCallError": {
@@ -11445,6 +11539,17 @@
                       "null"
                     ]
                   },
+                  "agent_path": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/definitions/v2/AgentPath"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  },
                   "agent_role": {
                     "default": null,
                     "type": [
@@ -11957,6 +12062,33 @@
           },
           {
             "properties": {
+              "fragments": {
+                "items": {
+                  "$ref": "#/definitions/v2/HookPromptFragment"
+                },
+                "type": "array"
+              },
+              "id": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "hookPrompt"
+                ],
+                "title": "HookPromptThreadItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "fragments",
+              "id",
+              "type"
+            ],
+            "title": "HookPromptThreadItem",
+            "type": "object"
+          },
+          {
+            "properties": {
               "id": {
                 "type": "string"
               },
@@ -12443,6 +12575,12 @@
                   "null"
                 ]
               },
+              "savedPath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "status": {
                 "type": "string"
               },
@@ -12923,6 +13061,28 @@
           "version"
         ],
         "title": "ThreadRealtimeStartedNotification",
+        "type": "object"
+      },
+      "ThreadRealtimeTranscriptUpdatedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "EXPERIMENTAL - flat transcript delta emitted whenever realtime transcript text changes.",
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "text",
+          "threadId"
+        ],
+        "title": "ThreadRealtimeTranscriptUpdatedNotification",
         "type": "object"
       },
       "ThreadResumeParams": {

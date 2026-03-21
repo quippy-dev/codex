@@ -110,7 +110,7 @@ impl OnboardingScreen {
                     highlighted_mode,
                     error: Arc::new(RwLock::new(None)),
                     sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
-                    auth_storage_home: auth_storage_home.clone(),
+                    auth_storage_home,
                     cli_auth_credentials_store_mode,
                     login_status,
                     app_server_request_handle,

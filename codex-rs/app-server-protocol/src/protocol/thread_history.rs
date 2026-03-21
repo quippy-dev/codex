@@ -18,6 +18,7 @@ use crate::protocol::v2::TurnError;
 use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
+use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
@@ -184,11 +185,37 @@ impl ThreadHistoryBuilder {
         match item {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
+            RolloutItem::ResponseItem(item) => self.handle_response_item(item),
             RolloutItem::TurnContext(_)
             | RolloutItem::SessionMeta(_)
-            | RolloutItem::ForkReference(_)
-            | RolloutItem::ResponseItem(_) => {}
+            | RolloutItem::ForkReference(_) => {}
         }
+    }
+
+    fn handle_response_item(&mut self, item: &codex_protocol::models::ResponseItem) {
+        let codex_protocol::models::ResponseItem::Message {
+            role, content, id, ..
+        } = item
+        else {
+            return;
+        };
+
+        if role != "user" {
+            return;
+        }
+
+        let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
+            return;
+        };
+
+        self.ensure_turn().items.push(ThreadItem::HookPrompt {
+            id: hook_prompt.id,
+            fragments: hook_prompt
+                .fragments
+                .into_iter()
+                .map(crate::protocol::v2::HookPromptFragment::from)
+                .collect(),
+        });
     }
 
     fn handle_user_message(&mut self, payload: &UserMessageEvent) {
@@ -282,6 +309,7 @@ impl ThreadHistoryBuilder {
                 );
             }
             codex_protocol::items::TurnItem::UserMessage(_)
+            | codex_protocol::items::TurnItem::HookPrompt(_)
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
@@ -302,6 +330,7 @@ impl ThreadHistoryBuilder {
                 );
             }
             codex_protocol::items::TurnItem::UserMessage(_)
+            | codex_protocol::items::TurnItem::HookPrompt(_)
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
@@ -542,6 +571,7 @@ impl ThreadHistoryBuilder {
             status: String::new(),
             revised_prompt: None,
             result: String::new(),
+            saved_path: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -552,6 +582,7 @@ impl ThreadHistoryBuilder {
             status: payload.status.clone(),
             revised_prompt: payload.revised_prompt.clone(),
             result: payload.result.clone(),
+            saved_path: payload.saved_path.clone(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -1150,8 +1181,10 @@ mod tests {
     use crate::protocol::v2::CommandExecutionSource;
     use codex_protocol::ThreadId;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
+    use codex_protocol::items::HookPromptFragment as CoreHookPromptFragment;
     use codex_protocol::items::TurnItem as CoreTurnItem;
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
+    use codex_protocol::items::build_hook_prompt_message;
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
@@ -1168,7 +1201,6 @@ mod tests {
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
     use codex_protocol::protocol::PatchApplyBeginEvent;
-    use codex_protocol::protocol::RetainedProposedPlan;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -1353,6 +1385,61 @@ mod tests {
                 text: "Final reply".into(),
                 phase: Some(MessagePhase::FinalAnswer),
                 memory_citation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn replays_image_generation_end_events_into_turn_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-image".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "generate an image".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+                call_id: "ig_123".into(),
+                status: "completed".into(),
+                revised_prompt: Some("final prompt".into()),
+                result: "Zm9v".into(),
+                saved_path: Some("/tmp/ig_123.png".into()),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-image".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0],
+            Turn {
+                id: "turn-image".into(),
+                status: TurnStatus::Completed,
+                error: None,
+                items: vec![
+                    ThreadItem::UserMessage {
+                        id: "item-1".into(),
+                        content: vec![UserInput::Text {
+                            text: "generate an image".into(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    ThreadItem::ImageGeneration {
+                        id: "ig_123".into(),
+                        status: "completed".into(),
+                        revised_prompt: Some("final prompt".into()),
+                        result: "Zm9v".into(),
+                        saved_path: Some("/tmp/ig_123.png".into()),
+                    },
+                ],
             }
         );
     }
@@ -2326,7 +2413,6 @@ mod tests {
             })),
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
-                retained_proposed_plan: RetainedProposedPlan::None,
                 replacement_history: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -2390,74 +2476,6 @@ mod tests {
                     "00000000-0000-0000-0000-000000000002".into(),
                     CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
-                        message: None,
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            }
-        );
-    }
-
-    #[test]
-    fn reconstructs_interrupted_send_input_as_completed_collab_call() {
-        // `send_input(interrupt=true)` first stops the child's active turn, then redirects it with
-        // new input. The transient interrupted status should remain visible in agent state, but the
-        // collab tool call itself is still a successful redirect rather than a failed operation.
-        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000001")
-            .expect("valid sender thread id");
-        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
-            .expect("valid receiver thread id");
-        let events = vec![
-            EventMsg::UserMessage(UserMessageEvent {
-                message: "redirect".into(),
-                images: None,
-                text_elements: Vec::new(),
-                local_images: Vec::new(),
-            }),
-            EventMsg::CollabAgentInteractionBegin(
-                codex_protocol::protocol::CollabAgentInteractionBeginEvent {
-                    call_id: "send-1".into(),
-                    sender_thread_id: sender,
-                    receiver_thread_id: receiver,
-                    prompt: "new task".into(),
-                },
-            ),
-            EventMsg::CollabAgentInteractionEnd(
-                codex_protocol::protocol::CollabAgentInteractionEndEvent {
-                    call_id: "send-1".into(),
-                    sender_thread_id: sender,
-                    receiver_thread_id: receiver,
-                    receiver_agent_nickname: None,
-                    receiver_agent_role: None,
-                    prompt: "new task".into(),
-                    status: AgentStatus::Interrupted,
-                },
-            ),
-        ];
-
-        let items = events
-            .into_iter()
-            .map(RolloutItem::EventMsg)
-            .collect::<Vec<_>>();
-        let turns = build_turns_from_rollout_items(&items);
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].items.len(), 2);
-        assert_eq!(
-            turns[0].items[1],
-            ThreadItem::CollabAgentToolCall {
-                id: "send-1".into(),
-                tool: CollabAgentTool::SendInput,
-                status: CollabAgentToolCallStatus::Completed,
-                sender_thread_id: sender.to_string(),
-                receiver_thread_ids: vec![receiver.to_string()],
-                prompt: Some("new task".into()),
-                model: None,
-                reasoning_effort: None,
-                agents_states: [(
-                    receiver.to_string(),
-                    CollabAgentState {
-                        status: crate::protocol::v2::CollabAgentStatus::Interrupted,
                         message: None,
                     },
                 )]
@@ -2715,5 +2733,81 @@ mod tests {
                 additional_details: None,
             })
         );
+    }
+
+    #[test]
+    fn rebuilds_hook_prompt_items_from_rollout_response_items() {
+        let hook_prompt = build_hook_prompt_message(&[
+            CoreHookPromptFragment::from_single_hook("Retry with tests.", "hook-run-1"),
+            CoreHookPromptFragment::from_single_hook("Then summarize cleanly.", "hook-run-2"),
+        ])
+        .expect("hook prompt message");
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::ResponseItem(hook_prompt),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::HookPrompt {
+                id: turns[0].items[1].id().to_string(),
+                fragments: vec![
+                    crate::protocol::v2::HookPromptFragment {
+                        text: "Retry with tests.".into(),
+                        hook_run_id: "hook-run-1".into(),
+                    },
+                    crate::protocol::v2::HookPromptFragment {
+                        text: "Then summarize cleanly.".into(),
+                        hook_run_id: "hook-run-2".into(),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_plain_user_response_items_in_rollout_replay() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
+                id: Some("msg-1".into()),
+                role: "user".into(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: "plain text".into(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].items.is_empty());
     }
 }

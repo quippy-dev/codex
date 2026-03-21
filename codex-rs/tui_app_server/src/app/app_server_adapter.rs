@@ -484,6 +484,9 @@ fn server_notification_thread_target(
         ServerNotification::ThreadRealtimeItemAdded(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadRealtimeTranscriptUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadRealtimeOutputAudioDelta(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -494,6 +497,7 @@ fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::SkillsChanged(_)
+        | ServerNotification::McpServerStatusUpdated(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
@@ -872,6 +876,7 @@ fn turn_snapshot_events(
                         }),
                 );
             }
+            TurnItem::HookPrompt(_) => {}
         }
     }
 
@@ -995,12 +1000,13 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
             status,
             revised_prompt,
             result,
+            saved_path,
         } => Some(TurnItem::ImageGeneration(ImageGenerationItem {
             id: id.clone(),
             status: status.clone(),
             revised_prompt: revised_prompt.clone(),
             result: result.clone(),
-            saved_path: None,
+            saved_path: saved_path.clone(),
         })),
         ThreadItem::ContextCompaction { id } => {
             Some(TurnItem::ContextCompaction(ContextCompactionItem {
@@ -1012,6 +1018,7 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
         | ThreadItem::McpToolCall { .. }
         | ThreadItem::DynamicToolCall { .. }
         | ThreadItem::CollabAgentToolCall { .. }
+        | ThreadItem::HookPrompt { .. }
         | ThreadItem::ImageView { .. }
         | ThreadItem::EnteredReviewMode { .. }
         | ThreadItem::ExitedReviewMode { .. } => {
@@ -1925,6 +1932,7 @@ mod tests {
                         status: "completed".to_string(),
                         revised_prompt: Some("diagram".to_string()),
                         result: "image.png".to_string(),
+                        saved_path: None,
                     },
                     ThreadItem::ContextCompaction {
                         id: "compact-1".to_string(),

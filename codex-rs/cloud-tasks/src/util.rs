@@ -76,8 +76,12 @@ pub async fn load_auth_manager(
     )
     .await
     .context("failed to load cloud-tasks config")?;
-    let auth_runtime = AuthFileRuntime::from_config(&config, auth_file)
-        .map_err(|err| anyhow::anyhow!("failed to resolve cloud-tasks auth storage: {err}"))?;
+    let auth_runtime = AuthFileRuntime::new(
+        config.codex_home.clone(),
+        config.cli_auth_credentials_store_mode,
+        auth_file,
+    )
+    .map_err(|err| anyhow::anyhow!("failed to resolve cloud-tasks auth storage: {err}"))?;
     auth_runtime
         .shared_auth_manager(false)
         .map_err(|err| anyhow::anyhow!("failed to create cloud-tasks auth manager: {err}"))
@@ -166,8 +170,8 @@ mod tests {
     use super::*;
     use codex_core::auth::AuthCredentialsStoreMode;
     use codex_core::auth::AuthMode;
-    use codex_core::auth::save_auth_with_auth_file;
     use codex_login::AuthDotJson;
+    use codex_login::auth::save_auth_with_auth_file;
     use pretty_assertions::assert_eq;
     use reqwest::header::AUTHORIZATION;
     use std::time::SystemTime;

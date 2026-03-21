@@ -47,7 +47,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 
-use crate::features::Feature;
+use codex_features::Feature;
 pub(crate) use compact::CompactTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;
@@ -157,8 +157,6 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.sync_mcp_request_headers_for_turn(initial_turn_context.as_ref())
-            .await;
 
         let task: Arc<dyn SessionTask> = Arc::new(task);
         let task_kind = task.kind();
@@ -241,7 +239,6 @@ impl Session {
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             active_turn.clear_pending().await;
         }
-        self.clear_mcp_request_headers().await;
     }
 
     pub async fn on_task_finished(
@@ -278,9 +275,6 @@ impl Session {
         drop(active);
         if let Some(current_turn_metadata_state) = current_turn_metadata_state {
             current_turn_metadata_state.cancel_git_enrichment_task();
-        }
-        if should_clear_active_turn {
-            self.clear_mcp_request_headers().await;
         }
         if !pending_input.is_empty() {
             for pending_input_item in pending_input {

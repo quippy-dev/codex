@@ -46,7 +46,11 @@ pub(crate) async fn prepare_runtime_bootstrap(
                 }
             }
 
-            let auth_runtime = AuthFileRuntime::from_config(&config, auth_file.clone())?;
+            let auth_runtime = AuthFileRuntime::new(
+                config.codex_home.clone(),
+                config.cli_auth_credentials_store_mode,
+                auth_file.clone(),
+            )?;
             let auth_manager = auth_runtime.shared_auth_manager(false)?;
             cloud_requirements_loader(
                 auth_manager,
@@ -82,8 +86,12 @@ pub(crate) async fn prepare_runtime_bootstrap(
         }
     };
 
-    let auth_storage_home =
-        AuthFileRuntime::from_config(&config, auth_file)?.into_auth_storage_home();
+    let auth_storage_home = AuthFileRuntime::new(
+        config.codex_home.clone(),
+        config.cli_auth_credentials_store_mode,
+        auth_file,
+    )?
+    .into_auth_storage_home();
 
     Ok(RuntimeBootstrap {
         cli_kv_overrides,
