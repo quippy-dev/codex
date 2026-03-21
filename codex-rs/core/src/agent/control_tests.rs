@@ -4026,6 +4026,8 @@ async fn fork_agent_uses_manager_default_auth_when_parent_rollout_has_no_auth_fi
         &config,
         default_auth_manager.clone(),
         SessionSource::default(),
+        config.model_catalog.clone(),
+        config.custom_models.clone(),
         crate::models_manager::collaboration_mode_presets::CollaborationModesConfig::default(),
     );
     let control = manager.agent_control();

@@ -213,6 +213,8 @@ impl InProcessClientStartArgs {
             self.config.as_ref(),
             auth_manager.clone(),
             self.session_source.clone(),
+            self.config.model_catalog.clone(),
+            self.config.custom_models.clone(),
             CollaborationModesConfig {
                 default_mode_request_user_input: self
                     .config
@@ -1539,6 +1541,8 @@ mod tests {
             &config,
             auth_manager.clone(),
             SessionSource::Exec,
+            config.model_catalog.clone(),
+            config.custom_models.clone(),
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features
