@@ -417,6 +417,7 @@ fn test_build_specs_collab_tools_enabled() {
             "send_input",
             "resume_agent",
             "list_agents",
+            "peek_agents",
             "wait",
             "wait_agent",
             "close_agent",
@@ -445,7 +446,7 @@ fn test_build_specs_collab_tools_without_watchdog_feature() {
     });
     let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
-    assert_contains_tool_names(&tools, &["list_agents"]);
+    assert_contains_tool_names(&tools, &["list_agents", "peek_agents"]);
     assert_lacks_tool_name(&tools, "compact_parent_context");
 }
 
@@ -522,6 +523,7 @@ fn test_build_specs_agent_job_worker_tools_enabled() {
             "send_input",
             "resume_agent",
             "list_agents",
+            "peek_agents",
             "wait",
             "wait_agent",
             "close_agent",
@@ -557,6 +559,7 @@ fn test_build_specs_collab_tools_without_spawn_csv_feature() {
             "send_input",
             "resume_agent",
             "list_agents",
+            "peek_agents",
             "wait",
             "close_agent",
         ],

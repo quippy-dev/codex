@@ -54,6 +54,7 @@ fn unsupported_message_calls_out_collab_feature_or_depth_gating() {
         "resume_agent",
         "compact_parent_context",
         "list_agents",
+        "peek_agents",
         "wait",
         "close_agent",
     ] {

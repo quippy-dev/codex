@@ -421,6 +421,7 @@ fn is_collab_tool_name(tool_name: &str) -> bool {
             | "resume_agent"
             | "compact_parent_context"
             | "list_agents"
+            | "peek_agents"
             | "wait"
             | "close_agent"
     )

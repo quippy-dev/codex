@@ -28,6 +28,8 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentReasoningDeltaEvent;
 use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -82,6 +84,25 @@ struct ListAgentEntryForTest {
     parent_id: String,
     status: AgentStatus,
     depth: usize,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PeekAgentsResultForTest {
+    agents: Vec<PeekAgentEntryForTest>,
+    next_cursor: u64,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PeekAgentEntryForTest {
+    id: String,
+    parent_id: String,
+    status: AgentStatus,
+    depth: usize,
+    cursor: u64,
+    prompt_preview: Option<String>,
+    reasoning_summary: Option<String>,
+    latest_message_preview: Option<String>,
+    terminal_summary: Option<String>,
 }
 
 async fn spawn_watchdog_for_test(
@@ -1768,6 +1789,259 @@ async fn list_agents_parent_alias_targets_immediate_parent() {
         .agent_control
         .shutdown_agent(child_id)
         .await;
+}
+
+#[tokio::test]
+async fn peek_agents_parent_alias_targets_immediate_parent_with_cached_progress() {
+    let (mut root_session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let agent_control = manager.agent_control();
+    root_session.services.agent_control = agent_control.clone();
+    let root_thread_id = root_session.conversation_id;
+    let child_id = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(root_thread_id, 1)),
+        )
+        .await
+        .expect("spawn child handle");
+    let grandchild_id = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(child_id, 2)),
+        )
+        .await
+        .expect("spawn grandchild handle");
+
+    agent_control
+        .record_prompt_preview(grandchild_id, "  investigate   flaky wait path  ")
+        .await;
+    agent_control
+        .observe_progress_event(
+            grandchild_id,
+            &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
+                delta: "collecting signal".to_string(),
+            }),
+        )
+        .await;
+    agent_control
+        .observe_progress_event(
+            grandchild_id,
+            &EventMsg::AgentMessage(AgentMessageEvent {
+                message: "found root cause".to_string(),
+                phase: None,
+                memory_citation: None,
+            }),
+        )
+        .await;
+
+    let child_session = manager
+        .get_thread(grandchild_id)
+        .await
+        .expect("grandchild thread should exist")
+        .codex
+        .session
+        .clone();
+
+    let invocation = invocation(
+        child_session.clone(),
+        Arc::new(turn),
+        "peek_agents",
+        function_payload(json!({
+            "id": "parent",
+            "recursive": false
+        })),
+    );
+    let output = MultiAgentHandler
+        .handle(invocation)
+        .await
+        .expect("peek_agents should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: PeekAgentsResultForTest =
+        serde_json::from_str(&content).expect("peek_agents result should be json");
+    let expected_status = agent_control.get_status(grandchild_id).await;
+    assert_eq!(
+        result.agents,
+        vec![PeekAgentEntryForTest {
+            id: grandchild_id.to_string(),
+            parent_id: child_id.to_string(),
+            status: expected_status,
+            depth: 1,
+            cursor: result.agents[0].cursor,
+            prompt_preview: Some("investigate flaky wait path".to_string()),
+            reasoning_summary: Some("collecting signal".to_string()),
+            latest_message_preview: Some("found root cause".to_string()),
+            terminal_summary: None,
+        }]
+    );
+    assert_eq!(result.next_cursor, result.agents[0].cursor);
+    assert_eq!(success, Some(true));
+
+    let _ = child_session
+        .services
+        .agent_control
+        .shutdown_agent(child_id)
+        .await;
+}
+
+#[tokio::test]
+async fn peek_agents_cursor_returns_incremental_updates_with_limit() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let agent_control = manager.agent_control();
+    session.services.agent_control = agent_control.clone();
+    let root_thread_id = session.conversation_id;
+    let child_a = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(root_thread_id, 1)),
+        )
+        .await
+        .expect("spawn child a");
+    let child_b = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(root_thread_id, 1)),
+        )
+        .await
+        .expect("spawn child b");
+
+    agent_control
+        .record_prompt_preview(child_a, "alpha work item")
+        .await;
+    agent_control
+        .record_prompt_preview(child_b, "beta work item")
+        .await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let first = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "peek_agents",
+            function_payload(json!({ "recursive": false })),
+        ))
+        .await
+        .expect("initial peek_agents should succeed");
+    let (first_content, _) = expect_text_output(first);
+    let first_result: PeekAgentsResultForTest =
+        serde_json::from_str(&first_content).expect("first peek result should be json");
+    assert_eq!(first_result.agents.len(), 2);
+    let first_cursor = first_result.next_cursor;
+
+    agent_control
+        .observe_progress_event(
+            child_b,
+            &EventMsg::AgentMessage(AgentMessageEvent {
+                message: "beta completed".to_string(),
+                phase: None,
+                memory_citation: None,
+            }),
+        )
+        .await;
+    agent_control
+        .observe_progress_event(
+            child_a,
+            &EventMsg::AgentMessage(AgentMessageEvent {
+                message: "alpha completed".to_string(),
+                phase: None,
+                memory_citation: None,
+            }),
+        )
+        .await;
+
+    let second = MultiAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "peek_agents",
+            function_payload(json!({
+                "recursive": false,
+                "cursor": first_cursor,
+                "limit": 1
+            })),
+        ))
+        .await
+        .expect("incremental peek_agents should succeed");
+    let (second_content, _) = expect_text_output(second);
+    let second_result: PeekAgentsResultForTest =
+        serde_json::from_str(&second_content).expect("second peek result should be json");
+    assert_eq!(second_result.agents.len(), 1);
+    assert!(second_result.agents[0].cursor > first_cursor);
+    assert_eq!(second_result.next_cursor, second_result.agents[0].cursor);
+}
+
+#[tokio::test]
+async fn peek_agents_default_returns_newest_updates_first_when_limited() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let agent_control = manager.agent_control();
+    session.services.agent_control = agent_control.clone();
+    let root_thread_id = session.conversation_id;
+    let child_recent = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(root_thread_id, 1)),
+        )
+        .await
+        .expect("spawn recent child");
+    let child_old = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(root_thread_id, 1)),
+        )
+        .await
+        .expect("spawn old child");
+    let _child_idle = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source(root_thread_id, 1)),
+        )
+        .await
+        .expect("spawn idle child");
+
+    agent_control
+        .record_prompt_preview(child_old, "old progress")
+        .await;
+    agent_control
+        .record_prompt_preview(child_recent, "recent progress")
+        .await;
+    agent_control
+        .observe_progress_event(
+            child_recent,
+            &EventMsg::AgentMessage(AgentMessageEvent {
+                message: "newest event".to_string(),
+                phase: None,
+                memory_citation: None,
+            }),
+        )
+        .await;
+
+    let output = MultiAgentHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "peek_agents",
+            function_payload(json!({
+                "recursive": false,
+                "limit": 1
+            })),
+        ))
+        .await
+        .expect("peek_agents should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: PeekAgentsResultForTest =
+        serde_json::from_str(&content).expect("peek result should be json");
+
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].id, child_recent.to_string());
+    assert_eq!(
+        result.agents[0].latest_message_preview.as_deref(),
+        Some("newest event")
+    );
+    assert_eq!(result.next_cursor, result.agents[0].cursor);
+    assert_eq!(success, Some(true));
 }
 
 #[tokio::test]

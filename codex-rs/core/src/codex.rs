@@ -3000,6 +3000,10 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        self.services
+            .agent_control
+            .observe_progress_event(self.conversation_id, &event.msg)
+            .await;
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }

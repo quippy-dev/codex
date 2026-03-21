@@ -65,8 +65,19 @@ Guidance:
 - Treat `wait` as returning on the first completion or timeout, not a full reconciliation of every agent.
 - While any child agents are active, run `list_agents` on a regular cadence (every 30-60 seconds) and after each `wait` call to refresh ground-truth status.
 - Keep an explicit set of outstanding agent ids. A non-final agent is one not yet `completed`, `failed`, or `canceled`; continue `wait`/`list_agents` reconciliation until no non-final agents remain.
+- If you only need a quick progress pulse between waits, use `peek_agents` sparingly instead of interrupting workers.
 
-### 4) `resume_agent`
+### 4) `peek_agents`
+
+Lightweight progress snapshots for active agents.
+
+Guidance:
+- Use it sparingly between waits when you want a quick progress pulse.
+- Treat it as pull-only and incremental, not a coordination channel.
+- Do not use it instead of `send_input` when you need to change direction or assign work.
+- Use `list_agents` when you need authoritative reconciliation across multiple active agents.
+
+### 5) `resume_agent`
 
 Resume a previously closed agent by id.
 
@@ -74,7 +85,7 @@ Guidance:
 - Use this when you need to continue work on a known closed agent instead of spawning a brand-new thread.
 - After resume, treat the returned id like any other active agent id (`send_input`, `wait`, `close_agent`).
 
-### 5) `list_agents`
+### 6) `list_agents`
 
 List child-agent status for a chosen owner thread.
 
@@ -84,7 +95,7 @@ Guidance:
 - `id = "parent"` targets the immediate parent thread.
 - `id = "root"` targets the true root thread.
 
-### 6) `close_agent`
+### 7) `close_agent`
 
 Close an agent that is complete, stuck, or no longer relevant.
 
@@ -92,7 +103,7 @@ Guidance:
 - Keep the set of active agents small and purposeful.
 - Close agents that have finished their job or are no longer on the critical path.
 
-### 7) `compact_parent_context`
+### 8) `compact_parent_context`
 
 Watchdog-only: request compaction for the watchdog helper's parent thread when it is idle and appears stuck.
 

@@ -4,10 +4,12 @@ use super::agent_delivery::log_post_turn_agent_enqueue_error;
 use super::agent_delivery::should_defer_agent_delivery;
 use super::agent_delivery::should_queue_agent_delivery_until_turn_end;
 use super::inbox_delivery::build_agent_inbox_items;
+use super::progress_cache::AgentProgressCache;
 use super::watchdog::RemovedWatchdog;
 use super::watchdog::WatchdogManager;
 use super::watchdog::WatchdogRegistration;
 use crate::AuthManager;
+use crate::agent::AgentProgressSnapshot;
 use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
 use crate::agent::guards::SpawnReservation;
@@ -40,6 +42,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AGENT_INBOX_KIND;
 #[cfg(test)]
 use codex_protocol::protocol::AgentInboxPayload;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ForkReferenceItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
@@ -117,6 +120,7 @@ pub(crate) struct AgentControl {
     guards: Arc<Guards>,
     watchdogs: Arc<WatchdogManager>,
     watchdog_compactions_in_progress: Arc<Mutex<HashSet<ThreadId>>>,
+    progress_cache: Arc<AgentProgressCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +174,25 @@ impl AgentControl {
             guards,
             watchdogs,
             watchdog_compactions_in_progress: Arc::new(Mutex::new(HashSet::new())),
+            progress_cache: Arc::new(AgentProgressCache::default()),
         }
+    }
+
+    pub(crate) async fn record_prompt_preview(&self, thread_id: ThreadId, prompt: &str) {
+        self.progress_cache
+            .record_prompt_preview(thread_id, prompt)
+            .await;
+    }
+
+    pub(crate) async fn observe_progress_event(&self, thread_id: ThreadId, event: &EventMsg) {
+        self.progress_cache.observe_event(thread_id, event).await;
+    }
+
+    pub(crate) async fn progress_snapshots(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> HashMap<ThreadId, AgentProgressSnapshot> {
+        self.progress_cache.snapshots(thread_ids).await
     }
 
     /// Spawn a new agent thread and submit the initial prompt.

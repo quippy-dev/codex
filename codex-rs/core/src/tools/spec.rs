@@ -1522,6 +1522,64 @@ fn create_list_agents_tool(agent_watchdog: bool) -> ToolSpec {
     })
 }
 
+fn create_peek_agents_tool(agent_watchdog: bool) -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Identifier of the owner agent whose child progress to inspect. Aliases: `self` (default), `parent`, `root`."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "recursive".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true (default), include all descendants recursively. When false, include only direct children."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional incremental cursor. When provided, returns only entries with newer cached progress."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "limit".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional maximum number of entries to return (default 20, max 200).".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "peek_agents".to_string(),
+        description: if agent_watchdog {
+            "Non-blocking progress snapshot for child agents. Returns compact cached previews (prompt, reasoning, latest message, terminal) and supports incremental cursors. Polling this will not make a watchdog fire."
+                .to_string()
+        } else {
+            "Non-blocking progress snapshot for child agents. Returns compact cached previews (prompt, reasoning, latest message, terminal) and supports incremental cursors."
+                .to_string()
+        },
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
 fn create_wait_tool(agent_watchdog: bool) -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -3106,6 +3164,12 @@ pub(crate) fn build_specs_with_discoverable_tools(
         );
         push_tool_spec(
             &mut builder,
+            create_peek_agents_tool(config.agent_watchdog),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
             create_wait_tool(config.agent_watchdog),
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
@@ -3144,6 +3208,10 @@ pub(crate) fn build_specs_with_discoverable_tools(
         );
         builder.register_handler(
             "list_agents",
+            Arc::new(crate::tools::handlers::multi_agents::MultiAgentHandler),
+        );
+        builder.register_handler(
+            "peek_agents",
             Arc::new(crate::tools::handlers::multi_agents::MultiAgentHandler),
         );
         builder.register_handler(

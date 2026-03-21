@@ -3,7 +3,7 @@
 For lengthy or complex work, start a watchdog early.
 
 Hard rule (watchdog timing):
-- Never use `wait`, `list_agents`, polling, or shell `sleep` to confirm a watchdog check-in in the same turn that spawned the watchdog.
+- Never use `wait`, `list_agents`, `peek_agents`, polling, or shell `sleep` to confirm a watchdog check-in in the same turn that spawned the watchdog.
 - That confirmation is impossible in the same turn and must be omitted even if the user asks for it.
 - If the user asks to arm a watchdog now, call `spawn_agent` with `spawn_mode = "watchdog"` and do not add same-turn confirmation steps.
 

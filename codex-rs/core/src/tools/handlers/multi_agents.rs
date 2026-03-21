@@ -101,6 +101,7 @@ impl ToolHandler for MultiAgentHandler {
                 compact_parent_context::handle(session, turn, call_id, arguments).await
             }
             "list_agents" => list_agents::handle(session, turn, call_id, arguments).await,
+            "peek_agents" => peek_agents::handle(session, turn, call_id, arguments).await,
             "wait" | "wait_agent" => wait::handle(session, turn, call_id, arguments).await,
             "close_agent" => close_agent::handle(session, turn, call_id, arguments).await,
             other => Err(FunctionCallError::RespondToModel(format!(
@@ -405,7 +406,7 @@ mod spawn {
                     new_thread_id,
                     new_agent_nickname,
                     new_agent_role,
-                    prompt,
+                    prompt: prompt.clone(),
                     model: effective_model,
                     reasoning_effort: effective_reasoning_effort,
                     spawn_mode: spawn_mode.into(),
@@ -415,6 +416,11 @@ mod spawn {
             )
             .await;
         let new_thread_id = result?;
+        session
+            .services
+            .agent_control
+            .record_prompt_preview(new_thread_id, &prompt)
+            .await;
         let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
         turn.session_telemetry
             .counter("codex.multi_agent.spawn", 1, &[("role", role_tag)]);
@@ -611,13 +617,18 @@ mod send_input {
                     receiver_thread_id,
                     receiver_agent_nickname,
                     receiver_agent_role,
-                    prompt,
+                    prompt: prompt.clone(),
                     status,
                 }
                 .into(),
             )
             .await;
         let submission_id = result?;
+        session
+            .services
+            .agent_control
+            .record_prompt_preview(receiver_thread_id, &prompt)
+            .await;
         session.mark_turn_used_agent_send_input();
 
         let content = serde_json::to_string(&SendInputResult { submission_id }).map_err(|err| {
@@ -974,21 +985,8 @@ mod list_agents {
         arguments: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
-        let owner_thread_id = match args.id.as_deref().map(str::trim) {
-            Some(id) if !id.is_empty() && id == "parent" => session
-                .parent_thread_id()
-                .await
-                .unwrap_or(session.conversation_id),
-            Some(id) if !id.is_empty() && id == "root" => {
-                session
-                    .services
-                    .agent_control
-                    .resolve_root_thread_id(session.conversation_id)
-                    .await
-            }
-            Some(id) if !id.is_empty() && !matches!(id, "self") => agent_id(id)?,
-            _ => session.conversation_id,
-        };
+        let owner_thread_id =
+            resolve_owner_thread_id(session.as_ref(), args.id.as_deref().map(str::trim)).await?;
 
         let listings = session
             .services
@@ -1015,6 +1013,166 @@ mod list_agents {
         })?;
 
         Ok(FunctionToolOutput::from_text(content, Some(true)))
+    }
+}
+
+mod peek_agents {
+    use super::*;
+    use crate::agent::AgentProgressSnapshot;
+    use std::sync::Arc;
+
+    const DEFAULT_PEEK_LIMIT: usize = 20;
+    const MAX_PEEK_LIMIT: usize = 200;
+
+    #[derive(Debug, Deserialize)]
+    struct PeekAgentsArgs {
+        id: Option<String>,
+        #[serde(default = "default_recursive")]
+        recursive: bool,
+        cursor: Option<u64>,
+        limit: Option<usize>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct PeekAgentsResult {
+        agents: Vec<PeekAgentEntry>,
+        next_cursor: u64,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct PeekAgentEntry {
+        id: String,
+        parent_id: String,
+        status: AgentStatus,
+        depth: usize,
+        cursor: u64,
+        prompt_preview: Option<String>,
+        reasoning_summary: Option<String>,
+        latest_message_preview: Option<String>,
+        terminal_summary: Option<String>,
+    }
+
+    fn default_recursive() -> bool {
+        true
+    }
+
+    pub async fn handle(
+        session: Arc<Session>,
+        _turn: Arc<TurnContext>,
+        _call_id: String,
+        arguments: String,
+    ) -> Result<FunctionToolOutput, FunctionCallError> {
+        let args: PeekAgentsArgs = parse_arguments(&arguments)?;
+        let owner_thread_id =
+            resolve_owner_thread_id(session.as_ref(), args.id.as_deref().map(str::trim)).await?;
+        let listings = session
+            .services
+            .agent_control
+            .list_agents(owner_thread_id, args.recursive, /*all*/ false)
+            .await
+            .map_err(multi_agent_spawn_error)?;
+        let thread_ids = listings
+            .iter()
+            .map(|entry| entry.thread_id)
+            .collect::<Vec<_>>();
+        let progress_by_thread = session
+            .services
+            .agent_control
+            .progress_snapshots(&thread_ids)
+            .await;
+        let max_selected_cursor = progress_by_thread
+            .values()
+            .map(|snapshot| snapshot.cursor)
+            .max()
+            .unwrap_or_default();
+        let cursor = args.cursor.unwrap_or_default();
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_PEEK_LIMIT)
+            .clamp(1, MAX_PEEK_LIMIT);
+        let incremental = args.cursor.is_some();
+
+        let mut agents = listings
+            .into_iter()
+            .filter_map(|entry| {
+                let progress = progress_by_thread.get(&entry.thread_id).cloned();
+                let snapshot_cursor = progress
+                    .as_ref()
+                    .map(|snapshot| snapshot.cursor)
+                    .unwrap_or_default();
+                if incremental && snapshot_cursor <= cursor {
+                    return None;
+                }
+                Some(build_peek_agent_entry(entry, progress))
+            })
+            .collect::<Vec<_>>();
+        if incremental {
+            agents.sort_by(|left, right| {
+                left.cursor
+                    .cmp(&right.cursor)
+                    .then(left.id.cmp(&right.id))
+                    .then(left.depth.cmp(&right.depth))
+            });
+        } else {
+            agents.sort_by(|left, right| {
+                right
+                    .cursor
+                    .cmp(&left.cursor)
+                    .then(left.id.cmp(&right.id))
+                    .then(left.depth.cmp(&right.depth))
+            });
+        }
+        let truncated = agents.len() > limit;
+        agents.truncate(limit);
+
+        let next_cursor = if truncated {
+            if incremental {
+                agents
+                    .last()
+                    .map(|entry| entry.cursor)
+                    .unwrap_or(max_selected_cursor.max(cursor))
+            } else {
+                max_selected_cursor.max(cursor)
+            }
+        } else {
+            max_selected_cursor.max(cursor)
+        };
+        let content = serde_json::to_string(&PeekAgentsResult {
+            agents,
+            next_cursor,
+        })
+        .map_err(|err| {
+            FunctionCallError::Fatal(format!("failed to serialize peek_agents result: {err}"))
+        })?;
+
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
+    }
+
+    fn build_peek_agent_entry(
+        listing: crate::agent::control::AgentListing,
+        progress: Option<AgentProgressSnapshot>,
+    ) -> PeekAgentEntry {
+        let AgentProgressSnapshot {
+            cursor,
+            prompt_preview,
+            reasoning_summary,
+            latest_message_preview,
+            terminal_summary,
+        } = progress.unwrap_or_default();
+        PeekAgentEntry {
+            id: listing.thread_id.to_string(),
+            parent_id: listing
+                .parent_thread_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            status: listing.status,
+            depth: listing.depth,
+            cursor,
+            prompt_preview,
+            reasoning_summary,
+            latest_message_preview,
+            terminal_summary,
+        }
     }
 }
 
@@ -1447,6 +1605,25 @@ fn watchdog_ref_spawn_mode(
     watchdog_target_ids
         .contains(&receiver_thread_id)
         .then_some(AgentSpawnMode::Watchdog)
+}
+
+async fn resolve_owner_thread_id(
+    session: &Session,
+    owner_alias: Option<&str>,
+) -> Result<ThreadId, FunctionCallError> {
+    match owner_alias {
+        Some("parent") => Ok(session
+            .parent_thread_id()
+            .await
+            .unwrap_or(session.conversation_id)),
+        Some("root") => Ok(session
+            .services
+            .agent_control
+            .resolve_root_thread_id(session.conversation_id)
+            .await),
+        Some(alias) if !alias.is_empty() && !matches!(alias, "self") => agent_id(alias),
+        _ => Ok(session.conversation_id),
+    }
 }
 
 pub mod close_agent {
