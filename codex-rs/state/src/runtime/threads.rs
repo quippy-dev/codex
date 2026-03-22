@@ -13,6 +13,7 @@ SELECT
     source,
     agent_nickname,
     agent_role,
+    agent_path,
     model_provider,
     model,
     reasoning_effort,
@@ -174,6 +175,62 @@ WHERE child_thread_id = ?
             .await
     }
 
+    /// Find a direct spawned child of `parent_thread_id` by canonical agent path.
+    pub async fn find_thread_spawn_child_by_path(
+        &self,
+        parent_thread_id: ThreadId,
+        agent_path: &str,
+    ) -> anyhow::Result<Option<ThreadId>> {
+        let rows = sqlx::query(
+            r#"
+SELECT threads.id
+FROM thread_spawn_edges
+JOIN threads ON threads.id = thread_spawn_edges.child_thread_id
+WHERE thread_spawn_edges.parent_thread_id = ?
+  AND threads.agent_path = ?
+ORDER BY threads.id
+LIMIT 2
+            "#,
+        )
+        .bind(parent_thread_id.to_string())
+        .bind(agent_path)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        one_thread_id_from_rows(rows, agent_path)
+    }
+
+    /// Find a spawned descendant of `root_thread_id` by canonical agent path.
+    pub async fn find_thread_spawn_descendant_by_path(
+        &self,
+        root_thread_id: ThreadId,
+        agent_path: &str,
+    ) -> anyhow::Result<Option<ThreadId>> {
+        let rows = sqlx::query(
+            r#"
+WITH RECURSIVE subtree(child_thread_id) AS (
+    SELECT child_thread_id
+    FROM thread_spawn_edges
+    WHERE parent_thread_id = ?
+    UNION ALL
+    SELECT edge.child_thread_id
+    FROM thread_spawn_edges AS edge
+    JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
+)
+SELECT threads.id
+FROM subtree
+JOIN threads ON threads.id = subtree.child_thread_id
+WHERE threads.agent_path = ?
+ORDER BY threads.id
+LIMIT 2
+            "#,
+        )
+        .bind(root_thread_id.to_string())
+        .bind(agent_path)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        one_thread_id_from_rows(rows, agent_path)
+    }
+
     async fn list_thread_spawn_children_matching(
         &self,
         parent_thread_id: ThreadId,
@@ -325,6 +382,7 @@ SELECT
     source,
     agent_nickname,
     agent_role,
+    agent_path,
     model_provider,
     model,
     reasoning_effort,
@@ -425,6 +483,7 @@ INSERT INTO threads (
     source,
     agent_nickname,
     agent_role,
+    agent_path,
     model_provider,
     model,
     reasoning_effort,
@@ -441,7 +500,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -452,6 +511,7 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.source.as_str())
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
+        .bind(metadata.agent_path.as_deref())
         .bind(metadata.model_provider.as_str())
         .bind(metadata.model.as_deref())
         .bind(
@@ -550,6 +610,7 @@ INSERT INTO threads (
     source,
     agent_nickname,
     agent_role,
+    agent_path,
     model_provider,
     model,
     reasoning_effort,
@@ -566,7 +627,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -574,6 +635,7 @@ ON CONFLICT(id) DO UPDATE SET
     source = excluded.source,
     agent_nickname = excluded.agent_nickname,
     agent_role = excluded.agent_role,
+    agent_path = excluded.agent_path,
     model_provider = excluded.model_provider,
     model = excluded.model,
     reasoning_effort = excluded.reasoning_effort,
@@ -598,6 +660,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.source.as_str())
         .bind(metadata.agent_nickname.as_deref())
         .bind(metadata.agent_role.as_deref())
+        .bind(metadata.agent_path.as_deref())
         .bind(metadata.model_provider.as_str())
         .bind(metadata.model.as_deref())
         .bind(
@@ -782,6 +845,26 @@ ON CONFLICT(thread_id, position) DO NOTHING
             .execute(self.pool.as_ref())
             .await?;
         Ok(result.rows_affected())
+    }
+}
+
+fn one_thread_id_from_rows(
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+    agent_path: &str,
+) -> anyhow::Result<Option<ThreadId>> {
+    let mut ids = rows
+        .into_iter()
+        .map(|row| {
+            let id: String = row.try_get("id")?;
+            ThreadId::try_from(id).map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match ids.len() {
+        0 => Ok(None),
+        1 => Ok(ids.pop()),
+        _ => Err(anyhow::anyhow!(
+            "multiple agents found for canonical path `{agent_path}`"
+        )),
     }
 }
 
@@ -976,6 +1059,7 @@ mod tests {
                 originator: String::new(),
                 cli_version: String::new(),
                 source: SessionSource::Cli,
+                agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
                 model_provider: None,
@@ -1031,6 +1115,7 @@ mod tests {
                 originator: String::new(),
                 cli_version: String::new(),
                 source: SessionSource::Cli,
+                agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
                 model_provider: None,

@@ -655,6 +655,7 @@ fn send_input_tool_does_not_require_id_for_thread_spawn_sessions() {
         session_source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),
             depth: 1,
+            agent_path: None,
             agent_nickname: None,
             agent_role: None,
         }),

@@ -352,11 +352,13 @@ fn with_thread_spawn_agent_metadata(
         CoreSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth,
+            agent_path,
             agent_nickname: existing_agent_nickname,
             agent_role: existing_agent_role,
         }) => CoreSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth,
+            agent_path,
             agent_nickname: agent_nickname.or(existing_agent_nickname),
             agent_role: agent_role.or(existing_agent_role),
         }),
@@ -607,6 +609,7 @@ mod tests {
             source: CoreSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
                 depth: 1,
+                agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
             }),
@@ -640,6 +643,7 @@ mod tests {
             serde_json::to_string(&CoreSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: ThreadId::from_string("ad7f0408-99b8-4f6e-a46f-bd0eec433370")?,
                 depth: 1,
+                agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
             }))?;

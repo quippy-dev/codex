@@ -4,29 +4,6 @@ use crate::tools::code_mode::PUBLIC_TOOL_NAME;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
-pub(crate) struct CodeModeToolReference {
-    pub(crate) module_path: String,
-    pub(crate) namespace: Vec<String>,
-    pub(crate) tool_key: String,
-}
-
-pub(crate) fn code_mode_tool_reference(tool_name: &str) -> CodeModeToolReference {
-    if let Some((server_name, tool_key)) = split_qualified_tool_name(tool_name) {
-        let namespace = vec!["mcp".to_string(), server_name];
-        return CodeModeToolReference {
-            module_path: format!("tools/{}.js", namespace.join("/")),
-            namespace,
-            tool_key,
-        };
-    }
-
-    CodeModeToolReference {
-        module_path: "tools.js".to_string(),
-        namespace: Vec::new(),
-        tool_key: tool_name.to_string(),
-    }
-}
-
 pub(crate) fn augment_tool_spec_for_code_mode(spec: ToolSpec, code_mode_enabled: bool) -> ToolSpec {
     if !code_mode_enabled {
         return spec;

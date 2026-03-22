@@ -354,7 +354,7 @@ pub async fn run_login_status(
                     std::process::exit(1);
                 }
             },
-            AuthMode::Chatgpt => {
+            AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => {
                 eprintln!("Logged in using ChatGPT");
                 std::process::exit(0);
             }
@@ -409,12 +409,16 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
 }
 
 fn resolve_auth_storage_home_or_exit(config: &Config, auth_file: Option<PathBuf>) -> PathBuf {
-    AuthFileRuntime::from_config(config, auth_file)
-        .map(AuthFileRuntime::into_auth_storage_home)
-        .unwrap_or_else(|err| {
-            eprintln!("Error resolving auth storage path: {err}");
-            std::process::exit(1);
-        })
+    AuthFileRuntime::new(
+        config.codex_home.clone(),
+        config.cli_auth_credentials_store_mode,
+        auth_file,
+    )
+    .map(AuthFileRuntime::into_auth_storage_home)
+    .unwrap_or_else(|err| {
+        eprintln!("Error resolving auth storage path: {err}");
+        std::process::exit(1);
+    })
 }
 
 fn safe_format_key(key: &str) -> String {

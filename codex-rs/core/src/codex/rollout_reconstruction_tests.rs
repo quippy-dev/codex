@@ -67,6 +67,7 @@ fn write_rollout_items(
                 originator: "codex".to_string(),
                 cli_version: "test".to_string(),
                 source: SessionSource::Exec,
+                agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
                 model_provider: Some("openai".to_string()),
@@ -518,6 +519,87 @@ async fn reconstruct_history_rollback_clears_latest_proposed_plan_text_from_roll
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
+    assert_eq!(reconstructed.latest_proposed_plan_text, None);
+}
+
+#[tokio::test]
+async fn reconstruct_history_ignores_obsolete_plan_items_before_replacement_history() {
+    let (session, turn_context) = make_session_and_context().await;
+    let compact_turn_id = "compact-turn".to_string();
+    let older_turn_id = "older-plan-turn".to_string();
+    let compact_context = TurnContextItem {
+        turn_id: Some(compact_turn_id.clone()),
+        ..turn_context.to_turn_context_item()
+    };
+    let obsolete_plan_text = "- obsolete plan".to_string();
+    let replacement_history = vec![
+        user_message("surviving user"),
+        assistant_message("surviving assistant"),
+    ];
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: older_turn_id.clone(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "older plan request".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::default(),
+            turn_id: older_turn_id.clone(),
+            item: TurnItem::Plan(PlanItem {
+                id: "obsolete-plan-id".to_string(),
+                text: obsolete_plan_text,
+            }),
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: older_turn_id,
+                last_agent_message: None,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: compact_turn_id.clone(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "surviving user".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::TurnContext(compact_context),
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            retained_proposed_plan: RetainedProposedPlan::None,
+            replacement_history: Some(replacement_history.clone()),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: compact_turn_id,
+                last_agent_message: None,
+            },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.history, replacement_history);
     assert_eq!(reconstructed.latest_proposed_plan_text, None);
 }
 

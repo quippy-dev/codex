@@ -11,8 +11,6 @@ pub(crate) struct LocalChatgptAuth {
     pub(crate) chatgpt_plan_type: Option<String>,
 }
 
-impl LocalChatgptAuth {}
-
 pub(crate) fn load_local_chatgpt_auth(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -61,9 +59,9 @@ mod tests {
     use chrono::Utc;
     use codex_app_server_protocol::AuthMode;
     use codex_core::auth::AuthDotJson;
-    use codex_core::auth::login_with_chatgpt_auth_tokens;
     use codex_core::auth::save_auth;
     use codex_core::token_data::TokenData;
+    use codex_login::auth::login_with_chatgpt_auth_tokens;
     use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde_json::json;

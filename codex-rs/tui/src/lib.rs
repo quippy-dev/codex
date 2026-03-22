@@ -12,6 +12,7 @@ use codex_core::AuthManager;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
 use codex_core::ThreadSortKey;
+use codex_core::auth::AuthConfig;
 use codex_core::auth::AuthFileRuntime;
 use codex_core::auth::AuthMode;
 use codex_core::auth::enforce_login_restrictions;
@@ -33,7 +34,6 @@ use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
 use codex_core::state_db::get_state_db;
-use codex_core::terminal::Multiplexer;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::AltScreenMode;
@@ -43,6 +43,8 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_state::log_db;
+use codex_terminal_detection::Multiplexer;
+use codex_terminal_detection::terminal_info;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -129,6 +131,7 @@ mod subagent_identity;
 mod subagent_panel;
 mod subagent_transcript;
 mod terminal_palette;
+mod terminal_title;
 mod text_formatting;
 mod theme_picker;
 mod thread_switch_replay;
@@ -274,7 +277,7 @@ pub use public_widgets::composer_input::ComposerInput;
 pub async fn run_main(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
-    _loader_overrides: LoaderOverrides,
+    loader_overrides: LoaderOverrides,
 ) -> std::io::Result<AppExitInfo> {
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
@@ -465,7 +468,12 @@ pub async fn run_main(
     }
 
     #[allow(clippy::print_stderr)]
-    if let Err(err) = enforce_login_restrictions(&config) {
+    if let Err(err) = enforce_login_restrictions(&AuthConfig {
+        codex_home: config.codex_home.clone(),
+        auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
+        forced_login_method: config.forced_login_method,
+        forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
+    }) {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -574,9 +582,11 @@ pub async fn run_main(
 
     run_ratatui_app(
         cli,
+        arg0_paths,
         config,
         overrides,
         cli_kv_overrides,
+        loader_overrides,
         cloud_requirements,
         feedback,
     )
@@ -587,9 +597,11 @@ pub async fn run_main(
 #[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
     cli: Cli,
+    arg0_paths: Arg0DispatchPaths,
     initial_config: Config,
     overrides: ConfigOverrides,
     cli_kv_overrides: Vec<(String, toml::Value)>,
+    loader_overrides: LoaderOverrides,
     mut cloud_requirements: CloudRequirementsLoader,
     feedback: codex_feedback::CodexFeedback,
 ) -> color_eyre::Result<AppExitInfo> {
@@ -636,10 +648,12 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let auth_runtime = AuthFileRuntime::from_config(&initial_config, cli.auth_file.clone())
-        .map_err(|err| {
-            std::io::Error::other(format!("Error resolving auth storage path: {err}"))
-        })?;
+    let auth_runtime = AuthFileRuntime::new(
+        initial_config.codex_home.clone(),
+        initial_config.cli_auth_credentials_store_mode,
+        cli.auth_file.clone(),
+    )
+    .map_err(|err| std::io::Error::other(format!("Error resolving auth storage path: {err}")))?;
     crate::voice::set_transcription_session_context(
         auth_runtime.auth_storage_home().to_path_buf(),
         initial_config.chatgpt_base_url.clone(),
@@ -998,6 +1012,9 @@ async fn run_ratatui_app(
         auth_manager,
         config,
         cli_kv_overrides.clone(),
+        arg0_paths,
+        loader_overrides,
+        cloud_requirements,
         overrides.clone(),
         active_profile,
         prompt,
@@ -1158,7 +1175,7 @@ fn determine_alt_screen_mode(no_alt_screen: bool, tui_alternate_screen: AltScree
             AltScreenMode::Always => true,
             AltScreenMode::Never => false,
             AltScreenMode::Auto => {
-                let terminal_info = codex_core::terminal::terminal_info();
+                let terminal_info = terminal_info();
                 !matches!(terminal_info.multiplexer, Some(Multiplexer::Zellij { .. }))
             }
         }
@@ -1254,7 +1271,7 @@ mod tests {
     use codex_core::config::ProjectConfig;
     use codex_core::config_loader::CloudRequirementsLoader;
     use codex_core::config_loader::LoaderOverrides;
-    use codex_core::features::Feature;
+    use codex_features::Feature;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
@@ -1269,6 +1286,11 @@ mod tests {
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_system_config: true,
+                ignore_system_requirements: true,
+                ..Default::default()
+            })
             .build()
             .await
     }
@@ -1279,7 +1301,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(false);
+        config.set_windows_sandbox_enabled(/*value*/ false);
 
         let should_show = should_show_trust_screen(&config);
         assert!(
@@ -1295,7 +1317,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(true);
+        config.set_windows_sandbox_enabled(/*value*/ true);
 
         let should_show = should_show_trust_screen(&config);
         if cfg!(target_os = "windows") {

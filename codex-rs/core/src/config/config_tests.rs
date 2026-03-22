@@ -13,9 +13,10 @@ use crate::config::types::NotificationMethod;
 use crate::config::types::Notifications;
 use crate::config::types::ToolSuggestDiscoverableType;
 use crate::config_loader::RequirementSource;
-use crate::features::Feature;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
+use codex_features::Feature;
+use codex_features::FeaturesToml;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -265,6 +266,7 @@ fn config_toml_deserializes_model_availability_nux() {
             show_tooltips: true,
             alternate_screen: AltScreenMode::default(),
             status_line: None,
+            terminal_title: None,
             theme: None,
             model_availability_nux: ModelAvailabilityNuxConfig {
                 shown_count: HashMap::from([
@@ -949,6 +951,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             show_tooltips: true,
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
+            terminal_title: None,
             theme: None,
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
         }
@@ -1688,7 +1691,7 @@ fn feature_table_overrides_legacy_flags() -> std::io::Result<()> {
     let mut entries = BTreeMap::new();
     entries.insert("apply_patch_freeform".to_string(), false);
     let cfg = ConfigToml {
-        features: Some(crate::features::FeaturesToml { entries }),
+        features: Some(FeaturesToml { entries }),
         ..Default::default()
     };
 
@@ -1736,7 +1739,7 @@ fn responses_websocket_features_do_not_change_wire_api() -> std::io::Result<()> 
         let mut entries = BTreeMap::new();
         entries.insert(feature_key.to_string(), true);
         let cfg = ConfigToml {
-            features: Some(crate::features::FeaturesToml { entries }),
+            features: Some(FeaturesToml { entries }),
             ..Default::default()
         };
 
@@ -4361,6 +4364,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             model_verbosity: None,
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+            experimental_exec_server_url: None,
             realtime_audio: RealtimeAudioConfig::default(),
             experimental_realtime_start_instructions: None,
             experimental_realtime_ws_base_url: None,
@@ -4399,6 +4403,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             tool_suggest: ToolSuggestConfig::default(),
             tui_alternate_screen: AltScreenMode::Auto,
             tui_status_line: None,
+            tui_terminal_title: None,
             tui_theme: None,
             otel: OtelConfig::default(),
         },
@@ -4506,6 +4511,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         model_verbosity: None,
         personality: Some(Personality::Pragmatic),
         chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+        experimental_exec_server_url: None,
         realtime_audio: RealtimeAudioConfig::default(),
         experimental_realtime_start_instructions: None,
         experimental_realtime_ws_base_url: None,
@@ -4544,6 +4550,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         tool_suggest: ToolSuggestConfig::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
+        tui_terminal_title: None,
         tui_theme: None,
         otel: OtelConfig::default(),
     };
@@ -4649,6 +4656,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         model_verbosity: None,
         personality: Some(Personality::Pragmatic),
         chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+        experimental_exec_server_url: None,
         realtime_audio: RealtimeAudioConfig::default(),
         experimental_realtime_start_instructions: None,
         experimental_realtime_ws_base_url: None,
@@ -4687,6 +4695,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         tool_suggest: ToolSuggestConfig::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
+        tui_terminal_title: None,
         tui_theme: None,
         otel: OtelConfig::default(),
     };
@@ -4778,6 +4787,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         model_verbosity: Some(Verbosity::High),
         personality: Some(Personality::Pragmatic),
         chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
+        experimental_exec_server_url: None,
         realtime_audio: RealtimeAudioConfig::default(),
         experimental_realtime_start_instructions: None,
         experimental_realtime_ws_base_url: None,
@@ -4816,6 +4826,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         tool_suggest: ToolSuggestConfig::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
+        tui_terminal_title: None,
         tui_theme: None,
         otel: OtelConfig::default(),
     };
@@ -6038,6 +6049,34 @@ experimental_realtime_start_instructions = "start instructions from config"
 }
 
 #[test]
+fn experimental_exec_server_url_loads_from_config_toml() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+experimental_exec_server_url = "http://127.0.0.1:8080"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    assert_eq!(
+        cfg.experimental_exec_server_url.as_deref(),
+        Some("http://127.0.0.1:8080")
+    );
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.experimental_exec_server_url.as_deref(),
+        Some("http://127.0.0.1:8080")
+    );
+    Ok(())
+}
+
+#[test]
 fn experimental_realtime_ws_base_url_loads_from_config_toml() -> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"
@@ -6220,7 +6259,7 @@ speaker = "Desk Speakers"
 
 #[test]
 fn agent_watchdog_defaults_enabled() {
-    let features = crate::features::Features::with_defaults();
+    let features = Features::with_defaults();
     assert!(features.enabled(Feature::AgentWatchdog));
 }
 

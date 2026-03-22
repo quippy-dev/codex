@@ -324,6 +324,7 @@ impl ChatComposerConfig {
 #[derive(Default)]
 struct VoiceState {
     transcription_enabled: bool,
+    transcription_runtime_context: Option<crate::voice::TranscriptionRuntimeContext>,
     // Spacebar hold-to-talk state.
     space_hold_started_at: Option<Instant>,
     space_hold_element_id: Option<String>,
@@ -403,6 +404,7 @@ pub(crate) struct ChatComposer {
     config: ChatComposerConfig,
     collaboration_mode_indicator: Option<CollaborationModeIndicator>,
     connectors_enabled: bool,
+    plugins_command_enabled: bool,
     fast_command_enabled: bool,
     personality_command_enabled: bool,
     realtime_conversation_enabled: bool,
@@ -441,6 +443,7 @@ impl ChatComposer {
         BuiltinCommandFlags {
             collaboration_modes_enabled: self.collaboration_modes_enabled,
             connectors_enabled: self.connectors_enabled,
+            plugins_command_enabled: self.plugins_command_enabled,
             fast_command_enabled: self.fast_command_enabled,
             personality_command_enabled: self.personality_command_enabled,
             realtime_conversation_enabled: self.realtime_conversation_enabled,
@@ -525,6 +528,7 @@ impl ChatComposer {
             config,
             collaboration_mode_indicator: None,
             connectors_enabled: false,
+            plugins_command_enabled: false,
             fast_command_enabled: false,
             personality_command_enabled: false,
             realtime_conversation_enabled: false,
@@ -557,6 +561,10 @@ impl ChatComposer {
     pub fn set_plugin_mentions(&mut self, plugins: Option<Vec<PluginCapabilitySummary>>) {
         self.plugins = plugins;
         self.sync_popups();
+    }
+
+    pub fn set_plugins_command_enabled(&mut self, enabled: bool) {
+        self.plugins_command_enabled = enabled;
     }
 
     /// Toggle composer-side image paste handling.
@@ -633,6 +641,13 @@ impl ChatComposer {
             self.voice_state.space_hold_trigger = None;
             self.voice_state.space_hold_repeat_seen = false;
         }
+    }
+
+    pub(crate) fn set_transcription_runtime_context(
+        &mut self,
+        runtime_context: crate::voice::TranscriptionRuntimeContext,
+    ) {
+        self.voice_state.transcription_runtime_context = Some(runtime_context);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3491,6 +3506,7 @@ impl ChatComposer {
                 if is_editing_slash_command_name {
                     let collaboration_modes_enabled = self.collaboration_modes_enabled;
                     let connectors_enabled = self.connectors_enabled;
+                    let plugins_command_enabled = self.plugins_command_enabled;
                     let fast_command_enabled = self.fast_command_enabled;
                     let personality_command_enabled = self.personality_command_enabled;
                     let realtime_conversation_enabled = self.realtime_conversation_enabled;
@@ -3500,6 +3516,7 @@ impl ChatComposer {
                         CommandPopupFlags {
                             collaboration_modes_enabled,
                             connectors_enabled,
+                            plugins_command_enabled,
                             fast_command_enabled,
                             personality_command_enabled,
                             realtime_conversation_enabled,
@@ -3933,8 +3950,17 @@ impl ChatComposer {
                 let _ = self.textarea.update_named_element_by_id(&id, "⠋");
                 // Spawn animated braille spinner until transcription finishes (or times out).
                 self.spawn_transcribing_spinner(id.clone());
+                let Some(runtime_context) = self.voice_state.transcription_runtime_context.clone()
+                else {
+                    tracing::error!("voice transcription runtime context is not initialized");
+                    self.app_event_tx.send(AppEvent::TranscriptionFailed {
+                        id,
+                        error: "voice transcription auth context is not initialized".to_string(),
+                    });
+                    return true;
+                };
                 let tx = self.app_event_tx.clone();
-                crate::voice::transcribe_async(id, audio, Some(prompt_source), tx);
+                crate::voice::transcribe_async(id, audio, Some(prompt_source), tx, runtime_context);
                 true
             }
             Err(e) => {

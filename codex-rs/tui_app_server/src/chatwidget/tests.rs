@@ -59,11 +59,10 @@ use codex_core::config_loader::ConfigLayerStack;
 use codex_core::config_loader::ConfigRequirements;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::config_loader::RequirementSource;
-use codex_core::features::FEATURES;
-use codex_core::features::Feature;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::skills::model::SkillMetadata;
-use codex_core::terminal::TerminalName;
+use codex_features::FEATURES;
+use codex_features::Feature;
 use codex_otel::RuntimeMetricsSummary;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
@@ -147,6 +146,7 @@ use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use codex_terminal_detection::TerminalName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
@@ -1006,8 +1006,10 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
 
     let remote_url = "https://example.com/remote-only.png".to_string();
     chat.set_remote_image_urls(vec![remote_url.clone()]);
-    chat.bottom_pane
-        .set_composer_input_enabled(false, Some("Input disabled for test.".to_string()));
+    chat.bottom_pane.set_composer_input_enabled(
+        /*enabled*/ false,
+        Some("Input disabled for test.".to_string()),
+    );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -1928,6 +1930,8 @@ async fn make_chatwidget_manual(
         connectors_partial_snapshot: None,
         connectors_prefetch_in_flight: false,
         connectors_force_refetch_pending: false,
+        plugins_cache: PluginsCacheState::default(),
+        plugins_fetch_state: PluginListFetchState::default(),
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
         full_reasoning_buffer: String::new(),
@@ -2501,9 +2505,29 @@ async fn plan_implementation_popup_no_selected_snapshot() {
 }
 
 #[tokio::test]
-async fn plan_implementation_popup_yes_emits_submit_message_event() {
+async fn plan_implementation_popup_execute_emits_submit_message_event() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.open_plan_implementation_prompt();
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let event = rx.try_recv().expect("expected AppEvent");
+    let AppEvent::SubmitUserMessageWithMode {
+        text,
+        collaboration_mode,
+    } = event
+    else {
+        panic!("expected SubmitUserMessageWithMode, got {event:?}");
+    };
+    assert_eq!(text, PLAN_IMPLEMENTATION_CODING_MESSAGE);
+    assert_eq!(collaboration_mode.mode, Some(ModeKind::Execute));
+}
+
+#[tokio::test]
+async fn plan_implementation_popup_default_emits_submit_message_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.open_plan_implementation_prompt();
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
@@ -6225,6 +6249,10 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
         popup.contains("Select Collaboration Mode"),
         "expected collaboration picker: {popup}"
     );
+    assert!(
+        popup.contains("Execute"),
+        "expected collaboration picker to include Execute: {popup}"
+    );
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
     let selected_mask = match rx.try_recv() {
@@ -6266,6 +6294,48 @@ async fn collab_slash_command_opens_picker_and_updates_mode() {
         } => {}
         other => {
             panic!("expected Op::UserTurn with code collab mode, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn collab_slash_command_can_select_execute_mode() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    chat.dispatch_command(SlashCommand::Collab);
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("Execute"),
+        "expected collaboration picker to include Execute: {popup}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let selected_mask = match rx.try_recv() {
+        Ok(AppEvent::UpdateCollaborationMode(mask)) => mask,
+        other => panic!("expected UpdateCollaborationMode event, got {other:?}"),
+    };
+    assert_eq!(selected_mask.mode, Some(ModeKind::Execute));
+    chat.set_collaboration_mask(selected_mask);
+
+    chat.bottom_pane
+        .set_composer_text("hello".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn {
+            collaboration_mode:
+                Some(CollaborationMode {
+                    mode: ModeKind::Execute,
+                    ..
+                }),
+            personality: Some(Personality::Pragmatic),
+            ..
+        } => {}
+        other => {
+            panic!("expected Op::UserTurn with execute collab mode, got {other:?}")
         }
     }
 }
@@ -6376,6 +6446,31 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
     let chat = ChatWidget::new_with_app_event(init);
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Default);
     assert_eq!(chat.current_model(), resolved_model);
+}
+
+#[tokio::test]
+async fn execute_collaboration_mode_renders_indicator_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+    let execute_mask =
+        collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Execute)
+            .expect("expected execute collaboration mode");
+    chat.set_collaboration_mask(execute_mask);
+
+    let width = 80;
+    let height = chat.desired_height(width);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw execute collaboration mode footer");
+    assert_snapshot!(
+        "execute_collaboration_mode_renders_indicator",
+        terminal.backend()
+    );
 }
 
 #[tokio::test]
@@ -7178,7 +7273,7 @@ async fn image_generation_call_adds_history_cell() {
             status: "completed".into(),
             revised_prompt: Some("A tiny blue square".into()),
             result: "Zm9v".into(),
-            saved_path: Some("/tmp/ig-1.png".into()),
+            saved_path: Some("file:///tmp/ig-1.png".into()),
         }),
     });
 

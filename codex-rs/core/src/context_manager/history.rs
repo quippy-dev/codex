@@ -162,7 +162,6 @@ impl ContextManager {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
@@ -206,8 +205,7 @@ impl ContextManager {
     /// Returns true when a tool image was replaced, false otherwise.
     pub(crate) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
         let Some(index) = self.items.iter().rposition(|item| {
-            matches!(item, ResponseItem::FunctionCallOutput { .. })
-                || matches!(item, ResponseItem::Message { role, .. } if role == "user")
+            matches!(item, ResponseItem::FunctionCallOutput { .. }) || is_user_turn_boundary(item)
         }) else {
             return false;
         };
@@ -229,7 +227,7 @@ impl ContextManager {
                 }
                 replaced
             }
-            ResponseItem::Message { role, .. } if role == "user" => false,
+            ResponseItem::Message { .. } => false,
             _ => false,
         }
     }
@@ -279,11 +277,7 @@ impl ContextManager {
 
     fn get_non_last_reasoning_items_tokens(&self) -> i64 {
         // Get reasoning items excluding all the ones after the last user message.
-        let Some(last_user_index) = self
-            .items
-            .iter()
-            .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"))
-        else {
+        let Some(last_user_index) = self.items.iter().rposition(is_user_turn_boundary) else {
             return 0;
         };
 

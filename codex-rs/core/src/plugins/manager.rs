@@ -18,6 +18,7 @@ use super::remote::enable_remote_plugin;
 use super::remote::fetch_remote_featured_plugin_ids;
 use super::remote::fetch_remote_plugin_status;
 use super::remote::uninstall_remote_plugin;
+use super::startup_sync::start_startup_remote_plugin_sync_once;
 use super::store::DEFAULT_PLUGIN_VERSION;
 use super::store::PluginId;
 use super::store::PluginIdError;
@@ -36,12 +37,12 @@ use crate::config::edit::ConfigEditsBuilder;
 use crate::config::types::McpServerConfig;
 use crate::config::types::PluginConfig;
 use crate::config_loader::ConfigLayerStack;
-use crate::features::Feature;
 use crate::skills::SkillMetadata;
 use crate::skills::loader::SkillRoot;
 use crate::skills::loader::load_skills_from_roots;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::MergeStrategy;
+use codex_features::Feature;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -61,8 +62,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use toml_edit::value;
 use tracing::info;
 use tracing::warn;
@@ -82,7 +83,8 @@ const DEFAULT_APP_CONFIG_FILE: &str = ".app.json";
 pub const OPENAI_CURATED_MARKETPLACE_NAME: &str = "openai-curated";
 static CURATED_REPO_SYNC_STARTED: AtomicBool = AtomicBool::new(false);
 const MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN: usize = 1024;
-const FEATURED_PLUGIN_IDS_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 3);
+const FEATURED_PLUGIN_IDS_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60 * 3);
 
 #[derive(Clone, PartialEq, Eq)]
 struct FeaturedPluginIdsCacheKey {
@@ -474,6 +476,7 @@ pub struct PluginsManager {
     store: PluginStore,
     featured_plugin_ids_cache: RwLock<Option<CachedFeaturedPluginIds>>,
     cached_enabled_outcome: RwLock<Option<CachedEnabledPlugins>>,
+    remote_sync_lock: Mutex<()>,
     restriction_product: Option<Product>,
     analytics_events_client: RwLock<Option<AnalyticsEventsClient>>,
 }
@@ -494,6 +497,7 @@ impl PluginsManager {
             store: PluginStore::new(codex_home),
             featured_plugin_ids_cache: RwLock::new(None),
             cached_enabled_outcome: RwLock::new(None),
+            remote_sync_lock: Mutex::new(()),
             restriction_product,
             analytics_events_client: RwLock::new(None),
         }
@@ -507,11 +511,14 @@ impl PluginsManager {
         *stored_client = Some(analytics_events_client);
     }
 
-    fn restriction_product_matches(&self, products: &[Product]) -> bool {
-        products.is_empty()
-            || self
+    fn restriction_product_matches(&self, products: Option<&[Product]>) -> bool {
+        match products {
+            None => true,
+            Some([]) => false,
+            Some(products) => self
                 .restriction_product
-                .is_some_and(|product| product.matches_product_restriction(products))
+                .is_some_and(|product| product.matches_product_restriction(products)),
+        }
     }
 
     pub fn plugins_for_config(&self, config: &Config) -> PluginLoadOutcome {
@@ -636,7 +643,8 @@ impl PluginsManager {
         if let Some(featured_plugin_ids) = self.cached_featured_plugin_ids(&cache_key) {
             return Ok(featured_plugin_ids);
         }
-        let featured_plugin_ids = fetch_remote_featured_plugin_ids(config, auth).await?;
+        let featured_plugin_ids =
+            fetch_remote_featured_plugin_ids(config, auth, self.restriction_product).await?;
         self.write_featured_plugin_ids_cache(cache_key, &featured_plugin_ids);
         Ok(featured_plugin_ids)
     }
@@ -792,7 +800,10 @@ impl PluginsManager {
         &self,
         config: &Config,
         auth: Option<&CodexAuth>,
+        additive_only: bool,
     ) -> Result<RemotePluginSyncResult, PluginRemoteSyncError> {
+        let _remote_sync_guard = self.remote_sync_lock.lock().await;
+
         if !config.features.enabled(Feature::Plugins) {
             return Ok(RemotePluginSyncResult::default());
         }
@@ -851,7 +862,8 @@ impl PluginsManager {
                 .get(&plugin_key)
                 .map(|plugin| plugin.enabled);
             let installed_version = self.store.active_plugin_version(&plugin_id);
-            let product_allowed = self.restriction_product_matches(&plugin.policy.products);
+            let product_allowed =
+                self.restriction_product_matches(plugin.policy.products.as_deref());
             local_plugins.push((
                 plugin_name,
                 plugin_id,
@@ -930,7 +942,7 @@ impl PluginsManager {
                         value: value(true),
                     });
                 }
-            } else {
+            } else if !additive_only {
                 if is_installed {
                     uninstalls.push(plugin_id);
                 }
@@ -1012,7 +1024,7 @@ impl PluginsManager {
                         if !seen_plugin_keys.insert(plugin_key.clone()) {
                             return None;
                         }
-                        if !self.restriction_product_matches(&plugin.policy.products) {
+                        if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
                             return None;
                         }
 
@@ -1062,7 +1074,7 @@ impl PluginsManager {
                 marketplace_name,
             });
         };
-        if !self.restriction_product_matches(&plugin.policy.products) {
+        if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
             return Err(MarketplaceError::PluginNotFound {
                 plugin_name: request.plugin_name.clone(),
                 marketplace_name,
@@ -1127,7 +1139,7 @@ impl PluginsManager {
         })
     }
 
-    pub fn maybe_start_curated_repo_sync_for_config(
+    pub fn maybe_start_plugin_startup_tasks_for_config(
         self: &Arc<Self>,
         config: &Config,
         auth_manager: Arc<AuthManager>,
@@ -1155,6 +1167,12 @@ impl PluginsManager {
                     .collect::<Vec<_>>();
             configured_curated_plugin_ids.sort_unstable_by_key(super::store::PluginId::as_key);
             self.start_curated_repo_sync(configured_curated_plugin_ids);
+            start_startup_remote_plugin_sync_once(
+                Arc::clone(self),
+                self.codex_home.clone(),
+                config.clone(),
+                auth_manager.clone(),
+            );
 
             let config = config.clone();
             let manager = Arc::clone(self);
@@ -1363,7 +1381,7 @@ pub(crate) fn load_plugins_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     store: &PluginStore,
     restriction_product: Option<Product>,
-    plugin_products_by_key: &HashMap<String, Vec<Product>>,
+    plugin_products_by_key: &HashMap<String, Option<Vec<Product>>>,
 ) -> PluginLoadOutcome {
     let mut configured_plugins: Vec<_> = configured_plugins_from_stack(config_layer_stack)
         .into_iter()
@@ -1377,7 +1395,7 @@ pub(crate) fn load_plugins_from_layer_stack(
         if !runtime_plugin_matches_product_restriction(
             plugin_products_by_key
                 .get(&configured_name)
-                .map(Vec::as_slice),
+                .and_then(Option::as_deref),
             restriction_product,
         ) {
             loaded_plugin.enabled = false;
@@ -1413,11 +1431,14 @@ fn runtime_plugin_matches_product_restriction(
         return true;
     };
 
-    products.is_empty()
-        || restriction_product.is_some_and(|product| product.matches_product_restriction(products))
+    if products.is_empty() {
+        return false;
+    }
+
+    restriction_product.is_some_and(|product| product.matches_product_restriction(products))
 }
 
-fn runtime_plugin_product_policies(codex_home: &Path) -> HashMap<String, Vec<Product>> {
+fn runtime_plugin_product_policies(codex_home: &Path) -> HashMap<String, Option<Vec<Product>>> {
     let mut plugin_products_by_key = HashMap::new();
 
     for marketplace_path in runtime_marketplace_paths(codex_home) {
@@ -1767,6 +1788,22 @@ pub fn plugin_telemetry_metadata_from_root(
             app_connector_ids: load_plugin_apps(plugin_root),
         }),
     }
+}
+
+pub fn load_plugin_mcp_servers(plugin_root: &Path) -> HashMap<String, McpServerConfig> {
+    let Some(manifest) = load_plugin_manifest(plugin_root) else {
+        return HashMap::new();
+    };
+
+    let mut mcp_servers = HashMap::new();
+    for mcp_config_path in plugin_mcp_config_paths(plugin_root, &manifest.paths) {
+        let plugin_mcp = load_mcp_servers_from_file(plugin_root, &mcp_config_path);
+        for (name, config) in plugin_mcp.mcp_servers {
+            mcp_servers.entry(name).or_insert(config);
+        }
+    }
+
+    mcp_servers
 }
 
 pub fn installed_plugin_telemetry_metadata(

@@ -1,6 +1,5 @@
 pub(crate) use crate::collaboration_mode_policy::request_user_input_tool_description;
 pub(crate) use crate::collaboration_mode_policy::request_user_input_unavailable_message;
-use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -9,6 +8,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
+use codex_features::Feature;
 #[cfg(test)]
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::request_user_input::RequestUserInputArgs;

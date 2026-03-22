@@ -1,6 +1,8 @@
 pub mod account;
 pub mod agent_inbox;
+mod agent_path;
 mod thread_id;
+pub use agent_path::AgentPath;
 pub use thread_id::ThreadId;
 pub mod approvals;
 pub mod config_types;

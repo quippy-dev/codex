@@ -130,6 +130,7 @@ export type { HookExecutionMode } from "./HookExecutionMode";
 export type { HookHandlerType } from "./HookHandlerType";
 export type { HookOutputEntry } from "./HookOutputEntry";
 export type { HookOutputEntryKind } from "./HookOutputEntryKind";
+export type { HookPromptFragment } from "./HookPromptFragment";
 export type { HookRunStatus } from "./HookRunStatus";
 export type { HookRunSummary } from "./HookRunSummary";
 export type { HookScope } from "./HookScope";
@@ -174,7 +175,9 @@ export type { McpServerOauthLoginCompletedNotification } from "./McpServerOauthL
 export type { McpServerOauthLoginParams } from "./McpServerOauthLoginParams";
 export type { McpServerOauthLoginResponse } from "./McpServerOauthLoginResponse";
 export type { McpServerRefreshResponse } from "./McpServerRefreshResponse";
+export type { McpServerStartupState } from "./McpServerStartupState";
 export type { McpServerStatus } from "./McpServerStatus";
+export type { McpServerStatusUpdatedNotification } from "./McpServerStatusUpdatedNotification";
 export type { McpToolCallError } from "./McpToolCallError";
 export type { McpToolCallProgressNotification } from "./McpToolCallProgressNotification";
 export type { McpToolCallResult } from "./McpToolCallResult";
@@ -282,6 +285,7 @@ export type { ThreadRealtimeErrorNotification } from "./ThreadRealtimeErrorNotif
 export type { ThreadRealtimeItemAddedNotification } from "./ThreadRealtimeItemAddedNotification";
 export type { ThreadRealtimeOutputAudioDeltaNotification } from "./ThreadRealtimeOutputAudioDeltaNotification";
 export type { ThreadRealtimeStartedNotification } from "./ThreadRealtimeStartedNotification";
+export type { ThreadRealtimeTranscriptUpdatedNotification } from "./ThreadRealtimeTranscriptUpdatedNotification";
 export type { ThreadResumeParams } from "./ThreadResumeParams";
 export type { ThreadResumeResponse } from "./ThreadResumeResponse";
 export type { ThreadRollbackParams } from "./ThreadRollbackParams";

@@ -13,6 +13,7 @@ use crate::compact_remote_invariants::retry_once_invalid_encrypted_content_with_
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
+use crate::context_manager::is_user_turn_boundary;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -248,7 +249,7 @@ pub(crate) async fn process_compacted_history(
 /// - `developer` messages because remote output can include stale/duplicated
 ///   instruction content.
 /// - non-user-content `user` messages (session prefix/instruction wrappers),
-///   keeping only real user messages as parsed by `parse_turn_item`.
+///   while preserving real user messages and persisted hook prompts.
 ///
 /// This intentionally keeps:
 /// - `assistant` messages (future remote compaction models may emit them)
@@ -260,7 +261,7 @@ fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         ResponseItem::Message { role, .. } if role == "user" => {
             matches!(
                 crate::event_mapping::parse_turn_item(item),
-                Some(TurnItem::UserMessage(_))
+                Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))
             )
         }
         ResponseItem::Message { role, .. } if role == "assistant" => true,
@@ -357,9 +358,18 @@ fn trim_history_to_fit_token_budget_for_remote_compaction(
             estimated_tokens.saturating_add(extra_token_budget) > context_window
         })
     {
-        // Preserve the oldest real user goal plus the newest user/tail context. If that still
-        // cannot fit, fall through and keep the existing remote compaction failure behavior.
-        if !history.remove_oldest_item_between_first_and_last_user_message() {
+        // Preserve the oldest real user goal plus the newest user/tail context when possible.
+        if history.remove_oldest_item_between_first_and_last_user_message() {
+            deleted_items += 1;
+            continue;
+        }
+
+        // Single-user-turn histories still need the old tail-trimming escape hatch so oversized
+        // assistant/tool output can be removed before remote compaction retries.
+        let Some(last_item) = history.raw_items().last() else {
+            break;
+        };
+        if is_user_turn_boundary(last_item) || !history.remove_last_item() {
             break;
         }
         deleted_items += 1;
@@ -673,5 +683,58 @@ mod tests {
 
         assert_eq!(deleted_items, 2);
         assert!(history.raw_items().is_empty());
+    }
+
+    #[test]
+    fn trim_history_single_user_turn_falls_back_to_tail_generated_items() {
+        let mut history = ContextManager::new();
+        let user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "only user turn".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let assistant = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "assistant output".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let tool_output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("large tool output".to_string()),
+                ..Default::default()
+            },
+        };
+        history.record_items(
+            [&user, &assistant, &tool_output],
+            TruncationPolicy::Tokens(10_000),
+        );
+
+        let base_instructions = BaseInstructions {
+            text: String::new(),
+        };
+        let mut trimmed_history = ContextManager::new();
+        trimmed_history.record_items([&user], TruncationPolicy::Tokens(10_000));
+        let trimmed_tokens = trimmed_history
+            .estimate_token_count_with_base_instructions(&base_instructions)
+            .expect("user-only history should estimate");
+
+        let deleted_items = trim_history_to_fit_token_budget_for_remote_compaction(
+            &mut history,
+            trimmed_tokens,
+            &base_instructions,
+            0,
+        );
+
+        assert_eq!(deleted_items, 2);
+        assert_eq!(history.raw_items(), &[user]);
     }
 }

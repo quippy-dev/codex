@@ -147,6 +147,12 @@ impl Session {
                         && let Some(replacement_history) = &compacted.replacement_history
                     {
                         active_segment.base_replacement_history = Some(replacement_history);
+                        if active_segment.latest_proposed_plan_text.is_none() {
+                            active_segment.latest_proposed_plan_text =
+                                retained_plan_replay::latest_proposed_plan_text(
+                                    replacement_history,
+                                );
+                        }
                         rollout_suffix = &rollout_items[index + 1..];
                     }
                     retained_plan_replay::hydrate_latest_proposed_plan_text(
@@ -259,7 +265,6 @@ impl Session {
 
             if base_replacement_history.is_some()
                 && previous_turn_settings.is_some()
-                && latest_proposed_plan_text.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
             {
                 // At this point we have both eager resume metadata values and the replacement-

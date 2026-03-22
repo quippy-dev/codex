@@ -4,7 +4,6 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::error::CodexErr;
-use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -13,6 +12,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
+use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelInfo;
@@ -1894,6 +1894,7 @@ fn thread_spawn_source_with_metadata(
     SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id,
         depth,
+        agent_path: None,
         agent_nickname,
         agent_role,
     })

@@ -22,7 +22,6 @@ use crate::config::Config;
 use crate::config::types::CollabInboxDeliveryRole;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
-use crate::features::Feature;
 use crate::find_archived_thread_path_by_id_str;
 use crate::find_thread_path_by_id_str;
 use crate::rollout::RolloutRecorder;
@@ -31,6 +30,7 @@ use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
+use codex_features::Feature;
 use codex_protocol::ThreadId;
 #[cfg(test)]
 use codex_protocol::models::ContentItem;
@@ -526,6 +526,7 @@ impl AgentControl {
                         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                             parent_thread_id,
                             depth: child_depth,
+                            agent_path: None,
                             agent_nickname: None,
                             agent_role: None,
                         });
@@ -573,6 +574,7 @@ impl AgentControl {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
                 depth,
+                agent_path,
                 agent_nickname,
                 agent_role,
             }) => {
@@ -606,6 +608,7 @@ impl AgentControl {
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id,
                     depth,
+                    agent_path,
                     agent_nickname: reserved_agent_nickname,
                     agent_role: resumed_agent_role,
                 })
@@ -1760,6 +1763,7 @@ impl AgentControl {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
                 depth,
+                agent_path,
                 agent_nickname,
                 agent_role,
             }) => {
@@ -1773,6 +1777,7 @@ impl AgentControl {
                 Ok(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id,
                     depth,
+                    agent_path,
                     agent_nickname: Some(agent_nickname),
                     agent_role,
                 }))

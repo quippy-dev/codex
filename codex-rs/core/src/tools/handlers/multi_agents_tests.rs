@@ -8,7 +8,6 @@ use crate::codex::make_session_and_context_with_rx;
 use crate::config::AgentRoleConfig;
 use crate::config::AgentRoleSpawnMode;
 use crate::config::types::ShellEnvironmentPolicy;
-use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::protocol::AskForApproval;
 use crate::protocol::ErrorEvent;
@@ -22,6 +21,7 @@ use crate::protocol::SessionSource;
 use crate::protocol::SubAgentSource;
 use crate::tools::context::ToolOutput;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -485,6 +485,7 @@ async fn spawn_agent_rejects_when_depth_limit_exceeded() {
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.conversation_id,
         depth: max_depth,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
     });
@@ -536,6 +537,7 @@ async fn spawn_agent_hides_multi_agent_tools_at_configured_max_depth() {
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.conversation_id,
         depth: current_max_depth,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
     });
@@ -597,6 +599,7 @@ async fn spawn_agent_config_backed_role_hides_multi_agent_tools_at_configured_ma
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.conversation_id,
         depth: current_max_depth,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
     });
@@ -683,6 +686,7 @@ async fn spawn_agent_rejects_watchdog_from_subagent() {
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.conversation_id,
         depth: 0,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
     });
@@ -2554,6 +2558,7 @@ async fn resume_agent_rejects_when_depth_limit_exceeded() {
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.conversation_id,
         depth: max_depth,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
     });
@@ -2799,6 +2804,7 @@ async fn wait_rejects_active_watchdog_helper_sessions() {
     helper_turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: owner_thread_id,
         depth: 1,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
     });
