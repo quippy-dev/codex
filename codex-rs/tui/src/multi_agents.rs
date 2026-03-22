@@ -30,6 +30,7 @@ use std::collections::HashSet;
 const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
+pub(crate) const AGENT_PICKER_SELECTION_VIEW_ID: &str = "agent_picker";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentPickerThreadEntry {
@@ -90,6 +91,9 @@ pub(crate) fn next_agent_shortcut() -> crate::key_hint::KeyBinding {
     crate::key_hint::alt(KeyCode::Right)
 }
 
+/// Matches the canonical "previous agent" binding plus platform-specific fallbacks that keep agent
+/// navigation working when terminals emit word-motion fallbacks instead of direct Option+arrow
+/// events.
 pub(crate) fn previous_agent_shortcut_matches(
     key_event: KeyEvent,
     allow_word_motion_fallback: bool,
@@ -98,6 +102,9 @@ pub(crate) fn previous_agent_shortcut_matches(
         || previous_agent_word_motion_fallback(key_event, allow_word_motion_fallback)
 }
 
+/// Matches the canonical "next agent" binding plus platform-specific fallbacks that keep agent
+/// navigation working when terminals emit word-motion fallbacks instead of direct Option+arrow
+/// events.
 pub(crate) fn next_agent_shortcut_matches(
     key_event: KeyEvent,
     allow_word_motion_fallback: bool,
@@ -111,6 +118,9 @@ fn previous_agent_word_motion_fallback(
     key_event: KeyEvent,
     allow_word_motion_fallback: bool,
 ) -> bool {
+    // Some terminals, especially on macOS, send Option+b/f as word-motion keys instead of
+    // Option+arrow events. Callers should only enable this fallback when the composer is empty so
+    // draft editing retains the expected word-wise motion behavior.
     allow_word_motion_fallback
         && matches!(
             key_event,
@@ -133,6 +143,9 @@ fn previous_agent_word_motion_fallback(
 
 #[cfg(target_os = "macos")]
 fn next_agent_word_motion_fallback(key_event: KeyEvent, allow_word_motion_fallback: bool) -> bool {
+    // Some terminals, especially on macOS, send Option+b/f as word-motion keys instead of
+    // Option+arrow events. Callers should only enable this fallback when the composer is empty so
+    // draft editing retains the expected word-wise motion behavior.
     allow_word_motion_fallback
         && matches!(
             key_event,

@@ -16,6 +16,9 @@ use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint::KeyBinding;
+use crate::multi_agents::AGENT_PICKER_SELECTION_VIEW_ID;
+use crate::multi_agents::next_agent_shortcut_matches;
+use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 
@@ -574,6 +577,19 @@ impl ListSelectionView {
 
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if self.view_id == Some(AGENT_PICKER_SELECTION_VIEW_ID)
+            && previous_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)
+        {
+            self.move_up();
+            return;
+        }
+        if self.view_id == Some(AGENT_PICKER_SELECTION_VIEW_ID)
+            && next_agent_shortcut_matches(key_event, /*allow_word_motion_fallback*/ true)
+        {
+            self.move_down();
+            return;
+        }
+
         match key_event {
             // Some terminals (or configurations) send Control key chords as
             // C0 control characters without reporting the CONTROL modifier.
@@ -1351,6 +1367,69 @@ mod tests {
             rx.try_recv().is_err(),
             "moving down in a single-item list should not fire on_selection_changed",
         );
+    }
+
+    #[test]
+    fn agent_picker_shortcuts_move_selection_without_selecting() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                view_id: Some(AGENT_PICKER_SELECTION_VIEW_ID),
+                items: vec![
+                    SelectionItem {
+                        name: "Main [default]".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Robie [worker]".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            tx,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+
+        assert_eq!(view.selected_actual_idx(), Some(1));
+        assert!(!view.is_complete());
+        assert!(
+            rx.try_recv().is_err(),
+            "agent picker navigation should move the highlight without selecting",
+        );
+    }
+
+    #[test]
+    fn non_agent_picker_ignores_agent_navigation_shortcuts() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                view_id: Some("other_picker"),
+                items: vec![
+                    SelectionItem {
+                        name: "Main [default]".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Robie [worker]".to_string(),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            tx,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+
+        assert_eq!(view.selected_actual_idx(), Some(0));
     }
 
     #[test]
