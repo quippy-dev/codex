@@ -324,6 +324,7 @@ impl ChatComposerConfig {
 #[derive(Default)]
 struct VoiceState {
     transcription_enabled: bool,
+    transcription_runtime_context: Option<crate::voice::TranscriptionRuntimeContext>,
     // Spacebar hold-to-talk state.
     space_hold_started_at: Option<Instant>,
     space_hold_element_id: Option<String>,
@@ -640,6 +641,13 @@ impl ChatComposer {
             self.voice_state.space_hold_trigger = None;
             self.voice_state.space_hold_repeat_seen = false;
         }
+    }
+
+    pub(crate) fn set_transcription_runtime_context(
+        &mut self,
+        runtime_context: crate::voice::TranscriptionRuntimeContext,
+    ) {
+        self.voice_state.transcription_runtime_context = Some(runtime_context);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3942,8 +3950,17 @@ impl ChatComposer {
                 let _ = self.textarea.update_named_element_by_id(&id, "⠋");
                 // Spawn animated braille spinner until transcription finishes (or times out).
                 self.spawn_transcribing_spinner(id.clone());
+                let Some(runtime_context) = self.voice_state.transcription_runtime_context.clone()
+                else {
+                    tracing::error!("voice transcription runtime context is not initialized");
+                    self.app_event_tx.send(AppEvent::TranscriptionFailed {
+                        id,
+                        error: "voice transcription auth context is not initialized".to_string(),
+                    });
+                    return true;
+                };
                 let tx = self.app_event_tx.clone();
-                crate::voice::transcribe_async(id, audio, Some(prompt_source), tx);
+                crate::voice::transcribe_async(id, audio, Some(prompt_source), tx, runtime_context);
                 true
             }
             Err(e) => {

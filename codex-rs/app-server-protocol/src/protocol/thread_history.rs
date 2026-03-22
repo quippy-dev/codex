@@ -2413,6 +2413,7 @@ mod tests {
             })),
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
+                retained_proposed_plan: Default::default(),
                 replacement_history: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {

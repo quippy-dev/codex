@@ -172,6 +172,27 @@ mod voice {
         pub channels: u16,
     }
 
+    #[derive(Clone)]
+    pub(crate) struct TranscriptionRuntimeContext {
+        _auth_storage_home: PathBuf,
+        _auth_credentials_store_mode: AuthCredentialsStoreMode,
+        _chatgpt_base_url: String,
+    }
+
+    impl TranscriptionRuntimeContext {
+        pub(crate) fn new(
+            auth_storage_home: PathBuf,
+            auth_credentials_store_mode: AuthCredentialsStoreMode,
+            chatgpt_base_url: String,
+        ) -> Self {
+            Self {
+                _auth_storage_home: auth_storage_home,
+                _auth_credentials_store_mode: auth_credentials_store_mode,
+                _chatgpt_base_url: chatgpt_base_url,
+            }
+        }
+    }
+
     pub struct VoiceCapture;
 
     pub(crate) struct RecordingMeterState;
@@ -239,18 +260,12 @@ mod voice {
         _audio: RecordedAudio,
         _context: Option<String>,
         tx: AppEventSender,
+        _runtime_context: TranscriptionRuntimeContext,
     ) {
         tx.send(AppEvent::TranscriptionFailed {
             id,
             error: "voice input is unavailable in this build".to_string(),
         });
-    }
-
-    pub(crate) fn set_transcription_runtime_context(
-        _auth_storage_home: PathBuf,
-        _auth_credentials_store_mode: AuthCredentialsStoreMode,
-        _chatgpt_base_url: String,
-    ) {
     }
 }
 

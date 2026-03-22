@@ -4308,6 +4308,13 @@ impl ChatWidget {
         widget.bottom_pane.set_voice_transcription_enabled(
             widget.config.features.enabled(Feature::VoiceTranscription),
         );
+        widget.bottom_pane.set_transcription_runtime_context(
+            crate::voice::TranscriptionRuntimeContext::new(
+                widget.auth_manager.storage_home().to_path_buf(),
+                widget.config.cli_auth_credentials_store_mode,
+                widget.config.chatgpt_base_url.clone(),
+            ),
+        );
         widget
             .bottom_pane
             .set_realtime_conversation_enabled(widget.realtime_conversation_enabled());

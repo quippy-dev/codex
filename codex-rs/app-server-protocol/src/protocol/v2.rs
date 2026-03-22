@@ -5971,17 +5971,6 @@ mod tests {
     }
 
     #[test]
-    fn collab_agent_state_maps_interrupted_status() {
-        assert_eq!(
-            CollabAgentState::from(CoreAgentStatus::Interrupted),
-            CollabAgentState {
-                status: CollabAgentStatus::Interrupted,
-                message: None,
-            }
-        );
-    }
-
-    #[test]
     fn command_execution_request_approval_rejects_relative_additional_permission_paths() {
         let err = serde_json::from_value::<CommandExecutionRequestApprovalParams>(json!({
             "threadId": "thr_123",

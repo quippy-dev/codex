@@ -20,8 +20,6 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
@@ -41,45 +39,24 @@ struct TranscriptionAuthContext {
 }
 
 #[derive(Clone)]
-struct TranscriptionRuntimeContext {
+pub(crate) struct TranscriptionRuntimeContext {
     auth_storage_home: PathBuf,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     chatgpt_base_url: String,
 }
 
-static TRANSCRIPTION_RUNTIME_CONTEXT: OnceLock<RwLock<Option<TranscriptionRuntimeContext>>> =
-    OnceLock::new();
-
-fn transcription_runtime_context_store() -> &'static RwLock<Option<TranscriptionRuntimeContext>> {
-    TRANSCRIPTION_RUNTIME_CONTEXT.get_or_init(|| RwLock::new(None))
-}
-
-pub(crate) fn set_transcription_runtime_context(
-    auth_storage_home: PathBuf,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    chatgpt_base_url: String,
-) {
-    match transcription_runtime_context_store().write() {
-        Ok(mut guard) => {
-            *guard = Some(TranscriptionRuntimeContext {
-                auth_storage_home,
-                auth_credentials_store_mode,
-                chatgpt_base_url,
-            });
-        }
-        Err(_) => {
-            error!("failed to set voice transcription runtime context");
+impl TranscriptionRuntimeContext {
+    pub(crate) fn new(
+        auth_storage_home: PathBuf,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        chatgpt_base_url: String,
+    ) -> Self {
+        Self {
+            auth_storage_home,
+            auth_credentials_store_mode,
+            chatgpt_base_url,
         }
     }
-}
-
-fn transcription_runtime_context() -> Result<TranscriptionRuntimeContext, String> {
-    let guard = transcription_runtime_context_store()
-        .read()
-        .map_err(|_| "failed to read voice transcription runtime context".to_string())?;
-    guard
-        .clone()
-        .ok_or_else(|| "voice transcription auth context is not initialized".to_string())
 }
 
 pub struct RecordedAudio {
@@ -255,6 +232,7 @@ pub fn transcribe_async(
     audio: RecordedAudio,
     context: Option<String>,
     tx: AppEventSender,
+    runtime_context: TranscriptionRuntimeContext,
 ) {
     std::thread::spawn(move || {
         // Enforce minimum duration to avoid garbage outputs.
@@ -290,8 +268,9 @@ pub fn transcribe_async(
 
         let tx2 = tx.clone();
         let id2 = id.clone();
-        let res: Result<String, String> = rt
-            .block_on(async move { transcribe_bytes(wav_bytes, context, duration_seconds).await });
+        let res: Result<String, String> = rt.block_on(async move {
+            transcribe_bytes(wav_bytes, context, duration_seconds, runtime_context).await
+        });
 
         match res {
             Ok(text) => {
@@ -806,8 +785,9 @@ fn normalize_chatgpt_base_url(input: &str) -> String {
     base_url
 }
 
-async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
-    let runtime_context = transcription_runtime_context()?;
+async fn resolve_auth(
+    runtime_context: &TranscriptionRuntimeContext,
+) -> Result<TranscriptionAuthContext, String> {
     let auth = CodexAuth::from_auth_storage(
         &runtime_context.auth_storage_home,
         runtime_context.auth_credentials_store_mode,
@@ -832,8 +812,9 @@ async fn transcribe_bytes(
     wav_bytes: Vec<u8>,
     context: Option<String>,
     duration_seconds: f32,
+    runtime_context: TranscriptionRuntimeContext,
 ) -> Result<String, String> {
-    let auth = resolve_auth().await?;
+    let auth = resolve_auth(&runtime_context).await?;
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
         .map_err(|error| format!("failed to build transcription HTTP client: {error}"))?;
     let audio_bytes = wav_bytes.len();
@@ -919,10 +900,10 @@ mod tests {
     use super::AuthCredentialsStoreMode;
     use super::AuthMode;
     use super::RecordedAudio;
+    use super::TranscriptionRuntimeContext;
     use super::convert_pcm16;
     use super::encode_wav_normalized;
     use super::resolve_auth;
-    use super::set_transcription_runtime_context;
     use codex_core::auth::login_with_api_key;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
@@ -973,17 +954,61 @@ mod tests {
         )
         .expect("override auth should save");
 
-        set_transcription_runtime_context(
+        let runtime_context = TranscriptionRuntimeContext::new(
             override_home.path().to_path_buf(),
             AuthCredentialsStoreMode::File,
             "https://chatgpt.com/".to_string(),
         );
 
-        let auth = resolve_auth()
+        let auth = resolve_auth(&runtime_context)
             .await
             .expect("transcription auth should load from configured home");
         assert_eq!(auth.mode, AuthMode::ApiKey);
         assert_eq!(auth.bearer_token, "sk-override");
         assert_eq!(auth.chatgpt_base_url, "https://chatgpt.com/backend-api");
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_uses_runtime_context_for_each_app_instance() {
+        let first_home = TempDir::new().expect("first auth home");
+        let second_home = TempDir::new().expect("second auth home");
+        login_with_api_key(
+            first_home.path(),
+            "sk-first",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("first auth should save");
+        login_with_api_key(
+            second_home.path(),
+            "sk-second",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("second auth should save");
+
+        let first_runtime_context = TranscriptionRuntimeContext::new(
+            first_home.path().to_path_buf(),
+            AuthCredentialsStoreMode::File,
+            "https://chatgpt.com/".to_string(),
+        );
+        let second_runtime_context = TranscriptionRuntimeContext::new(
+            second_home.path().to_path_buf(),
+            AuthCredentialsStoreMode::File,
+            "https://chat.openai.com/".to_string(),
+        );
+
+        let first = resolve_auth(&first_runtime_context)
+            .await
+            .expect("first transcription auth should load");
+        assert_eq!(first.bearer_token, "sk-first");
+        assert_eq!(first.chatgpt_base_url, "https://chatgpt.com/backend-api");
+
+        let second = resolve_auth(&second_runtime_context)
+            .await
+            .expect("second transcription auth should load");
+        assert_eq!(second.bearer_token, "sk-second");
+        assert_eq!(
+            second.chatgpt_base_url,
+            "https://chat.openai.com/backend-api"
+        );
     }
 }
