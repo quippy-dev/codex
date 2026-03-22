@@ -1435,7 +1435,11 @@ fn runtime_plugin_matches_product_restriction(
         return false;
     }
 
-    restriction_product.is_some_and(|product| product.matches_product_restriction(products))
+    let Some(restriction_product) = restriction_product else {
+        return true;
+    };
+
+    restriction_product.matches_product_restriction(products)
 }
 
 fn runtime_plugin_product_policies(codex_home: &Path) -> HashMap<String, Option<Vec<Product>>> {

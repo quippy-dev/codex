@@ -952,6 +952,106 @@ fn plugins_for_config_reapplies_runtime_product_restriction() {
     assert!(chatgpt_plugin.apps.is_empty());
 }
 
+#[test]
+fn plugins_for_config_keeps_runtime_capabilities_when_restriction_product_is_none() {
+    let codex_home = TempDir::new().unwrap();
+    let curated_root = curated_plugins_repo_path(codex_home.path());
+
+    write_plugin(&curated_root, "plugins/codex-only", "codex-only");
+    write_plugin(&curated_root, "plugins/chatgpt-only", "chatgpt-only");
+    write_file(
+        &curated_root.join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "openai-curated",
+  "plugins": [
+    {
+      "name": "codex-only",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-only"
+      },
+      "policy": {
+        "products": ["CODEX"]
+      }
+    },
+    {
+      "name": "chatgpt-only",
+      "source": {
+        "source": "local",
+        "path": "./plugins/chatgpt-only"
+      },
+      "policy": {
+        "products": ["CHATGPT"]
+      }
+    }
+  ]
+}"#,
+    );
+
+    let cache_root = codex_home.path().join("plugins/cache/openai-curated");
+    write_plugin_with_runtime_capabilities(
+        &cache_root,
+        "codex-only/local",
+        "codex-only",
+        "codex-mcp",
+        "connector_codex",
+    );
+    write_plugin_with_runtime_capabilities(
+        &cache_root,
+        "chatgpt-only/local",
+        "chatgpt-only",
+        "chatgpt-mcp",
+        "connector_chatgpt",
+    );
+
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        &plugin_config_toml_for_plugins(
+            &[
+                ("codex-only@openai-curated", true),
+                ("chatgpt-only@openai-curated", true),
+            ],
+            true,
+        ),
+    );
+
+    let config = load_config_blocking(codex_home.path(), codex_home.path());
+    let outcome =
+        PluginsManager::new_with_restriction_product(codex_home.path().to_path_buf(), None)
+            .plugins_for_config(&config);
+
+    let mut capability_names = outcome
+        .capability_summaries()
+        .iter()
+        .map(|summary| summary.config_name.as_str())
+        .collect::<Vec<_>>();
+    capability_names.sort_unstable();
+    assert_eq!(
+        capability_names,
+        vec!["chatgpt-only@openai-curated", "codex-only@openai-curated"],
+    );
+
+    let codex_plugin = outcome
+        .plugins()
+        .iter()
+        .find(|plugin| plugin.config_name == "codex-only@openai-curated")
+        .expect("codex-only plugin should be present");
+    assert!(codex_plugin.enabled);
+    assert!(!codex_plugin.skill_roots.is_empty());
+    assert!(!codex_plugin.mcp_servers.is_empty());
+    assert!(!codex_plugin.apps.is_empty());
+
+    let chatgpt_plugin = outcome
+        .plugins()
+        .iter()
+        .find(|plugin| plugin.config_name == "chatgpt-only@openai-curated")
+        .expect("chatgpt-only plugin should be present");
+    assert!(chatgpt_plugin.enabled);
+    assert!(!chatgpt_plugin.skill_roots.is_empty());
+    assert!(!chatgpt_plugin.mcp_servers.is_empty());
+    assert!(!chatgpt_plugin.apps.is_empty());
+}
+
 #[tokio::test]
 async fn install_plugin_updates_config_with_relative_path_and_plugin_key() {
     let tmp = tempfile::tempdir().unwrap();
