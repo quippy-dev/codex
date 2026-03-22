@@ -1,0 +1,10 @@
+---
+source: tui_app_server/src/chatwidget/tests.rs
+assertion_line: 6452
+expression: terminal.backend()
+---
+"                                                                                "
+"                                                                                "
+"› Ask Codex to do anything                                                      "
+"                                                                                "
+"  ? for shortcuts · Execute mode (shift+tab to cycle)        100% context left  "

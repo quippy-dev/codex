@@ -10,6 +10,8 @@ const COLLABORATION_MODE_PLAN: &str =
     include_str!("../../core/templates/collaboration_mode/plan.md");
 const COLLABORATION_MODE_DEFAULT: &str =
     include_str!("../../core/templates/collaboration_mode/default.md");
+const COLLABORATION_MODE_EXECUTE: &str =
+    include_str!("../../core/templates/collaboration_mode/execute.md");
 const KNOWN_MODE_NAMES_PLACEHOLDER: &str = "{{KNOWN_MODE_NAMES}}";
 const REQUEST_USER_INPUT_AVAILABILITY_PLACEHOLDER: &str = "{{REQUEST_USER_INPUT_AVAILABILITY}}";
 const ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER: &str = "{{ASKING_QUESTIONS_GUIDANCE}}";
@@ -43,7 +45,11 @@ impl ModelCatalog {
 fn builtin_collaboration_mode_presets(
     collaboration_modes_config: CollaborationModesConfig,
 ) -> Vec<CollaborationModeMask> {
-    vec![plan_preset(), default_preset(collaboration_modes_config)]
+    vec![
+        plan_preset(),
+        default_preset(collaboration_modes_config),
+        execute_preset(),
+    ]
 }
 
 fn plan_preset() -> CollaborationModeMask {
@@ -63,6 +69,16 @@ fn default_preset(collaboration_modes_config: CollaborationModesConfig) -> Colla
         model: None,
         reasoning_effort: None,
         developer_instructions: Some(Some(default_mode_instructions(collaboration_modes_config))),
+    }
+}
+
+fn execute_preset() -> CollaborationModeMask {
+    CollaborationModeMask {
+        name: ModeKind::Execute.display_name().to_string(),
+        mode: Some(ModeKind::Execute),
+        model: None,
+        reasoning_effort: None,
+        developer_instructions: Some(Some(COLLABORATION_MODE_EXECUTE.to_string())),
     }
 }
 
