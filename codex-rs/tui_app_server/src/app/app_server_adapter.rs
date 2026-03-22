@@ -265,11 +265,13 @@ impl App {
     ) {
         let auth_storage_home = self.chat_widget.auth_manager.storage_home().to_path_buf();
         let auth_credentials_store_mode = self.config.cli_auth_credentials_store_mode;
+        let active_auth_mode = self.chat_widget.auth_manager.get_api_auth_mode();
         let forced_chatgpt_workspace_id = self.config.forced_chatgpt_workspace_id.clone();
         let result = tokio::task::spawn_blocking(move || {
             resolve_chatgpt_auth_tokens_refresh_response(
                 &auth_storage_home,
                 auth_credentials_store_mode,
+                active_auth_mode,
                 forced_chatgpt_workspace_id.as_deref(),
                 &params,
             )
@@ -486,12 +488,17 @@ fn server_notification_thread_target(
 fn resolve_chatgpt_auth_tokens_refresh_response(
     auth_storage_home: &std::path::Path,
     auth_credentials_store_mode: codex_core::auth::AuthCredentialsStoreMode,
+    active_auth_mode: Option<AuthMode>,
     forced_chatgpt_workspace_id: Option<&str>,
     params: &ChatgptAuthTokensRefreshParams,
 ) -> Result<ChatgptAuthTokensRefreshResponse, String> {
+    let auth_store_mode = match active_auth_mode {
+        Some(AuthMode::ChatgptAuthTokens) => codex_core::auth::AuthCredentialsStoreMode::Ephemeral,
+        _ => auth_credentials_store_mode,
+    };
     let auth = load_local_chatgpt_auth(
         auth_storage_home,
-        auth_credentials_store_mode,
+        auth_store_mode,
         forced_chatgpt_workspace_id,
     )?;
     if let Some(previous_account_id) = params.previous_account_id.as_deref()
@@ -1138,6 +1145,7 @@ mod tests {
     use codex_core::auth::AuthDotJson;
     use codex_core::auth::save_auth;
     use codex_core::token_data::TokenData;
+    use codex_login::auth::login_with_chatgpt_auth_tokens;
     use codex_protocol::ThreadId;
     use codex_protocol::items::AgentMessageContent;
     use codex_protocol::items::AgentMessageItem;
@@ -1415,6 +1423,7 @@ mod tests {
         let response = resolve_chatgpt_auth_tokens_refresh_response(
             override_home.path(),
             AuthCredentialsStoreMode::File,
+            Some(AuthMode::Chatgpt),
             Some("workspace-override"),
             &ChatgptAuthTokensRefreshParams {
                 reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
@@ -1425,6 +1434,35 @@ mod tests {
 
         assert_eq!(response.chatgpt_account_id, "workspace-override");
         assert_eq!(response.access_token, "override-token");
+    }
+
+    #[test]
+    fn chatgpt_auth_refresh_prefers_external_auth_when_active_mode_is_chatgpt_auth_tokens() {
+        let home = TempDir::new().expect("tempdir");
+        write_chatgpt_auth(home.path(), "workspace-managed", "managed-token");
+        let external_access_token = fake_jwt("user@example.com", "workspace-external", "business");
+        login_with_chatgpt_auth_tokens(
+            home.path(),
+            &external_access_token,
+            "workspace-external",
+            Some("business"),
+        )
+        .expect("external auth should save");
+
+        let response = resolve_chatgpt_auth_tokens_refresh_response(
+            home.path(),
+            AuthCredentialsStoreMode::File,
+            Some(AuthMode::ChatgptAuthTokens),
+            Some("workspace-external"),
+            &ChatgptAuthTokensRefreshParams {
+                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-external".to_string()),
+            },
+        )
+        .expect("external auth refresh should load from ephemeral auth");
+
+        assert_eq!(response.chatgpt_account_id, "workspace-external");
+        assert_eq!(response.access_token, external_access_token);
     }
 
     #[test]
