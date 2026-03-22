@@ -512,7 +512,8 @@ fn view_image_tool_includes_detail_with_original_detail_feature() {
     let mut model_info =
         ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
     model_info.supports_image_detail_original = true;
-    let features = Features::with_defaults();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::ImageDetailOriginal);
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
         features: &features,
@@ -530,6 +531,17 @@ fn view_image_tool_includes_detail_with_original_detail_feature() {
         panic!("view_image should use an object schema");
     };
     assert!(properties.contains_key("detail"));
+    let detail_schema = properties
+        .get("detail")
+        .expect("detail schema should be present");
+    let JsonSchema::String {
+        description: Some(description),
+    } = detail_schema
+    else {
+        panic!("detail schema should be a string with description");
+    };
+    assert!(description.contains("`original`"));
+    assert!(!description.contains("`high`"));
 }
 
 #[test]

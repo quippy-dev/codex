@@ -88,7 +88,8 @@ pub struct Cli {
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 
-    #[clap(skip)]
+    /// Override the auth storage file path (expects a path to `auth.json`).
+    #[arg(long = "auth-file", value_name = "PATH", global = true)]
     pub auth_file: Option<PathBuf>,
 
     /// Specifies color settings for use in the output.
@@ -355,5 +356,12 @@ mod tests {
             .expect_err("fork should conflict with subcommands");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn auth_file_parses_for_standalone_exec() {
+        let cli = Cli::parse_from(["codex-exec", "--auth-file", "/tmp/auth.json", "echo ok"]);
+        assert_eq!(cli.auth_file, Some(PathBuf::from("/tmp/auth.json")));
+        assert_eq!(cli.prompt.as_deref(), Some("echo ok"));
     }
 }

@@ -5237,6 +5237,102 @@ async fn close_agent_marks_persisted_descendants_closed_even_through_closed_inte
 }
 
 #[tokio::test]
+async fn close_agent_marks_persisted_subtree_closed_when_target_is_offline() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let grandchild_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello grandchild"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("grandchild spawn should succeed");
+
+    let state_db = parent_thread
+        .state_db()
+        .expect("sqlite state db should be available");
+    wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
+        .await;
+    wait_for_live_thread_spawn_children(&harness.control, child_thread_id, &[grandchild_thread_id])
+        .await;
+
+    let _ = harness
+        .control
+        .close_agent(child_thread_id)
+        .await
+        .expect("child close should succeed");
+    assert_eq!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::NotFound
+    );
+
+    state_db
+        .set_thread_spawn_edge_status(child_thread_id, DirectionalThreadSpawnEdgeStatus::Open)
+        .await
+        .expect("child edge reopen should succeed");
+    state_db
+        .set_thread_spawn_edge_status(grandchild_thread_id, DirectionalThreadSpawnEdgeStatus::Open)
+        .await
+        .expect("grandchild edge reopen should succeed");
+    let open_descendants_before = state_db
+        .list_thread_spawn_descendants_with_status(
+            child_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("open descendants from child should load");
+    assert_eq!(open_descendants_before, vec![grandchild_thread_id]);
+
+    let close_offline_result = harness.control.close_agent(child_thread_id).await;
+    assert_matches!(
+        close_offline_result,
+        Err(CodexErr::ThreadNotFound(id)) if id == child_thread_id
+    );
+
+    let closed_children = state_db
+        .list_thread_spawn_children_with_status(
+            parent_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("closed children from parent should load");
+    assert_eq!(closed_children, vec![child_thread_id]);
+
+    let closed_descendants = state_db
+        .list_thread_spawn_descendants_with_status(
+            child_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("closed descendants from child should load");
+    assert_eq!(closed_descendants, vec![grandchild_thread_id]);
+}
+
+#[tokio::test]
 async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;

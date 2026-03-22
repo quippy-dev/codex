@@ -1994,6 +1994,8 @@ impl App {
             }) => {
                 self.thread_parent_by_child
                     .insert(thread_id, *parent_thread_id);
+                self.closed_agent_thread_roots.remove(&thread_id);
+                self.suppressed_descendant_threads.remove(&thread_id);
             }
             _ => {
                 self.thread_parent_by_child.remove(&thread_id);
@@ -7082,6 +7084,55 @@ guardian_approval = true
         assert!(app.should_suppress_thread_events(child_thread_id));
         assert!(app.should_suppress_thread_events(grandchild_thread_id));
         assert!(!app.suppressed_descendant_threads.contains(&root_thread_id));
+    }
+
+    #[tokio::test]
+    async fn observe_subagent_resume_clears_reopened_suppression_only_for_reopened_threads() {
+        let mut app = make_test_app().await;
+        let parent_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+        let grandchild_thread_id = ThreadId::new();
+
+        app.thread_parent_by_child
+            .insert(child_thread_id, parent_thread_id);
+        app.thread_parent_by_child
+            .insert(grandchild_thread_id, child_thread_id);
+        app.close_agent_subtree_in_ui(child_thread_id);
+        assert!(app.should_suppress_thread_events(grandchild_thread_id));
+
+        app.observe_thread_parent_from_session_source(
+            child_thread_id,
+            &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+        );
+        assert!(!app.closed_agent_thread_roots.contains(&child_thread_id));
+        assert!(!app.suppressed_descendant_threads.contains(&child_thread_id));
+        assert!(
+            app.suppressed_descendant_threads
+                .contains(&grandchild_thread_id)
+        );
+        assert!(app.should_suppress_thread_events(grandchild_thread_id));
+
+        app.observe_thread_parent_from_session_source(
+            grandchild_thread_id,
+            &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+        );
+        assert!(
+            !app.suppressed_descendant_threads
+                .contains(&grandchild_thread_id)
+        );
+        assert!(!app.should_suppress_thread_events(grandchild_thread_id));
     }
 
     #[tokio::test]

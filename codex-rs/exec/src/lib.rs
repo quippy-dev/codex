@@ -105,7 +105,9 @@ use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
+use codex_core::find_archived_thread_path_by_id_str;
 use codex_core::find_or_unarchive_thread_path_by_id_str;
+use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
@@ -1529,9 +1531,30 @@ async fn resolve_resume_path(
 }
 
 async fn resolve_fork_path(config: &Config, session_id: &str) -> anyhow::Result<PathBuf> {
-    resolve_thread_path_by_id_or_name(config, session_id)
+    resolve_thread_path_by_id_or_name_for_fork(config, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("No saved session found with ID {session_id}"))
+}
+
+async fn resolve_thread_path_by_id_or_name_for_fork(
+    config: &Config,
+    id_or_name: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    if Uuid::parse_str(id_or_name).is_ok() {
+        let active = find_thread_path_by_id_str(&config.codex_home, id_or_name)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if active.is_some() {
+            return Ok(active);
+        }
+        find_archived_thread_path_by_id_str(&config.codex_home, id_or_name)
+            .await
+            .map_err(anyhow::Error::from)
+    } else {
+        find_thread_path_by_name_str(&config.codex_home, id_or_name)
+            .await
+            .map_err(anyhow::Error::from)
+    }
 }
 
 async fn resolve_thread_path_by_id_or_name(
@@ -1728,6 +1751,7 @@ mod tests {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
+    use std::fs;
     use tempfile::tempdir;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -1986,6 +2010,50 @@ mod tests {
         assert_eq!(
             params.approvals_reviewer,
             Some(codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_fork_path_reads_archived_source_without_unarchive_side_effect() {
+        let codex_home = tempdir().expect("create temp codex home");
+        let cwd = tempdir().expect("create temp cwd");
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(cwd.path().to_path_buf()))
+            .build()
+            .await
+            .expect("build default config");
+
+        let thread_id = Uuid::new_v4();
+        let archived_rollout_path = codex_home
+            .path()
+            .join("archived_sessions/2026/03/22")
+            .join(format!("rollout-2026-03-22T00-00-00-{thread_id}.jsonl"));
+        let sessions_rollout_path = codex_home
+            .path()
+            .join("sessions/2026/03/22")
+            .join(format!("rollout-2026-03-22T00-00-00-{thread_id}.jsonl"));
+        fs::create_dir_all(
+            archived_rollout_path
+                .parent()
+                .expect("archived rollout path should have a parent"),
+        )
+        .expect("create archived rollout directory");
+        fs::write(&archived_rollout_path, "{\"event\":\"placeholder\"}\n")
+            .expect("write archived rollout file");
+
+        let resolved = resolve_fork_path(&config, &thread_id.to_string())
+            .await
+            .expect("fork source path should resolve");
+
+        assert_eq!(resolved, archived_rollout_path);
+        assert!(
+            archived_rollout_path.exists(),
+            "fork source lookup should not move archived rollout into sessions/"
+        );
+        assert!(
+            !sessions_rollout_path.exists(),
+            "fork source lookup should remain read-only"
         );
     }
 

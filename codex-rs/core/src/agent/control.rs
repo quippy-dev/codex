@@ -1104,7 +1104,11 @@ impl AgentControl {
         let state_db_ctx = if let Ok(thread) = state.get_thread(agent_id).await {
             thread.state_db()
         } else {
-            None
+            state
+                .list_threads()
+                .await
+                .into_iter()
+                .find_map(|(_, thread)| thread.state_db())
         };
 
         let Some(state_db_ctx) = state_db_ctx else {

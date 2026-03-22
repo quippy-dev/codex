@@ -978,7 +978,7 @@ fn create_view_image_tool(can_request_original_image_detail: bool) -> ToolSpec {
             "detail".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional image detail level. Use `high` only when fine visual detail matters."
+                    "Optional image detail level. Use `original` only when fine visual detail matters."
                         .to_string(),
                 ),
             },

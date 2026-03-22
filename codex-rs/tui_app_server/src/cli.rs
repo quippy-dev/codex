@@ -110,9 +110,24 @@ pub struct Cli {
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
-    #[clap(skip)]
+    /// Override the auth storage file path (expects a path to `auth.json`).
+    #[arg(long = "auth-file", value_name = "PATH")]
     pub auth_file: Option<PathBuf>,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+
+    #[test]
+    fn auth_file_parses_for_standalone_tui_app_server() {
+        let cli = Cli::parse_from(["codex-tui-app-server", "--auth-file", "/tmp/auth.json"]);
+        assert_eq!(cli.auth_file, Some(PathBuf::from("/tmp/auth.json")));
+    }
 }
