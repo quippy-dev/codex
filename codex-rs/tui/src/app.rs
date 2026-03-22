@@ -85,6 +85,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillErrorInfo;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
@@ -98,6 +99,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -617,6 +619,9 @@ pub(crate) struct App {
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
+    thread_parent_by_child: HashMap<ThreadId, ThreadId>,
+    closed_agent_thread_roots: HashSet<ThreadId>,
+    suppressed_descendant_threads: HashSet<ThreadId>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<Event>>,
     primary_thread_id: Option<ThreadId>,
@@ -1534,6 +1539,9 @@ impl App {
             if Some(thread_id) == self.active_thread_id {
                 continue;
             }
+            if self.should_suppress_thread_events(thread_id) {
+                continue;
+            }
 
             let store = store.lock().await;
             if store.has_pending_thread_approvals() {
@@ -1553,6 +1561,22 @@ impl App {
 
     async fn enqueue_thread_event(&mut self, thread_id: ThreadId, mut event: Event) -> Result<()> {
         self.backfill_collab_event_identity(&mut event);
+        match &event.msg {
+            EventMsg::CollabAgentSpawnEnd(ev) => {
+                self.observe_spawn_edge(ev.sender_thread_id, ev.new_thread_id);
+            }
+            EventMsg::CollabCloseEnd(ev) => {
+                self.close_agent_subtree_in_ui(ev.receiver_thread_id);
+            }
+            EventMsg::ShutdownComplete => {
+                self.close_agent_subtree_in_ui(thread_id);
+            }
+            _ => {}
+        }
+        if self.should_suppress_thread_events(thread_id) {
+            tracing::debug!("dropping event for suppressed descendant thread {thread_id}");
+            return Ok(());
+        }
         self.process_subagent_side_effects(thread_id, &event);
         let refresh_pending_thread_approvals =
             ThreadEventStore::event_can_change_pending_thread_approvals(&event);
@@ -1612,6 +1636,10 @@ impl App {
         thread_id: ThreadId,
         event: Event,
     ) -> Result<()> {
+        if self.should_suppress_thread_events(thread_id) {
+            tracing::debug!("dropping stale event for suppressed thread {thread_id}");
+            return Ok(());
+        }
         if !self.thread_event_channels.contains_key(&thread_id) {
             tracing::debug!("dropping stale event for untracked thread {thread_id}");
             return Ok(());
@@ -1659,6 +1687,7 @@ impl App {
             match self.server.get_thread(thread_id).await {
                 Ok(thread) => {
                     let session_source = thread.config_snapshot().await.session_source;
+                    self.observe_thread_parent_from_session_source(thread_id, &session_source);
                     self.upsert_agent_picker_thread(
                         thread_id,
                         session_source.get_nickname(),
@@ -1667,20 +1696,24 @@ impl App {
                     );
                 }
                 Err(_) => {
-                    self.mark_agent_picker_thread_closed(thread_id);
+                    self.close_agent_subtree_in_ui(thread_id);
                 }
             }
         }
 
+        let visible_thread_ids = self.ordered_visible_thread_ids();
         let has_non_primary_agent_thread = self
             .agent_navigation
-            .has_non_primary_thread(self.primary_thread_id);
+            .has_non_primary_thread(self.primary_thread_id)
+            && visible_thread_ids
+                .iter()
+                .any(|thread_id| Some(*thread_id) != self.primary_thread_id);
         if !self.config.features.enabled(Feature::Collab) && !has_non_primary_agent_thread {
             self.chat_widget.open_multi_agent_enable_prompt();
             return;
         }
 
-        if self.agent_navigation.is_empty() {
+        if self.agent_navigation.is_empty() || visible_thread_ids.is_empty() {
             self.chat_widget
                 .add_info_message("No agents available yet.".to_string(), /*hint*/ None);
             return;
@@ -1690,14 +1723,15 @@ impl App {
         let items: Vec<SelectionItem> = self
             .agent_navigation
             .ordered_threads()
-            .iter()
+            .into_iter()
+            .filter(|(thread_id, _)| !self.suppressed_descendant_threads.contains(thread_id))
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
-                if self.active_thread_id == Some(*thread_id) {
+                if self.active_thread_id == Some(thread_id) {
                     initial_selected_idx = Some(idx);
                 }
-                let id = *thread_id;
-                let is_primary = self.primary_thread_id == Some(*thread_id);
+                let id = thread_id;
+                let is_primary = self.primary_thread_id == Some(thread_id);
                 let name = format_agent_picker_item_name(
                     entry.agent_nickname.as_deref(),
                     entry.agent_role.as_deref(),
@@ -1708,7 +1742,7 @@ impl App {
                     name: name.clone(),
                     name_prefix_spans: agent_picker_status_dot_spans(entry.is_closed),
                     description: Some(uuid.clone()),
-                    is_current: self.active_thread_id == Some(*thread_id),
+                    is_current: self.active_thread_id == Some(thread_id),
                     actions: vec![Box::new(move |tx| {
                         tx.send(AppEvent::SelectAgentThread(id));
                     })],
@@ -1754,8 +1788,147 @@ impl App {
         self.sync_active_agent_label();
     }
 
+    fn observe_thread_parent_from_session_source(
+        &mut self,
+        thread_id: ThreadId,
+        source: &SessionSource,
+    ) {
+        match source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => {
+                self.thread_parent_by_child
+                    .insert(thread_id, *parent_thread_id);
+            }
+            _ => {
+                self.thread_parent_by_child.remove(&thread_id);
+                self.closed_agent_thread_roots.remove(&thread_id);
+                self.suppressed_descendant_threads.remove(&thread_id);
+            }
+        }
+    }
+
+    fn observe_spawn_edge(
+        &mut self,
+        parent_thread_id: ThreadId,
+        child_thread_id: Option<ThreadId>,
+    ) {
+        let Some(child_thread_id) = child_thread_id else {
+            return;
+        };
+        self.thread_parent_by_child
+            .insert(child_thread_id, parent_thread_id);
+        if self.has_closed_ancestor(child_thread_id) {
+            self.suppress_descendant_thread(child_thread_id);
+        }
+    }
+
+    fn has_closed_ancestor(&self, thread_id: ThreadId) -> bool {
+        let mut seen = HashSet::new();
+        let mut current = thread_id;
+        while let Some(parent) = self.thread_parent_by_child.get(&current).copied() {
+            if !seen.insert(parent) {
+                break;
+            }
+            if self.closed_agent_thread_roots.contains(&parent) {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    fn collect_known_descendants(&self, root_thread_id: ThreadId) -> Vec<ThreadId> {
+        let mut descendants = Vec::new();
+        let mut frontier = vec![root_thread_id];
+        let mut seen = HashSet::from([root_thread_id]);
+        while let Some(parent) = frontier.pop() {
+            for (&child, &mapped_parent) in &self.thread_parent_by_child {
+                if mapped_parent == parent && seen.insert(child) {
+                    descendants.push(child);
+                    frontier.push(child);
+                }
+            }
+        }
+        descendants
+    }
+
+    fn suppress_descendant_thread(&mut self, thread_id: ThreadId) {
+        self.suppressed_descendant_threads.insert(thread_id);
+        self.mark_agent_picker_thread_closed(thread_id);
+        self.abort_thread_event_listener(thread_id);
+        if let Some(info) = self.subagents.agents.get_mut(&thread_id) {
+            info.status = codex_protocol::protocol::AgentStatus::Shutdown;
+            info.notified_terminal = true;
+            info.inflight_message.clear();
+            info.reasoning_buffer.clear();
+            info.latest_summary.clear();
+            info.latest_update_at = Instant::now();
+        }
+    }
+
+    fn close_agent_subtree_in_ui(&mut self, closed_thread_id: ThreadId) {
+        self.closed_agent_thread_roots.insert(closed_thread_id);
+        self.mark_agent_picker_thread_closed(closed_thread_id);
+        self.suppressed_descendant_threads.remove(&closed_thread_id);
+        if let Some(info) = self.subagents.agents.get_mut(&closed_thread_id) {
+            info.status = codex_protocol::protocol::AgentStatus::Shutdown;
+            info.notified_terminal = true;
+            info.inflight_message.clear();
+            info.reasoning_buffer.clear();
+            info.latest_summary.clear();
+            info.latest_update_at = Instant::now();
+        }
+        for descendant_id in self.collect_known_descendants(closed_thread_id) {
+            self.suppress_descendant_thread(descendant_id);
+        }
+        self.sync_subagent_panel_state();
+    }
+
+    fn should_suppress_thread_events(&self, thread_id: ThreadId) -> bool {
+        self.suppressed_descendant_threads.contains(&thread_id)
+            || self.has_closed_ancestor(thread_id)
+    }
+
+    fn ordered_visible_thread_ids(&self) -> Vec<ThreadId> {
+        self.agent_navigation
+            .ordered_threads()
+            .into_iter()
+            .map(|(thread_id, _)| thread_id)
+            .filter(|thread_id| !self.suppressed_descendant_threads.contains(thread_id))
+            .collect()
+    }
+
+    fn adjacent_visible_thread_id(&self, direction: AgentNavigationDirection) -> Option<ThreadId> {
+        let ordered = self.ordered_visible_thread_ids();
+        if ordered.len() < 2 {
+            return None;
+        }
+        let mut current_thread_id = self.current_displayed_thread_id()?;
+        for _ in 0..self.agent_navigation.ordered_threads().len() {
+            let candidate = self
+                .agent_navigation
+                .adjacent_thread_id(Some(current_thread_id), direction)?;
+            if !self.suppressed_descendant_threads.contains(&candidate) {
+                return Some(candidate);
+            }
+            current_thread_id = candidate;
+        }
+        None
+    }
+
     async fn select_agent_thread(&mut self, tui: &mut tui::Tui, thread_id: ThreadId) -> Result<()> {
         if self.active_thread_id == Some(thread_id) {
+            return Ok(());
+        }
+        if self.should_suppress_thread_events(thread_id) {
+            self.mark_agent_picker_thread_closed(thread_id);
+            self.chat_widget.add_info_message(
+                format!(
+                    "Agent thread {thread_id} was closed with its parent and is not available."
+                ),
+                /*hint*/ None,
+            );
             return Ok(());
         }
 
@@ -1763,7 +1936,7 @@ impl App {
             Ok(thread) => Some(thread),
             Err(err) => {
                 if self.thread_event_channels.contains_key(&thread_id) {
-                    self.mark_agent_picker_thread_closed(thread_id);
+                    self.close_agent_subtree_in_ui(thread_id);
                     None
                 } else {
                     self.chat_widget.add_error_message(format!(
@@ -1832,6 +2005,9 @@ impl App {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
         self.agent_navigation.clear();
+        self.thread_parent_by_child.clear();
+        self.closed_agent_thread_roots.clear();
+        self.suppressed_descendant_threads.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
@@ -2234,6 +2410,9 @@ impl App {
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
+            thread_parent_by_child: HashMap::new(),
+            closed_agent_thread_roots: HashSet::new(),
+            suppressed_descendant_threads: HashSet::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -3878,7 +4057,7 @@ impl App {
         if let Some((closed_thread_id, primary_thread_id)) =
             self.active_non_primary_shutdown_target(&event.msg)
         {
-            self.mark_agent_picker_thread_closed(closed_thread_id);
+            self.close_agent_subtree_in_ui(closed_thread_id);
             self.select_agent_thread(tui, primary_thread_id).await?;
             if self.active_thread_id == Some(primary_thread_id) {
                 self.chat_widget.add_info_message(
@@ -3920,6 +4099,11 @@ impl App {
             }
         };
         let config_snapshot = thread.config_snapshot().await;
+        self.observe_thread_parent_from_session_source(thread_id, &config_snapshot.session_source);
+        if self.has_closed_ancestor(thread_id) {
+            self.suppress_descendant_thread(thread_id);
+            return Ok(());
+        }
         self.upsert_agent_picker_thread(
             thread_id,
             config_snapshot.session_source.get_nickname(),
@@ -4111,10 +4295,9 @@ impl App {
             && self.chat_widget.composer_text_with_pending().is_empty()
             && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
         {
-            if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
-                self.current_displayed_thread_id(),
-                AgentNavigationDirection::Previous,
-            ) {
+            if let Some(thread_id) =
+                self.adjacent_visible_thread_id(AgentNavigationDirection::Previous)
+            {
                 let _ = self.select_agent_thread(tui, thread_id).await;
             }
             return;
@@ -4126,10 +4309,8 @@ impl App {
             && self.chat_widget.composer_text_with_pending().is_empty()
             && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
         {
-            if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
-                self.current_displayed_thread_id(),
-                AgentNavigationDirection::Next,
-            ) {
+            if let Some(thread_id) = self.adjacent_visible_thread_id(AgentNavigationDirection::Next)
+            {
                 let _ = self.select_agent_thread(tui, thread_id).await;
             }
             return;
@@ -6432,17 +6613,42 @@ guardian_approval = true
     {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         app.config.features.disable(Feature::Collab)?;
+        app.thread_event_channels.clear();
+        app.thread_event_listener_tasks.clear();
+        app.agent_navigation.clear();
+        app.primary_thread_id = None;
+        app.active_thread_id = None;
         let thread_id = ThreadId::new();
         app.thread_event_channels
             .insert(thread_id, ThreadEventChannel::new(1));
 
         app.open_agent_picker().await;
+        assert!(
+            app.agent_navigation
+                .has_non_primary_thread(app.primary_thread_id)
+        );
+        assert!(
+            app.ordered_visible_thread_ids()
+                .iter()
+                .any(|id| Some(*id) != app.primary_thread_id)
+        );
         app.chat_widget
             .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_matches!(
-            app_event_rx.try_recv(),
-            Ok(AppEvent::SelectAgentThread(selected_thread_id)) if selected_thread_id == thread_id
+        let events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AppEvent::SelectAgentThread(selected_thread_id) if *selected_thread_id == thread_id
+            )),
+            "expected SelectAgentThread({thread_id}) in picker events, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AppEvent::UpdateFeatureFlags { updates }
+                    if updates == &vec![(Feature::Collab, true)]
+            )),
+            "existing thread should bypass collab-enable prompt, got {events:?}"
         );
         Ok(())
     }
@@ -6529,6 +6735,86 @@ guardian_approval = true
         app.active_thread_id = Some(agent_thread_id);
         app.refresh_pending_thread_approvals().await;
         assert!(app.chat_widget.pending_thread_approvals().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_agent_subtree_marks_known_descendants_suppressed() {
+        let mut app = make_test_app().await;
+        let root_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+        let grandchild_thread_id = ThreadId::new();
+
+        app.agent_navigation
+            .upsert(root_thread_id, Some("Root".to_string()), None, false);
+        app.agent_navigation
+            .upsert(child_thread_id, Some("Child".to_string()), None, false);
+        app.agent_navigation.upsert(
+            grandchild_thread_id,
+            Some("Grandchild".to_string()),
+            None,
+            false,
+        );
+        app.thread_parent_by_child
+            .insert(child_thread_id, root_thread_id);
+        app.thread_parent_by_child
+            .insert(grandchild_thread_id, child_thread_id);
+
+        app.close_agent_subtree_in_ui(root_thread_id);
+
+        assert!(
+            app.agent_navigation
+                .get(&root_thread_id)
+                .is_some_and(|entry| entry.is_closed)
+        );
+        assert!(
+            app.agent_navigation
+                .get(&child_thread_id)
+                .is_some_and(|entry| entry.is_closed)
+        );
+        assert!(
+            app.agent_navigation
+                .get(&grandchild_thread_id)
+                .is_some_and(|entry| entry.is_closed)
+        );
+        assert!(app.should_suppress_thread_events(child_thread_id));
+        assert!(app.should_suppress_thread_events(grandchild_thread_id));
+        assert!(!app.suppressed_descendant_threads.contains(&root_thread_id));
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_ignores_suppressed_descendant_events() -> Result<()> {
+        let mut app = make_test_app().await;
+        let root_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+
+        app.thread_parent_by_child
+            .insert(child_thread_id, root_thread_id);
+        app.close_agent_subtree_in_ui(root_thread_id);
+        app.thread_event_channels
+            .insert(child_thread_id, ThreadEventChannel::new(8));
+
+        app.enqueue_thread_event(
+            child_thread_id,
+            Event {
+                id: "stale-descendant".to_string(),
+                msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: "stale descendant update".to_string(),
+                    codex_error_info: None,
+                }),
+            },
+        )
+        .await?;
+
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&child_thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.snapshot()
+        };
+        assert!(snapshot.events.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -6924,6 +7210,9 @@ guardian_approval = true
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
+            thread_parent_by_child: HashMap::new(),
+            closed_agent_thread_roots: HashSet::new(),
+            suppressed_descendant_threads: HashSet::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -6987,6 +7276,9 @@ guardian_approval = true
                 thread_event_channels: HashMap::new(),
                 thread_event_listener_tasks: HashMap::new(),
                 agent_navigation: AgentNavigationState::default(),
+                thread_parent_by_child: HashMap::new(),
+                closed_agent_thread_roots: HashSet::new(),
+                suppressed_descendant_threads: HashSet::new(),
                 active_thread_id: None,
                 active_thread_rx: None,
                 primary_thread_id: None,
