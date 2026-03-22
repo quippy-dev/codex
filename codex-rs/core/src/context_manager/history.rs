@@ -162,7 +162,6 @@ impl ContextManager {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
