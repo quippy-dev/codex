@@ -3168,12 +3168,14 @@ pub(crate) fn build_specs_with_discoverable_tools(
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
-        push_tool_spec(
-            &mut builder,
-            create_wait_tool(config.agent_watchdog),
-            /*supports_parallel_tool_calls*/ false,
-            config.code_mode_enabled,
-        );
+        if !config.code_mode_enabled {
+            push_tool_spec(
+                &mut builder,
+                create_wait_tool(config.agent_watchdog),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+        }
         push_tool_spec(
             &mut builder,
             create_wait_agent_tool(config.agent_watchdog),
@@ -3214,10 +3216,12 @@ pub(crate) fn build_specs_with_discoverable_tools(
             "peek_agents",
             Arc::new(crate::tools::handlers::multi_agents::MultiAgentHandler),
         );
-        builder.register_handler(
-            "wait",
-            Arc::new(crate::tools::handlers::multi_agents::MultiAgentHandler),
-        );
+        if !config.code_mode_enabled {
+            builder.register_handler(
+                "wait",
+                Arc::new(crate::tools::handlers::multi_agents::MultiAgentHandler),
+            );
+        }
         builder.register_handler(
             "wait_agent",
             Arc::new(crate::tools::handlers::multi_agents::WaitAgentHandler),

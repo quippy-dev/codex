@@ -451,6 +451,62 @@ fn test_build_specs_collab_tools_without_watchdog_feature() {
 }
 
 #[test]
+fn test_build_specs_collab_and_code_mode_keep_code_mode_wait_contract() {
+    let config = test_config();
+    let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Collab);
+    features.enable(Feature::CollaborationModes);
+    features.enable(Feature::Sqlite);
+    features.enable(Feature::CodeMode);
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+    assert_contains_tool_names(&tools, &["wait", "wait_agent"]);
+
+    let wait_spec = match &find_tool(&tools, "wait").spec {
+        ToolSpec::Function(spec) => spec,
+        other => panic!("expected function tool for wait, found {other:?}"),
+    };
+    let wait_agent_spec = match &find_tool(&tools, "wait_agent").spec {
+        ToolSpec::Function(spec) => spec,
+        other => panic!("expected function tool for wait_agent, found {other:?}"),
+    };
+
+    let JsonSchema::Object {
+        properties: wait_properties,
+        required: wait_required,
+        ..
+    } = &wait_spec.parameters
+    else {
+        panic!("wait parameters should be an object");
+    };
+    assert_eq!(wait_required.as_ref(), Some(&vec!["cell_id".to_string()]));
+    assert!(wait_properties.contains_key("cell_id"));
+    assert!(!wait_properties.contains_key("ids"));
+
+    let JsonSchema::Object {
+        properties: wait_agent_properties,
+        required: wait_agent_required,
+        ..
+    } = &wait_agent_spec.parameters
+    else {
+        panic!("wait_agent parameters should be an object");
+    };
+    assert_eq!(wait_agent_required.as_ref(), Some(&vec!["ids".to_string()]));
+    assert!(wait_agent_properties.contains_key("ids"));
+    assert!(!wait_agent_properties.contains_key("cell_id"));
+}
+
+#[test]
 fn view_image_tool_includes_detail_with_original_detail_feature() {
     let config = test_config();
     let mut model_info =
