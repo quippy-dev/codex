@@ -629,6 +629,19 @@ mod send_input {
             .agent_control
             .record_prompt_preview(receiver_thread_id, &prompt)
             .await;
+        if session
+            .services
+            .agent_control
+            .watchdog_owner_for_active_helper(session.conversation_id)
+            .await
+            == Some(receiver_thread_id)
+        {
+            session
+                .services
+                .agent_control
+                .mark_watchdog_idle_episode_satisfied_for_helper(session.conversation_id)
+                .await;
+        }
         session.mark_turn_used_agent_send_input();
 
         let content = serde_json::to_string(&SendInputResult { submission_id }).map_err(|err| {
@@ -1219,7 +1232,7 @@ pub(crate) mod wait {
             .await
         {
             return Err(FunctionCallError::RespondToModel(format!(
-                "wait is not available to watchdog check-in agents. This thread is a one-shot watchdog check-in for owner {owner_thread_id}. Send the result to the parent/root agent with `send_input`. If you finish without `send_input`, runtime will forward your conclusory message to the owner as the mandatory fallback wake-up path. Exiting without either `send_input` or a final message is a bug; every watchdog check-in must wake the owner thread."
+                "wait is not available to watchdog check-in agents. This thread is a one-shot watchdog check-in for owner {owner_thread_id}. Send the result to the parent/root agent with `send_input`. A successful watchdog handoff wakes the owner into a real follow-up turn. If you finish without `send_input`, runtime will forward your conclusory message to the owner as the mandatory fallback wake-up path. After a successful handoff, exit quietly and do not add extra completion narration."
             )));
         }
         let args: WaitArgs = parse_arguments(&arguments)?;
@@ -1313,7 +1326,7 @@ pub(crate) mod wait {
             })?;
 
             return Err(FunctionCallError::RespondToModel(format!(
-                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins only happen after the current turn ends and the owner thread is idle for at least the watchdog interval. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
+                "wait cannot be used to wait for watchdog check-ins. You passed only watchdog handle ids. Watchdog check-ins happen only after the current turn ends and the owner thread is idle for at least the watchdog interval. Each idle stretch allows at most one successful watchdog handoff; failed runs may retry while the owner stays idle until one succeeds. `wait` on a watchdog handle is status-only and cannot confirm a new check-in. Do not poll with `wait`, `list_agents`, or shell `sleep`: the owner thread is still active during this turn, so those calls cannot make the watchdog fire. Do not call `wait` again on this watchdog handle in this turn. Continue the task now or end the turn so the watchdog can check in later. Current watchdog handle statuses: {content}"
             )));
         }
 

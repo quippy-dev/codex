@@ -54,6 +54,7 @@ struct WatchdogEntry {
     active_helper_id: Option<ThreadId>,
     owner_idle_since: Option<Instant>,
     owner_was_running: bool,
+    idle_episode_satisfied: bool,
     force_due_once: bool,
     generation: i64,
 }
@@ -117,6 +118,7 @@ impl WatchdogManager {
             active_helper_id: None,
             owner_idle_since: Some(now),
             owner_was_running: false,
+            idle_episode_satisfied: false,
             force_due_once: false,
             generation,
         };
@@ -234,7 +236,7 @@ impl WatchdogManager {
         let Some(owner_idle_since) = owner_idle_since else {
             return;
         };
-        if now.duration_since(owner_idle_since) < snapshot.interval {
+        if !force_due && now.duration_since(owner_idle_since) < snapshot.interval {
             return;
         }
 
@@ -255,7 +257,11 @@ impl WatchdogManager {
             return;
         }
 
-        if now.duration_since(snapshot.last_trigger) < snapshot.interval {
+        if snapshot.idle_episode_satisfied {
+            return;
+        }
+
+        if !force_due && now.duration_since(snapshot.last_trigger) < snapshot.interval {
             return;
         }
 
@@ -319,6 +325,7 @@ impl WatchdogManager {
             last_trigger: entry.last_trigger,
             active_helper_id: entry.active_helper_id,
             owner_idle_since: entry.owner_idle_since,
+            idle_episode_satisfied: entry.idle_episode_satisfied,
         })
     }
 
@@ -343,11 +350,13 @@ impl WatchdogManager {
         if owner_running {
             entry.owner_idle_since = None;
             entry.owner_was_running = true;
+            entry.idle_episode_satisfied = false;
             return None;
         }
 
         if entry.owner_was_running || entry.owner_idle_since.is_none() {
             entry.owner_idle_since = Some(now);
+            entry.idle_episode_satisfied = false;
         }
         entry.owner_was_running = false;
         entry.owner_idle_since
@@ -393,6 +402,21 @@ impl WatchdogManager {
         }
         entry.last_trigger = now;
         entry.active_helper_id = active_helper_id;
+    }
+
+    pub(crate) async fn mark_idle_episode_satisfied_for_helper(
+        &self,
+        helper_thread_id: ThreadId,
+    ) -> bool {
+        let mut registrations = self.registrations.lock().await;
+        let Some(entry) = registrations
+            .values_mut()
+            .find(|entry| entry.active_helper_id == Some(helper_thread_id))
+        else {
+            return false;
+        };
+        entry.idle_episode_satisfied = true;
+        true
     }
 
     pub(crate) async fn unregister(&self, target_thread_id: ThreadId) -> Option<RemovedWatchdog> {
@@ -470,7 +494,30 @@ impl WatchdogManager {
         entry.last_trigger = due_at;
         entry.owner_idle_since = Some(due_at);
         entry.owner_was_running = false;
+        entry.idle_episode_satisfied = false;
         entry.active_helper_id = Some(helper_thread_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_helper_for_target(
+        &self,
+        target_thread_id: ThreadId,
+    ) -> Option<ThreadId> {
+        let registrations = self.registrations.lock().await;
+        registrations
+            .get(&target_thread_id)
+            .and_then(|entry| entry.active_helper_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn idle_episode_satisfied_for_target(
+        &self,
+        target_thread_id: ThreadId,
+    ) -> Option<bool> {
+        let registrations = self.registrations.lock().await;
+        registrations
+            .get(&target_thread_id)
+            .map(|entry| entry.idle_episode_satisfied)
     }
 
     pub(crate) async fn preserve_helper_owner_for_completion_fallback(
@@ -502,6 +549,7 @@ struct WatchdogSnapshot {
     last_trigger: Instant,
     active_helper_id: Option<ThreadId>,
     owner_idle_since: Option<Instant>,
+    idle_episode_satisfied: bool,
 }
 
 async fn get_status(manager_state: &Arc<ThreadManagerState>, thread_id: ThreadId) -> AgentStatus {

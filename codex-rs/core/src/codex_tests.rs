@@ -224,6 +224,41 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     ));
 }
 
+#[tokio::test]
+async fn inject_response_items_without_active_turn_starts_followup_turn_with_pending_input() {
+    let (sess, _tc, rx) = make_session_and_context_with_rx().await;
+    sess.set_session_startup_prewarm(blocking_startup_prewarm_handle())
+        .await;
+
+    let queued = ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "queued collab handoff".to_string(),
+        }],
+    };
+
+    super::handlers::inject_response_items(
+        &sess,
+        "idle-inject-response-items-turn".to_string(),
+        vec![queued.clone()],
+    )
+    .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("expected turn started event")
+        .expect("channel open");
+    assert!(matches!(
+        first.msg,
+        EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. })
+            if turn_id == "idle-inject-response-items-turn"
+    ));
+    assert!(sess.has_active_turn().await);
+    assert_eq!(sess.get_pending_input().await, vec![queued]);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
 fn test_model_client_session() -> crate::client::ModelClientSession {
     crate::client::ModelClient::new(
         None,
@@ -239,6 +274,20 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         None,
     )
     .new_session()
+}
+
+fn blocking_startup_prewarm_handle() -> crate::session_startup_prewarm::SessionStartupPrewarmHandle
+{
+    let handle = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        Ok(test_model_client_session())
+    });
+
+    crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+        handle,
+        std::time::Instant::now(),
+        crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+    )
 }
 
 fn developer_input_texts(items: &[ResponseItem]) -> Vec<&str> {

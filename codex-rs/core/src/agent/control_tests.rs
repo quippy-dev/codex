@@ -132,26 +132,6 @@ fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
     })
 }
 
-fn count_history_text(history_items: &[ResponseItem], needle: &str) -> usize {
-    history_items
-        .iter()
-        .filter(|item| match item {
-            ResponseItem::Message { content, .. } => {
-                content.iter().any(|content_item| match content_item {
-                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        text.contains(needle)
-                    }
-                    ContentItem::InputImage { .. } => false,
-                })
-            }
-            ResponseItem::FunctionCallOutput { output, .. } => output
-                .text_content()
-                .is_some_and(|text| text.contains(needle)),
-            _ => false,
-        })
-        .count()
-}
-
 fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
     history_items.iter().any(|item| {
         let ResponseItem::Message { role, content, .. } = item else {
@@ -234,6 +214,52 @@ async fn wait_for_raw_response_text_with_timeout(
         }
     };
     tokio::time::timeout(timeout, wait).await.is_ok()
+}
+
+async fn wait_for_active_turn(thread: &Arc<CodexThread>) -> bool {
+    let wait = async {
+        loop {
+            if thread.has_active_turn().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+        .await
+        .is_ok()
+}
+
+async fn install_blocking_startup_prewarm(thread: &Arc<CodexThread>) {
+    let handle = tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        Ok(crate::client::ModelClient::new(
+            None,
+            ThreadId::try_from("00000000-0000-4000-8000-000000000001")
+                .expect("test thread id should be valid"),
+            crate::model_provider_info::ModelProviderInfo::create_openai_provider(
+                /* base_url */ None,
+            ),
+            SessionSource::Exec,
+            None,
+            false,
+            false,
+            None,
+        )
+        .new_session())
+    });
+
+    thread
+        .codex
+        .session
+        .set_session_startup_prewarm(
+            crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                handle,
+                std::time::Instant::now(),
+                crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+            ),
+        )
+        .await;
 }
 
 fn auth_manager_with_auth_file(config: &Config, root: &TempDir, label: &str) -> Arc<AuthManager> {
@@ -1072,6 +1098,7 @@ async fn send_agent_message_watchdog_helper_bypasses_deferral() {
 async fn root_watchdog_helper_shutdown_without_send_input_wakes_owner() {
     let harness = AgentControlHarness::new().await;
     let (owner_thread_id, owner_thread) = harness.start_thread().await;
+    install_blocking_startup_prewarm(&owner_thread).await;
     let watchdog_handle_id = harness
         .control
         .spawn_agent_handle(
@@ -1125,9 +1152,10 @@ async fn root_watchdog_helper_shutdown_without_send_input_wakes_owner() {
     })
     .await
     .expect("helper should reach shutdown");
-    assert_eq!(
-        wait_for_history_text(&owner_thread, "before calling send_input").await,
-        true
+    assert!(wait_for_raw_response_text(&owner_thread, "before calling send_input",).await);
+    assert!(
+        wait_for_active_turn(&owner_thread).await,
+        "fallback wake-up should start a real owner follow-up turn"
     );
     harness
         .control
@@ -1135,17 +1163,20 @@ async fn root_watchdog_helper_shutdown_without_send_input_wakes_owner() {
         .await;
     harness.control.run_watchdogs_once_for_tests().await;
     tokio::task::yield_now().await;
-    let owner_history = owner_thread
+    assert!(
+        !wait_for_raw_response_text_with_timeout(
+            &owner_thread,
+            "before calling send_input",
+            std::time::Duration::from_millis(300),
+        )
+        .await,
+        "watchdog should not re-emit the same fallback within one idle stretch"
+    );
+    owner_thread
         .codex
         .session
-        .clone_history()
-        .await
-        .raw_items()
-        .to_vec();
-    assert_eq!(
-        count_history_text(&owner_history, "before calling send_input"),
-        1
-    );
+        .abort_all_tasks(TurnAbortReason::Interrupted)
+        .await;
 }
 
 #[tokio::test]
@@ -1335,6 +1366,123 @@ async fn root_watchdog_helper_completed_without_final_body_after_send_input_does
         .await
         .is_ok();
     assert_eq!(duplicate_false_fallback, false);
+
+    owner_thread
+        .codex
+        .session
+        .abort_all_tasks(TurnAbortReason::Interrupted)
+        .await;
+}
+
+#[tokio::test]
+async fn root_watchdog_helper_send_input_to_idle_owner_wakes_owner_without_terminal_completion_chatter()
+ {
+    let harness = AgentControlHarness::new().await;
+    let (owner_thread_id, owner_thread) = harness.start_thread().await;
+    install_blocking_startup_prewarm(&owner_thread).await;
+
+    let watchdog_handle_id = harness
+        .control
+        .spawn_agent_handle(
+            harness.config.clone(),
+            Some(thread_spawn_source(owner_thread_id)),
+        )
+        .await
+        .expect("watchdog handle should spawn");
+    let helper_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("check in"),
+            Some(thread_spawn_source(owner_thread_id)),
+        )
+        .await
+        .expect("watchdog helper should spawn");
+    let helper_thread = harness
+        .manager
+        .get_thread(helper_thread_id)
+        .await
+        .expect("watchdog helper thread should exist");
+    let helper_turn = helper_thread
+        .codex
+        .session
+        .new_default_turn_with_sub_id("idle-owner-watchdog-helper-turn".to_string())
+        .await;
+    helper_thread
+        .codex
+        .session
+        .spawn_task(
+            Arc::clone(&helper_turn),
+            text_input("helper task"),
+            WaitForCancellationTask,
+        )
+        .await;
+
+    let removed = harness
+        .control
+        .register_watchdog(WatchdogRegistration {
+            owner_thread_id,
+            target_thread_id: watchdog_handle_id,
+            child_depth: 1,
+            interval_s: 1,
+            prompt: "check in".to_string(),
+            config: harness.config.clone(),
+        })
+        .await
+        .expect("watchdog registration should succeed");
+    assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+    harness
+        .control
+        .set_watchdog_active_helper_for_tests(watchdog_handle_id, helper_thread_id)
+        .await;
+
+    helper_thread
+        .codex
+        .session
+        .mark_turn_used_agent_send_input();
+    harness
+        .control
+        .send_agent_message(
+            owner_thread_id,
+            helper_thread_id,
+            "watchdog progress".to_string(),
+        )
+        .await
+        .expect("watchdog progress send_input should succeed");
+
+    assert!(wait_for_raw_response_text(&owner_thread, "watchdog progress").await);
+    assert!(
+        wait_for_active_turn(&owner_thread).await,
+        "idle-owner watchdog handoff should wake the owner into a real follow-up turn"
+    );
+
+    helper_thread
+        .codex
+        .session
+        .on_task_finished(
+            Arc::clone(&helper_turn),
+            Some("Reported completion to parent.".to_string()),
+        )
+        .await;
+
+    assert!(
+        !wait_for_raw_response_text_with_timeout(
+            &owner_thread,
+            "Reported completion to parent.",
+            std::time::Duration::from_millis(300),
+        )
+        .await,
+        "watchdog helper completion text should be suppressed after successful send_input"
+    );
+    assert!(
+        !wait_for_raw_response_text_with_timeout(
+            &owner_thread,
+            "before calling send_input",
+            std::time::Duration::from_millis(300),
+        )
+        .await,
+        "watchdog helper should not emit synthetic fallback after successful send_input"
+    );
 
     owner_thread
         .codex
@@ -2317,6 +2465,149 @@ async fn watchdog_run_once_cleans_up_active_helper_when_owner_missing() {
         .expect("replacement spawn should succeed after helper cleanup");
     let _ = control.shutdown_agent(replacement).await;
     let _ = control.shutdown_agent(watchdog_handle_id).await;
+}
+
+#[tokio::test]
+async fn watchdog_rearms_only_after_owner_activity_cycle() {
+    let harness = AgentControlHarness::new().await;
+    let (owner_thread_id, owner_thread) = harness.start_thread().await;
+    let initial_owner_turn = owner_thread
+        .codex
+        .session
+        .new_default_turn_with_sub_id("watchdog-owner-initial-activity-turn".to_string())
+        .await;
+    owner_thread
+        .codex
+        .session
+        .spawn_task(
+            Arc::clone(&initial_owner_turn),
+            text_input("owner initial activity"),
+            WaitForCancellationTask,
+        )
+        .await;
+    assert!(wait_for_active_turn(&owner_thread).await);
+    owner_thread
+        .codex
+        .session
+        .abort_all_tasks(TurnAbortReason::Interrupted)
+        .await;
+
+    let watchdog_handle_id = harness
+        .control
+        .spawn_agent_handle(
+            harness.config.clone(),
+            Some(thread_spawn_source(owner_thread_id)),
+        )
+        .await
+        .expect("watchdog handle should spawn");
+    let removed = harness
+        .control
+        .register_watchdog(WatchdogRegistration {
+            owner_thread_id,
+            target_thread_id: watchdog_handle_id,
+            child_depth: 1,
+            interval_s: 30,
+            prompt: "check in".to_string(),
+            config: harness.config.clone(),
+        })
+        .await
+        .expect("watchdog registration should succeed");
+    assert_eq!(removed, Vec::<RemovedWatchdog>::new());
+
+    let initial_helper_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("check in"),
+            Some(thread_spawn_source(owner_thread_id)),
+        )
+        .await
+        .expect("initial watchdog helper should spawn");
+    harness
+        .control
+        .set_watchdog_active_helper_for_tests(watchdog_handle_id, initial_helper_id)
+        .await;
+
+    harness
+        .control
+        .mark_watchdog_idle_episode_satisfied_for_helper(initial_helper_id)
+        .await;
+    let _ = harness
+        .control
+        .shutdown_agent(initial_helper_id)
+        .await
+        .expect("helper shutdown should submit");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                harness.control.get_status(initial_helper_id).await,
+                AgentStatus::Shutdown | AgentStatus::NotFound
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("helper should finish");
+
+    harness.control.run_watchdogs_once_for_tests().await;
+    harness
+        .control
+        .force_watchdog_due_for_tests(watchdog_handle_id)
+        .await;
+    harness.control.run_watchdogs_once_for_tests().await;
+
+    assert_eq!(
+        harness
+            .control
+            .watchdog_active_helper_for_tests(watchdog_handle_id)
+            .await,
+        None,
+        "watchdog should stay quiet after a satisfied handoff within the same idle stretch"
+    );
+    assert_eq!(
+        harness
+            .control
+            .watchdog_idle_episode_satisfied_for_tests(watchdog_handle_id)
+            .await,
+        Some(true),
+        "watchdog should keep the current idle stretch marked satisfied until the owner works again"
+    );
+
+    let owner_turn = owner_thread
+        .codex
+        .session
+        .new_default_turn_with_sub_id("watchdog-owner-activity-turn".to_string())
+        .await;
+    owner_thread
+        .codex
+        .session
+        .spawn_task(
+            Arc::clone(&owner_turn),
+            text_input("owner activity"),
+            WaitForCancellationTask,
+        )
+        .await;
+    assert!(wait_for_active_turn(&owner_thread).await);
+    harness.control.run_watchdogs_once_for_tests().await;
+
+    owner_thread
+        .codex
+        .session
+        .abort_all_tasks(TurnAbortReason::Interrupted)
+        .await;
+    assert_eq!(
+        harness
+            .control
+            .watchdog_idle_episode_satisfied_for_tests(watchdog_handle_id)
+            .await,
+        Some(false),
+        "watchdog should rearm after owner activity"
+    );
+
+    let _ = harness.control.shutdown_agent(watchdog_handle_id).await;
+    let _ = harness.control.shutdown_agent(owner_thread_id).await;
 }
 
 #[tokio::test]

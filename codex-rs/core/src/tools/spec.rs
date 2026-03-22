@@ -1071,14 +1071,14 @@ fn create_collab_input_items_schema() -> JsonSchema {
 
 fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
     let spawn_mode_description = if config.agent_watchdog {
-        "Spawn behavior: fork, spawn (fresh context), or watchdog (idle-time check-ins). Roles may override the omitted-mode default. Watchdog mode returns a handle, not a conversational worker, and check-ins only happen after the current turn ends and the owner thread is idle."
+        "Spawn behavior: fork, spawn (fresh context), or watchdog (idle-time check-ins). Roles may override the omitted-mode default. Watchdog mode returns a handle, not a conversational worker. Check-ins only happen after the current turn ends and the owner thread is idle, complete at most one successful handoff per idle stretch, may retry failed runs while the owner stays idle, and rearm only after the owner works again and later becomes idle."
             .to_string()
     } else {
         "Spawn behavior: fork or spawn (fresh context). Roles may override the omitted-mode default."
             .to_string()
     };
     let description_prefix = if config.agent_watchdog {
-        "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. Watchdog mode returns a control handle, not a conversational worker; watchdog check-ins are asynchronous and cannot arrive until the current turn ends and the owner thread becomes idle."
+        "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. Watchdog mode returns a control handle, not a conversational worker; watchdog check-ins are asynchronous, cannot arrive until the current turn ends and the owner thread becomes idle, and wake the owner into a real follow-up turn."
     } else {
         "Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent."
     };
@@ -1400,7 +1400,7 @@ fn create_send_input_tool(config: &ToolsConfig) -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_input".to_string(),
-        description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."
+        description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task. For watchdog check-ins, a successful handoff wakes the owner into a real follow-up turn."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -1587,7 +1587,7 @@ fn create_wait_tool(agent_watchdog: bool) -> ToolSpec {
         JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
             description: Some(if agent_watchdog {
-                "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first. Watchdog handle ids are status-only here: if all ids are watchdog handles, wait returns an immediate correction instead of blocking; if mixed with normal agent ids, wait still waits on normal agents and includes current watchdog statuses."
+                "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first. Watchdog handle ids are status-only here: if all ids are watchdog handles, wait returns an immediate correction instead of blocking; if mixed with normal agent ids, wait still waits on normal agents and includes current watchdog statuses. Waiting or polling cannot trigger a new watchdog check-in."
                     .to_string()
             } else {
                 "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first."
@@ -1607,7 +1607,7 @@ fn create_wait_tool(agent_watchdog: bool) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
         description: if agent_watchdog {
-            "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Watchdog handles cannot be waited on for new check-ins, and sleeping or polling cannot make a watchdog fire while the current turn is active."
+            "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Watchdog handles cannot be waited on for new check-ins, and sleeping or polling cannot make a watchdog fire while the current turn is active or force a second successful handoff in the same idle stretch."
                 .to_string()
         } else {
             "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out."

@@ -42,7 +42,10 @@ use codex_otel::metrics::names::TURN_E2E_DURATION_METRIC;
 use codex_otel::metrics::names::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::metrics::names::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::metrics::names::TURN_TOOL_CALL_METRIC;
+use codex_protocol::agent_inbox::is_agent_inbox_response_item;
+use codex_protocol::agent_inbox::parse_agent_inbox_message_from_item;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
@@ -155,6 +158,17 @@ impl Session {
         input: Vec<UserInput>,
         task: T,
     ) {
+        self.spawn_task_with_pending_response_items(initial_turn_context, input, Vec::new(), task)
+            .await;
+    }
+
+    pub(crate) async fn spawn_task_with_pending_response_items<T: SessionTask>(
+        self: &Arc<Self>,
+        initial_turn_context: Arc<TurnContext>,
+        input: Vec<UserInput>,
+        initial_pending_input: Vec<ResponseInputItem>,
+        task: T,
+    ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.sync_mcp_request_headers_for_turn(initial_turn_context.as_ref())
@@ -172,8 +186,10 @@ impl Session {
 
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
+        let start_gate = Arc::new(Notify::new());
 
         let done_clone = Arc::clone(&done);
+        let start_gate_clone = Arc::clone(&start_gate);
         let handle = {
             let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
             let task_initial_turn_context = Arc::clone(&initial_turn_context);
@@ -190,6 +206,7 @@ impl Session {
             );
             tokio::spawn(
                 async move {
+                    start_gate_clone.notified().await;
                     let initial_turn_context_for_finish = Arc::clone(&task_initial_turn_context);
                     let last_agent_message = task_for_run
                         .run(
@@ -228,8 +245,13 @@ impl Session {
             initial_turn_context: Arc::clone(&initial_turn_context),
             _timer: timer,
         };
-        self.register_new_active_task(running_task, token_usage_at_turn_start)
-            .await;
+        self.register_new_active_task(
+            running_task,
+            token_usage_at_turn_start,
+            initial_pending_input,
+        )
+        .await;
+        start_gate.notify_one();
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -252,6 +274,8 @@ impl Session {
         initial_turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
+        self.snapshot_turn_collab_delivery_state_on_completion()
+            .await;
 
         let mut active = self.active_turn.lock().await;
         let mut pending_input = Vec::<PendingInputItem>::new();
@@ -391,14 +415,39 @@ impl Session {
         &self,
         task: RunningTask,
         token_usage_at_turn_start: TokenUsage,
+        initial_pending_input: Vec<ResponseInputItem>,
     ) {
         let mut active = self.active_turn.lock().await;
         let mut turn = ActiveTurn::default();
+        let turn_context = Arc::clone(&task.initial_turn_context);
         let mut turn_state = turn.turn_state.lock().await;
         turn_state.token_usage_at_turn_start = token_usage_at_turn_start;
+        let mut live_response_items = Vec::new();
+        for pending_input in initial_pending_input {
+            let response_item: ResponseItem = pending_input.clone().into();
+            if is_agent_inbox_response_item(&response_item) {
+                if let Some(inbox_message) = parse_agent_inbox_message_from_item(&response_item)
+                    && let Some(canonical_sender) = inbox_message.canonical_sender
+                {
+                    turn_state.record_live_emitted_agent_inbox_message(
+                        canonical_sender,
+                        inbox_message.message,
+                    );
+                }
+                turn_state.push_live_emitted_pending_input(pending_input);
+                live_response_items.push(response_item);
+            } else {
+                turn_state.push_pending_input(pending_input);
+            }
+        }
         drop(turn_state);
         turn.add_task(task);
         *active = Some(turn);
+        drop(active);
+        if !live_response_items.is_empty() {
+            self.emit_raw_response_items(turn_context.as_ref(), &live_response_items)
+                .await;
+        }
     }
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;

@@ -115,6 +115,10 @@ pub(crate) fn completed_message_for_agent_fallback(
     last_completed_turn_forwarded_same_message: bool,
     require_message_for_final_status: bool,
 ) -> Option<String> {
+    if require_message_for_final_status && last_completed_turn_used_agent_send_input {
+        return None;
+    }
+
     match status {
         AgentStatus::Completed(Some(message))
             if !message.trim().is_empty() && !last_completed_turn_forwarded_same_message =>
@@ -124,18 +128,12 @@ pub(crate) fn completed_message_for_agent_fallback(
         AgentStatus::Completed(None) | AgentStatus::Completed(Some(_))
             if require_message_for_final_status =>
         {
-            if last_completed_turn_used_agent_send_input {
-                return None;
-            }
             Some(
                 "Watchdog check-in completed without calling send_input or returning a final message."
                     .to_string(),
             )
         }
         AgentStatus::Errored(message) if require_message_for_final_status => {
-            if last_completed_turn_used_agent_send_input {
-                return None;
-            }
             if message.trim().is_empty() {
                 Some("Watchdog check-in failed before calling send_input.".to_string())
             } else {
@@ -145,15 +143,9 @@ pub(crate) fn completed_message_for_agent_fallback(
             }
         }
         AgentStatus::Shutdown if require_message_for_final_status => {
-            if last_completed_turn_used_agent_send_input {
-                return None;
-            }
             Some("Watchdog check-in ended before calling send_input.".to_string())
         }
         AgentStatus::NotFound if require_message_for_final_status => {
-            if last_completed_turn_used_agent_send_input {
-                return None;
-            }
             Some("Watchdog check-in disappeared before calling send_input.".to_string())
         }
         AgentStatus::Completed(None)
@@ -246,6 +238,10 @@ mod tests {
             None
         );
         assert_eq!(
+            completed_message_for_agent_fallback(&completed, true, false, true),
+            None
+        );
+        assert_eq!(
             completed_message_for_agent_fallback(&whitespace, true, false, true),
             None
         );
@@ -259,6 +255,10 @@ mod tests {
         );
         assert_eq!(
             completed_message_for_agent_fallback(&AgentStatus::NotFound, true, false, true),
+            None
+        );
+        assert_eq!(
+            completed_message_for_agent_fallback(&completed, true, false, true),
             None
         );
         assert_eq!(

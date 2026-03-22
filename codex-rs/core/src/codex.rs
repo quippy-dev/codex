@@ -2115,6 +2115,23 @@ impl Session {
             .store(true, Ordering::Release);
     }
 
+    pub(crate) async fn snapshot_turn_collab_delivery_state_on_completion(&self) {
+        self.last_completed_turn_used_agent_send_input.store(
+            self.turn_used_agent_send_input
+                .swap(false, Ordering::AcqRel),
+            Ordering::Release,
+        );
+        let completed_turn_live_forwarded_agent_messages = {
+            let mut live_forwarded = self.turn_live_forwarded_agent_messages.lock().await;
+            std::mem::take(&mut *live_forwarded)
+        };
+        let mut last_completed = self
+            .last_completed_turn_live_forwarded_agent_messages
+            .lock()
+            .await;
+        *last_completed = completed_turn_live_forwarded_agent_messages;
+    }
+
     pub(crate) async fn record_turn_live_forwarded_agent_message(&self, message: &str) {
         if message.trim().is_empty() {
             return;
@@ -3899,6 +3916,14 @@ impl Session {
         }
     }
 
+    pub(crate) async fn emit_raw_response_items(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) {
+        self.send_raw_response_items(turn_context, items).await;
+    }
+
     pub(crate) async fn build_initial_context(
         &self,
         turn_context: &TurnContext,
@@ -5335,6 +5360,7 @@ mod handlers {
         if pending_items.is_empty() {
             return;
         }
+
         let mut attempts = 0usize;
         loop {
             let current_context = if let Some((turn_context, _)) =

@@ -703,6 +703,18 @@ impl AgentControl {
         result
     }
 
+    async fn note_watchdog_delivery_if_needed(
+        &self,
+        sender_thread_id: ThreadId,
+        sender_is_watchdog_helper_for_receiver: bool,
+    ) {
+        if sender_is_watchdog_helper_for_receiver {
+            let _ = self
+                .mark_watchdog_idle_episode_satisfied_for_helper(sender_thread_id)
+                .await;
+        }
+    }
+
     pub(crate) async fn drop_pending_input(&self, agent_id: ThreadId) -> CodexResult<bool> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
@@ -780,7 +792,14 @@ impl AgentControl {
                 .enqueue_post_turn_agent_items(queued_items)
                 .await
             {
-                Ok(()) => return Ok(Uuid::now_v7().to_string()),
+                Ok(()) => {
+                    self.note_watchdog_delivery_if_needed(
+                        sender_thread_id,
+                        sender_is_watchdog_helper_for_receiver,
+                    )
+                    .await;
+                    return Ok(Uuid::now_v7().to_string());
+                }
                 Err(err) => log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err),
             }
         }
@@ -803,6 +822,11 @@ impl AgentControl {
                         self.record_live_forwarded_agent_message(sender_thread_id, &message)
                             .await;
                     }
+                    self.note_watchdog_delivery_if_needed(
+                        sender_thread_id,
+                        sender_is_watchdog_helper_for_receiver,
+                    )
+                    .await;
                     return Ok(Uuid::now_v7().to_string());
                 }
                 Err(late_items) => {
@@ -824,6 +848,11 @@ impl AgentControl {
                             .await
                         {
                             Ok(()) => {
+                                self.note_watchdog_delivery_if_needed(
+                                    sender_thread_id,
+                                    sender_is_watchdog_helper_for_receiver,
+                                )
+                                .await;
                                 return Ok(Uuid::now_v7().to_string());
                             }
                             Err(err) => {
@@ -860,6 +889,11 @@ impl AgentControl {
                             self.record_live_forwarded_agent_message(sender_thread_id, &message)
                                 .await;
                         }
+                        self.note_watchdog_delivery_if_needed(
+                            sender_thread_id,
+                            sender_is_watchdog_helper_for_receiver,
+                        )
+                        .await;
                         return Ok(Uuid::now_v7().to_string());
                     } else {
                         match thread
@@ -876,6 +910,11 @@ impl AgentControl {
                                     .await
                                 {
                                     if thread.has_active_turn().await {
+                                        self.note_watchdog_delivery_if_needed(
+                                            sender_thread_id,
+                                            sender_is_watchdog_helper_for_receiver,
+                                        )
+                                        .await;
                                         return Ok(Uuid::now_v7().to_string());
                                     }
                                     if let Err(err) = state
@@ -892,9 +931,19 @@ impl AgentControl {
                                         );
                                         thread.codex.session.clear_post_turn_agent_items().await;
                                     } else {
+                                        self.note_watchdog_delivery_if_needed(
+                                            sender_thread_id,
+                                            sender_is_watchdog_helper_for_receiver,
+                                        )
+                                        .await;
                                         return Ok(Uuid::now_v7().to_string());
                                     }
                                 } else {
+                                    self.note_watchdog_delivery_if_needed(
+                                        sender_thread_id,
+                                        sender_is_watchdog_helper_for_receiver,
+                                    )
+                                    .await;
                                     return Ok(Uuid::now_v7().to_string());
                                 }
                             }
@@ -926,6 +975,11 @@ impl AgentControl {
                 .await
             {
                 Ok(()) => {
+                    self.note_watchdog_delivery_if_needed(
+                        sender_thread_id,
+                        sender_is_watchdog_helper_for_receiver,
+                    )
+                    .await;
                     return Ok(Uuid::now_v7().to_string());
                 }
                 Err(err) => log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err),
@@ -940,9 +994,15 @@ impl AgentControl {
             message.clone(),
             false,
         )?;
-        state
+        let submission_id = state
             .send_op(agent_id, Op::InjectResponseItems { items })
-            .await
+            .await?;
+        self.note_watchdog_delivery_if_needed(
+            sender_thread_id,
+            sender_is_watchdog_helper_for_receiver,
+        )
+        .await;
+        Ok(submission_id)
     }
 
     /// Interrupt the current task for an existing agent thread.
@@ -1223,27 +1283,40 @@ impl AgentControl {
                     child_used_agent_send_input,
                     child_completed_message_already_forwarded,
                     child_is_watchdog_helper_for_parent,
-                ) && let Err(err) = control
-                    .send_agent_message_inner(
-                        parent_thread_id,
-                        child_thread_id,
-                        message,
-                        false,
-                        if child_is_watchdog_helper_for_parent {
-                            LateAgentDeliveryMode::QueuePostTurn
-                        } else {
-                            LateAgentDeliveryMode::LiveOnlyAfterSamplingComplete
-                        },
-                        #[cfg(test)]
-                        None,
-                    )
-                    .await
-                {
-                    warn!(
-                        child_thread_id = %child_thread_id,
-                        parent_thread_id = %parent_thread_id,
-                        "subagent completion fallback forward failed: {err}"
-                    );
+                ) {
+                    match control
+                        .send_agent_message_inner(
+                            parent_thread_id,
+                            child_thread_id,
+                            message,
+                            false,
+                            if child_is_watchdog_helper_for_parent {
+                                LateAgentDeliveryMode::QueuePostTurn
+                            } else {
+                                LateAgentDeliveryMode::LiveOnlyAfterSamplingComplete
+                            },
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            if child_is_watchdog_helper_for_parent {
+                                control
+                                    .mark_watchdog_idle_episode_satisfied_for_helper(
+                                        child_thread_id,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                child_thread_id = %child_thread_id,
+                                parent_thread_id = %parent_thread_id,
+                                "subagent completion fallback forward failed: {err}"
+                            );
+                        }
+                    }
                 }
             }
             parent_thread
@@ -1413,6 +1486,35 @@ impl AgentControl {
     ) -> Option<ThreadId> {
         self.watchdogs
             .owner_for_active_helper(helper_thread_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn watchdog_active_helper_for_tests(
+        &self,
+        target_thread_id: ThreadId,
+    ) -> Option<ThreadId> {
+        self.watchdogs
+            .active_helper_for_target(target_thread_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn watchdog_idle_episode_satisfied_for_tests(
+        &self,
+        target_thread_id: ThreadId,
+    ) -> Option<bool> {
+        self.watchdogs
+            .idle_episode_satisfied_for_target(target_thread_id)
+            .await
+    }
+
+    pub(crate) async fn mark_watchdog_idle_episode_satisfied_for_helper(
+        &self,
+        helper_thread_id: ThreadId,
+    ) -> bool {
+        self.watchdogs
+            .mark_idle_episode_satisfied_for_helper(helper_thread_id)
             .await
     }
 
