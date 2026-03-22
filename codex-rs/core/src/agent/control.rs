@@ -1032,18 +1032,12 @@ impl AgentControl {
         self.shutdown_single_live_agent(&state, agent_id).await
     }
 
-    /// Mark `agent_id` as explicitly closed in persisted spawn-edge state, then shut down the
+    /// Mark `agent_id` and its persisted spawned subtree explicitly closed, then shut down the
     /// agent and any live descendants reached from the in-memory tree.
     pub(crate) async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
-        if let Ok(thread) = state.get_thread(agent_id).await
-            && let Some(state_db_ctx) = thread.state_db()
-            && let Err(err) = state_db_ctx
-                .set_thread_spawn_edge_status(agent_id, DirectionalThreadSpawnEdgeStatus::Closed)
-                .await
-        {
-            warn!("failed to persist thread-spawn edge status for {agent_id}: {err}");
-        }
+        self.mark_persisted_spawn_subtree_closed(&state, agent_id)
+            .await;
         self.shutdown_agent_tree(agent_id).await
     }
 
@@ -1097,6 +1091,29 @@ impl AgentControl {
         let _ = state.remove_thread(&agent_id).await;
         self.guards.release_spawned_thread(agent_id);
         result
+    }
+
+    async fn mark_persisted_spawn_subtree_closed(
+        &self,
+        state: &ThreadManagerState,
+        agent_id: ThreadId,
+    ) {
+        let state_db_ctx = if let Ok(thread) = state.get_thread(agent_id).await {
+            thread.state_db()
+        } else {
+            None
+        };
+
+        let Some(state_db_ctx) = state_db_ctx else {
+            return;
+        };
+
+        if let Err(err) = state_db_ctx
+            .set_thread_spawn_subtree_status(agent_id, DirectionalThreadSpawnEdgeStatus::Closed)
+            .await
+        {
+            warn!("failed to persist thread-spawn subtree status for {agent_id}: {err}");
+        }
     }
 
     /// Fetch the last known status for `agent_id`, returning `NotFound` when unavailable.

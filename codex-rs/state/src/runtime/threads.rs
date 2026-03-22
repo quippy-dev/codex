@@ -120,6 +120,38 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         Ok(())
     }
 
+    /// Recursively update the lifecycle status for `root_thread_id`'s incoming edge (when
+    /// present) and all descendant incoming edges.
+    pub async fn set_thread_spawn_subtree_status(
+        &self,
+        root_thread_id: ThreadId,
+        status: crate::DirectionalThreadSpawnEdgeStatus,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+WITH RECURSIVE subtree(child_thread_id) AS (
+    SELECT child_thread_id
+    FROM thread_spawn_edges
+    WHERE parent_thread_id = ?
+    UNION ALL
+    SELECT edge.child_thread_id
+    FROM thread_spawn_edges AS edge
+    JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
+)
+UPDATE thread_spawn_edges
+SET status = ?
+WHERE child_thread_id = ?
+   OR child_thread_id IN (SELECT child_thread_id FROM subtree)
+            "#,
+        )
+        .bind(root_thread_id.to_string())
+        .bind(status.as_ref())
+        .bind(root_thread_id.to_string())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
     /// List direct spawned children of `parent_thread_id` whose edge matches `status`.
     pub async fn list_thread_spawn_children_with_status(
         &self,
@@ -1349,5 +1381,43 @@ mod tests {
             .await
             .expect("open descendants from child should load");
         assert_eq!(open_descendants_from_child, vec![grandchild_thread_id]);
+
+        runtime
+            .set_thread_spawn_subtree_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("subtree close should succeed");
+        let closed_descendants = runtime
+            .list_thread_spawn_descendants_with_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("closed descendants should load");
+        assert_eq!(
+            closed_descendants,
+            vec![child_thread_id, grandchild_thread_id]
+        );
+
+        runtime
+            .set_thread_spawn_subtree_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("subtree reopen should succeed");
+        let open_descendants = runtime
+            .list_thread_spawn_descendants_with_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("open descendants should load");
+        assert_eq!(
+            open_descendants,
+            vec![child_thread_id, grandchild_thread_id]
+        );
     }
 }
