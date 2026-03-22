@@ -33,6 +33,7 @@ use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
+use crate::multi_agents::AGENT_PICKER_SELECTION_VIEW_ID;
 use crate::multi_agents::agent_picker_status_dot_spans;
 use crate::multi_agents::format_agent_picker_item_name;
 use crate::multi_agents::next_agent_shortcut_matches;
@@ -2477,6 +2478,7 @@ impl App {
             .collect();
 
         self.chat_widget.show_selection_view(SelectionViewParams {
+            view_id: Some(AGENT_PICKER_SELECTION_VIEW_ID),
             title: Some("Subagents".to_string()),
             subtitle: Some(AgentNavigationState::picker_subtitle()),
             footer_hint: Some(standard_popup_hint_line()),
@@ -4890,18 +4892,17 @@ impl App {
         app_server: &mut AppServerSession,
         key_event: KeyEvent,
     ) {
-        // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
-        // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
-        // agent-switch shortcuts when the composer is empty so we never steal the expected
-        // editing behavior for moving across words inside a draft.
-        let allow_agent_word_motion_fallback = !self.enhanced_keys_supported
-            && self.chat_widget.composer_text_with_pending().is_empty();
+        // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f. We only
+        // treat those word-motion fallbacks as agent-switch shortcuts when the composer is empty
+        // so we never steal the expected editing behavior for moving across words inside a draft.
+        let composer_is_empty = self.chat_widget.composer_text_with_pending().is_empty();
+        let allow_agent_word_motion_fallback = composer_is_empty;
         if self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
             // Alt+Left/Right are also natural word-motion keys in the composer. Keep agent
             // fast-switch available only once the draft is empty so editing behavior wins whenever
             // there is text on screen.
-            && self.chat_widget.composer_text_with_pending().is_empty()
+            && composer_is_empty
             && previous_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
         {
             if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
@@ -4916,7 +4917,7 @@ impl App {
             && self.chat_widget.no_modal_or_popup_active()
             // Mirror the previous-agent rule above: empty drafts may use these keys for thread
             // switching, but non-empty drafts keep them for expected word-wise cursor motion.
-            && self.chat_widget.composer_text_with_pending().is_empty()
+            && composer_is_empty
             && next_agent_shortcut_matches(key_event, allow_agent_word_motion_fallback)
         {
             if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
@@ -6911,6 +6912,88 @@ guardian_approval = true
             Ok(AppEvent::SelectAgentThread(selected_thread_id)) if selected_thread_id == thread_id
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_agent_picker_agent_shortcuts_move_selection_before_enter() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let primary_thread_id = ThreadId::new();
+        let agent_thread_id = ThreadId::new();
+        app.primary_thread_id = Some(primary_thread_id);
+        app.active_thread_id = Some(primary_thread_id);
+        app.thread_event_channels
+            .insert(primary_thread_id, ThreadEventChannel::new(1));
+        app.thread_event_channels
+            .insert(agent_thread_id, ThreadEventChannel::new(1));
+        app.agent_navigation
+            .upsert(primary_thread_id, None, None, /*is_closed*/ false);
+        app.agent_navigation.upsert(
+            agent_thread_id,
+            Some("Robie".to_string()),
+            Some("worker".to_string()),
+            /*is_closed*/ false,
+        );
+
+        app.open_agent_picker().await;
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+
+        assert!(
+            app_event_rx.try_recv().is_err(),
+            "navigation shortcut should move the highlight without selecting",
+        );
+
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::SelectAgentThread(selected_thread_id))
+                if selected_thread_id == agent_thread_id
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn empty_composer_keeps_agent_word_motion_fallback_with_enhanced_keys() {
+        let mut app = make_test_app().await;
+        app.enhanced_keys_supported = true;
+
+        let allow_agent_word_motion_fallback =
+            app.chat_widget.composer_text_with_pending().is_empty();
+
+        assert!(allow_agent_word_motion_fallback);
+        assert!(previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            allow_agent_word_motion_fallback,
+        ));
+        assert!(next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            allow_agent_word_motion_fallback,
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn draft_text_disables_agent_word_motion_fallback_even_with_enhanced_keys() {
+        let mut app = make_test_app().await;
+        app.enhanced_keys_supported = true;
+        app.chat_widget
+            .apply_external_edit("draft prompt".to_string());
+
+        let allow_agent_word_motion_fallback =
+            app.chat_widget.composer_text_with_pending().is_empty();
+
+        assert!(!allow_agent_word_motion_fallback);
+        assert!(!previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            allow_agent_word_motion_fallback,
+        ));
+        assert!(!next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            allow_agent_word_motion_fallback,
+        ));
     }
 
     #[tokio::test]
