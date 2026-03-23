@@ -312,7 +312,7 @@ impl ChatWidget {
                 }
             }
         }
-        (items, invalid)
+        (normalize_terminal_title_items(items), invalid)
     }
 
     /// Returns the configured terminal-title ids, or the default ordering when unset.
@@ -532,6 +532,21 @@ impl ChatWidget {
             TerminalTitleItem::AppName => Some("codex".to_string()),
             TerminalTitleItem::Project => self.terminal_title_project_name(),
             TerminalTitleItem::Spinner => self.terminal_title_spinner_text_at(now),
+            TerminalTitleItem::Session => {
+                self.terminal_title_session_label
+                    .as_ref()
+                    .and_then(|label| {
+                        let trimmed = label.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(Self::truncate_terminal_title_part(
+                                trimmed.to_string(),
+                                /*max_chars*/ 48,
+                            ))
+                        }
+                    })
+            }
             TerminalTitleItem::Status => Some(self.terminal_title_status_text()),
             TerminalTitleItem::Thread => self.thread_name.as_ref().and_then(|name| {
                 let trimmed = name.trim();

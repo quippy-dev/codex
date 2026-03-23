@@ -48,6 +48,7 @@ use crate::bottom_pane::StatusLinePreviewData;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
+use crate::bottom_pane::normalize_terminal_title_items;
 use crate::status::RateLimitWindowDisplay;
 use crate::status::format_directory_display;
 use crate::status::format_tokens_compact;
@@ -834,6 +835,8 @@ pub(crate) struct ChatWidget {
     // App carries this cache across ChatWidget replacement so the next widget can
     // clear a stale title when its own configuration renders no title content.
     pub(crate) last_terminal_title: Option<String>,
+    // Ephemeral /title label kept only in this runtime widget state.
+    terminal_title_session_label: Option<String>,
     // Original terminal-title config captured when opening the setup UI so live preview can be
     // rolled back on cancel.
     terminal_title_setup_original_items: Option<Option<Vec<String>>>,
@@ -1304,6 +1307,7 @@ impl ChatWidget {
             self.terminal_title_setup_original_items = Some(self.config.tui_terminal_title.clone());
         }
 
+        let items = normalize_terminal_title_items(items);
         let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
         self.config.tui_terminal_title = Some(ids);
         self.refresh_terminal_title();
@@ -1329,11 +1333,35 @@ impl ChatWidget {
     ///
     /// An empty selection persists as an explicit empty list (disables title updates).
     pub(crate) fn setup_terminal_title(&mut self, items: Vec<TerminalTitleItem>) {
+        let items = normalize_terminal_title_items(items);
         tracing::info!("terminal title setup confirmed with items: {items:#?}");
         let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
         self.terminal_title_setup_original_items = None;
         self.config.tui_terminal_title = Some(ids);
         self.refresh_terminal_title();
+    }
+
+    fn set_terminal_title_session_label(&mut self, label: String) {
+        self.terminal_title_session_label = Some(label);
+        self.ensure_terminal_title_session_item_enabled();
+        self.refresh_terminal_title();
+    }
+
+    fn ensure_terminal_title_session_item_enabled(&mut self) {
+        let configured_items = self.configured_terminal_title_items();
+        let items = normalize_terminal_title_items(
+            configured_items
+                .into_iter()
+                .filter_map(|id| id.parse::<TerminalTitleItem>().ok())
+                .chain(std::iter::once(TerminalTitleItem::Session)),
+        );
+        let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+        if ids == self.configured_terminal_title_items() {
+            return;
+        }
+        self.config.tui_terminal_title = Some(ids);
+        self.app_event_tx
+            .send(AppEvent::TerminalTitleSetup { items });
     }
 
     /// Stores async git-branch lookup results for the current status-line cwd.
@@ -3673,6 +3701,7 @@ impl ChatWidget {
             status_line_invalid_items_warned,
             terminal_title_invalid_items_warned,
             last_terminal_title: None,
+            terminal_title_session_label: None,
             terminal_title_setup_original_items: None,
             terminal_title_animation_origin: Instant::now(),
             status_line_project_root_name_cache: None,
@@ -3875,6 +3904,7 @@ impl ChatWidget {
             status_line_invalid_items_warned,
             terminal_title_invalid_items_warned,
             last_terminal_title: None,
+            terminal_title_session_label: None,
             terminal_title_setup_original_items: None,
             terminal_title_animation_origin: Instant::now(),
             status_line_project_root_name_cache: None,
@@ -4069,6 +4099,7 @@ impl ChatWidget {
             status_line_invalid_items_warned,
             terminal_title_invalid_items_warned,
             last_terminal_title: None,
+            terminal_title_session_label: None,
             terminal_title_setup_original_items: None,
             terminal_title_animation_origin: Instant::now(),
             status_line_project_root_name_cache: None,
@@ -4715,6 +4746,21 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Title if !trimmed.is_empty() => {
+                let Some((prepared_args, _prepared_elements)) = self
+                    .bottom_pane
+                    .prepare_inline_args_submission(/*record_history*/ false)
+                else {
+                    return;
+                };
+                let label = prepared_args.trim().to_string();
+                if label.is_empty() {
+                    self.dispatch_command(cmd);
+                    return;
+                }
+                self.set_terminal_title_session_label(label);
+                self.bottom_pane.drain_pending_submission_state();
+            }
             SlashCommand::Fast => {
                 if trimmed.is_empty() {
                     self.dispatch_command(cmd);

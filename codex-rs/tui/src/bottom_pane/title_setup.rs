@@ -34,6 +34,8 @@ pub(crate) enum TerminalTitleItem {
     Project,
     /// Animated task spinner while active.
     Spinner,
+    /// User-defined ephemeral session label.
+    Session,
     /// Compact runtime status text.
     Status,
     /// Current thread title (if available).
@@ -54,6 +56,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::Spinner => {
                 "Animated task spinner (omitted while idle or when animations are off)"
             }
+            TerminalTitleItem::Session => "Ephemeral session label set via /title <text>",
             TerminalTitleItem::Status => "Compact session status text (Ready, Working, Thinking)",
             TerminalTitleItem::Thread => "Current thread title (omitted until available)",
             TerminalTitleItem::GitBranch => "Current Git branch (omitted when unavailable)",
@@ -73,6 +76,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::AppName => "codex",
             TerminalTitleItem::Project => "my-project",
             TerminalTitleItem::Spinner => "⠋",
+            TerminalTitleItem::Session => "Investigating title bug",
             TerminalTitleItem::Status => "Working",
             TerminalTitleItem::Thread => "Investigate flaky test",
             TerminalTitleItem::GitBranch => "feat/awesome-feature",
@@ -94,6 +98,34 @@ impl TerminalTitleItem {
     }
 }
 
+pub(crate) fn normalize_terminal_title_items(
+    items: impl IntoIterator<Item = TerminalTitleItem>,
+) -> Vec<TerminalTitleItem> {
+    let mut seen = std::collections::HashSet::new();
+    let deduped = items
+        .into_iter()
+        .filter(|item| seen.insert(*item))
+        .collect_vec();
+
+    let has_spinner = deduped.contains(&TerminalTitleItem::Spinner);
+    let has_session = deduped.contains(&TerminalTitleItem::Session);
+
+    let mut normalized = Vec::with_capacity(deduped.len());
+    if has_spinner {
+        normalized.push(TerminalTitleItem::Spinner);
+    }
+    if has_session {
+        normalized.push(TerminalTitleItem::Session);
+    }
+    normalized.extend(
+        deduped
+            .into_iter()
+            .filter(|item| *item != TerminalTitleItem::Spinner)
+            .filter(|item| *item != TerminalTitleItem::Session),
+    );
+    normalized
+}
+
 fn parse_terminal_title_items<T>(ids: impl Iterator<Item = T>) -> Option<Vec<TerminalTitleItem>>
 where
     T: AsRef<str>,
@@ -105,6 +137,7 @@ where
     ids.map(|id| id.as_ref().parse::<TerminalTitleItem>())
         .collect::<Result<Vec<_>, _>>()
         .ok()
+        .map(normalize_terminal_title_items)
 }
 
 /// Interactive view for configuring terminal-title items.
@@ -124,8 +157,8 @@ impl TerminalTitleSetupView {
             .into_iter()
             .flatten()
             .filter_map(|id| id.parse::<TerminalTitleItem>().ok())
-            .unique()
             .collect_vec();
+        let selected_items = normalize_terminal_title_items(selected_items);
         let selected_set = selected_items
             .iter()
             .copied()
@@ -276,17 +309,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_terminal_title_items_preserves_order() {
-        let items =
-            parse_terminal_title_items(["project", "spinner", "status", "thread"].into_iter());
+    fn parse_terminal_title_items_normalizes_spinner_and_session_order() {
+        let items = parse_terminal_title_items(
+            ["project", "session", "spinner", "status", "thread"].into_iter(),
+        );
         assert_eq!(
             items,
             Some(vec![
-                TerminalTitleItem::Project,
                 TerminalTitleItem::Spinner,
+                TerminalTitleItem::Session,
+                TerminalTitleItem::Project,
                 TerminalTitleItem::Status,
                 TerminalTitleItem::Thread,
             ])
+        );
+    }
+
+    #[test]
+    fn normalize_terminal_title_items_dedupes_and_enforces_spinner_then_session() {
+        let normalized = normalize_terminal_title_items(vec![
+            TerminalTitleItem::Thread,
+            TerminalTitleItem::Session,
+            TerminalTitleItem::Spinner,
+            TerminalTitleItem::Project,
+            TerminalTitleItem::Session,
+            TerminalTitleItem::Spinner,
+            TerminalTitleItem::Status,
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                TerminalTitleItem::Spinner,
+                TerminalTitleItem::Session,
+                TerminalTitleItem::Thread,
+                TerminalTitleItem::Project,
+                TerminalTitleItem::Status,
+            ]
         );
     }
 
