@@ -5602,6 +5602,7 @@ impl ChatWidget {
                 self.on_agent_event(multi_agents::waiting_begin(ev))
             }
             EventMsg::CollabWaitingEnd(ev) => self.on_agent_event(multi_agents::waiting_end(ev)),
+            EventMsg::CollabPeekEnd(ev) => self.on_agent_event(multi_agents::peek_end(ev)),
             EventMsg::CollabCloseBegin(_) => {}
             EventMsg::CollabCloseEnd(ev) => self.on_agent_event(multi_agents::close_end(ev)),
             EventMsg::CollabResumeBegin(ev) => self.on_agent_event(multi_agents::resume_begin(ev)),

@@ -1889,6 +1889,110 @@ async fn peek_agents_parent_alias_targets_immediate_parent_with_cached_progress(
 }
 
 #[tokio::test]
+async fn peek_agents_emits_collab_event_for_returned_agents() {
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    let agent_control = manager.agent_control();
+    Arc::get_mut(&mut session)
+        .expect("no extra session refs")
+        .services
+        .agent_control = agent_control.clone();
+    let root_thread_id = session.conversation_id;
+    let child_id = agent_control
+        .spawn_agent_handle(
+            turn.config.as_ref().clone(),
+            Some(thread_spawn_source_with_metadata(
+                root_thread_id,
+                1,
+                Some("Robie".to_string()),
+                Some("explorer".to_string()),
+            )),
+        )
+        .await
+        .expect("spawn child handle");
+
+    let output = MultiAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "peek_agents",
+            function_payload(json!({ "recursive": false })),
+        ))
+        .await
+        .expect("peek_agents should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: PeekAgentsResultForTest =
+        serde_json::from_str(&content).expect("peek result should be json");
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(success, Some(true));
+
+    let peek_event = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("collab event");
+            if let EventMsg::CollabPeekEnd(event) = event.msg {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("peek end event should arrive");
+    assert_eq!(peek_event.sender_thread_id, root_thread_id);
+    assert_eq!(peek_event.receiver_thread_ids, vec![child_id]);
+    assert_eq!(peek_event.call_id, "call-1");
+    assert_eq!(peek_event.receiver_agents.len(), 1);
+    assert_eq!(
+        peek_event.receiver_agents[0],
+        CollabAgentRef {
+            thread_id: child_id,
+            agent_nickname: Some("Robie".to_string()),
+            agent_role: Some("explorer".to_string()),
+            spawn_mode: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn peek_agents_does_not_emit_collab_event_for_empty_results() {
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    Arc::get_mut(&mut session)
+        .expect("no extra session refs")
+        .services
+        .agent_control = manager.agent_control();
+
+    let output = MultiAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "peek_agents",
+            function_payload(json!({ "recursive": false })),
+        ))
+        .await
+        .expect("peek_agents should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: PeekAgentsResultForTest =
+        serde_json::from_str(&content).expect("peek result should be json");
+    assert!(result.agents.is_empty());
+    assert_eq!(success, Some(true));
+
+    let saw_peek_event = timeout(Duration::from_millis(200), async {
+        loop {
+            match rx.recv().await {
+                Ok(event) if matches!(event.msg, EventMsg::CollabPeekEnd(_)) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .expect("peek event stream should settle quickly");
+    assert!(
+        !saw_peek_event,
+        "empty peek result should not emit a peek collab event"
+    );
+}
+
+#[tokio::test]
 async fn peek_agents_cursor_returns_incremental_updates_with_limit() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();

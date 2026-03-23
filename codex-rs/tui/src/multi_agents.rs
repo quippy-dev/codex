@@ -11,6 +11,7 @@ use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabCloseResult;
+use codex_protocol::protocol::CollabPeekEndEvent;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
@@ -282,6 +283,32 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
     } = ev;
     let details = wait_complete_lines(&statuses, &agent_statuses);
     agent_event(title_text("Finished waiting"), details)
+}
+
+pub(crate) fn peek_end(ev: CollabPeekEndEvent) -> PlainHistoryCell {
+    let CollabPeekEndEvent {
+        sender_thread_id: _,
+        receiver_thread_ids,
+        receiver_agents,
+        call_id: _,
+    } = ev;
+    let receiver_agents = merge_wait_receivers(&receiver_thread_ids, receiver_agents);
+
+    let title = match receiver_agents.as_slice() {
+        [receiver] => title_with_agent("Peeked at", agent_label_from_ref(receiver)),
+        _ => title_text(format!("Peeked at {} agents", receiver_agents.len())),
+    };
+
+    let details = if receiver_agents.len() > 1 {
+        receiver_agents
+            .iter()
+            .map(|receiver| agent_label_line(agent_label_from_ref(receiver)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    agent_event(title, details)
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -676,6 +703,18 @@ mod tests {
             call_id: "call-wait".to_string(),
         });
 
+        let peek = peek_end(CollabPeekEndEvent {
+            sender_thread_id,
+            receiver_thread_ids: vec![robie_id],
+            receiver_agents: vec![CollabAgentRef {
+                thread_id: robie_id,
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                spawn_mode: None,
+            }],
+            call_id: "call-peek".to_string(),
+        });
+
         let mut statuses = HashMap::new();
         statuses.insert(
             robie_id,
@@ -715,7 +754,7 @@ mod tests {
             close_result: CollabCloseResult::Closed,
         });
 
-        let snapshot = [spawn, send, waiting, finished, close]
+        let snapshot = [spawn, send, peek, waiting, finished, close]
             .iter()
             .map(cell_to_text)
             .collect::<Vec<_>>()

@@ -7423,6 +7423,7 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::CollabAgentInteractionEnd(_)
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabWaitingEnd(_)
+        | EventMsg::CollabPeekEnd(_)
         | EventMsg::CollabCloseBegin(_)
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeBegin(_)

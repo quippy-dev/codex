@@ -1341,6 +1341,8 @@ pub enum EventMsg {
     CollabWaitingBegin(CollabWaitingBeginEvent),
     /// Collab interaction: waiting end.
     CollabWaitingEnd(CollabWaitingEndEvent),
+    /// Collab interaction: peek end.
+    CollabPeekEnd(CollabPeekEndEvent),
     /// Collab interaction: close begin.
     CollabCloseBegin(CollabCloseBeginEvent),
     /// Collab interaction: close end.
@@ -1501,6 +1503,12 @@ impl From<CollabWaitingBeginEvent> for EventMsg {
 impl From<CollabWaitingEndEvent> for EventMsg {
     fn from(event: CollabWaitingEndEvent) -> Self {
         EventMsg::CollabWaitingEnd(event)
+    }
+}
+
+impl From<CollabPeekEndEvent> for EventMsg {
+    fn from(event: CollabPeekEndEvent) -> Self {
+        EventMsg::CollabPeekEnd(event)
     }
 }
 
@@ -3469,6 +3477,19 @@ pub struct CollabWaitingEndEvent {
     pub agent_statuses: Vec<CollabAgentStatusEntry>,
     /// Last known status of the receiver agents reported to the sender agent.
     pub statuses: HashMap<ThreadId, AgentStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct CollabPeekEndEvent {
+    /// Thread ID of the sender.
+    pub sender_thread_id: ThreadId,
+    /// Thread IDs of the peeked receivers.
+    pub receiver_thread_ids: Vec<ThreadId>,
+    /// Optional receiver metadata paired with receiver thread IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receiver_agents: Vec<CollabAgentRef>,
+    /// ID of the peek call.
+    pub call_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

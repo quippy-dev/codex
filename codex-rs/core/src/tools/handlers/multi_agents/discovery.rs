@@ -187,8 +187,8 @@ pub(crate) mod peek_agents {
 
     pub async fn handle(
         session: Arc<Session>,
-        _turn: Arc<TurnContext>,
-        _call_id: String,
+        turn: Arc<TurnContext>,
+        call_id: String,
         arguments: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: PeekAgentsArgs = parse_arguments(&arguments)?;
@@ -220,39 +220,98 @@ pub(crate) mod peek_agents {
             .unwrap_or(DEFAULT_PEEK_LIMIT)
             .clamp(1, MAX_PEEK_LIMIT);
         let incremental = args.cursor.is_some();
+        let snapshot_cursor = |progress: &Option<AgentProgressSnapshot>| {
+            progress
+                .as_ref()
+                .map(|snapshot| snapshot.cursor)
+                .unwrap_or_default()
+        };
 
-        let mut agents = listings
+        let mut selected_agents = listings
             .into_iter()
             .filter_map(|entry| {
                 let progress = progress_by_thread.get(&entry.thread_id).cloned();
-                let snapshot_cursor = progress
-                    .as_ref()
-                    .map(|snapshot| snapshot.cursor)
-                    .unwrap_or_default();
-                if incremental && snapshot_cursor <= cursor {
+                if incremental && snapshot_cursor(&progress) <= cursor {
                     return None;
                 }
-                Some(build_peek_agent_entry(entry, progress))
+                Some((entry, progress))
             })
             .collect::<Vec<_>>();
         if incremental {
-            agents.sort_by(|left, right| {
-                left.cursor
-                    .cmp(&right.cursor)
-                    .then(left.id.cmp(&right.id))
-                    .then(left.depth.cmp(&right.depth))
-            });
+            selected_agents.sort_by(
+                |(left_entry, left_progress), (right_entry, right_progress)| {
+                    snapshot_cursor(left_progress)
+                        .cmp(&snapshot_cursor(right_progress))
+                        .then(
+                            left_entry
+                                .thread_id
+                                .to_string()
+                                .cmp(&right_entry.thread_id.to_string()),
+                        )
+                        .then(left_entry.depth.cmp(&right_entry.depth))
+                },
+            );
         } else {
-            agents.sort_by(|left, right| {
-                right
-                    .cursor
-                    .cmp(&left.cursor)
-                    .then(left.id.cmp(&right.id))
-                    .then(left.depth.cmp(&right.depth))
-            });
+            selected_agents.sort_by(
+                |(left_entry, left_progress), (right_entry, right_progress)| {
+                    snapshot_cursor(right_progress)
+                        .cmp(&snapshot_cursor(left_progress))
+                        .then(
+                            left_entry
+                                .thread_id
+                                .to_string()
+                                .cmp(&right_entry.thread_id.to_string()),
+                        )
+                        .then(left_entry.depth.cmp(&right_entry.depth))
+                },
+            );
         }
-        let truncated = agents.len() > limit;
-        agents.truncate(limit);
+        let truncated = selected_agents.len() > limit;
+        selected_agents.truncate(limit);
+
+        let agents = selected_agents
+            .iter()
+            .map(|(entry, progress)| build_peek_agent_entry(entry.clone(), progress.clone()))
+            .collect::<Vec<_>>();
+
+        if !selected_agents.is_empty() {
+            let receiver_thread_ids = selected_agents
+                .iter()
+                .map(|(entry, _)| entry.thread_id)
+                .collect::<Vec<_>>();
+            let watchdog_target_ids = session
+                .services
+                .agent_control
+                .watchdog_targets(&receiver_thread_ids)
+                .await;
+            let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
+            for receiver_thread_id in &receiver_thread_ids {
+                let (agent_nickname, agent_role) = session
+                    .services
+                    .agent_control
+                    .get_agent_nickname_and_role(*receiver_thread_id)
+                    .await
+                    .unwrap_or((None, None));
+                receiver_agents.push(CollabAgentRef {
+                    thread_id: *receiver_thread_id,
+                    agent_nickname,
+                    agent_role,
+                    spawn_mode: watchdog_ref_spawn_mode(&watchdog_target_ids, *receiver_thread_id),
+                });
+            }
+            session
+                .send_event(
+                    &turn,
+                    CollabPeekEndEvent {
+                        sender_thread_id: session.conversation_id,
+                        receiver_thread_ids,
+                        receiver_agents,
+                        call_id,
+                    }
+                    .into(),
+                )
+                .await;
+        }
 
         let next_cursor = if truncated {
             if incremental {

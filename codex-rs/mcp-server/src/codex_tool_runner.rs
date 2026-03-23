@@ -384,6 +384,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::CollabAgentInteractionEnd(_)
                     | EventMsg::CollabWaitingBegin(_)
                     | EventMsg::CollabWaitingEnd(_)
+                    | EventMsg::CollabPeekEnd(_)
                     | EventMsg::CollabCloseBegin(_)
                     | EventMsg::CollabCloseEnd(_)
                     | EventMsg::CollabResumeBegin(_)
