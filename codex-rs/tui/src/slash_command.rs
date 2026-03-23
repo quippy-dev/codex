@@ -87,7 +87,9 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
-            SlashCommand::Title => "configure which items appear in the terminal title",
+            SlashCommand::Title => {
+                "configure terminal title items, or set an ephemeral label with /title <text>"
+            }
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
@@ -132,6 +134,7 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Fast
+                | SlashCommand::Title
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -219,5 +222,10 @@ mod tests {
     #[test]
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
+    }
+
+    #[test]
+    fn title_command_supports_inline_args() {
+        assert!(SlashCommand::Title.supports_inline_args());
     }
 }

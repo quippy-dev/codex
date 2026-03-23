@@ -2288,6 +2288,7 @@ async fn make_chatwidget_manual(
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         last_terminal_title: None,
+        terminal_title_session_label: None,
         terminal_title_setup_original_items: None,
         terminal_title_animation_origin: Instant::now(),
         status_line_project_root_name_cache: None,
@@ -11325,9 +11326,74 @@ async fn terminal_title_uses_spaces_around_spinner_item() {
         .last_terminal_title
         .clone()
         .expect("expected terminal title");
-    assert!(title.contains(" ⠋ Working | "));
+    assert!(title.starts_with("⠋ "));
     assert!(!title.contains("| ⠋"));
     assert!(!title.contains("⠋ |"));
+}
+
+#[tokio::test]
+async fn title_inline_args_set_ephemeral_session_label_and_enable_session_item() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_composer_text(
+        "/title Investigate flaky tests".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_eq!(
+        chat.terminal_title_session_label,
+        Some("Investigate flaky tests".to_string())
+    );
+    assert_eq!(
+        chat.config.tui_terminal_title,
+        Some(vec![
+            "spinner".to_string(),
+            "session".to_string(),
+            "project".to_string()
+        ])
+    );
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::TerminalTitleSetup { items }
+            if items
+                == &vec![
+                    TerminalTitleItem::Spinner,
+                    TerminalTitleItem::Session,
+                    TerminalTitleItem::Project
+                ]
+        )),
+        "expected terminal-title persistence event with auto-enabled session item; events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_title_session_label_is_hidden_when_unselected_but_retained_in_memory() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.config.tui_terminal_title = Some(vec!["project".to_string(), "session".to_string()]);
+    chat.terminal_title_session_label = Some("Bug bash".to_string());
+
+    chat.refresh_terminal_title();
+    let title_with_session = chat
+        .last_terminal_title
+        .clone()
+        .expect("expected title with session");
+    assert!(title_with_session.starts_with("Bug bash | "));
+
+    chat.setup_terminal_title(vec![TerminalTitleItem::Project]);
+
+    assert_eq!(
+        chat.terminal_title_session_label,
+        Some("Bug bash".to_string())
+    );
+    let title_without_session = chat
+        .last_terminal_title
+        .clone()
+        .expect("expected title without session");
+    assert!(!title_without_session.contains("Bug bash"));
 }
 
 #[tokio::test]

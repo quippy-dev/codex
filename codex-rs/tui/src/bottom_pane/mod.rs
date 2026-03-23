@@ -103,6 +103,7 @@ pub(crate) use status_line_setup::StatusLinePreviewData;
 pub(crate) use status_line_setup::StatusLineSetupView;
 pub(crate) use title_setup::TerminalTitleItem;
 pub(crate) use title_setup::TerminalTitleSetupView;
+pub(crate) use title_setup::normalize_terminal_title_items;
 mod paste_burst;
 mod pending_input_preview;
 mod pending_thread_approvals;
