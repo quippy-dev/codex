@@ -2973,9 +2973,9 @@ async fn compact_parent_for_watchdog_helper_rechecks_parent_idleness_before_subm
 async fn compact_handler_rechecks_watchdog_parent_idleness_at_execution_time() {
     let harness = AgentControlHarness::new().await;
     let (owner_thread_id, owner_thread) = harness.start_thread().await;
+    let owner_control = owner_thread.codex.session.services.agent_control.clone();
 
-    harness
-        .control
+    owner_control
         .mark_watchdog_parent_compaction_in_progress_for_tests(owner_thread_id)
         .await;
 
@@ -2991,8 +2991,7 @@ async fn compact_handler_rechecks_watchdog_parent_idleness_at_execution_time() {
 
     timeout(Duration::from_secs(2), async {
         loop {
-            if !harness
-                .control
+            if !owner_control
                 .watchdog_parent_compaction_in_progress(owner_thread_id)
                 .await
             {
@@ -3014,8 +3013,7 @@ async fn compact_handler_rechecks_watchdog_parent_idleness_at_execution_time() {
         *active_turn = None;
     }
 
-    let _ = harness
-        .control
+    let _ = owner_control
         .shutdown_agent(owner_thread_id)
         .await
         .expect("owner shutdown should submit");
@@ -4843,10 +4841,11 @@ fn build_agent_inbox_items_tool_role_prepends_empty_user_message_when_requested(
         ResponseInputItem::Message { role, content } => {
             assert_eq!(role, "user");
             assert_eq!(
-                content,
-                &vec![ContentItem::InputText {
+                content.as_slice(),
+                [ContentItem::InputText {
                     text: String::new()
                 }]
+                .as_slice()
             );
         }
         other => panic!("expected prepended user message, got {other:?}"),
@@ -4874,10 +4873,11 @@ fn build_agent_inbox_items_assistant_role_prepends_empty_user_message_when_reque
         ResponseInputItem::Message { role, content } => {
             assert_eq!(role, "user");
             assert_eq!(
-                content,
-                &vec![ContentItem::InputText {
+                content.as_slice(),
+                [ContentItem::InputText {
                     text: String::new()
                 }]
+                .as_slice()
             );
         }
         other => panic!("expected prepended user message, got {other:?}"),
@@ -4908,10 +4908,11 @@ fn build_agent_inbox_items_developer_role_prepends_empty_user_message_when_reque
         ResponseInputItem::Message { role, content } => {
             assert_eq!(role, "user");
             assert_eq!(
-                content,
-                &vec![ContentItem::InputText {
+                content.as_slice(),
+                [ContentItem::InputText {
                     text: String::new()
                 }]
+                .as_slice()
             );
         }
         other => panic!("expected prepended user message, got {other:?}"),

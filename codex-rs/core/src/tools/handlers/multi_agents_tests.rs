@@ -2549,6 +2549,132 @@ async fn resume_agent_restores_closed_fork_agent_with_turn_developer_instruction
 }
 
 #[tokio::test]
+async fn resume_agent_restores_archived_agent_with_turn_developer_instructions() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let mut config = turn.config.as_ref().clone();
+    config.developer_instructions = Some("base-dev".to_string());
+    turn.developer_instructions = Some("turn-dev".to_string());
+    turn.reasoning_effort = Some(ReasoningEffort::XHigh);
+    turn.config = Arc::new(config.clone());
+    let thread = manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Forked(vec![
+                RolloutItem::TurnContext(TurnContextItem {
+                    turn_id: Some("turn-1".to_string()),
+                    cwd: turn.cwd.clone(),
+                    current_date: turn.current_date.clone(),
+                    timezone: turn.timezone.clone(),
+                    trace_id: None,
+                    approval_policy: turn.approval_policy.value(),
+                    sandbox_policy: turn.sandbox_policy.get().clone(),
+                    network: None,
+                    model: "gpt-5.1-codex-mini".to_string(),
+                    personality: turn.personality,
+                    collaboration_mode: Some(turn.collaboration_mode.clone()),
+                    realtime_active: Some(turn.realtime_active),
+                    effort: Some(ReasoningEffort::High),
+                    summary: turn.reasoning_summary,
+                    user_instructions: turn.user_instructions.clone(),
+                    developer_instructions: turn.developer_instructions.clone(),
+                    final_output_json_schema: turn.final_output_json_schema.clone(),
+                    truncation_policy: Some(turn.truncation_policy.into()),
+                }),
+                RolloutItem::ResponseItem(ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "materialized".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                }),
+            ]),
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            false,
+            None,
+        )
+        .await
+        .expect("start thread");
+    let agent_id = thread.thread_id;
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(agent_id)
+        .await
+        .expect("shutdown agent");
+    assert_eq!(
+        manager.agent_control().get_status(agent_id).await,
+        AgentStatus::NotFound
+    );
+
+    let rollout_path =
+        crate::find_thread_path_by_id_str(turn.config.codex_home.as_path(), &agent_id.to_string())
+            .await
+            .expect("rollout lookup should succeed")
+            .expect("rollout should exist before archive move");
+    let sessions_root = turn.config.codex_home.join(crate::rollout::SESSIONS_SUBDIR);
+    let relative_rollout_path = rollout_path
+        .strip_prefix(&sessions_root)
+        .expect("rollout should be under sessions root")
+        .to_path_buf();
+    let archived_rollout_path = turn
+        .config
+        .codex_home
+        .join(crate::rollout::ARCHIVED_SESSIONS_SUBDIR)
+        .join(relative_rollout_path);
+    let archived_parent = archived_rollout_path
+        .parent()
+        .expect("archived rollout path should have parent");
+    tokio::fs::create_dir_all(archived_parent)
+        .await
+        .expect("archive dir should be created");
+    tokio::fs::rename(&rollout_path, &archived_rollout_path)
+        .await
+        .expect("rollout should move to archived path");
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let resume_invocation = invocation(
+        session,
+        turn.clone(),
+        "resume_agent",
+        function_payload(json!({"id": agent_id.to_string()})),
+    );
+    let output = MultiAgentHandler
+        .handle(resume_invocation)
+        .await
+        .expect("resume_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: resume_agent::ResumeAgentResult =
+        serde_json::from_str(&content).expect("resume_agent result should be json");
+    assert_ne!(result.status, AgentStatus::NotFound);
+    assert_eq!(success, Some(true));
+
+    let resumed_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("resumed thread should be registered");
+    let resumed_config = resumed_thread.codex.session.get_config().await;
+    assert_eq!(resumed_config.model.as_deref(), Some("gpt-5.1-codex-mini"));
+    assert_eq!(
+        resumed_config.model_reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(
+        resumed_config.developer_instructions,
+        turn.developer_instructions
+    );
+
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(agent_id)
+        .await
+        .expect("shutdown resumed agent");
+}
+
+#[tokio::test]
 async fn resume_agent_rejects_when_depth_limit_exceeded() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -3164,6 +3290,165 @@ async fn close_agent_reports_already_closed_for_known_id() {
         close_agent::CloseAgentOutcome::AlreadyClosed
     );
     assert_eq!(success, Some(true));
+}
+
+#[tokio::test]
+async fn close_agent_offline_persists_subtree_closure_across_parent_resume() {
+    let (_session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let mut config = turn.config.as_ref().clone();
+    config.agent_max_depth = 3;
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("parent thread should start");
+    let parent_thread_id = parent.thread_id;
+    let parent_session = parent.thread.codex.session.clone();
+
+    let child_spawn_output = SpawnAgentHandler
+        .handle(invocation(
+            parent_session.clone(),
+            parent_session.new_default_turn().await,
+            "spawn_agent",
+            function_payload(json!({"message": "hello child"})),
+        ))
+        .await
+        .expect("child spawn should succeed");
+    let (child_content, child_success) = expect_text_output(child_spawn_output);
+    let child_result: serde_json::Value =
+        serde_json::from_str(&child_content).expect("child spawn result should be json");
+    let child_thread_id = agent_id(
+        child_result
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("child spawn result should include agent_id"),
+    )
+    .expect("child agent_id should be valid");
+    assert_eq!(child_success, Some(true));
+
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_session = child_thread.codex.session.clone();
+    let grandchild_spawn_output = SpawnAgentHandler
+        .handle(invocation(
+            child_session.clone(),
+            child_session.new_default_turn().await,
+            "spawn_agent",
+            function_payload(json!({"message": "hello grandchild"})),
+        ))
+        .await
+        .expect("grandchild spawn should succeed");
+    let (grandchild_content, grandchild_success) = expect_text_output(grandchild_spawn_output);
+    let grandchild_result: serde_json::Value =
+        serde_json::from_str(&grandchild_content).expect("grandchild spawn result should be json");
+    let grandchild_thread_id = agent_id(
+        grandchild_result
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("grandchild spawn result should include agent_id"),
+    )
+    .expect("grandchild agent_id should be valid");
+    assert_eq!(grandchild_success, Some(true));
+
+    manager
+        .agent_control()
+        .shutdown_live_agent(grandchild_thread_id)
+        .await
+        .expect("grandchild shutdown should succeed");
+    manager
+        .agent_control()
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should succeed");
+    assert_eq!(
+        manager.agent_control().get_status(child_thread_id).await,
+        AgentStatus::NotFound
+    );
+    assert_eq!(
+        manager
+            .agent_control()
+            .get_status(grandchild_thread_id)
+            .await,
+        AgentStatus::NotFound
+    );
+
+    let close_output = CloseAgentHandler
+        .handle(invocation(
+            parent_session.clone(),
+            parent_session.new_default_turn().await,
+            "close_agent",
+            function_payload(json!({"id": child_thread_id.to_string()})),
+        ))
+        .await
+        .expect("offline close_agent should succeed");
+    let (close_content, close_success) = expect_text_output(close_output);
+    let close_result: close_agent::CloseAgentResult =
+        serde_json::from_str(&close_content).expect("close_agent result should be json");
+    assert_eq!(close_result.status, AgentStatus::NotFound);
+    assert_eq!(
+        close_result.close_result,
+        close_agent::CloseAgentOutcome::AlreadyClosed
+    );
+    assert_eq!(close_success, Some(true));
+
+    manager
+        .agent_control()
+        .shutdown_live_agent(parent_thread_id)
+        .await
+        .expect("parent shutdown should succeed");
+    assert_eq!(
+        manager.agent_control().get_status(parent_thread_id).await,
+        AgentStatus::NotFound
+    );
+
+    let operator = manager
+        .start_thread(config)
+        .await
+        .expect("operator thread should start");
+    let operator_session = operator.thread.codex.session.clone();
+    let parent_resume_output = ResumeAgentHandler
+        .handle(invocation(
+            operator_session,
+            operator.thread.codex.session.new_default_turn().await,
+            "resume_agent",
+            function_payload(json!({"id": parent_thread_id.to_string()})),
+        ))
+        .await
+        .expect("parent resume should succeed");
+    let (parent_resume_content, parent_resume_success) = expect_text_output(parent_resume_output);
+    let parent_resume_result: resume_agent::ResumeAgentResult =
+        serde_json::from_str(&parent_resume_content).expect("resume result should be json");
+    assert_ne!(parent_resume_result.status, AgentStatus::NotFound);
+    assert_eq!(parent_resume_success, Some(true));
+    assert_eq!(
+        manager.agent_control().get_status(child_thread_id).await,
+        AgentStatus::NotFound
+    );
+    assert_eq!(
+        manager
+            .agent_control()
+            .get_status(grandchild_thread_id)
+            .await,
+        AgentStatus::NotFound
+    );
+
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(parent_thread_id)
+        .await
+        .expect("cleanup parent shutdown should succeed");
+    let _ = manager
+        .agent_control()
+        .shutdown_agent(operator.thread_id)
+        .await
+        .expect("cleanup operator shutdown should succeed");
 }
 
 #[tokio::test]
