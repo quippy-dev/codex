@@ -24,6 +24,7 @@ use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::ReadOnlyAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -62,17 +63,31 @@ use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_otel::TelemetryAuthMode;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::W3cTraceContext;
+use core_test_support::context_snapshot;
+use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
+use core_test_support::test_codex::test_codex;
 use core_test_support::tracing::install_test_tracing;
+use core_test_support::wait_for_event;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
 use std::path::Path;
@@ -1002,6 +1017,196 @@ async fn recompute_token_usage_updates_model_context_window() {
 
     let actual = session.state.lock().await.token_info().expect("token info");
     assert_eq!(actual.model_context_window, Some(128_000));
+}
+
+#[tokio::test]
+async fn record_initial_history_reconstructs_forked_transcript() {
+    let (session, turn_context) = make_session_and_context().await;
+    let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;
+
+    session
+        .record_initial_history(InitialHistory::Forked(rollout_items))
+        .await;
+
+    let reconstruction_turn = session.new_default_turn().await;
+    expected.extend(
+        session
+            .build_initial_context(reconstruction_turn.as_ref())
+            .await,
+    );
+    let history = session.state.lock().await.clone_history();
+    assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let first_forked_request = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.permissions.approval_policy =
+            codex_config::Constrained::allow_any(AskForApproval::OnRequest);
+    });
+    let initial = builder.build(&server).await?;
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    initial
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "fork seed".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let mut fork_config = initial.config.clone();
+    fork_config.permissions.approval_policy =
+        codex_config::Constrained::allow_any(AskForApproval::UnlessTrusted);
+    let forked = initial
+        .thread_manager
+        .fork_thread(usize::MAX, fork_config, rollout_path, false, None)
+        .await?;
+
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: forked.session_configured.model.clone(),
+            reasoning_effort: None,
+            developer_instructions: Some("Fork turn collaboration instructions.".to_string()),
+        },
+    };
+    forked
+        .thread
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: Some(collaboration_mode),
+            personality: None,
+        })
+        .await?;
+
+    forked
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "after fork".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&forked.thread, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = first_forked_request.single_request();
+    let snapshot = context_snapshot::format_labeled_requests_snapshot(
+        "First request after fork when fork startup changes approval policy and the first forked turn changes approval policy again and enters plan mode.",
+        &[("First Forked Turn Request", &request)],
+        &ContextSnapshotOptions::default()
+            .render_mode(ContextSnapshotRenderMode::KindWithTextPrefix { max_chars: 96 })
+            .strip_capability_instructions()
+            .strip_agents_md_user_context(),
+    );
+
+    let mut settings = insta::Settings::clone_current();
+    settings.set_snapshot_path("snapshots");
+    settings.set_prepend_module_to_snapshot(false);
+    settings.bind(|| {
+        insta::assert_snapshot!(
+            "codex_core__codex_tests__fork_startup_context_then_first_turn_diff",
+            snapshot
+        );
+    });
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_initial_history_forked_hydrates_previous_turn_settings() {
+    let (session, turn_context) = make_session_and_context().await;
+    let previous_model = "forked-rollout-model";
+    let previous_context_item = TurnContextItem {
+        turn_id: Some(turn_context.sub_id.clone()),
+        trace_id: turn_context.trace_id.clone(),
+        cwd: turn_context.cwd.clone(),
+        current_date: turn_context.current_date.clone(),
+        timezone: turn_context.timezone.clone(),
+        approval_policy: turn_context.approval_policy.value(),
+        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        network: None,
+        model: previous_model.to_string(),
+        personality: turn_context.personality,
+        collaboration_mode: Some(turn_context.collaboration_mode.clone()),
+        realtime_active: Some(turn_context.realtime_active),
+        effort: turn_context.reasoning_effort,
+        summary: turn_context.reasoning_summary,
+        user_instructions: None,
+        developer_instructions: None,
+        final_output_json_schema: None,
+        truncation_policy: Some(turn_context.truncation_policy.into()),
+    };
+    let turn_id = previous_context_item
+        .turn_id
+        .clone()
+        .expect("turn context should have turn_id");
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "forked seed".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::TurnContext(previous_context_item),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id,
+                last_agent_message: None,
+            },
+        )),
+    ];
+
+    session
+        .record_initial_history(InitialHistory::Forked(rollout_items))
+        .await;
+
+    assert_eq!(
+        session.previous_turn_settings().await,
+        Some(PreviousTurnSettings {
+            model: previous_model.to_string(),
+            realtime_active: Some(turn_context.realtime_active),
+        })
+    );
 }
 
 #[tokio::test]
@@ -2387,6 +2592,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        idle_pending_input: Mutex::new(Vec::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         js_repl,
@@ -3187,6 +3393,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        idle_pending_input: Mutex::new(Vec::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         js_repl,
@@ -4215,6 +4422,43 @@ async fn steer_input_enforces_expected_turn_id() {
 }
 
 #[tokio::test]
+async fn steer_input_rejects_non_regular_turns() {
+    for (task_kind, turn_kind) in [
+        (TaskKind::Review, NonSteerableTurnKind::Review),
+        (TaskKind::Compact, NonSteerableTurnKind::Compact),
+    ] {
+        let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+        let input = vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }];
+        let turn_context = sess.new_default_turn_with_sub_id("turn".to_string()).await;
+        sess.spawn_task(
+            turn_context,
+            input,
+            NeverEndingTask {
+                kind: task_kind,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+        let steer_input = vec![UserInput::Text {
+            text: "steer".to_string(),
+            text_elements: Vec::new(),
+        }];
+        let err = sess
+            .steer_input(steer_input, /*expected_turn_id*/ None)
+            .await
+            .expect_err("steering a non-regular turn should fail");
+
+        assert_eq!(err, SteerInputError::ActiveTurnNotSteerable { turn_kind });
+
+        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    }
+}
+
+#[tokio::test]
 async fn steer_input_returns_active_turn_id() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     let input = vec![UserInput::Text {
@@ -4298,6 +4542,32 @@ async fn prepend_pending_input_keeps_older_tail_ahead_of_newer_input() {
         .expect("requeue later pending input at the front of the queue");
 
     assert_eq!(sess.get_pending_input().await, vec![later, newer]);
+}
+
+#[tokio::test]
+async fn queued_response_items_for_next_turn_move_into_next_active_turn() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let queued_item = ResponseInputItem::Message {
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "queued before wake".to_string(),
+        }],
+    };
+
+    sess.queue_response_items_for_next_turn(vec![queued_item.clone()])
+        .await;
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    assert_eq!(sess.get_pending_input().await, vec![queued_item]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

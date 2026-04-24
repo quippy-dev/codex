@@ -32,6 +32,7 @@ use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::CancelLoginAccountResponse;
 use codex_app_server_protocol::CancelLoginAccountStatus;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::CollaborationModeListParams;
 use codex_app_server_protocol::CollaborationModeListResponse;
 use codex_app_server_protocol::CommandExecParams;
@@ -161,6 +162,7 @@ use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -5877,7 +5879,7 @@ impl CodexMessageProcessor {
                 interface: outcome.plugin.interface.map(plugin_interface_to_info),
             },
             description: outcome.plugin.description,
-            skills: plugin_skills_to_info(&visible_skills),
+            skills: plugin_skills_to_info(&visible_skills, &outcome.plugin.disabled_skill_paths),
             apps: app_summaries,
             mcp_servers: outcome.plugin.mcp_server_names,
         };
@@ -5892,8 +5894,30 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: SkillsConfigWriteParams,
     ) {
-        let SkillsConfigWriteParams { path, enabled } = params;
-        let edits = vec![ConfigEdit::SetSkillConfig { path, enabled }];
+        let SkillsConfigWriteParams {
+            path,
+            name,
+            enabled,
+        } = params;
+        let edit = match (path, name) {
+            (Some(path), None) => ConfigEdit::SetSkillConfig {
+                path: path.into_path_buf(),
+                enabled,
+            },
+            (None, Some(name)) if !name.trim().is_empty() => {
+                ConfigEdit::SetSkillConfigByName { name, enabled }
+            }
+            _ => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_PARAMS_ERROR_CODE,
+                    message: "skills/config/write requires exactly one of path or name".to_string(),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+        let edits = vec![edit];
         let result = ConfigEditsBuilder::new(&self.config.codex_home)
             .with_edits(edits)
             .apply()
@@ -5901,6 +5925,7 @@ impl CodexMessageProcessor {
 
         match result {
             Ok(()) => {
+                self.thread_manager.plugins_manager().clear_cache();
                 self.thread_manager.skills_manager().clear_cache();
                 self.outgoing
                     .send_response(
@@ -6339,24 +6364,57 @@ impl CodexMessageProcessor {
                 self.outgoing.send_response(request_id, response).await;
             }
             Err(err) => {
-                let (code, message) = match err {
+                let (code, message, data) = match err {
                     SteerInputError::NoActiveTurn(_) => (
                         INVALID_REQUEST_ERROR_CODE,
                         "no active turn to steer".to_string(),
+                        None,
                     ),
                     SteerInputError::ExpectedTurnMismatch { expected, actual } => (
                         INVALID_REQUEST_ERROR_CODE,
                         format!("expected active turn id `{expected}` but found `{actual}`"),
+                        None,
                     ),
+                    SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
+                        let message = match turn_kind {
+                            codex_protocol::protocol::NonSteerableTurnKind::Review => {
+                                "cannot steer a review turn".to_string()
+                            }
+                            codex_protocol::protocol::NonSteerableTurnKind::Compact => {
+                                "cannot steer a compact turn".to_string()
+                            }
+                        };
+                        let error = TurnError {
+                            message: message.clone(),
+                            codex_error_info: Some(
+                                AppServerCodexErrorInfo::ActiveTurnNotSteerable {
+                                    turn_kind: turn_kind.into(),
+                                },
+                            ),
+                            additional_details: None,
+                        };
+                        let data = match serde_json::to_value(error) {
+                            Ok(data) => Some(data),
+                            Err(error) => {
+                                tracing::error!(
+                                    ?error,
+                                    "failed to serialize active-turn-not-steerable turn error"
+                                );
+                                None
+                            }
+                        };
+                        (INVALID_REQUEST_ERROR_CODE, message, data)
+                    }
                     SteerInputError::EmptyInput => (
                         INVALID_REQUEST_ERROR_CODE,
                         "input must not be empty".to_string(),
+                        None,
                     ),
                 };
                 let error = JSONRPCErrorError {
                     code,
                     message,
-                    data: None,
+                    data,
                 };
                 self.outgoing.send_error(request_id, error).await;
             }
@@ -7842,7 +7900,10 @@ fn skills_to_info(
         .collect()
 }
 
-fn plugin_skills_to_info(skills: &[codex_core::skills::SkillMetadata]) -> Vec<SkillSummary> {
+fn plugin_skills_to_info(
+    skills: &[codex_core::skills::SkillMetadata],
+    disabled_skill_paths: &std::collections::HashSet<PathBuf>,
+) -> Vec<SkillSummary> {
     skills
         .iter()
         .map(|skill| SkillSummary {
@@ -7860,6 +7921,7 @@ fn plugin_skills_to_info(skills: &[codex_core::skills::SkillMetadata]) -> Vec<Sk
                 }
             }),
             path: skill.path_to_skills_md.clone(),
+            enabled: !disabled_skill_paths.contains(&skill.path_to_skills_md),
         })
         .collect()
 }

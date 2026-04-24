@@ -58,6 +58,7 @@ use crate::terminal_title::clear_terminal_title;
 use crate::terminal_title::set_terminal_title;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
+use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
@@ -156,6 +157,8 @@ use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use codex_terminal_detection::Multiplexer;
+use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
 use codex_utils_sleep_inhibitor::SleepInhibitor;
@@ -192,14 +195,21 @@ const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
 /// Apple Terminal, Warp, and VSCode integrated terminals intercept or silently
-/// swallow Alt+Up, so users in those environments would never be able to trigger
-/// the edit action.  We fall back to Shift+Left for those terminals while
-/// keeping the more discoverable Alt+Up everywhere else.
+/// swallow Alt+Up, and tmux does not reliably pass that chord through. We fall
+/// back to Shift+Left for those environments while keeping the more discoverable
+/// Alt+Up everywhere else.
 ///
 /// The match is exhaustive so that adding a new `TerminalName` variant forces
 /// an explicit decision about which binding that terminal should use.
-fn queued_message_edit_binding_for_terminal(terminal_name: TerminalName) -> KeyBinding {
-    match terminal_name {
+fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyBinding {
+    if matches!(
+        terminal_info.multiplexer.as_ref(),
+        Some(Multiplexer::Tmux { .. })
+    ) {
+        return key_hint::shift(KeyCode::Left);
+    }
+
+    match terminal_info.name {
         TerminalName::AppleTerminal | TerminalName::WarpTerminal | TerminalName::VsCode => {
             key_hint::shift(KeyCode::Left)
         }
@@ -531,6 +541,12 @@ struct PluginListFetchState {
     in_flight_cwd: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct PluginInstallAuthFlowState {
+    plugin_display_name: String,
+    next_app_index: usize,
+}
+
 #[derive(Debug)]
 enum RateLimitErrorKind {
     ServerOverloaded,
@@ -726,6 +742,8 @@ pub(crate) struct ChatWidget {
     pending_mcp_output_requests: usize,
     plugins_cache: PluginsCacheState,
     plugins_fetch_state: PluginListFetchState,
+    plugin_install_apps_needing_auth: Vec<AppSummary>,
+    plugin_install_auth_flow: Option<PluginInstallAuthFlowState>,
     // Queue of interruptive UI events deferred during an active write cycle
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
@@ -759,6 +777,8 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // User messages that tried to steer a non-regular turn and must be retried first.
+    rejected_steers_queue: VecDeque<UserMessage>,
     // Steers already submitted to core but not yet committed into history.
     //
     // The bottom pane shows these above queued drafts until core records the
@@ -921,9 +941,11 @@ impl ThreadComposerState {
 pub(crate) struct ThreadInputState {
     composer: Option<ThreadComposerState>,
     pending_steers: VecDeque<UserMessage>,
+    rejected_steers_queue: VecDeque<UserMessage>,
     queued_user_messages: VecDeque<UserMessage>,
     current_collaboration_mode: CollaborationMode,
     active_collaboration_mask: Option<CollaborationModeMask>,
+    task_running: bool,
     agent_turn_running: bool,
 }
 
@@ -1826,7 +1848,7 @@ impl ChatWidget {
         let had_pending_steers = !self.pending_steers.is_empty();
         self.refresh_pending_input_preview();
 
-        if !from_replay && self.queued_user_messages.is_empty() && !had_pending_steers {
+        if !from_replay && !self.has_queued_follow_up_messages() && !had_pending_steers {
             self.maybe_prompt_plan_implementation();
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
@@ -1848,7 +1870,7 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return;
         }
-        if !self.queued_user_messages.is_empty() {
+        if self.has_queued_follow_up_messages() {
             return;
         }
         if self.active_mode_kind() != ModeKind::Plan {
@@ -1880,6 +1902,50 @@ impl ChatWidget {
         self.notify(Notification::PlanModePrompt {
             title: PLAN_IMPLEMENTATION_TITLE.to_string(),
         });
+    }
+
+    fn has_queued_follow_up_messages(&self) -> bool {
+        !self.rejected_steers_queue.is_empty() || !self.queued_user_messages.is_empty()
+    }
+
+    fn pop_next_queued_user_message(&mut self) -> Option<UserMessage> {
+        if self.rejected_steers_queue.is_empty() {
+            self.queued_user_messages.pop_front()
+        } else {
+            Some(merge_user_messages(
+                self.rejected_steers_queue.drain(..).collect(),
+            ))
+        }
+    }
+
+    fn pop_latest_queued_user_message(&mut self) -> Option<UserMessage> {
+        self.queued_user_messages
+            .pop_back()
+            .or_else(|| self.rejected_steers_queue.pop_back())
+    }
+
+    pub(crate) fn enqueue_rejected_steer(&mut self) -> bool {
+        let Some(pending_steer) = self.pending_steers.pop_front() else {
+            tracing::warn!(
+                "received active-turn-not-steerable error without a matching pending steer"
+            );
+            return false;
+        };
+        self.rejected_steers_queue
+            .push_back(pending_steer.user_message);
+        if !self.bottom_pane.is_task_running() {
+            // Will drain rejected_steers_queue in case the steer rejection arrives after task completion
+            self.maybe_send_next_queued_input();
+        }
+        self.refresh_pending_input_preview();
+        true
+    }
+
+    fn handle_steer_rejected_error(&mut self, codex_error_info: &CodexErrorInfo) -> bool {
+        matches!(
+            codex_error_info,
+            CodexErrorInfo::ActiveTurnNotSteerable { .. }
+        ) && self.enqueue_rejected_steer()
     }
 
     pub(crate) fn open_multi_agent_enable_prompt(&mut self) {
@@ -2246,7 +2312,7 @@ impl ChatWidget {
     /// state stays aligned with the merged attachment list. Returns `None` when there is nothing to
     /// restore.
     fn drain_pending_messages_for_restore(&mut self) -> Option<UserMessage> {
-        if self.pending_steers.is_empty() && self.queued_user_messages.is_empty() {
+        if self.pending_steers.is_empty() && !self.has_queued_follow_up_messages() {
             return None;
         }
 
@@ -2258,11 +2324,12 @@ impl ChatWidget {
             mention_bindings: self.bottom_pane.composer_mention_bindings(),
         };
 
-        let mut to_merge: Vec<UserMessage> = self
-            .pending_steers
-            .drain(..)
-            .map(|steer| steer.user_message)
-            .collect();
+        let mut to_merge: Vec<UserMessage> = self.rejected_steers_queue.drain(..).collect();
+        to_merge.extend(
+            self.pending_steers
+                .drain(..)
+                .map(|steer| steer.user_message),
+        );
         to_merge.extend(self.queued_user_messages.drain(..));
         if !existing_message.text.is_empty()
             || !existing_message.local_images.is_empty()
@@ -2308,14 +2375,17 @@ impl ChatWidget {
                 .iter()
                 .map(|pending| pending.user_message.clone())
                 .collect(),
+            rejected_steers_queue: self.rejected_steers_queue.clone(),
             queued_user_messages: self.queued_user_messages.clone(),
             current_collaboration_mode: self.current_collaboration_mode.clone(),
             active_collaboration_mask: self.active_collaboration_mask.clone(),
+            task_running: self.bottom_pane.is_task_running(),
             agent_turn_running: self.agent_turn_running,
         })
     }
 
     pub(crate) fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>) {
+        let restored_task_running = input_state.as_ref().is_some_and(|state| state.task_running);
         if let Some(input_state) = input_state {
             self.current_collaboration_mode = input_state.current_collaboration_mode;
             self.active_collaboration_mask = input_state.active_collaboration_mask;
@@ -2347,13 +2417,24 @@ impl ChatWidget {
                 );
                 self.bottom_pane.set_composer_pending_pastes(Vec::new());
             }
-            self.pending_steers.clear();
-            self.queued_user_messages = input_state.pending_steers;
-            self.queued_user_messages
-                .extend(input_state.queued_user_messages);
+            self.pending_steers = input_state
+                .pending_steers
+                .into_iter()
+                .map(|user_message| PendingSteer {
+                    compare_key: PendingSteerCompareKey {
+                        message: user_message.text.clone(),
+                        image_count: user_message.local_images.len()
+                            + user_message.remote_image_urls.len(),
+                    },
+                    user_message,
+                })
+                .collect();
+            self.rejected_steers_queue = input_state.rejected_steers_queue;
+            self.queued_user_messages = input_state.queued_user_messages;
         } else {
             self.agent_turn_running = false;
             self.pending_steers.clear();
+            self.rejected_steers_queue.clear();
             self.set_remote_image_urls(Vec::new());
             self.bottom_pane.set_composer_text_with_mention_bindings(
                 String::new(),
@@ -2367,6 +2448,10 @@ impl ChatWidget {
         self.turn_sleep_inhibitor
             .set_turn_running(self.agent_turn_running);
         self.update_task_running_state();
+        if restored_task_running && !self.bottom_pane.is_task_running() {
+            self.bottom_pane.set_task_running(/*running*/ true);
+            self.refresh_terminal_title();
+        }
         self.refresh_pending_input_preview();
         self.request_redraw();
     }
@@ -3604,8 +3689,7 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
         let current_cwd = Some(config.cwd.clone());
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_info());
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -3659,6 +3743,8 @@ impl ChatWidget {
             pending_mcp_output_requests: 0,
             plugins_cache: PluginsCacheState::default(),
             plugins_fetch_state: PluginListFetchState::default(),
+            plugin_install_apps_needing_auth: Vec::new(),
+            plugin_install_auth_flow: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
@@ -3672,6 +3758,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
             pending_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
             queued_message_edit_binding,
@@ -3807,8 +3894,7 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
         let current_cwd = Some(config.cwd.clone());
 
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_info());
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -3862,6 +3948,8 @@ impl ChatWidget {
             pending_mcp_output_requests: 0,
             plugins_cache: PluginsCacheState::default(),
             plugins_fetch_state: PluginListFetchState::default(),
+            plugin_install_apps_needing_auth: Vec::new(),
+            plugin_install_auth_flow: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
@@ -3880,6 +3968,7 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
             pending_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
             queued_message_edit_binding,
@@ -4002,8 +4091,7 @@ impl ChatWidget {
             settings: fallback_default,
         };
 
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_info());
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -4057,6 +4145,8 @@ impl ChatWidget {
             pending_mcp_output_requests: 0,
             plugins_cache: PluginsCacheState::default(),
             plugins_fetch_state: PluginListFetchState::default(),
+            plugin_install_apps_needing_auth: Vec::new(),
+            plugin_install_auth_flow: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
@@ -4070,6 +4160,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
             pending_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
             queued_message_edit_binding,
@@ -4213,9 +4304,9 @@ impl ChatWidget {
 
         if key_event.kind == KeyEventKind::Press
             && self.queued_message_edit_binding.is_press(key_event)
-            && !self.queued_user_messages.is_empty()
+            && self.has_queued_follow_up_messages()
         {
-            if let Some(user_message) = self.queued_user_messages.pop_back() {
+            if let Some(user_message) = self.pop_latest_queued_user_message() {
                 self.restore_user_message_to_composer(user_message);
                 self.refresh_pending_input_preview();
                 self.request_redraw();
@@ -4439,6 +4530,9 @@ impl ChatWidget {
             }
             SlashCommand::Compact => {
                 self.clear_token_usage();
+                if !self.bottom_pane.is_task_running() {
+                    self.bottom_pane.set_task_running(/*running*/ true);
+                }
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
             SlashCommand::Review => {
@@ -4954,10 +5048,7 @@ impl ChatWidget {
     }
 
     fn queue_user_message(&mut self, user_message: UserMessage) {
-        if !self.is_session_configured()
-            || self.bottom_pane.is_task_running()
-            || self.is_review_mode
-        {
+        if !self.is_session_configured() || self.bottom_pane.is_task_running() {
             self.queued_user_messages.push_back(user_message);
             self.refresh_pending_input_preview();
         } else {
@@ -4972,12 +5063,6 @@ impl ChatWidget {
             self.refresh_pending_input_preview();
             return;
         }
-        if self.is_review_mode {
-            self.queued_user_messages.push_back(user_message);
-            self.refresh_pending_input_preview();
-            return;
-        }
-
         let UserMessage {
             text,
             local_images,
@@ -5382,7 +5467,9 @@ impl ChatWidget {
             }
             EventMsg::TurnComplete(TurnCompleteEvent {
                 last_agent_message, ..
-            }) => self.on_task_complete(last_agent_message, from_replay),
+            }) => {
+                self.on_task_complete(last_agent_message, from_replay);
+            }
             EventMsg::TokenCount(ev) => {
                 self.set_token_info(ev.info);
                 self.on_rate_limit_snapshot(ev.rate_limits);
@@ -5394,8 +5481,11 @@ impl ChatWidget {
                 message,
                 codex_error_info,
             }) => {
-                if let Some(info) = codex_error_info
-                    && let Some(kind) = rate_limit_error_kind(&info)
+                if codex_error_info
+                    .as_ref()
+                    .is_some_and(|info| self.handle_steer_rejected_error(info))
+                {
+                } else if let Some(kind) = codex_error_info.as_ref().and_then(rate_limit_error_kind)
                 {
                     match kind {
                         RateLimitErrorKind::ServerOverloaded => {
@@ -5755,7 +5845,7 @@ impl ChatWidget {
         if self.bottom_pane.is_task_running() {
             return;
         }
-        if let Some(user_message) = self.queued_user_messages.pop_front() {
+        if let Some(user_message) = self.pop_next_queued_user_message() {
             self.submit_user_message(user_message);
         }
         // Update the list to reflect the remaining queued messages (if any).
@@ -5774,8 +5864,16 @@ impl ChatWidget {
             .iter()
             .map(|steer| steer.user_message.text.clone())
             .collect();
-        self.bottom_pane
-            .set_pending_input_preview(queued_messages, pending_steers);
+        let rejected_steers: Vec<String> = self
+            .rejected_steers_queue
+            .iter()
+            .map(|message| message.text.clone())
+            .collect();
+        self.bottom_pane.set_pending_input_preview(
+            queued_messages,
+            pending_steers,
+            rejected_steers,
+        );
     }
 
     pub(crate) fn set_pending_thread_approvals(&mut self, threads: Vec<String>) {
@@ -8797,9 +8895,14 @@ impl ChatWidget {
 
     #[cfg(test)]
     pub(crate) fn queued_user_message_texts(&self) -> Vec<String> {
-        self.queued_user_messages
+        self.rejected_steers_queue
             .iter()
             .map(|message| message.text.clone())
+            .chain(
+                self.queued_user_messages
+                    .iter()
+                    .map(|message| message.text.clone()),
+            )
             .collect()
     }
 
