@@ -237,6 +237,11 @@ impl AgentControl {
 
         let live_rollout_path = match state.get_thread(parent_thread_id).await {
             Ok(parent_thread) => {
+                parent_thread
+                    .codex
+                    .session
+                    .ensure_rollout_materialized()
+                    .await;
                 parent_thread.flush_rollout().await;
                 parent_thread.rollout_path()
             }

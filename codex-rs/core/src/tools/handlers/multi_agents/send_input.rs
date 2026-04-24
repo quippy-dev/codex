@@ -75,7 +75,20 @@ pub async fn handle(
             .into(),
         )
         .await;
-    let result = if let Some(message) = single_text_input(&input_items) {
+    let sender_is_watchdog_helper_for_receiver = session
+        .services
+        .agent_control
+        .watchdog_owner_for_active_helper(session.conversation_id)
+        .await
+        == Some(receiver_thread_id);
+    let result = if sender_is_watchdog_helper_for_receiver {
+        session
+            .services
+            .agent_control
+            .send_watchdog_wakeup(receiver_thread_id, session.conversation_id, prompt.clone())
+            .await
+            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
+    } else if let Some(message) = single_text_input(&input_items) {
         session
             .services
             .agent_control
@@ -116,19 +129,6 @@ pub async fn handle(
         .agent_control
         .record_prompt_preview(receiver_thread_id, &prompt)
         .await;
-    if session
-        .services
-        .agent_control
-        .watchdog_owner_for_active_helper(session.conversation_id)
-        .await
-        == Some(receiver_thread_id)
-    {
-        session
-            .services
-            .agent_control
-            .mark_watchdog_idle_episode_satisfied_for_helper(session.conversation_id)
-            .await;
-    }
     session.mark_turn_used_agent_send_input();
 
     let content = serde_json::to_string(&SendInputResult { submission_id }).map_err(|err| {

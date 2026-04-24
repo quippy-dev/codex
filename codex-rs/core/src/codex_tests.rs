@@ -62,6 +62,7 @@ use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_otel::TelemetryAuthMode;
+use codex_protocol::agent_inbox::build_tool_response_input_items;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
@@ -255,6 +256,63 @@ async fn inject_response_items_without_active_turn_starts_followup_turn_with_pen
     ));
     assert!(sess.has_active_turn().await);
     assert_eq!(sess.get_pending_input().await, vec![queued]);
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn inject_agent_inbox_items_without_active_turn_starts_followup_without_live_emit() {
+    let (sess, _tc, rx) = make_session_and_context_with_rx().await;
+    sess.set_session_startup_prewarm(blocking_startup_prewarm_handle())
+        .await;
+
+    let queued = build_tool_response_input_items(
+        ThreadId::new(),
+        Some("Turing".to_string()),
+        Some("watchdog".to_string()),
+        "Root agent: confirm new turn".to_string(),
+        "agent_inbox_test".to_string(),
+    )
+    .expect("agent inbox items should serialize");
+
+    super::handlers::inject_response_items(
+        &sess,
+        "idle-agent-inbox-turn".to_string(),
+        queued.clone(),
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        loop {
+            let event = rx.recv().await.expect("channel open");
+            match event.msg {
+                EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. })
+                    if turn_id == "idle-agent-inbox-turn" =>
+                {
+                    break;
+                }
+                EventMsg::RawResponseItem(_) => {
+                    panic!("idle agent inbox wake should not live-emit collab items");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("expected turn started event");
+    assert!(sess.has_active_turn().await);
+    assert_eq!(sess.get_pending_input().await, queued);
+
+    let leaked_agent_message =
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|event| matches!(event.msg, EventMsg::RawResponseItem(_)));
+    assert_eq!(
+        leaked_agent_message, false,
+        "idle agent inbox wake should start with pending input instead of live-emitting a collab message"
+    );
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

@@ -32,6 +32,13 @@ fn event_close_result(outcome: CloseAgentOutcome) -> CollabCloseResult {
     }
 }
 
+fn close_status(outcome: CloseAgentOutcome, live_status: AgentStatus) -> AgentStatus {
+    match outcome {
+        CloseAgentOutcome::Closed => AgentStatus::Shutdown,
+        CloseAgentOutcome::AlreadyClosed | CloseAgentOutcome::NotFound => live_status,
+    }
+}
+
 pub async fn handle(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -47,14 +54,24 @@ pub async fn handle(
         .get_agent_nickname_and_role(agent_id)
         .await
         .unwrap_or((None, None));
-    let receiver_spawn_mode = watchdog_ref_spawn_mode(
-        &session
+    let watchdog_targets = session
+        .services
+        .agent_control
+        .watchdog_targets(&[agent_id])
+        .await;
+    if watchdog_targets.contains(&agent_id)
+        && session
             .services
             .agent_control
-            .watchdog_targets(&[agent_id])
-            .await,
-        agent_id,
-    );
+            .watchdog_owner_for_active_helper(session.conversation_id)
+            .await
+            .is_some()
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "close_agent cannot target watchdog handles from an active watchdog check-in agent. Send the result to the parent/root agent with `send_input` and let watchdog runtime manage shutdown.".to_string(),
+        ));
+    }
+    let receiver_spawn_mode = watchdog_ref_spawn_mode(&watchdog_targets, agent_id);
     let mut was_known = if matches!(status_before, AgentStatus::NotFound) {
         let listed = session
             .services
@@ -104,8 +121,10 @@ pub async fn handle(
                 .shutdown_agent(helper_id)
                 .await;
         }
+        let outcome = not_found_outcome(was_known);
         let _ = session.services.agent_control.close_agent(agent_id).await;
-        let status = session.services.agent_control.get_status(agent_id).await;
+        let live_status = session.services.agent_control.get_status(agent_id).await;
+        let status = close_status(outcome, live_status);
         session
             .send_event(
                 &turn,
@@ -117,7 +136,7 @@ pub async fn handle(
                     receiver_agent_role: receiver_agent_role.clone(),
                     receiver_spawn_mode,
                     status: status.clone(),
-                    close_result: event_close_result(not_found_outcome(was_known)),
+                    close_result: event_close_result(outcome),
                 }
                 .into(),
             )
@@ -125,7 +144,7 @@ pub async fn handle(
         return if matches!(err, CodexErr::ThreadNotFound(_)) {
             let content = serde_json::to_string(&CloseAgentResult {
                 status,
-                close_result: not_found_outcome(was_known),
+                close_result: outcome,
             })
             .map_err(|serialize_err| {
                 FunctionCallError::Fatal(format!(
@@ -160,14 +179,9 @@ pub async fn handle(
         }
         Err(err) => Err(multi_agent_tool_error(agent_id, err)),
     };
-    let status = match close_result {
-        Ok(CloseAgentOutcome::Closed) => session.services.agent_control.get_status(agent_id).await,
-        Ok(CloseAgentOutcome::AlreadyClosed) | Ok(CloseAgentOutcome::NotFound) => {
-            session.services.agent_control.get_status(agent_id).await
-        }
-        Err(_) => session.services.agent_control.get_status(agent_id).await,
-    };
+    let live_status = session.services.agent_control.get_status(agent_id).await;
     let close_result = close_result?;
+    let status = close_status(close_result, live_status);
     session
         .send_event(
             &turn,

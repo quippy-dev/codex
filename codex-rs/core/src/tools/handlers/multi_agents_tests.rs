@@ -2,6 +2,7 @@ use super::*;
 use crate::AuthManager;
 use crate::CodexAuth;
 use crate::ThreadManager;
+use crate::agent::WatchdogRegistration;
 use crate::built_in_model_providers;
 use crate::codex::make_session_and_context;
 use crate::codex::make_session_and_context_with_rx;
@@ -2346,6 +2347,190 @@ async fn send_input_interrupt_rejects_watchdog_handle() {
 }
 
 #[tokio::test]
+async fn send_input_from_watchdog_helper_uses_watchdog_wake_path() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let owner_thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start owner thread");
+    let helper_thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start helper thread");
+
+    let mut session = Arc::new(session);
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .conversation_id = helper_thread.thread_id;
+    let turn = Arc::new(turn);
+    let watchdog_id = spawn_watchdog_for_test(session.clone(), turn.clone()).await;
+
+    session
+        .services
+        .agent_control
+        .register_watchdog(WatchdogRegistration {
+            owner_thread_id: owner_thread.thread_id,
+            target_thread_id: watchdog_id,
+            child_depth: 1,
+            interval_s: 30,
+            prompt: "watchdog check-in".to_string(),
+            config: turn.config.as_ref().clone(),
+        })
+        .await
+        .expect("register watchdog");
+    session
+        .services
+        .agent_control
+        .set_watchdog_active_helper_for_tests(watchdog_id, helper_thread.thread_id)
+        .await;
+    owner_thread
+        .thread
+        .codex
+        .session
+        .mark_active_turn_sampling_completed()
+        .await;
+
+    let invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "send_input",
+        function_payload(json!({
+            "id": owner_thread.thread_id.to_string(),
+            "message": "watchdog helper wake"
+        })),
+    );
+    MultiAgentHandler
+        .handle(invocation)
+        .await
+        .expect("send_input should succeed");
+
+    let ops = manager.captured_ops();
+    let owner_received_collab_inbox = ops.iter().any(|(id, op)| {
+        *id == owner_thread.thread_id && matches!(op, Op::InjectResponseItems { .. })
+    });
+    assert!(owner_received_collab_inbox);
+
+    let (queued_items, _, flush_pending) = owner_thread
+        .thread
+        .codex
+        .session
+        .post_turn_agent_stats()
+        .await;
+    assert_eq!(queued_items, 0);
+    assert!(!flush_pending);
+
+    let _ = session
+        .services
+        .agent_control
+        .shutdown_agent(watchdog_id)
+        .await;
+    let _ = session
+        .services
+        .agent_control
+        .shutdown_agent(helper_thread.thread_id)
+        .await;
+    let _ = session
+        .services
+        .agent_control
+        .shutdown_agent(owner_thread.thread_id)
+        .await;
+}
+
+#[tokio::test]
+async fn send_input_from_watchdog_helper_with_items_uses_watchdog_wake_path() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let owner_thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start owner thread");
+    let helper_thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start helper thread");
+
+    let mut session = Arc::new(session);
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .conversation_id = helper_thread.thread_id;
+    let turn = Arc::new(turn);
+    let watchdog_id = spawn_watchdog_for_test(session.clone(), turn.clone()).await;
+
+    session
+        .services
+        .agent_control
+        .register_watchdog(WatchdogRegistration {
+            owner_thread_id: owner_thread.thread_id,
+            target_thread_id: watchdog_id,
+            child_depth: 1,
+            interval_s: 30,
+            prompt: "watchdog check-in".to_string(),
+            config: turn.config.as_ref().clone(),
+        })
+        .await
+        .expect("register watchdog");
+    session
+        .services
+        .agent_control
+        .set_watchdog_active_helper_for_tests(watchdog_id, helper_thread.thread_id)
+        .await;
+    owner_thread
+        .thread
+        .codex
+        .session
+        .mark_active_turn_sampling_completed()
+        .await;
+
+    let invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "send_input",
+        function_payload(json!({
+            "id": owner_thread.thread_id.to_string(),
+            "items": [
+                {"type": "mention", "name": "drive", "path": "app://google_drive"},
+                {"type": "text", "text": "read the folder"}
+            ]
+        })),
+    );
+    MultiAgentHandler
+        .handle(invocation)
+        .await
+        .expect("send_input should succeed");
+
+    let ops = manager.captured_ops();
+    let owner_received_collab_inbox = ops.iter().any(|(id, op)| {
+        *id == owner_thread.thread_id && matches!(op, Op::InjectResponseItems { .. })
+    });
+    let owner_received_direct_user_input = ops
+        .iter()
+        .any(|(id, op)| *id == owner_thread.thread_id && matches!(op, Op::UserInput { .. }));
+    assert!(owner_received_collab_inbox);
+    assert!(!owner_received_direct_user_input);
+
+    let _ = session
+        .services
+        .agent_control
+        .shutdown_agent(watchdog_id)
+        .await;
+    let _ = session
+        .services
+        .agent_control
+        .shutdown_agent(helper_thread.thread_id)
+        .await;
+    let _ = session
+        .services
+        .agent_control
+        .shutdown_agent(owner_thread.thread_id)
+        .await;
+}
+
+#[tokio::test]
 async fn send_input_accepts_structured_items() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -3342,7 +3527,7 @@ async fn close_agent_submits_shutdown_and_returns_status() {
     let result: close_agent::CloseAgentResult =
         serde_json::from_str(&content).expect("close_agent result should be json");
     let status_after = manager.agent_control().get_status(agent_id).await;
-    assert_eq!(result.status, status_after);
+    assert_eq!(result.status, AgentStatus::Shutdown);
     assert_eq!(result.close_result, close_agent::CloseAgentOutcome::Closed);
     assert_eq!(success, Some(true));
 
@@ -3627,6 +3812,124 @@ async fn close_agent_reports_already_closed_for_registered_watchdog_without_live
 }
 
 #[tokio::test]
+async fn close_agent_rejects_watchdog_handle_for_active_watchdog_helper() {
+    let (mut owner_session, owner_turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let agent_control = manager.agent_control();
+    owner_session.services.agent_control = agent_control.clone();
+    let owner_thread = manager
+        .start_thread(owner_turn.config.as_ref().clone())
+        .await
+        .expect("start owner thread");
+    owner_session.conversation_id = owner_thread.thread_id;
+
+    let owner_session = Arc::new(owner_session);
+    let owner_turn = Arc::new(owner_turn);
+    let watchdog_id = spawn_watchdog_for_test(owner_session.clone(), owner_turn.clone()).await;
+
+    let helper_thread = manager
+        .start_thread(owner_turn.config.as_ref().clone())
+        .await
+        .expect("start helper thread");
+    let helper_thread_id = helper_thread.thread_id;
+    owner_session
+        .services
+        .agent_control
+        .set_watchdog_active_helper_for_tests(watchdog_id, helper_thread_id)
+        .await;
+    assert!(
+        owner_session
+            .services
+            .agent_control
+            .watchdog_targets(&[watchdog_id])
+            .await
+            .contains(&watchdog_id),
+        "watchdog test setup should register the target"
+    );
+    assert_eq!(
+        owner_session
+            .services
+            .agent_control
+            .watchdog_active_helper_for_tests(watchdog_id)
+            .await,
+        Some(helper_thread_id),
+        "watchdog test setup should mark the helper active"
+    );
+    assert_eq!(
+        owner_session
+            .services
+            .agent_control
+            .watchdog_owner_for_active_helper(helper_thread_id)
+            .await,
+        Some(owner_thread.thread_id),
+        "watchdog test setup should map active helper back to its owner"
+    );
+
+    let (mut helper_session, helper_turn) = make_session_and_context().await;
+    helper_session.services.agent_control = agent_control;
+    helper_session.conversation_id = helper_thread_id;
+
+    let invocation = invocation(
+        Arc::new(helper_session),
+        Arc::new(helper_turn),
+        "close_agent",
+        function_payload(json!({"id": watchdog_id.to_string()})),
+    );
+    let Err(err) = MultiAgentHandler.handle(invocation).await else {
+        panic!("watchdog helper close should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "close_agent cannot target watchdog handles from an active watchdog check-in agent. Send the result to the parent/root agent with `send_input` and let watchdog runtime manage shutdown.".to_string()
+        )
+    );
+
+    let watchdog_targets = owner_session
+        .services
+        .agent_control
+        .watchdog_targets(&[watchdog_id])
+        .await;
+    assert!(
+        watchdog_targets.contains(&watchdog_id),
+        "watchdog handle should remain registered after rejection"
+    );
+    assert_eq!(
+        owner_session
+            .services
+            .agent_control
+            .watchdog_active_helper_for_tests(watchdog_id)
+            .await,
+        Some(helper_thread_id)
+    );
+    assert_ne!(
+        owner_session
+            .services
+            .agent_control
+            .get_status(helper_thread_id)
+            .await,
+        AgentStatus::NotFound,
+        "watchdog helper should remain alive after rejection"
+    );
+
+    let _ = owner_session
+        .services
+        .agent_control
+        .shutdown_agent(helper_thread_id)
+        .await;
+    let _ = owner_session
+        .services
+        .agent_control
+        .shutdown_agent(watchdog_id)
+        .await;
+    let _ = owner_session
+        .services
+        .agent_control
+        .shutdown_agent(owner_thread.thread_id)
+        .await;
+}
+
+#[tokio::test]
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
     let (_session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -3703,7 +4006,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let (close_content, close_success) = expect_text_output(close_output);
     let close_result: close_agent::CloseAgentResult =
         serde_json::from_str(&close_content).expect("close_agent result should be json");
-    assert_eq!(close_result.status, AgentStatus::NotFound);
+    assert_eq!(close_result.status, AgentStatus::Shutdown);
     assert_eq!(
         close_result.close_result,
         close_agent::CloseAgentOutcome::Closed
@@ -3760,7 +4063,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let close_again_result: close_agent::CloseAgentResult =
         serde_json::from_str(&close_again_content)
             .expect("second close_agent result should be json");
-    assert_eq!(close_again_result.status, AgentStatus::NotFound);
+    assert_eq!(close_again_result.status, AgentStatus::Shutdown);
     assert_eq!(
         close_again_result.close_result,
         close_agent::CloseAgentOutcome::Closed

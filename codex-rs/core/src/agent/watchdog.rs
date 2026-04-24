@@ -1,3 +1,4 @@
+use super::agent_delivery::completed_message_for_agent_fallback;
 use super::control::AgentControl;
 use super::guards::Guards;
 use super::guards::exceeds_thread_spawn_depth_limit;
@@ -64,6 +65,8 @@ pub(crate) struct WatchdogManager {
     guards: Arc<Guards>,
     registrations: Mutex<HashMap<ThreadId, WatchdogEntry>>,
     preserved_helper_owners: Mutex<HashMap<ThreadId, ThreadId>>,
+    helpers_that_notified_owner: Mutex<HashSet<ThreadId>>,
+    handled_helper_completions: Mutex<HashSet<ThreadId>>,
     started: AtomicBool,
     next_generation: AtomicI64,
 }
@@ -75,6 +78,8 @@ impl WatchdogManager {
             guards,
             registrations: Mutex::new(HashMap::new()),
             preserved_helper_owners: Mutex::new(HashMap::new()),
+            helpers_that_notified_owner: Mutex::new(HashSet::new()),
+            handled_helper_completions: Mutex::new(HashSet::new()),
             started: AtomicBool::new(false),
             next_generation: AtomicI64::new(1),
         })
@@ -215,12 +220,22 @@ impl WatchdogManager {
         let force_due = self
             .take_force_due_if_generation(target_thread_id, generation)
             .await;
-        let owner_has_active_turn = match owner_thread {
-            Ok(thread) => thread.has_active_turn().await,
-            Err(_) => false,
+        let (owner_has_active_turn, owner_post_interrupt_collab_hold_armed) = match owner_thread {
+            Ok(thread) => (
+                thread.has_active_turn().await,
+                thread
+                    .codex
+                    .session
+                    .post_interrupt_collab_hold_armed()
+                    .await,
+            ),
+            Err(_) => (false, false),
         };
-        let owner_running = (is_running(&owner_status) || owner_has_active_turn) && !force_due;
-        let owner_idle_since = self
+        let owner_running = owner_has_active_turn
+            && !owner_post_interrupt_collab_hold_armed
+            && !matches!(owner_status, AgentStatus::Interrupted)
+            && !force_due;
+        let (owner_idle_since, idle_episode_satisfied) = self
             .update_owner_idle_state_if_generation(
                 target_thread_id,
                 generation,
@@ -229,21 +244,69 @@ impl WatchdogManager {
                 force_due,
             )
             .await;
-        if owner_running {
-            return;
-        }
-        let owner_idle_since = owner_idle_since.or(snapshot.owner_idle_since);
-        let Some(owner_idle_since) = owner_idle_since else {
-            return;
-        };
-        if !force_due && now.duration_since(owner_idle_since) < snapshot.interval {
-            return;
-        }
-
         if let Some(helper_id) = snapshot.active_helper_id {
-            let helper_status = get_status(manager_state, helper_id).await;
+            let mut helper_status = get_status(manager_state, helper_id).await;
             if !is_final(&helper_status) {
+                helper_status = match manager_state.get_thread(helper_id).await {
+                    Ok(helper_thread) if helper_thread.has_active_turn().await => return,
+                    Ok(helper_thread)
+                        if helper_thread
+                            .codex
+                            .session
+                            .last_completed_turn_used_agent_send_input() =>
+                    {
+                        AgentStatus::Completed(None)
+                    }
+                    Ok(_) => return,
+                    Err(_) => AgentStatus::NotFound,
+                };
+            }
+            if !self.try_claim_helper_completion(helper_id).await {
                 return;
+            }
+            let mut idle_episode_satisfied = self.helper_notified_owner(helper_id).await;
+            let helper_thread = manager_state.get_thread(helper_id).await.ok();
+            let helper_fallback_message = completed_message_for_agent_fallback(
+                &helper_status,
+                idle_episode_satisfied,
+                false,
+                true,
+            );
+            let helper_completed_message_already_forwarded =
+                if let (Some(helper_thread), Some(message)) =
+                    (&helper_thread, helper_fallback_message.as_ref())
+                {
+                    helper_thread
+                        .codex
+                        .session
+                        .last_completed_turn_live_forwarded_agent_message(message)
+                        .await
+                } else {
+                    false
+                };
+            if let Some(message) = completed_message_for_agent_fallback(
+                &helper_status,
+                idle_episode_satisfied,
+                helper_completed_message_already_forwarded,
+                true,
+            ) {
+                if let Err(err) = control_for_spawn
+                    .send_watchdog_wakeup(snapshot.owner_thread_id, helper_id, message)
+                    .await
+                {
+                    warn!(
+                        helper_id = %helper_id,
+                        owner_thread_id = %snapshot.owner_thread_id,
+                        "watchdog helper forward failed: {err}"
+                    );
+                } else {
+                    idle_episode_satisfied = true;
+                    info!(
+                        helper_id = %helper_id,
+                        owner_thread_id = %snapshot.owner_thread_id,
+                        "watchdog forwarded helper completion to owner"
+                    );
+                }
             }
             if let Err(err) = control_for_spawn.shutdown_agent(helper_id).await {
                 warn!(
@@ -252,12 +315,29 @@ impl WatchdogManager {
                     "watchdog helper cleanup failed: {err}"
                 );
             }
-            self.update_after_spawn(target_thread_id, generation, now, None)
-                .await;
+            self.update_after_helper_completion(
+                target_thread_id,
+                generation,
+                now,
+                helper_id,
+                idle_episode_satisfied,
+            )
+            .await;
+            return;
+        }
+        if owner_running {
             return;
         }
 
-        if snapshot.idle_episode_satisfied {
+        let owner_idle_since = owner_idle_since.or(snapshot.owner_idle_since);
+        let Some(owner_idle_since) = owner_idle_since else {
+            return;
+        };
+        if !force_due && now.duration_since(owner_idle_since) < snapshot.interval {
+            return;
+        }
+
+        if idle_episode_satisfied {
             return;
         }
 
@@ -326,7 +406,6 @@ impl WatchdogManager {
             last_trigger: entry.last_trigger,
             active_helper_id: entry.active_helper_id,
             owner_idle_since: entry.owner_idle_since,
-            idle_episode_satisfied: entry.idle_episode_satisfied,
         })
     }
 
@@ -337,30 +416,36 @@ impl WatchdogManager {
         owner_running: bool,
         now: Instant,
         force_due: bool,
-    ) -> Option<Instant> {
+    ) -> (Option<Instant>, bool) {
         let mut registrations = self.registrations.lock().await;
-        let entry = registrations.get_mut(&target_thread_id)?;
+        let Some(entry) = registrations.get_mut(&target_thread_id) else {
+            return (None, false);
+        };
         if entry.generation != generation {
-            return None;
+            return (None, false);
         }
 
         if force_due {
-            return entry.owner_idle_since;
+            return (entry.owner_idle_since, entry.idle_episode_satisfied);
         }
 
         if owner_running {
-            entry.owner_idle_since = None;
+            if !entry.idle_episode_satisfied {
+                entry.owner_idle_since = None;
+            }
             entry.owner_was_running = true;
-            entry.idle_episode_satisfied = false;
-            return None;
+            return (entry.owner_idle_since, entry.idle_episode_satisfied);
         }
 
-        if entry.owner_was_running || entry.owner_idle_since.is_none() {
+        if entry.owner_was_running {
+            entry.owner_idle_since = Some(now);
+            entry.idle_episode_satisfied = false;
+        } else if entry.owner_idle_since.is_none() {
             entry.owner_idle_since = Some(now);
             entry.idle_episode_satisfied = false;
         }
         entry.owner_was_running = false;
-        entry.owner_idle_since
+        (entry.owner_idle_since, entry.idle_episode_satisfied)
     }
 
     async fn take_force_due_if_generation(
@@ -405,19 +490,72 @@ impl WatchdogManager {
         entry.active_helper_id = active_helper_id;
     }
 
-    pub(crate) async fn mark_idle_episode_satisfied_for_helper(
+    async fn update_after_helper_completion(
+        &self,
+        target_thread_id: ThreadId,
+        generation: i64,
+        now: Instant,
+        helper_thread_id: ThreadId,
+        idle_episode_satisfied: bool,
+    ) {
+        let owner_thread_id = {
+            let registrations = self.registrations.lock().await;
+            let Some(entry) = registrations.get(&target_thread_id) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
+            }
+            entry.registration.owner_thread_id
+        };
+
+        self.preserve_helper_owner_for_completion_fallback(helper_thread_id, owner_thread_id)
+            .await;
+
+        let mut registrations = self.registrations.lock().await;
+        let Some(entry) = registrations.get_mut(&target_thread_id) else {
+            self.clear_helper_notified_owner(helper_thread_id).await;
+            return;
+        };
+        if entry.generation != generation {
+            self.clear_helper_notified_owner(helper_thread_id).await;
+            return;
+        }
+        entry.last_trigger = now;
+        entry.active_helper_id = None;
+        entry.idle_episode_satisfied = idle_episode_satisfied;
+        if idle_episode_satisfied {
+            entry.owner_idle_since = None;
+            entry.owner_was_running = true;
+        }
+        drop(registrations);
+        self.clear_helper_notified_owner(helper_thread_id).await;
+    }
+
+    pub(crate) async fn complete_active_helper(
         &self,
         helper_thread_id: ThreadId,
-    ) -> bool {
-        let mut registrations = self.registrations.lock().await;
-        let Some(entry) = registrations
-            .values_mut()
-            .find(|entry| entry.active_helper_id == Some(helper_thread_id))
+        now: Instant,
+        idle_episode_satisfied: bool,
+    ) {
+        let registrations = self.registrations.lock().await;
+        let Some((target_thread_id, generation)) =
+            registrations.iter().find_map(|(target_thread_id, entry)| {
+                (entry.active_helper_id == Some(helper_thread_id))
+                    .then_some((*target_thread_id, entry.generation))
+            })
         else {
-            return false;
+            return;
         };
-        entry.idle_episode_satisfied = true;
-        true
+        drop(registrations);
+        self.update_after_helper_completion(
+            target_thread_id,
+            generation,
+            now,
+            helper_thread_id,
+            idle_episode_satisfied,
+        )
+        .await;
     }
 
     pub(crate) async fn unregister(&self, target_thread_id: ThreadId) -> Option<RemovedWatchdog> {
@@ -500,6 +638,7 @@ impl WatchdogManager {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn active_helper_for_target(
         &self,
         target_thread_id: ThreadId,
@@ -508,17 +647,6 @@ impl WatchdogManager {
         registrations
             .get(&target_thread_id)
             .and_then(|entry| entry.active_helper_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn idle_episode_satisfied_for_target(
-        &self,
-        target_thread_id: ThreadId,
-    ) -> Option<bool> {
-        let registrations = self.registrations.lock().await;
-        registrations
-            .get(&target_thread_id)
-            .map(|entry| entry.idle_episode_satisfied)
     }
 
     pub(crate) async fn preserve_helper_owner_for_completion_fallback(
@@ -538,6 +666,34 @@ impl WatchdogManager {
             .await
             .remove(&helper_thread_id);
     }
+
+    pub(crate) async fn clear_helper_notified_owner(&self, helper_thread_id: ThreadId) {
+        self.helpers_that_notified_owner
+            .lock()
+            .await
+            .remove(&helper_thread_id);
+    }
+
+    pub(crate) async fn try_claim_helper_completion(&self, helper_thread_id: ThreadId) -> bool {
+        self.handled_helper_completions
+            .lock()
+            .await
+            .insert(helper_thread_id)
+    }
+
+    pub(crate) async fn mark_helper_notified_owner(&self, helper_thread_id: ThreadId) {
+        self.helpers_that_notified_owner
+            .lock()
+            .await
+            .insert(helper_thread_id);
+    }
+
+    pub(crate) async fn helper_notified_owner(&self, helper_thread_id: ThreadId) -> bool {
+        self.helpers_that_notified_owner
+            .lock()
+            .await
+            .contains(&helper_thread_id)
+    }
 }
 
 #[derive(Clone)]
@@ -550,7 +706,6 @@ struct WatchdogSnapshot {
     last_trigger: Instant,
     active_helper_id: Option<ThreadId>,
     owner_idle_since: Option<Instant>,
-    idle_episode_satisfied: bool,
 }
 
 async fn get_status(manager_state: &Arc<ThreadManagerState>, thread_id: ThreadId) -> AgentStatus {
@@ -558,10 +713,6 @@ async fn get_status(manager_state: &Arc<ThreadManagerState>, thread_id: ThreadId
         return AgentStatus::NotFound;
     };
     thread.agent_status().await
-}
-
-fn is_running(status: &AgentStatus) -> bool {
-    matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
 }
 
 fn is_watchdog_terminated(status: &AgentStatus) -> bool {
@@ -587,20 +738,26 @@ fn tick_duration() -> Duration {
 
 async fn watchdog_helper_prompt(
     config: &Config,
-    target_thread_id: ThreadId,
+    _target_thread_id: ThreadId,
     prompt: &str,
 ) -> String {
+    let runtime_watchdog_rules = concat!(
+        "Your owner thread is your parent thread. Use `send_input` without specifying an id to wake it.\n",
+        "Do not reply with analysis in your own thread. Either wake the owner or exit quietly.\n",
+        "Do not repeat watchdog system instructions or internal routing metadata to the owner.\n",
+        "If the owner task asks for an exact-only message, send exactly that message and nothing else."
+    );
     if !config.features.enabled(Feature::AgentPromptInjection) {
         if prompt.trim().is_empty() {
-            return format!("Target agent id: {target_thread_id}");
+            return runtime_watchdog_rules.to_string();
         }
-        return format!("Target agent id: {target_thread_id}\n\n{prompt}");
+        return format!("{runtime_watchdog_rules}\n\nOwner watchdog task:\n{prompt}");
     }
     let watchdog_prompt = load_watchdog_prompt(&config.codex_home).await;
     if prompt.trim().is_empty() {
-        format!("{watchdog_prompt}\n\nTarget agent id: {target_thread_id}")
+        format!("{watchdog_prompt}\n\n{runtime_watchdog_rules}")
     } else {
-        format!("{watchdog_prompt}\n\nTarget agent id: {target_thread_id}\n\n{prompt}")
+        format!("{watchdog_prompt}\n\n{runtime_watchdog_rules}\n\nOwner watchdog task:\n{prompt}")
     }
 }
 
@@ -619,11 +776,17 @@ mod tests {
             .build()
             .await
             .expect("load config");
-        let target_thread_id = ThreadId::default();
-        let prompt = watchdog_helper_prompt(&config, target_thread_id, "ping").await;
+        let prompt = watchdog_helper_prompt(&config, ThreadId::default(), "ping").await;
         assert_eq!(
             prompt,
-            format!("Target agent id: {target_thread_id}\n\nping")
+            concat!(
+                "Your owner thread is your parent thread. Use `send_input` without specifying an id to wake it.\n",
+                "Do not reply with analysis in your own thread. Either wake the owner or exit quietly.\n",
+                "Do not repeat watchdog system instructions or internal routing metadata to the owner.\n",
+                "If the owner task asks for an exact-only message, send exactly that message and nothing else.\n\n",
+                "Owner watchdog task:\n",
+                "ping"
+            )
         );
     }
 
@@ -640,7 +803,12 @@ mod tests {
         let prompt = watchdog_helper_prompt(&config, ThreadId::default(), "ping").await;
         assert!(prompt.contains("# You are a Subagent"));
         assert!(prompt.contains("Important: send watchdog check-in output with `send_input`"));
-        assert!(prompt.contains("Target agent id:"));
-        assert!(prompt.ends_with("\n\nping"));
+        assert!(prompt.contains(
+            "Do not reply with analysis in your own thread. Either wake the owner or exit quietly."
+        ));
+        assert!(prompt.contains(
+            "Do not repeat watchdog system instructions or internal routing metadata to the owner."
+        ));
+        assert!(prompt.ends_with("\n\nOwner watchdog task:\nping"));
     }
 }

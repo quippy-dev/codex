@@ -193,7 +193,7 @@ fn close_agent_output_schema() -> JsonValue {
         "type": "object",
         "properties": {
             "status": {
-                "description": "The agent status returned by close_agent after applying idempotent close semantics.",
+                "description": "The terminal close status returned by close_agent after applying idempotent close semantics (`shutdown` when this call closes the agent; otherwise the current live status).",
                 "allOf": [agent_status_output_schema()]
             },
             "close_result": {

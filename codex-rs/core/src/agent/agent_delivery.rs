@@ -57,18 +57,6 @@ impl AgentControl {
         result
     }
 
-    async fn note_watchdog_delivery_if_needed(
-        &self,
-        sender_thread_id: ThreadId,
-        sender_is_watchdog_helper_for_receiver: bool,
-    ) {
-        if sender_is_watchdog_helper_for_receiver {
-            let _ = self
-                .mark_watchdog_idle_episode_satisfied_for_helper(sender_thread_id)
-                .await;
-        }
-    }
-
     pub(crate) async fn drop_pending_input(&self, agent_id: ThreadId) -> CodexResult<bool> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
@@ -96,6 +84,56 @@ impl AgentControl {
             None,
         )
         .await
+    }
+
+    /// Deliver watchdog wake-up input to an owner thread.
+    ///
+    /// This intentionally bypasses the generic deferred collab paths for
+    /// non-subagent owners. Watchdog check-ins must wake the owner directly
+    /// while preserving helper identity in the injected inbox items.
+    pub(crate) async fn send_watchdog_wakeup(
+        &self,
+        agent_id: ThreadId,
+        sender_thread_id: ThreadId,
+        message: String,
+    ) -> CodexResult<String> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        let snapshot = thread.config_snapshot().await;
+        let (sender_agent_nickname, sender_agent_role) = self
+            .get_agent_nickname_and_role(sender_thread_id)
+            .await
+            .unwrap_or((None, None));
+        let result = if matches!(snapshot.session_source, SessionSource::SubAgent(_)) {
+            self.send_prompt(agent_id, message.clone()).await
+        } else {
+            state
+                .send_op(
+                    agent_id,
+                    Op::InjectResponseItems {
+                        items: build_agent_inbox_items(
+                            snapshot.collab_inbox_delivery_role,
+                            sender_thread_id,
+                            sender_agent_nickname,
+                            sender_agent_role,
+                            message.clone(),
+                            false,
+                        )?,
+                    },
+                )
+                .await
+        };
+        if result.is_ok() {
+            self.mark_watchdog_helper_notified_owner_if_match(sender_thread_id, agent_id)
+                .await;
+            self.record_live_forwarded_agent_message(sender_thread_id, &message)
+                .await;
+        }
+        if matches!(result, Err(CodexErr::InternalAgentDied)) {
+            let _ = state.remove_thread(&agent_id).await;
+            self.guards.release_spawned_thread(agent_id);
+        }
+        result
     }
 
     pub(crate) async fn send_agent_message_inner(
@@ -127,10 +165,6 @@ impl AgentControl {
             .session
             .post_interrupt_collab_hold_armed()
             .await;
-        let sender_is_watchdog_helper_for_receiver = self
-            .watchdog_owner_for_active_helper(sender_thread_id)
-            .await
-            == Some(agent_id);
         if should_queue_agent_delivery_until_turn_end(post_turn_agent_flush_pending) {
             let queued_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
@@ -146,14 +180,7 @@ impl AgentControl {
                 .enqueue_post_turn_agent_items(queued_items)
                 .await
             {
-                Ok(()) => {
-                    self.note_watchdog_delivery_if_needed(
-                        sender_thread_id,
-                        sender_is_watchdog_helper_for_receiver,
-                    )
-                    .await;
-                    return Ok(Uuid::now_v7().to_string());
-                }
+                Ok(()) => return Ok(Uuid::now_v7().to_string()),
                 Err(err) => log_post_turn_agent_enqueue_error(agent_id, sender_thread_id, err),
             }
         }
@@ -173,14 +200,14 @@ impl AgentControl {
             match thread.codex.session.inject_response_items(live_items).await {
                 Ok(()) => {
                     if record_live_sender_message_for_completion_dedupe {
+                        self.mark_watchdog_helper_notified_owner_if_match(
+                            sender_thread_id,
+                            agent_id,
+                        )
+                        .await;
                         self.record_live_forwarded_agent_message(sender_thread_id, &message)
                             .await;
                     }
-                    self.note_watchdog_delivery_if_needed(
-                        sender_thread_id,
-                        sender_is_watchdog_helper_for_receiver,
-                    )
-                    .await;
                     return Ok(Uuid::now_v7().to_string());
                 }
                 Err(late_items) => {
@@ -189,11 +216,8 @@ impl AgentControl {
                         .session
                         .post_interrupt_collab_hold_armed()
                         .await;
-                    let should_defer_late_items = should_defer_agent_delivery(
-                        false,
-                        post_interrupt_collab_hold_armed,
-                        sender_is_watchdog_helper_for_receiver,
-                    );
+                    let should_defer_late_items =
+                        should_defer_agent_delivery(false, post_interrupt_collab_hold_armed);
                     if should_defer_late_items {
                         match thread
                             .codex
@@ -201,14 +225,7 @@ impl AgentControl {
                             .enqueue_deferred_collab_items(late_items)
                             .await
                         {
-                            Ok(()) => {
-                                self.note_watchdog_delivery_if_needed(
-                                    sender_thread_id,
-                                    sender_is_watchdog_helper_for_receiver,
-                                )
-                                .await;
-                                return Ok(Uuid::now_v7().to_string());
-                            }
+                            Ok(()) => return Ok(Uuid::now_v7().to_string()),
                             Err(err) => {
                                 log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err)
                             }
@@ -240,14 +257,14 @@ impl AgentControl {
                             .record_conversation_items(turn_context.as_ref(), &live_response_items)
                             .await;
                         if record_live_sender_message_for_completion_dedupe {
+                            self.mark_watchdog_helper_notified_owner_if_match(
+                                sender_thread_id,
+                                agent_id,
+                            )
+                            .await;
                             self.record_live_forwarded_agent_message(sender_thread_id, &message)
                                 .await;
                         }
-                        self.note_watchdog_delivery_if_needed(
-                            sender_thread_id,
-                            sender_is_watchdog_helper_for_receiver,
-                        )
-                        .await;
                         return Ok(Uuid::now_v7().to_string());
                     } else {
                         match thread
@@ -264,11 +281,6 @@ impl AgentControl {
                                     .await
                                 {
                                     if thread.has_active_turn().await {
-                                        self.note_watchdog_delivery_if_needed(
-                                            sender_thread_id,
-                                            sender_is_watchdog_helper_for_receiver,
-                                        )
-                                        .await;
                                         return Ok(Uuid::now_v7().to_string());
                                     }
                                     if let Err(err) = state
@@ -285,19 +297,9 @@ impl AgentControl {
                                         );
                                         thread.codex.session.clear_post_turn_agent_items().await;
                                     } else {
-                                        self.note_watchdog_delivery_if_needed(
-                                            sender_thread_id,
-                                            sender_is_watchdog_helper_for_receiver,
-                                        )
-                                        .await;
                                         return Ok(Uuid::now_v7().to_string());
                                     }
                                 } else {
-                                    self.note_watchdog_delivery_if_needed(
-                                        sender_thread_id,
-                                        sender_is_watchdog_helper_for_receiver,
-                                    )
-                                    .await;
                                     return Ok(Uuid::now_v7().to_string());
                                 }
                             }
@@ -309,11 +311,7 @@ impl AgentControl {
                 }
             }
         }
-        if should_defer_agent_delivery(
-            receiver_has_active_turn,
-            post_interrupt_collab_hold_armed,
-            sender_is_watchdog_helper_for_receiver,
-        ) {
+        if should_defer_agent_delivery(receiver_has_active_turn, post_interrupt_collab_hold_armed) {
             let deferred_items = build_agent_inbox_items(
                 snapshot.collab_inbox_delivery_role,
                 sender_thread_id,
@@ -328,14 +326,7 @@ impl AgentControl {
                 .enqueue_deferred_collab_items(deferred_items)
                 .await
             {
-                Ok(()) => {
-                    self.note_watchdog_delivery_if_needed(
-                        sender_thread_id,
-                        sender_is_watchdog_helper_for_receiver,
-                    )
-                    .await;
-                    return Ok(Uuid::now_v7().to_string());
-                }
+                Ok(()) => return Ok(Uuid::now_v7().to_string()),
                 Err(err) => log_deferred_agent_enqueue_error(agent_id, sender_thread_id, err),
             }
         }
@@ -348,26 +339,35 @@ impl AgentControl {
             message.clone(),
             false,
         )?;
-        let submission_id = state
+        let result = state
             .send_op(agent_id, Op::InjectResponseItems { items })
-            .await?;
-        self.note_watchdog_delivery_if_needed(
-            sender_thread_id,
-            sender_is_watchdog_helper_for_receiver,
-        )
-        .await;
-        Ok(submission_id)
+            .await;
+        if result.is_ok() && record_live_sender_message_for_completion_dedupe {
+            self.mark_watchdog_helper_notified_owner_if_match(sender_thread_id, agent_id)
+                .await;
+            self.record_live_forwarded_agent_message(sender_thread_id, &message)
+                .await;
+        }
+        result
     }
 
     async fn record_live_forwarded_agent_message(&self, sender_thread_id: ThreadId, message: &str) {
         if let Ok(state) = self.upgrade()
             && let Ok(sender_thread) = state.get_thread(sender_thread_id).await
         {
-            sender_thread
-                .codex
-                .session
-                .record_turn_live_forwarded_agent_message(message)
-                .await;
+            if sender_thread.codex.session.has_active_turn().await {
+                sender_thread
+                    .codex
+                    .session
+                    .record_turn_live_forwarded_agent_message(message)
+                    .await;
+            } else {
+                sender_thread
+                    .codex
+                    .session
+                    .record_last_completed_turn_live_forwarded_agent_message(message)
+                    .await;
+            }
         }
     }
 }
@@ -381,11 +381,8 @@ pub(crate) fn should_queue_agent_delivery_until_turn_end(
 pub(crate) fn should_defer_agent_delivery(
     receiver_has_active_turn: bool,
     post_interrupt_agent_hold_armed: bool,
-    sender_is_watchdog_helper_for_receiver: bool,
 ) -> bool {
-    !receiver_has_active_turn
-        && post_interrupt_agent_hold_armed
-        && !sender_is_watchdog_helper_for_receiver
+    !receiver_has_active_turn && post_interrupt_agent_hold_armed
 }
 
 pub(crate) fn log_post_turn_agent_enqueue_error(
@@ -485,6 +482,14 @@ pub(crate) fn completed_message_for_agent_fallback(
     require_message_for_final_status: bool,
 ) -> Option<String> {
     if require_message_for_final_status && last_completed_turn_used_agent_send_input {
+        return None;
+    }
+
+    if matches!(
+        status,
+        AgentStatus::Completed(Some(message))
+            if !message.trim().is_empty() && last_completed_turn_forwarded_same_message
+    ) {
         return None;
     }
 

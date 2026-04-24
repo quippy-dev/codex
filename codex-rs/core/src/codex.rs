@@ -2161,6 +2161,19 @@ impl Session {
             .insert(message.to_string());
     }
 
+    pub(crate) async fn record_last_completed_turn_live_forwarded_agent_message(
+        &self,
+        message: &str,
+    ) {
+        if message.trim().is_empty() {
+            return;
+        }
+        self.last_completed_turn_live_forwarded_agent_messages
+            .lock()
+            .await
+            .insert(message.to_string());
+    }
+
     pub(crate) fn last_completed_turn_used_agent_send_input(&self) -> bool {
         self.last_completed_turn_used_agent_send_input
             .load(Ordering::Acquire)
@@ -5223,13 +5236,27 @@ mod handlers {
 
         let mut attempts = 0usize;
         loop {
-            let current_context = if let Some((turn_context, _)) =
-                sess.active_turn_context_and_cancellation_token().await
-            {
-                turn_context
-            } else {
-                sess.new_default_turn_with_sub_id(sub_id.clone()).await
-            };
+            let had_active_turn = sess
+                .active_turn_context_and_cancellation_token()
+                .await
+                .is_some();
+            if !had_active_turn {
+                let current_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+                sess.spawn_task_with_pending_response_items(
+                    current_context,
+                    Vec::new(),
+                    std::mem::take(&mut pending_items),
+                    false,
+                    RegularTask::new(),
+                )
+                .await;
+                break;
+            }
+            let current_context = sess
+                .active_turn_context_and_cancellation_token()
+                .await
+                .map(|(turn_context, _)| turn_context)
+                .expect("active turn should still exist when had_active_turn is true");
             sess.refresh_mcp_servers_if_requested(&current_context)
                 .await;
 

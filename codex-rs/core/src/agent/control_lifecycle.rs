@@ -209,8 +209,19 @@ impl AgentControl {
                 .watchdog_owner_for_active_helper(child_thread_id)
                 .await
                 == Some(parent_thread_id);
-
-            if parent_is_root_thread {
+            if parent_is_root_thread && child_is_watchdog_helper_for_parent {
+                let helper_notified_owner = control
+                    .watchdogs
+                    .helper_notified_owner(child_thread_id)
+                    .await;
+                if helper_notified_owner {
+                    control
+                        .watchdogs
+                        .complete_active_helper(child_thread_id, tokio::time::Instant::now(), true)
+                        .await;
+                }
+            }
+            if parent_is_root_thread && !child_is_watchdog_helper_for_parent {
                 let child_used_agent_send_input =
                     if let Ok(child_thread) = state.get_thread(child_thread_id).await {
                         child_thread
@@ -220,65 +231,65 @@ impl AgentControl {
                     } else {
                         false
                     };
-                let child_completed_message_already_forwarded = match &status {
-                    AgentStatus::Completed(Some(message)) if !message.trim().is_empty() => {
-                        if let Ok(child_thread) = state.get_thread(child_thread_id).await {
-                            child_thread
-                                .codex
-                                .session
-                                .last_completed_turn_live_forwarded_agent_message(message)
-                                .await
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
+                let child_fallback_message = completed_message_for_agent_fallback(
+                    &status,
+                    child_used_agent_send_input,
+                    false,
+                    child_is_watchdog_helper_for_parent,
+                );
+                let child_completed_message_already_forwarded =
+                    if let (Ok(child_thread), Some(message)) = (
+                        state.get_thread(child_thread_id).await,
+                        child_fallback_message.as_ref(),
+                    ) {
+                        child_thread
+                            .codex
+                            .session
+                            .last_completed_turn_live_forwarded_agent_message(message)
+                            .await
+                    } else {
+                        false
+                    };
                 if let Some(message) = completed_message_for_agent_fallback(
                     &status,
                     child_used_agent_send_input,
                     child_completed_message_already_forwarded,
-                    child_is_watchdog_helper_for_parent,
+                    false,
                 ) {
-                    match control
+                    let forward_result = control
                         .send_agent_message_inner(
                             parent_thread_id,
                             child_thread_id,
                             message,
                             false,
-                            if child_is_watchdog_helper_for_parent {
-                                LateAgentDeliveryMode::QueuePostTurn
-                            } else {
-                                LateAgentDeliveryMode::LiveOnlyAfterSamplingComplete
-                            },
+                            LateAgentDeliveryMode::LiveOnlyAfterSamplingComplete,
                             #[cfg(test)]
                             None,
                         )
-                        .await
-                    {
-                        Ok(_) => {
-                            if child_is_watchdog_helper_for_parent {
-                                control
-                                    .mark_watchdog_idle_episode_satisfied_for_helper(
-                                        child_thread_id,
-                                    )
-                                    .await;
-                            }
-                        }
-                        Err(err) => {
-                            warn!(
-                                child_thread_id = %child_thread_id,
-                                parent_thread_id = %parent_thread_id,
-                                "subagent completion fallback forward failed: {err}"
-                            );
-                        }
+                        .await;
+                    if let Err(err) = forward_result {
+                        warn!(
+                            child_thread_id = %child_thread_id,
+                            parent_thread_id = %parent_thread_id,
+                            "subagent completion fallback forward failed: {err}"
+                        );
                     }
                 }
             }
+            let notification_status =
+                if parent_is_root_thread && child_is_watchdog_helper_for_parent {
+                    match &status {
+                        AgentStatus::Completed(_) => AgentStatus::Completed(None),
+                        AgentStatus::Errored(_) => AgentStatus::Errored(String::new()),
+                        _ => status.clone(),
+                    }
+                } else {
+                    status.clone()
+                };
             parent_thread
                 .inject_user_message_without_turn(format_subagent_notification_message(
                     &child_thread_id.to_string(),
-                    &status,
+                    &notification_status,
                 ))
                 .await;
             control
@@ -412,6 +423,17 @@ impl AgentControl {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn watchdog_active_helper_for_tests(
+        &self,
+        target_thread_id: ThreadId,
+    ) -> Option<ThreadId> {
+        self.watchdogs
+            .active_helper_for_target(target_thread_id)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn mark_watchdog_parent_compaction_in_progress_for_tests(
         &self,
         parent_thread_id: ThreadId,
@@ -429,32 +451,20 @@ impl AgentControl {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn watchdog_active_helper_for_tests(
-        &self,
-        target_thread_id: ThreadId,
-    ) -> Option<ThreadId> {
-        self.watchdogs
-            .active_helper_for_target(target_thread_id)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn watchdog_idle_episode_satisfied_for_tests(
-        &self,
-        target_thread_id: ThreadId,
-    ) -> Option<bool> {
-        self.watchdogs
-            .idle_episode_satisfied_for_target(target_thread_id)
-            .await
-    }
-
-    pub(crate) async fn mark_watchdog_idle_episode_satisfied_for_helper(
+    pub(crate) async fn mark_watchdog_helper_notified_owner_if_match(
         &self,
         helper_thread_id: ThreadId,
-    ) -> bool {
-        self.watchdogs
-            .mark_idle_episode_satisfied_for_helper(helper_thread_id)
+        owner_thread_id: ThreadId,
+    ) {
+        if self
+            .watchdogs
+            .owner_for_active_helper(helper_thread_id)
             .await
+            == Some(owner_thread_id)
+        {
+            self.watchdogs
+                .mark_helper_notified_owner(helper_thread_id)
+                .await;
+        }
     }
 }

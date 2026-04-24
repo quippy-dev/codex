@@ -158,8 +158,14 @@ impl Session {
         input: Vec<UserInput>,
         task: T,
     ) {
-        self.spawn_task_with_pending_response_items(initial_turn_context, input, Vec::new(), task)
-            .await;
+        self.spawn_task_with_pending_response_items(
+            initial_turn_context,
+            input,
+            Vec::new(),
+            true,
+            task,
+        )
+        .await;
     }
 
     pub(crate) async fn spawn_task_with_pending_response_items<T: SessionTask>(
@@ -167,6 +173,7 @@ impl Session {
         initial_turn_context: Arc<TurnContext>,
         input: Vec<UserInput>,
         initial_pending_input: Vec<ResponseInputItem>,
+        emit_initial_agent_inbox_live: bool,
         task: T,
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
@@ -247,6 +254,7 @@ impl Session {
             running_task,
             token_usage_at_turn_start,
             initial_pending_input,
+            emit_initial_agent_inbox_live,
         )
         .await;
         start_gate.notify_one();
@@ -410,6 +418,7 @@ impl Session {
         task: RunningTask,
         token_usage_at_turn_start: TokenUsage,
         initial_pending_input: Vec<ResponseInputItem>,
+        emit_initial_agent_inbox_live: bool,
     ) {
         let mut active = self.active_turn.lock().await;
         let mut turn = ActiveTurn::default();
@@ -419,7 +428,7 @@ impl Session {
         let mut live_response_items = Vec::new();
         for pending_input in initial_pending_input {
             let response_item: ResponseItem = pending_input.clone().into();
-            if is_agent_inbox_response_item(&response_item) {
+            if emit_initial_agent_inbox_live && is_agent_inbox_response_item(&response_item) {
                 if let Some(inbox_message) = parse_agent_inbox_message_from_item(&response_item)
                     && let Some(canonical_sender) = inbox_message.canonical_sender
                 {
