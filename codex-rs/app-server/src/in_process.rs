@@ -50,6 +50,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::config_manager::ConfigManager;
 use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::error_code::OVERLOADED_ERROR_CODE;
@@ -60,27 +61,31 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::CHANNEL_CAPACITY;
+use crate::transport::ConnectionOrigin;
 use crate::transport::OutboundConnectionState;
 use crate::transport::route_outgoing_envelope;
+use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
-use codex_core::AuthManager;
-use codex_core::ThreadManager;
+use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
+use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
+use codex_login::AuthManager;
 use codex_protocol::protocol::SessionSource;
+pub use codex_state::log_db::LogDbLayer;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -96,16 +101,6 @@ type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorErro
 
 fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
     matches!(notification, ServerNotification::TurnCompleted(_))
-}
-
-fn legacy_notification_requires_delivery(notification: &JSONRPCNotification) -> bool {
-    matches!(
-        notification
-            .method
-            .strip_prefix("codex/event/")
-            .unwrap_or(&notification.method),
-        "task_complete" | "turn_aborted" | "shutdown_complete"
-    )
 }
 
 /// Input needed to start an in-process app-server runtime.
@@ -126,12 +121,14 @@ pub struct InProcessStartArgs {
     pub loader_overrides: LoaderOverrides,
     /// Preloaded cloud requirements provider.
     pub cloud_requirements: CloudRequirementsLoader,
-    /// Optional prebuilt auth manager reused by an embedding caller.
-    pub auth_manager: Option<Arc<AuthManager>>,
-    /// Optional prebuilt thread manager reused by an embedding caller.
-    pub thread_manager: Option<Arc<ThreadManager>>,
+    /// Loader used to fetch typed thread config sources before a thread starts.
+    pub thread_config_loader: Arc<dyn ThreadConfigLoader>,
     /// Feedback sink used by app-server/core telemetry and logs.
     pub feedback: CodexFeedback,
+    /// SQLite tracing layer used to flush recently emitted logs before feedback upload.
+    pub log_db: Option<LogDbLayer>,
+    /// Environment manager used by core execution and filesystem operations.
+    pub environment_manager: Arc<EnvironmentManager>,
     /// Startup warnings emitted after initialize succeeds.
     pub config_warnings: Vec<ConfigWarningNotification>,
     /// Session source stamped into thread/session metadata.
@@ -146,11 +143,6 @@ pub struct InProcessStartArgs {
 
 /// Event emitted from the app-server to the in-process client.
 ///
-/// The stream carries three event families because CLI surfaces are mid-migration
-/// from the legacy `codex_protocol::Event` model to the typed app-server
-/// notification model. Once all surfaces consume only [`ServerNotification`],
-/// [`LegacyNotification`](Self::LegacyNotification) can be removed.
-///
 /// [`Lagged`](Self::Lagged) is a transport health marker, not an application
 /// event — it signals that the consumer fell behind and some events were dropped.
 #[derive(Debug, Clone)]
@@ -159,8 +151,6 @@ pub enum InProcessServerEvent {
     ServerRequest(ServerRequest),
     /// App-server notification directed to the embedded client.
     ServerNotification(ServerNotification),
-    /// Legacy JSON-RPC notification from core event bridge.
-    LegacyNotification(JSONRPCNotification),
     /// Indicates one or more events were dropped due to backpressure.
     Lagged { skipped: usize },
 }
@@ -379,7 +369,7 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(channel_capacity);
         let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<OutgoingMessage>(channel_capacity);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(channel_capacity);
         let outbound_initialized = Arc::new(AtomicBool::new(false));
         let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
         let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
@@ -392,7 +382,6 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                 Arc::clone(&outbound_initialized),
                 Arc::clone(&outbound_experimental_api_enabled),
                 Arc::clone(&outbound_opted_out_notification_methods),
-                /*allow_legacy_notifications*/ true,
                 /*disconnect_sender*/ None,
             ),
         );
@@ -403,26 +392,35 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
         });
 
         let processor_outgoing = Arc::clone(&outgoing_message_sender);
+        let auth_manager =
+            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env);
+        let config_manager = ConfigManager::new(
+            args.config.codex_home.to_path_buf(),
+            args.cli_overrides,
+            args.loader_overrides,
+            args.cloud_requirements,
+            args.arg0_paths.clone(),
+            args.thread_config_loader,
+        );
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
         let mut processor_handle = tokio::spawn(async move {
-            let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
                 outgoing: Arc::clone(&processor_outgoing),
                 auth_storage_home: args.auth_storage_home,
                 arg0_paths: args.arg0_paths,
                 config: args.config,
-                cli_overrides: args.cli_overrides,
-                loader_overrides: args.loader_overrides,
-                cloud_requirements: args.cloud_requirements,
-                auth_manager: args.auth_manager,
-                thread_manager: args.thread_manager,
+                config_manager,
+                environment_manager: args.environment_manager,
                 feedback: args.feedback,
-                log_db: None,
+                log_db: args.log_db,
                 config_warnings: args.config_warnings,
                 session_source: args.session_source,
-                enable_codex_api_key_env: args.enable_codex_api_key_env,
-            });
+                auth_manager,
+                rpc_transport: AppServerRpcTransport::InProcess,
+                remote_control_handle: None,
+            }));
             let mut thread_created_rx = processor.thread_created_receiver();
-            let mut session = ConnectionSessionState::default();
+            let session = Arc::new(ConnectionSessionState::new(ConnectionOrigin::InProcess));
             let mut listen_for_threads = true;
 
             loop {
@@ -430,28 +428,33 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                     command = processor_rx.recv() => {
                         match command {
                             Some(ProcessorCommand::Request(request)) => {
-                                let was_initialized = session.initialized;
+                                let was_initialized = session.initialized();
                                 processor
                                     .process_client_request(
                                         IN_PROCESS_CONNECTION_ID,
                                         *request,
-                                        &mut session,
+                                        Arc::clone(&session),
                                         &outbound_initialized,
                                     )
                                     .await;
+                                let opted_out_notification_methods_snapshot =
+                                    session.opted_out_notification_methods();
+                                let experimental_api_enabled =
+                                    session.experimental_api_enabled();
+                                let is_initialized = session.initialized();
                                 if let Ok(mut opted_out_notification_methods) =
                                     outbound_opted_out_notification_methods.write()
                                 {
                                     *opted_out_notification_methods =
-                                        session.opted_out_notification_methods.clone();
+                                        opted_out_notification_methods_snapshot;
                                 } else {
                                     warn!("failed to update outbound opted-out notifications");
                                 }
                                 outbound_experimental_api_enabled.store(
-                                    session.experimental_api_enabled,
+                                    experimental_api_enabled,
                                     Ordering::Release,
                                 );
-                                if !was_initialized && session.initialized {
+                                if !was_initialized && is_initialized {
                                     processor.send_initialize_notifications().await;
                                 }
                             }
@@ -466,7 +469,7 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
-                                let connection_ids = if session.initialized {
+                                let connection_ids = if session.initialized() {
                                     vec![IN_PROCESS_CONNECTION_ID]
                                 } else {
                                     Vec::<ConnectionId>::new()
@@ -487,6 +490,7 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
             }
 
             processor.clear_runtime_references();
+            processor.cancel_active_login().await;
             processor.connection_closed(IN_PROCESS_CONNECTION_ID).await;
             processor.clear_all_thread_listeners().await;
             processor.drain_background_tasks().await;
@@ -577,10 +581,11 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                         }
                     }
                 }
-                outgoing_message = writer_rx.recv() => {
-                    let Some(outgoing_message) = outgoing_message else {
+                queued_message = writer_rx.recv() => {
+                    let Some(queued_message) = queued_message else {
                         break;
                     };
+                    let outgoing_message = queued_message.message;
                     match outgoing_message {
                         OutgoingMessage::Response(response) => {
                             if let Some(response_tx) = pending_request_responses.remove(&response.id) {
@@ -658,32 +663,9 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
                                 }
                             }
                         }
-                        OutgoingMessage::Notification(notification) => {
-                            let notification = JSONRPCNotification {
-                                method: notification.method,
-                                params: notification.params,
-                            };
-                            if legacy_notification_requires_delivery(&notification) {
-                                if event_tx
-                                    .send(InProcessServerEvent::LegacyNotification(notification))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            } else if let Err(send_error) =
-                                event_tx.try_send(InProcessServerEvent::LegacyNotification(notification))
-                            {
-                                match send_error {
-                                    mpsc::error::TrySendError::Full(_) => {
-                                        warn!("dropping in-process legacy notification (queue full)");
-                                    }
-                                    mpsc::error::TrySendError::Closed(_) => {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                    }
+                    if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                        let _ = write_complete_tx.send(());
                     }
                 }
             }
@@ -735,6 +717,11 @@ mod tests {
     use super::*;
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
+    use codex_app_server_protocol::DeviceKeyPublicParams;
+    use codex_app_server_protocol::DeviceKeySignParams;
+    use codex_app_server_protocol::DeviceKeySignPayload;
+    use codex_app_server_protocol::RemoteControlClientConnectionAudience;
+    use codex_app_server_protocol::RemoteControlClientEnrollmentAudience;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
@@ -748,6 +735,7 @@ mod tests {
         match ConfigBuilder::default().build().await {
             Ok(config) => config,
             Err(_) => Config::load_default_with_cli_overrides(Vec::new())
+                .await
                 .expect("default config should load"),
         }
     }
@@ -759,14 +747,15 @@ mod tests {
         let config = Arc::new(build_test_config().await);
         let args = InProcessStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            auth_storage_home: config.codex_home.clone(),
+            auth_storage_home: config.codex_home.to_path_buf(),
             config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
             cloud_requirements: CloudRequirementsLoader::default(),
-            auth_manager: None,
-            thread_manager: None,
+            thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
             feedback: CodexFeedback::new(),
+            log_db: None,
+            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source,
             enable_codex_api_key_env: false,
@@ -809,6 +798,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_process_allows_device_key_requests_to_reach_device_key_api() {
+        let client = start_test_client(SessionSource::Cli).await;
+        const MALFORMED_KEY_ID_MESSAGE: &str = concat!(
+            "invalid device key payload: keyId must be dk_hse_, dk_tpm_, or dk_osn_ ",
+            "followed by unpadded base64url-encoded 32 bytes"
+        );
+        let requests = [
+            (
+                ClientRequest::DeviceKeyPublic {
+                    request_id: RequestId::Integer(11),
+                    params: DeviceKeyPublicParams {
+                        key_id: String::new(),
+                    },
+                },
+                MALFORMED_KEY_ID_MESSAGE,
+            ),
+            (
+                ClientRequest::DeviceKeySign {
+                    request_id: RequestId::Integer(12),
+                    params: DeviceKeySignParams {
+                        key_id: String::new(),
+                        payload: DeviceKeySignPayload::RemoteControlClientConnection {
+                            nonce: "nonce-123".to_string(),
+                            audience:
+                                RemoteControlClientConnectionAudience::RemoteControlClientWebsocket,
+                            session_id: "wssess_123".to_string(),
+                            target_origin: "https://chatgpt.com".to_string(),
+                            target_path: "/api/codex/remote/control/client".to_string(),
+                            account_user_id: "acct_123".to_string(),
+                            client_id: "cli_123".to_string(),
+                            token_expires_at: 4_102_444_800,
+                            token_sha256_base64url: "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+                                .to_string(),
+                            scopes: vec!["remote_control_controller_websocket".to_string()],
+                        },
+                    },
+                },
+                MALFORMED_KEY_ID_MESSAGE,
+            ),
+            (
+                ClientRequest::DeviceKeySign {
+                    request_id: RequestId::Integer(13),
+                    params: DeviceKeySignParams {
+                        key_id: String::new(),
+                        payload: DeviceKeySignPayload::RemoteControlClientEnrollment {
+                            nonce: "nonce-123".to_string(),
+                            audience:
+                                RemoteControlClientEnrollmentAudience::RemoteControlClientEnrollment,
+                            challenge_id: "rch_123".to_string(),
+                            target_origin: "https://chatgpt.com".to_string(),
+                            target_path: "/wham/remote/control/client/enroll".to_string(),
+                            account_user_id: "acct_123".to_string(),
+                            client_id: "cli_123".to_string(),
+                            device_identity_sha256_base64url:
+                                "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU".to_string(),
+                            challenge_expires_at: 4_102_444_800,
+                        },
+                    },
+                },
+                MALFORMED_KEY_ID_MESSAGE,
+            ),
+        ];
+
+        for (request, expected_message) in requests {
+            let error = client
+                .request(request)
+                .await
+                .expect("request transport should work")
+                .expect_err("request should be rejected");
+
+            assert_eq!(error.code, INVALID_REQUEST_ERROR_CODE);
+            assert_eq!(error.message, expected_message);
+        }
+
+        client
+            .shutdown()
+            .await
+            .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
     async fn in_process_start_uses_requested_session_source_for_thread_start() {
         for (requested_source, expected_source) in [
             (SessionSource::Cli, ApiSessionSource::Cli),
@@ -838,7 +908,8 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_start_clamps_zero_channel_capacity() {
-        let client = start_test_client_with_capacity(SessionSource::Cli, 0).await;
+        let client =
+            start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;
         let response = loop {
             match client
                 .request(ClientRequest::ConfigRequirementsRead {
@@ -863,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn guaranteed_delivery_helpers_cover_terminal_notifications() {
+    fn guaranteed_delivery_helpers_cover_terminal_server_notifications() {
         assert!(server_notification_requires_delivery(
             &ServerNotification::TurnCompleted(TurnCompletedNotification {
                 thread_id: "thread-1".to_string(),
@@ -872,33 +943,11 @@ mod tests {
                     items: Vec::new(),
                     status: TurnStatus::Completed,
                     error: None,
+                    started_at: None,
+                    completed_at: Some(0),
+                    duration_ms: None,
                 },
             })
-        ));
-
-        assert!(legacy_notification_requires_delivery(
-            &JSONRPCNotification {
-                method: "codex/event/task_complete".to_string(),
-                params: None,
-            }
-        ));
-        assert!(legacy_notification_requires_delivery(
-            &JSONRPCNotification {
-                method: "codex/event/turn_aborted".to_string(),
-                params: None,
-            }
-        ));
-        assert!(legacy_notification_requires_delivery(
-            &JSONRPCNotification {
-                method: "codex/event/shutdown_complete".to_string(),
-                params: None,
-            }
-        ));
-        assert!(!legacy_notification_requires_delivery(
-            &JSONRPCNotification {
-                method: "codex/event/item_started".to_string(),
-                params: None,
-            }
         ));
     }
 }

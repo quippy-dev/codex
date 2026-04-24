@@ -1,5 +1,3 @@
-pub(crate) use crate::collaboration_mode_policy::request_user_input_tool_description;
-pub(crate) use crate::collaboration_mode_policy::request_user_input_unavailable_message;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -7,15 +5,16 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
-use codex_features::Feature;
-#[cfg(test)]
-use codex_protocol::config_types::ModeKind;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::request_user_input::RequestUserInputArgs;
+use codex_tools::REQUEST_USER_INPUT_TOOL_NAME;
+use codex_tools::normalize_request_user_input_args;
+use codex_tools::request_user_input_unavailable_message;
 
-pub struct RequestUserInputHandler;
+pub struct RequestUserInputHandler {
+    pub default_mode_request_user_input: bool,
+}
 
-#[async_trait]
 impl ToolHandler for RequestUserInputHandler {
     type Output = FunctionToolOutput;
 
@@ -35,47 +34,40 @@ impl ToolHandler for RequestUserInputHandler {
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
-                    "request_user_input handler received unsupported payload".to_string(),
-                ));
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "{REQUEST_USER_INPUT_TOOL_NAME} handler received unsupported payload"
+                )));
             }
         };
 
-        let request_user_input_outside_plan_mode = session
-            .features()
-            .enabled(Feature::RequestUserInputOutsidePlanMode);
+        if matches!(turn.session_source, SessionSource::SubAgent(_)) {
+            return Err(FunctionCallError::RespondToModel(
+                "request_user_input can only be used by the root thread".to_string(),
+            ));
+        }
+
         let mode = session.collaboration_mode().await.mode;
         if let Some(message) =
-            request_user_input_unavailable_message(mode, request_user_input_outside_plan_mode)
+            request_user_input_unavailable_message(mode, self.default_mode_request_user_input)
         {
             return Err(FunctionCallError::RespondToModel(message));
         }
 
-        let mut args: RequestUserInputArgs = parse_arguments(&arguments)?;
-        let missing_options = args
-            .questions
-            .iter()
-            .any(|question| question.options.as_ref().is_none_or(Vec::is_empty));
-        if missing_options {
-            return Err(FunctionCallError::RespondToModel(
-                "request_user_input requires non-empty options for every question".to_string(),
-            ));
-        }
-        for question in &mut args.questions {
-            question.is_other = true;
-        }
+        let args: RequestUserInputArgs = parse_arguments(&arguments)?;
+        let args =
+            normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)?;
         let response = session
             .request_user_input(turn.as_ref(), call_id, args)
             .await
             .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "request_user_input was cancelled before receiving a response".to_string(),
-                )
+                FunctionCallError::RespondToModel(format!(
+                    "{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response"
+                ))
             })?;
 
         let content = serde_json::to_string(&response).map_err(|err| {
             FunctionCallError::Fatal(format!(
-                "failed to serialize request_user_input response: {err}"
+                "failed to serialize {REQUEST_USER_INPUT_TOOL_NAME} response: {err}"
             ))
         })?;
 

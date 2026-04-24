@@ -1,11 +1,11 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::compact::CompactTrigger;
 use crate::compact::insert_retained_plan_context_message;
 use crate::compact::retained_proposed_plan_for_manual_plan_compaction;
 use crate::encrypted_content_fallback::apply_invalid_encrypted_content_fallback;
-use crate::error::CodexErr;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_protocol::RetainedProposedPlan;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseItem;
 
 pub(crate) fn retry_once_invalid_encrypted_content_with_sanitized_prompt_input(

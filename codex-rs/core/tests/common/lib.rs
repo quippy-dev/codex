@@ -14,6 +14,8 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config_loader::LoaderOverrides;
 use codex_utils_absolute_path::AbsolutePathBuf;
+pub use codex_utils_absolute_path::test_support::PathBufExt;
+pub use codex_utils_absolute_path::test_support::PathExt;
 use regex_lite::Regex;
 use std::path::PathBuf;
 use std::process::Command;
@@ -106,6 +108,16 @@ pub fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf {
     test_absolute_path_with_windows(unix_path, /*windows_path*/ None)
 }
 
+pub trait TempDirExt {
+    fn abs(&self) -> AbsolutePathBuf;
+}
+
+impl TempDirExt for TempDir {
+    fn abs(&self) -> AbsolutePathBuf {
+        self.path().abs()
+    }
+}
+
 pub fn test_tmp_path() -> AbsolutePathBuf {
     test_absolute_path_with_windows("/tmp", Some(r"C:\Users\codex\AppData\Local\Temp"))
 }
@@ -184,15 +196,15 @@ fn default_test_overrides() -> ConfigOverrides {
 
 #[cfg(target_os = "linux")]
 pub fn find_codex_linux_sandbox_exe() -> Result<PathBuf, CargoBinError> {
-    if let Ok(path) = std::env::current_exe() {
-        return Ok(path);
-    }
-
     if let Some(path) = TEST_ARG0_PATH_ENTRY
         .get()
         .and_then(Option::as_ref)
         .and_then(|path_entry| path_entry.paths().codex_linux_sandbox_exe.clone())
     {
+        return Ok(path);
+    }
+
+    if let Ok(path) = std::env::current_exe() {
         return Ok(path);
     }
 
@@ -263,7 +275,7 @@ where
     F: Fn(&codex_protocol::protocol::EventMsg) -> Option<T>,
 {
     let ev = wait_for_event(codex, |ev| matcher(ev).is_some()).await;
-    matcher(&ev).unwrap()
+    matcher(&ev).expect("EventMsg should match matcher predicate")
 }
 
 pub async fn wait_for_event_with_timeout<F>(
@@ -297,6 +309,10 @@ pub fn sandbox_network_env_var() -> &'static str {
 }
 
 const REMOTE_ENV_ENV_VAR: &str = "CODEX_TEST_REMOTE_ENV";
+
+pub fn remote_env_env_var() -> &'static str {
+    REMOTE_ENV_ENV_VAR
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteEnvConfig {
@@ -427,7 +443,7 @@ pub mod fs_wait {
         let deadline = Instant::now() + timeout;
         loop {
             if path.exists() {
-                return Ok(path.clone());
+                return Ok(path);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -437,7 +453,7 @@ pub mod fs_wait {
             match rx.recv_timeout(remaining) {
                 Ok(Ok(_event)) => {
                     if path.exists() {
-                        return Ok(path.clone());
+                        return Ok(path);
                     }
                 }
                 Ok(Err(err)) => return Err(err.into()),
@@ -560,6 +576,30 @@ macro_rules! skip_if_no_network {
         if ::std::env::var($crate::sandbox_network_env_var()).is_ok() {
             println!(
                 "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+            );
+            return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_remote {
+    ($reason:expr $(,)?) => {{
+        if ::std::env::var_os($crate::remote_env_env_var()).is_some() {
+            eprintln!(
+                "Skipping test under {}: {}",
+                $crate::remote_env_env_var(),
+                $reason
+            );
+            return;
+        }
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        if ::std::env::var_os($crate::remote_env_env_var()).is_some() {
+            eprintln!(
+                "Skipping test under {}: {}",
+                $crate::remote_env_env_var(),
+                $reason
             );
             return $return_value;
         }

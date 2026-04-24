@@ -2,11 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::codex::built_tools;
 use crate::compact::CompactTrigger;
+use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::InitialContextInjection;
+use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_remote_invariants::insert_retained_plan_for_remote_compaction;
 use crate::compact_remote_invariants::retry_once_invalid_encrypted_content_with_sanitized_prompt_input;
@@ -14,17 +13,26 @@ use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::context_manager::is_user_turn_boundary;
-use crate::error::CodexErr;
-use crate::error::Result as CodexResult;
-use crate::protocol::CompactedItem;
-use crate::protocol::EventMsg;
-use crate::protocol::TurnStartedEvent;
-use crate::tools::spec::create_tools_json_for_responses_api;
-use crate::truncate::approx_token_count;
+use crate::session::session::Session;
+use crate::session::turn::built_tools;
+use crate::session::turn_context::TurnContext;
+use codex_analytics::CompactionImplementation;
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
+use codex_analytics::CompactionTrigger;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_rollout_trace::CompactionCheckpointTracePayload;
+use codex_tools::ToolSpec;
+use codex_tools::create_tools_json_for_responses_api;
+use codex_utils_output_truncation::approx_token_count;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
@@ -33,12 +41,17 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
         initial_context_injection,
         CompactTrigger::Auto,
+        CompactionTrigger::Auto,
+        reason,
+        phase,
     )
     .await?;
     Ok(())
@@ -50,6 +63,7 @@ pub(crate) async fn run_remote_compact_task(
 ) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
+        started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
         model_context_window: turn_context.model_context_window(),
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
@@ -60,6 +74,9 @@ pub(crate) async fn run_remote_compact_task(
         &turn_context,
         InitialContextInjection::DoNotInject,
         CompactTrigger::Manual,
+        CompactionTrigger::Manual,
+        CompactionReason::UserRequested,
+        CompactionPhase::StandaloneTurn,
     )
     .await
 }
@@ -69,15 +86,34 @@ async fn run_remote_compact_task_inner(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
     compact_trigger: CompactTrigger,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
-    if let Err(err) = run_remote_compact_task_inner_impl(
+    let attempt = CompactionAnalyticsAttempt::begin(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        trigger,
+        reason,
+        CompactionImplementation::ResponsesCompact,
+        phase,
+    )
+    .await;
+    let result = run_remote_compact_task_inner_impl(
         sess,
         turn_context,
         initial_context_injection,
         compact_trigger,
     )
-    .await
-    {
+    .await;
+    attempt
+        .track(
+            sess.as_ref(),
+            compaction_status_from_result(&result),
+            result.as_ref().err().map(ToString::to_string),
+        )
+        .await;
+    if let Err(err) = result {
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),
         );
@@ -93,7 +129,16 @@ async fn run_remote_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compact_trigger: CompactTrigger,
 ) -> CodexResult<()> {
-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    let context_compaction_item = ContextCompactionItem::new();
+    // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
+    // endpoint attempts, and the installed history checkpoint all have one join key.
+    let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
+        turn_context.sub_id.as_str(),
+        context_compaction_item.id.as_str(),
+        turn_context.model_info.slug.as_str(),
+        turn_context.provider.info().name.as_str(),
+    );
+    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;
@@ -122,6 +167,10 @@ async fn run_remote_compact_task_inner_impl(
             "trimmed history items before remote compaction"
         );
     }
+    // This is the history selected for remote compaction, after any trimming required to fit the
+    // compact endpoint. The checkpoint below records it separately from the next sampling request,
+    // whose prompt will repeat current developer/context prefix items.
+    let trace_input_history = history.raw_items().to_vec();
     // Required to keep `/undo` available after compaction
     let ghost_snapshots: Vec<ResponseItem> = history
         .raw_items()
@@ -138,6 +187,7 @@ async fn run_remote_compact_task_inner_impl(
         base_instructions,
         personality: turn_context.personality,
         output_schema: None,
+        output_schema_strict: true,
     };
 
     let mut retried_invalid_encrypted_content = false;
@@ -152,6 +202,7 @@ async fn run_remote_compact_task_inner_impl(
                 turn_context.reasoning_effort,
                 turn_context.reasoning_summary,
                 &turn_context.session_telemetry,
+                &compaction_trace,
             )
             .await;
         match result {
@@ -209,6 +260,13 @@ async fn run_remote_compact_task_inner_impl(
         retained_proposed_plan,
         replacement_history: Some(new_history.clone()),
     };
+    // Install is the semantic boundary where the compact endpoint's output becomes live
+    // thread history. Keep it distinct from the later inference request so the reducer can
+    // still represent repeated developer/context prefix items exactly as the model saw them.
+    compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+        input_history: &trace_input_history,
+        replacement_history: &new_history,
+    });
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(turn_context).await;
@@ -290,7 +348,7 @@ struct CompactRequestLogData {
 fn build_compact_request_log_data(
     input: &[ResponseItem],
     instructions: &str,
-    tools: &[crate::client_common::tools::ToolSpec],
+    tools: &[ToolSpec],
 ) -> CompactRequestLogData {
     let tool_tokens = estimate_tool_token_count(tools).unwrap_or_default();
     let failing_compaction_request_model_visible_bytes = input
@@ -383,7 +441,7 @@ async fn build_compact_tools(
     turn_context: &TurnContext,
     prompt_input: &[ResponseItem],
     cancellation_token: &CancellationToken,
-) -> CodexResult<Vec<crate::client_common::tools::ToolSpec>> {
+) -> CodexResult<Vec<ToolSpec>> {
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
     let tool_router = built_tools(
         sess,
@@ -397,7 +455,7 @@ async fn build_compact_tools(
     Ok(tool_router.specs())
 }
 
-fn estimate_tool_token_count(tools: &[crate::client_common::tools::ToolSpec]) -> CodexResult<i64> {
+fn estimate_tool_token_count(tools: &[ToolSpec]) -> CodexResult<i64> {
     let tools_json = create_tools_json_for_responses_api(tools)?;
     let serialized = serde_json::to_string(&tools_json)?;
     Ok(i64::try_from(approx_token_count(&serialized)).unwrap_or(i64::MAX))
@@ -407,12 +465,12 @@ fn estimate_tool_token_count(tools: &[crate::client_common::tools::ToolSpec]) ->
 mod tests {
     use super::trim_history_to_fit_token_budget_for_remote_compaction;
     use crate::context_manager::ContextManager;
-    use crate::truncate::TruncationPolicy;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::ResponseItem;
+    use codex_utils_output_truncation::TruncationPolicy;
 
     #[test]
     fn trim_function_call_history_accounts_for_tool_budget() {

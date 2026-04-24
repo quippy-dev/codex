@@ -32,6 +32,7 @@ use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::enable_raw_mode;
 use ratatui::layout::Offset;
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use ratatui::text::Line;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
@@ -45,7 +46,8 @@ use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
-use codex_core::config::types::NotificationMethod;
+use codex_config::types::NotificationCondition;
+use codex_config::types::NotificationMethod;
 
 mod event_stream;
 mod frame_rate_limiter;
@@ -55,9 +57,215 @@ mod job_control;
 
 /// Target frame interval for UI redraw scheduling.
 pub(crate) const TARGET_FRAME_INTERVAL: Duration = frame_rate_limiter::MIN_FRAME_INTERVAL;
+const DISABLE_KEYBOARD_ENHANCEMENT_ENV_VAR: &str = "CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT";
 
 /// A type alias for the terminal type used in this application
 pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
+
+fn keyboard_enhancement_disabled() -> bool {
+    let disable_env = std::env::var(DISABLE_KEYBOARD_ENHANCEMENT_ENV_VAR).ok();
+    let is_wsl = running_in_wsl();
+    let is_vscode_terminal = is_wsl && running_in_vscode_terminal();
+    keyboard_enhancement_disabled_for(disable_env.as_deref(), is_wsl, is_vscode_terminal)
+}
+
+fn keyboard_enhancement_disabled_for(
+    disable_env: Option<&str>,
+    is_wsl: bool,
+    is_vscode_terminal: bool,
+) -> bool {
+    if let Some(disabled) = parse_bool_env(disable_env) {
+        return disabled;
+    }
+
+    // VS Code running a WSL shell can hide TERM_PROGRAM from the Linux process
+    // environment, so `running_in_vscode_terminal` also probes the Windows-side
+    // environment through WSL interop.
+    is_wsl && is_vscode_terminal
+}
+
+fn parse_bool_env(value: Option<&str>) -> Option<bool> {
+    match value.map(str::trim) {
+        Some("1") => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Some(true),
+        Some(value) if value.eq_ignore_ascii_case("yes") => Some(true),
+        Some("0") => Some(false),
+        Some(value) if value.eq_ignore_ascii_case("false") => Some(false),
+        Some(value) if value.eq_ignore_ascii_case("no") => Some(false),
+        _ => None,
+    }
+}
+
+fn running_in_wsl() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::clipboard_paste::is_probably_wsl()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn running_in_vscode_terminal() -> bool {
+    vscode_terminal_detected(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        windows_term_program().as_deref(),
+    )
+}
+
+fn vscode_terminal_detected(
+    linux_term_program: Option<&str>,
+    windows_term_program: Option<&str>,
+) -> bool {
+    term_program_is_vscode(linux_term_program) || term_program_is_vscode(windows_term_program)
+}
+
+fn term_program_is_vscode(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("vscode"))
+}
+
+fn windows_term_program() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        static WINDOWS_TERM_PROGRAM: std::sync::OnceLock<Option<String>> =
+            std::sync::OnceLock::new();
+        WINDOWS_TERM_PROGRAM
+            .get_or_init(read_windows_term_program)
+            .clone()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_windows_term_program() -> Option<String> {
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "set TERM_PROGRAM"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.trim_end_matches('\r')
+                .strip_prefix("TERM_PROGRAM=")
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn should_emit_notification(condition: NotificationCondition, terminal_focused: bool) -> bool {
+    match condition {
+        NotificationCondition::Unfocused => !terminal_focused,
+        NotificationCondition::Always => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keyboard_enhancement_disabled_for;
+    use super::parse_bool_env;
+    use super::should_emit_notification;
+    use super::vscode_terminal_detected;
+    use codex_config::types::NotificationCondition;
+
+    #[test]
+    fn unfocused_notification_condition_is_suppressed_when_focused() {
+        assert!(!should_emit_notification(
+            NotificationCondition::Unfocused,
+            /*terminal_focused*/ true
+        ));
+    }
+
+    #[test]
+    fn always_notification_condition_emits_when_focused() {
+        assert!(should_emit_notification(
+            NotificationCondition::Always,
+            /*terminal_focused*/ true
+        ));
+    }
+
+    #[test]
+    fn unfocused_notification_condition_emits_when_unfocused() {
+        assert!(should_emit_notification(
+            NotificationCondition::Unfocused,
+            /*terminal_focused*/ false
+        ));
+    }
+
+    #[test]
+    fn keyboard_enhancement_env_flag_parses_common_values() {
+        assert_eq!(parse_bool_env(Some("1")), Some(true));
+        assert_eq!(parse_bool_env(Some("true")), Some(true));
+        assert_eq!(parse_bool_env(Some("YES")), Some(true));
+        assert_eq!(parse_bool_env(Some("0")), Some(false));
+        assert_eq!(parse_bool_env(Some("false")), Some(false));
+        assert_eq!(parse_bool_env(Some("NO")), Some(false));
+        assert_eq!(parse_bool_env(Some("unexpected")), None);
+        assert_eq!(parse_bool_env(/*value*/ None), None);
+    }
+
+    #[test]
+    fn keyboard_enhancement_auto_disables_for_vscode_in_wsl() {
+        assert!(keyboard_enhancement_disabled_for(
+            /*disable_env*/ None, /*is_wsl*/ true, /*is_vscode_terminal*/ true
+        ));
+    }
+
+    #[test]
+    fn keyboard_enhancement_auto_disable_requires_wsl_and_vscode() {
+        assert!(!keyboard_enhancement_disabled_for(
+            /*disable_env*/ None, /*is_wsl*/ true, /*is_vscode_terminal*/ false
+        ));
+        assert!(!keyboard_enhancement_disabled_for(
+            /*disable_env*/ None, /*is_wsl*/ false, /*is_vscode_terminal*/ true
+        ));
+    }
+
+    #[test]
+    fn keyboard_enhancement_env_flag_overrides_auto_detection() {
+        assert!(!keyboard_enhancement_disabled_for(
+            Some("0"),
+            /*is_wsl*/ true,
+            /*is_vscode_terminal*/ true
+        ));
+        assert!(keyboard_enhancement_disabled_for(
+            Some("1"),
+            /*is_wsl*/ false,
+            /*is_vscode_terminal*/ false
+        ));
+    }
+
+    #[test]
+    fn vscode_terminal_detection_uses_linux_and_windows_term_program() {
+        assert!(vscode_terminal_detected(
+            Some("vscode"),
+            /*windows_term_program*/ None
+        ));
+        assert!(vscode_terminal_detected(
+            /*linux_term_program*/ None,
+            Some("vscode")
+        ));
+        assert!(!vscode_terminal_detected(
+            /*linux_term_program*/ None,
+            Some("WindowsTerminal")
+        ));
+        assert!(!vscode_terminal_detected(
+            /*linux_term_program*/ None, /*windows_term_program*/ None
+        ));
+    }
+}
 
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
@@ -69,14 +277,16 @@ pub fn set_modes() -> Result<()> {
     // Some terminals (notably legacy Windows consoles) do not support
     // keyboard enhancement flags. Attempt to enable them, but continue
     // gracefully if unsupported.
-    let _ = execute!(
-        stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        )
-    );
+    if !keyboard_enhancement_disabled() {
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        );
+    }
 
     let _ = execute!(stdout(), EnableFocusChange);
     Ok(())
@@ -253,6 +463,8 @@ pub struct Tui {
     terminal_focused: Arc<AtomicBool>,
     enhanced_keys_supported: bool,
     notification_backend: Option<DesktopNotificationBackend>,
+    notification_condition: NotificationCondition,
+    is_zellij: bool,
     // When false, enter_alt_screen() becomes a no-op (for Zellij scrollback support)
     alt_screen_enabled: bool,
 }
@@ -264,10 +476,15 @@ impl Tui {
 
         // Detect keyboard enhancement support before any EventStream is created so the
         // crossterm poller can acquire its lock without contention.
-        let enhanced_keys_supported = supports_keyboard_enhancement().unwrap_or(false);
+        let enhanced_keys_supported =
+            !keyboard_enhancement_disabled() && supports_keyboard_enhancement().unwrap_or(false);
         // Cache this to avoid contention with the event reader.
         supports_color::on_cached(supports_color::Stream::Stdout);
         let _ = crate::terminal_palette::default_colors();
+        let is_zellij = matches!(
+            codex_terminal_detection::terminal_info().multiplexer,
+            Some(codex_terminal_detection::Multiplexer::Zellij {})
+        );
 
         Self {
             frame_requester,
@@ -282,6 +499,8 @@ impl Tui {
             terminal_focused: Arc::new(AtomicBool::new(true)),
             enhanced_keys_supported,
             notification_backend: Some(detect_backend(NotificationMethod::default())),
+            notification_condition: NotificationCondition::default(),
+            is_zellij,
             alt_screen_enabled: true,
         }
     }
@@ -291,8 +510,13 @@ impl Tui {
         self.alt_screen_enabled = enabled;
     }
 
-    pub fn set_notification_method(&mut self, method: NotificationMethod) {
+    pub fn set_notification_settings(
+        &mut self,
+        method: NotificationMethod,
+        condition: NotificationCondition,
+    ) {
         self.notification_backend = Some(detect_backend(method));
+        self.notification_condition = condition;
     }
 
     pub fn frame_requester(&self) -> FrameRequester {
@@ -360,7 +584,8 @@ impl Tui {
     /// Emit a desktop notification now if the terminal is unfocused.
     /// Returns true if a notification was posted.
     pub fn notify(&mut self, message: impl AsRef<str>) -> bool {
-        if self.terminal_focused.load(Ordering::Relaxed) {
+        let terminal_focused = self.terminal_focused.load(Ordering::Relaxed);
+        if !should_emit_notification(self.notification_condition, terminal_focused) {
             return false;
         }
 
@@ -449,6 +674,82 @@ impl Tui {
         self.pending_history_lines.clear();
     }
 
+    /// Resize the inline viewport to `height` rows, scrolling content above it if
+    /// the viewport would extend past the bottom of the screen. Returns `true` when
+    /// the caller must invalidate the diff buffer (Zellij mode), because the scroll
+    /// was performed with raw newlines that ratatui cannot track.
+    fn update_inline_viewport(
+        terminal: &mut Terminal,
+        height: u16,
+        is_zellij: bool,
+    ) -> Result<bool> {
+        let size = terminal.size()?;
+        let mut needs_full_repaint = false;
+
+        let mut area = terminal.viewport_area;
+        area.height = height.min(size.height);
+        area.width = size.width;
+        if area.bottom() > size.height {
+            let scroll_by = area.bottom() - size.height;
+            if is_zellij {
+                Self::scroll_zellij_expanded_viewport(terminal, size, scroll_by)?;
+                needs_full_repaint = true;
+            } else {
+                terminal
+                    .backend_mut()
+                    .scroll_region_up(0..area.top(), scroll_by)?;
+            }
+            area.y = size.height - area.height;
+        }
+        if area != terminal.viewport_area {
+            // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
+            terminal.clear()?;
+            terminal.set_viewport_area(area);
+        }
+
+        Ok(needs_full_repaint)
+    }
+
+    /// Push content above the viewport upward by `scroll_by` rows using raw
+    /// newlines at the screen bottom. This is the Zellij-safe alternative to
+    /// `scroll_region_up`, which relies on DECSTBM sequences Zellij does not
+    /// support.
+    fn scroll_zellij_expanded_viewport(
+        terminal: &mut Terminal,
+        size: Size,
+        scroll_by: u16,
+    ) -> Result<()> {
+        crossterm::queue!(
+            terminal.backend_mut(),
+            crossterm::cursor::MoveTo(0, size.height.saturating_sub(1))
+        )?;
+        for _ in 0..scroll_by {
+            crossterm::queue!(terminal.backend_mut(), crossterm::style::Print("\n"))?;
+        }
+        Ok(())
+    }
+
+    /// Write any buffered history lines above the viewport and clear the buffer.
+    /// Returns `true` when Zellij mode was used, signaling that the caller must
+    /// invalidate the diff buffer for a full repaint.
+    fn flush_pending_history_lines(
+        terminal: &mut Terminal,
+        pending_history_lines: &mut Vec<Line<'static>>,
+        is_zellij: bool,
+    ) -> Result<bool> {
+        if pending_history_lines.is_empty() {
+            return Ok(false);
+        }
+
+        crate::insert_history::insert_history_lines_with_mode(
+            terminal,
+            pending_history_lines.clone(),
+            crate::insert_history::InsertHistoryMode::new(is_zellij),
+        )?;
+        pending_history_lines.clear();
+        Ok(is_zellij)
+    }
+
     pub fn draw(
         &mut self,
         height: u16,
@@ -477,35 +778,22 @@ impl Tui {
                 terminal.clear()?;
             }
 
-            let size = terminal.size()?;
+            let mut needs_full_repaint =
+                Self::update_inline_viewport(terminal, height, self.is_zellij)?;
+            needs_full_repaint |= Self::flush_pending_history_lines(
+                terminal,
+                &mut self.pending_history_lines,
+                self.is_zellij,
+            )?;
 
-            let mut area = terminal.viewport_area;
-            area.height = height.min(size.height);
-            area.width = size.width;
-            // If the viewport has expanded, scroll everything else up to make room.
-            if area.bottom() > size.height {
-                terminal
-                    .backend_mut()
-                    .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
-                area.y = size.height - area.height;
-            }
-            if area != terminal.viewport_area {
-                // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
-                terminal.clear()?;
-                terminal.set_viewport_area(area);
-            }
-
-            if !self.pending_history_lines.is_empty() {
-                crate::insert_history::insert_history_lines(
-                    terminal,
-                    self.pending_history_lines.clone(),
-                )?;
-                self.pending_history_lines.clear();
+            if needs_full_repaint {
+                terminal.invalidate_viewport();
             }
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
             #[cfg(unix)]
             {
+                let area = terminal.viewport_area;
                 let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
                     self.alt_saved_viewport
                         .map(|r| r.bottom().saturating_sub(1))

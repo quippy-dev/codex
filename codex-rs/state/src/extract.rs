@@ -19,10 +19,10 @@ pub fn apply_rollout_item(
 ) {
     match item {
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
+        RolloutItem::ForkReference(_) => {}
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
-        RolloutItem::ForkReference(_) => {}
         RolloutItem::Compacted(_) => {}
     }
     if metadata.model_provider.is_empty() {
@@ -34,11 +34,13 @@ pub fn apply_rollout_item(
 pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::SessionMeta(_) | RolloutItem::TurnContext(_) => true,
-        RolloutItem::EventMsg(EventMsg::TokenCount(_) | EventMsg::UserMessage(_)) => true,
-        RolloutItem::EventMsg(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::ForkReference(_)
-        | RolloutItem::Compacted(_) => false,
+        RolloutItem::ForkReference(_) => false,
+        RolloutItem::EventMsg(
+            EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadNameUpdated(_),
+        ) => true,
+        RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
+            false
+        }
     }
 }
 
@@ -63,7 +65,7 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
         metadata.cwd = meta_line.meta.cwd.clone();
     }
     if let Some(git) = meta_line.git.as_ref() {
-        metadata.git_sha = git.commit_hash.clone();
+        metadata.git_sha = git.commit_hash.as_ref().map(|sha| sha.0.clone());
         metadata.git_branch = git.branch.clone();
         metadata.git_origin_url = git.repository_url.clone();
     }
@@ -97,13 +99,18 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
                 }
             }
         }
+        EventMsg::ThreadNameUpdated(updated) => {
+            if let Some(title) = updated.thread_name.as_deref()
+                && !title.trim().is_empty()
+            {
+                metadata.title = title.trim().to_string();
+            }
+        }
         _ => {}
     }
 }
 
-fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {
-    // Title and first_user_message are derived from EventMsg::UserMessage only.
-}
+fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
 
 fn strip_user_message_prefix(text: &str) -> &str {
     match text.find(USER_MESSAGE_BEGIN) {
@@ -154,6 +161,7 @@ mod tests {
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::ThreadNameUpdatedEvent;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
@@ -198,6 +206,25 @@ mod tests {
             Some("actual user request")
         );
         assert_eq!(metadata.title, "actual user request");
+    }
+
+    #[test]
+    fn thread_name_update_replaces_title_without_changing_first_user_message() {
+        let mut metadata = metadata_for_test();
+        metadata.title = "actual user request".to_string();
+        metadata.first_user_message = Some("actual user request".to_string());
+        let item = RolloutItem::EventMsg(EventMsg::ThreadNameUpdated(ThreadNameUpdatedEvent {
+            thread_id: metadata.id,
+            thread_name: Some("saved-session".to_string()),
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("actual user request")
+        );
+        assert_eq!(metadata.title, "saved-session");
     }
 
     #[test]
@@ -276,7 +303,9 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::Never,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -314,7 +343,9 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -346,7 +377,9 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,

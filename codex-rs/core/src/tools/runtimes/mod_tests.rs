@@ -1,6 +1,14 @@
 use super::*;
 use crate::shell::ShellType;
 use crate::shell_snapshot::ShellSnapshot;
+#[cfg(target_os = "macos")]
+use codex_network_proxy::CODEX_PROXY_GIT_SSH_COMMAND_MARKER;
+use codex_network_proxy::PROXY_ACTIVE_ENV_KEY;
+#[cfg(target_os = "macos")]
+use codex_network_proxy::PROXY_GIT_SSH_COMMAND_ENV_KEY;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use std::process::Command;
@@ -11,8 +19,8 @@ use tokio::sync::watch;
 fn shell_with_snapshot(
     shell_type: ShellType,
     shell_path: &str,
-    snapshot_path: PathBuf,
-    snapshot_cwd: PathBuf,
+    snapshot_path: AbsolutePathBuf,
+    snapshot_cwd: AbsolutePathBuf,
 ) -> Shell {
     let (_tx, shell_snapshot) = watch::channel(Some(Arc::new(ShellSnapshot {
         path: snapshot_path,
@@ -33,8 +41,8 @@ fn maybe_wrap_shell_lc_with_snapshot_bootstraps_in_user_shell() {
     let session_shell = shell_with_snapshot(
         ShellType::Zsh,
         "/bin/zsh",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -42,8 +50,13 @@ fn maybe_wrap_shell_lc_with_snapshot_bootstraps_in_user_shell() {
         "echo hello".to_string(),
     ];
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, dir.path(), &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert_eq!(rewritten[0], "/bin/zsh");
     assert_eq!(rewritten[1], "-c");
@@ -59,8 +72,8 @@ fn maybe_wrap_shell_lc_with_snapshot_escapes_single_quotes() {
     let session_shell = shell_with_snapshot(
         ShellType::Zsh,
         "/bin/zsh",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -68,8 +81,13 @@ fn maybe_wrap_shell_lc_with_snapshot_escapes_single_quotes() {
         "echo 'hello'".to_string(),
     ];
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, dir.path(), &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert!(rewritten[2].contains(r#"exec '/bin/bash' -c 'echo '"'"'hello'"'"''"#));
 }
@@ -82,8 +100,8 @@ fn maybe_wrap_shell_lc_with_snapshot_uses_bash_bootstrap_shell() {
     let session_shell = shell_with_snapshot(
         ShellType::Bash,
         "/bin/bash",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/zsh".to_string(),
@@ -91,8 +109,13 @@ fn maybe_wrap_shell_lc_with_snapshot_uses_bash_bootstrap_shell() {
         "echo hello".to_string(),
     ];
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, dir.path(), &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert_eq!(rewritten[0], "/bin/bash");
     assert_eq!(rewritten[1], "-c");
@@ -108,8 +131,8 @@ fn maybe_wrap_shell_lc_with_snapshot_uses_sh_bootstrap_shell() {
     let session_shell = shell_with_snapshot(
         ShellType::Sh,
         "/bin/sh",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -117,8 +140,13 @@ fn maybe_wrap_shell_lc_with_snapshot_uses_sh_bootstrap_shell() {
         "echo hello".to_string(),
     ];
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, dir.path(), &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert_eq!(rewritten[0], "/bin/sh");
     assert_eq!(rewritten[1], "-c");
@@ -134,8 +162,8 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_trailing_args() {
     let session_shell = shell_with_snapshot(
         ShellType::Zsh,
         "/bin/zsh",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -145,8 +173,13 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_trailing_args() {
         "arg1".to_string(),
     ];
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, dir.path(), &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert!(
         rewritten[2]
@@ -163,16 +196,25 @@ fn maybe_wrap_shell_lc_with_snapshot_skips_when_cwd_mismatch() {
     let command_cwd = dir.path().join("worktree-b");
     std::fs::create_dir_all(&snapshot_cwd).expect("create snapshot cwd");
     std::fs::create_dir_all(&command_cwd).expect("create command cwd");
-    let session_shell =
-        shell_with_snapshot(ShellType::Zsh, "/bin/zsh", snapshot_path, snapshot_cwd);
+    let session_shell = shell_with_snapshot(
+        ShellType::Zsh,
+        "/bin/zsh",
+        snapshot_path.abs(),
+        snapshot_cwd.abs(),
+    );
     let command = vec![
         "/bin/bash".to_string(),
         "-lc".to_string(),
         "echo hello".to_string(),
     ];
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, &command_cwd, &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &command_cwd.abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert_eq!(rewritten, command);
 }
@@ -185,8 +227,8 @@ fn maybe_wrap_shell_lc_with_snapshot_accepts_dot_alias_cwd() {
     let session_shell = shell_with_snapshot(
         ShellType::Zsh,
         "/bin/zsh",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -195,8 +237,13 @@ fn maybe_wrap_shell_lc_with_snapshot_accepts_dot_alias_cwd() {
     ];
     let command_cwd = dir.path().join(".");
 
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, &command_cwd, &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &command_cwd.abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
 
     assert_eq!(rewritten[0], "/bin/zsh");
     assert_eq!(rewritten[1], "-c");
@@ -216,8 +263,8 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_explicit_override_precedence() {
     let session_shell = shell_with_snapshot(
         ShellType::Bash,
         "/bin/bash",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -229,8 +276,9 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_explicit_override_precedence() {
     let rewritten = maybe_wrap_shell_lc_with_snapshot(
         &command,
         &session_shell,
-        dir.path(),
+        &dir.path().abs(),
         &explicit_env_overrides,
+        &HashMap::from([("TEST_ENV_SNAPSHOT".to_string(), "worktree".to_string())]),
     );
     let output = Command::new(&rewritten[0])
         .args(&rewritten[1..])
@@ -246,6 +294,326 @@ fn maybe_wrap_shell_lc_with_snapshot_restores_explicit_override_precedence() {
 }
 
 #[test]
+fn maybe_wrap_shell_lc_with_snapshot_restores_codex_thread_id_from_env() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot_path,
+        "# Snapshot file\nexport CODEX_THREAD_ID='parent-thread'\n",
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        "printf '%s' \"$CODEX_THREAD_ID\"".to_string(),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::from([("CODEX_THREAD_ID".to_string(), "nested-thread".to_string())]),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env("CODEX_THREAD_ID", "nested-thread")
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "nested-thread");
+}
+
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_restores_proxy_env_from_process_env() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot_path,
+        "# Snapshot file\n\
+         export PIP_PROXY='http://127.0.0.1:8080'\n\
+         export HTTP_PROXY='http://127.0.0.1:8080'\n\
+         export http_proxy='http://127.0.0.1:8080'\n\
+         export GIT_SSH_COMMAND='ssh -o ProxyCommand=stale'\n",
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        "printf '%s\\n%s\\n%s\\n%s' \"$PIP_PROXY\" \"$HTTP_PROXY\" \"$http_proxy\" \"$GIT_SSH_COMMAND\""
+            .to_string(),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env(PROXY_ACTIVE_ENV_KEY, "1")
+        .env("PIP_PROXY", "http://127.0.0.1:4321")
+        .env("HTTP_PROXY", "http://127.0.0.1:4321")
+        .env("http_proxy", "http://127.0.0.1:4321")
+        .env("GIT_SSH_COMMAND", "ssh -o ProxyCommand=fresh")
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "http://127.0.0.1:4321\n\
+         http://127.0.0.1:4321\n\
+         http://127.0.0.1:4321\n\
+         ssh -o ProxyCommand=stale"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_refreshes_codex_proxy_git_ssh_command() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    let stale_command = format!(
+        "{CODEX_PROXY_GIT_SSH_COMMAND_MARKER}ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:8081 %h %p'"
+    );
+    let fresh_command = format!(
+        "{CODEX_PROXY_GIT_SSH_COMMAND_MARKER}ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:48081 %h %p'"
+    );
+    std::fs::write(
+        &snapshot_path,
+        format!(
+            "# Snapshot file\nexport {PROXY_GIT_SSH_COMMAND_ENV_KEY}='{}'\n",
+            shell_single_quote(&stale_command)
+        ),
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        format!("printf '%s' \"${PROXY_GIT_SSH_COMMAND_ENV_KEY}\""),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env(PROXY_GIT_SSH_COMMAND_ENV_KEY, &fresh_command)
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), fresh_command);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_restores_custom_git_ssh_command() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    let stale_command = format!(
+        "{CODEX_PROXY_GIT_SSH_COMMAND_MARKER}ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:8081 %h %p'"
+    );
+    let custom_command = "ssh -o ProxyCommand='tsh proxy ssh --cluster=dev %r@%h:%p'";
+    std::fs::write(
+        &snapshot_path,
+        format!(
+            "# Snapshot file\nexport {PROXY_GIT_SSH_COMMAND_ENV_KEY}='{}'\n",
+            shell_single_quote(&stale_command)
+        ),
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        format!("printf '%s' \"${PROXY_GIT_SSH_COMMAND_ENV_KEY}\""),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env(PROXY_GIT_SSH_COMMAND_ENV_KEY, custom_command)
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), custom_command);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_clears_stale_codex_git_ssh_command_without_live_command() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    let stale_command = format!(
+        "{CODEX_PROXY_GIT_SSH_COMMAND_MARKER}ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:8081 %h %p'"
+    );
+    std::fs::write(
+        &snapshot_path,
+        format!(
+            "# Snapshot file\nexport {PROXY_GIT_SSH_COMMAND_ENV_KEY}='{}'\n",
+            shell_single_quote(&stale_command)
+        ),
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        format!(
+            "if [ \"${{{PROXY_GIT_SSH_COMMAND_ENV_KEY}+x}}\" = x ]; then printf 'set'; else printf 'unset'; fi"
+        ),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env_remove(PROXY_GIT_SSH_COMMAND_ENV_KEY)
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "unset");
+}
+
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_keeps_user_proxy_env_when_proxy_inactive() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot_path,
+        "# Snapshot file\nexport HTTP_PROXY='http://user.proxy:8080'\n",
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        "printf '%s' \"$HTTP_PROXY\"".to_string(),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "http://user.proxy:8080"
+    );
+}
+
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_restores_live_env_when_snapshot_proxy_active() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot_path,
+        format!(
+            "# Snapshot file\n\
+             export {PROXY_ACTIVE_ENV_KEY}='1'\n\
+             export PIP_PROXY='http://127.0.0.1:8080'\n\
+             export HTTP_PROXY='http://127.0.0.1:8080'\n"
+        ),
+    )
+    .expect("write snapshot");
+    let session_shell = shell_with_snapshot(
+        ShellType::Bash,
+        "/bin/bash",
+        snapshot_path.abs(),
+        dir.path().abs(),
+    );
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        format!(
+            "if [ \"${{PIP_PROXY+x}}\" = x ]; then printf 'pip:%s\\n' \"$PIP_PROXY\"; else printf 'pip:unset\\n'; fi; \
+             printf 'http:%s\\n' \"$HTTP_PROXY\"; \
+             if [ \"${{{PROXY_ACTIVE_ENV_KEY}+x}}\" = x ]; then printf 'active:%s' \"${PROXY_ACTIVE_ENV_KEY}\"; else printf 'active:unset'; fi"
+        ),
+    ];
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::from([(
+            "HTTP_PROXY".to_string(),
+            "http://user.proxy:8080".to_string(),
+        )]),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env("HTTP_PROXY", "http://user.proxy:8080")
+        .env_remove("PIP_PROXY")
+        .env_remove(PROXY_ACTIVE_ENV_KEY)
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "pip:unset\nhttp:http://user.proxy:8080\nactive:unset"
+    );
+}
+
+#[test]
 fn maybe_wrap_shell_lc_with_snapshot_keeps_snapshot_path_without_override() {
     let dir = tempdir().expect("create temp dir");
     let snapshot_path = dir.path().join("snapshot.sh");
@@ -257,16 +625,21 @@ fn maybe_wrap_shell_lc_with_snapshot_keeps_snapshot_path_without_override() {
     let session_shell = shell_with_snapshot(
         ShellType::Bash,
         "/bin/bash",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
         "-lc".to_string(),
         "printf '%s' \"$PATH\"".to_string(),
     ];
-    let rewritten =
-        maybe_wrap_shell_lc_with_snapshot(&command, &session_shell, dir.path(), &HashMap::new());
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        &dir.path().abs(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
     let output = Command::new(&rewritten[0])
         .args(&rewritten[1..])
         .output()
@@ -288,8 +661,8 @@ fn maybe_wrap_shell_lc_with_snapshot_applies_explicit_path_override() {
     let session_shell = shell_with_snapshot(
         ShellType::Bash,
         "/bin/bash",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -300,8 +673,9 @@ fn maybe_wrap_shell_lc_with_snapshot_applies_explicit_path_override() {
     let rewritten = maybe_wrap_shell_lc_with_snapshot(
         &command,
         &session_shell,
-        dir.path(),
+        &dir.path().abs(),
         &explicit_env_overrides,
+        &HashMap::from([("PATH".to_string(), "/worktree/bin".to_string())]),
     );
     let output = Command::new(&rewritten[0])
         .args(&rewritten[1..])
@@ -325,8 +699,8 @@ fn maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv() {
     let session_shell = shell_with_snapshot(
         ShellType::Bash,
         "/bin/bash",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
         "/bin/bash".to_string(),
@@ -340,8 +714,12 @@ fn maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv() {
     let rewritten = maybe_wrap_shell_lc_with_snapshot(
         &command,
         &session_shell,
-        dir.path(),
+        &dir.path().abs(),
         &explicit_env_overrides,
+        &HashMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "super-secret-value".to_string(),
+        )]),
     );
 
     assert!(!rewritten[2].contains("super-secret-value"));
@@ -369,8 +747,8 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_unset_override_variables() {
     let session_shell = shell_with_snapshot(
         ShellType::Bash,
         "/bin/bash",
-        snapshot_path,
-        dir.path().to_path_buf(),
+        snapshot_path.abs(),
+        dir.path().abs(),
     );
     let command = vec![
             "/bin/bash".to_string(),
@@ -384,8 +762,9 @@ fn maybe_wrap_shell_lc_with_snapshot_preserves_unset_override_variables() {
     let rewritten = maybe_wrap_shell_lc_with_snapshot(
         &command,
         &session_shell,
-        dir.path(),
+        &dir.path().abs(),
         &explicit_env_overrides,
+        &HashMap::new(),
     );
 
     let output = Command::new(&rewritten[0])

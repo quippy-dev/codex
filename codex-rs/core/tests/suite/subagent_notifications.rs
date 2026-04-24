@@ -19,6 +19,8 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::fs;
+use std::path::Path;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -29,11 +31,11 @@ const TURN_0_FORK_PROMPT: &str = "seed fork context";
 const TURN_1_PROMPT: &str = "spawn a child and continue";
 const TURN_2_NO_WAIT_PROMPT: &str = "follow up without wait";
 const CHILD_PROMPT: &str = "child: do work";
-const INHERITED_MODEL: &str = "gpt-5.2-codex";
+const INHERITED_MODEL: &str = "gpt-5.3-codex";
 const INHERITED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
-const REQUESTED_MODEL: &str = "gpt-5.1";
+const REQUESTED_MODEL: &str = "gpt-5.4";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
-const ROLE_MODEL: &str = "gpt-5.1-codex-max";
+const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
@@ -100,8 +102,16 @@ fn role_block(description: &str, role_name: &str) -> Option<String> {
     Some(block.join("\n"))
 }
 
+fn write_home_skill(codex_home: &Path, dir: &str, name: &str, description: &str) -> Result<()> {
+    let skill_dir = codex_home.join("skills").join(dir);
+    fs::create_dir_all(&skill_dir)?;
+    let contents = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
+    fs::write(skill_dir.join("SKILL.md"), contents)?;
+    Ok(())
+}
+
 async fn wait_for_spawned_thread_id(test: &TestCodex) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let ids = test.thread_manager.list_thread_ids().await;
         if let Some(spawned_id) = ids
@@ -143,7 +153,7 @@ async fn setup_turn_one_with_spawned_child(
             "message": CHILD_PROMPT,
         }),
         child_response_delay,
-        true,
+        /*wait_for_parent_notification*/ true,
         |builder| builder,
     )
     .await
@@ -224,7 +234,7 @@ async fn setup_turn_one_with_custom_spawned_child(
             .codex
             .rollout_path()
             .ok_or_else(|| anyhow::anyhow!("expected parent rollout path"))?;
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(6);
         loop {
             let has_notification = tokio::fs::read_to_string(&rollout_path)
                 .await
@@ -252,9 +262,14 @@ async fn spawn_child_and_capture_snapshot(
         core_test_support::test_codex::TestCodexBuilder,
     ) -> core_test_support::test_codex::TestCodexBuilder,
 ) -> Result<ThreadConfigSnapshot> {
-    let (test, spawned_id) =
-        setup_turn_one_with_custom_spawned_child(server, spawn_args, None, false, configure_test)
-            .await?;
+    let (test, spawned_id) = setup_turn_one_with_custom_spawned_child(
+        server,
+        spawn_args,
+        /*child_response_delay*/ None,
+        /*wait_for_parent_notification*/ false,
+        configure_test,
+    )
+    .await?;
     let thread_id = ThreadId::from_string(&spawned_id)?;
     Ok(test
         .thread_manager
@@ -269,7 +284,8 @@ async fn subagent_notification_is_included_without_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let (test, _spawned_id) = setup_turn_one_with_spawned_child(&server, None).await?;
+    let (test, _spawned_id) =
+        setup_turn_one_with_spawned_child(&server, /*child_response_delay*/ None).await?;
 
     let turn2 = mount_sse_once_match(
         &server,
@@ -357,14 +373,16 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = spawn_turn.single_request();
 
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + Duration::from_secs(2);
     let child_request = loop {
         if let Some(request) = server
             .received_requests()
             .await
             .unwrap_or_default()
             .into_iter()
-            .find(|request| body_contains(request, CHILD_PROMPT))
+            .find(|request| {
+                body_contains(request, CHILD_PROMPT) && !body_contains(request, SPAWN_CALL_ID)
+            })
         {
             break request;
         }
@@ -374,43 +392,7 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
         sleep(Duration::from_millis(10)).await;
     };
     assert!(body_contains(&child_request, TURN_0_FORK_PROMPT));
-    assert!(body_contains(&child_request, "seeded"));
-
-    let child_body = child_request
-        .body_json::<serde_json::Value>()
-        .expect("forked child request body should be json");
-    let has_spawn_result_output = child_body["input"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|item| {
-            item["type"].as_str() == Some("function_call_output")
-                && item["call_id"].as_str() == Some(SPAWN_CALL_ID)
-        })
-        .any(|function_call_output| {
-            let output_text = match &function_call_output["output"] {
-                serde_json::Value::String(text) => Some(text.as_str()),
-                serde_json::Value::Object(output) => {
-                    if output.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
-                        return false;
-                    }
-                    output.get("content").and_then(serde_json::Value::as_str)
-                }
-                _ => None,
-            };
-            output_text
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-                .and_then(|json| {
-                    json.get("agent_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .is_some()
-        });
-    assert!(
-        has_spawn_result_output,
-        "expected forked child request to include spawn_agent result output: {child_body}"
-    );
+    assert!(!body_contains(&child_request, SPAWN_CALL_ID));
 
     Ok(())
 }
@@ -442,6 +424,182 @@ async fn spawn_agent_requested_model_and_reasoning_override_inherited_settings_w
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-turn1-1"),
+            ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
+            ev_completed("resp-turn1-1"),
+        ]),
+    )
+    .await;
+
+    let _child_request_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, CHILD_PROMPT),
+        sse(vec![
+            ev_response_created("resp-child-1"),
+            ev_completed("resp-child-1"),
+        ]),
+    )
+    .await;
+
+    let _turn1_followup = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, "function_call_output") && body_contains(req, "/root/worker")
+        },
+        sse(vec![
+            ev_response_created("resp-turn1-2"),
+            ev_assistant_message("msg-turn1-2", "parent done"),
+            ev_completed("resp-turn1-2"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        config.developer_instructions = Some("Parent developer instructions.".to_string());
+    });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let child_request = loop {
+        if let Some(request) = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                body_contains(request, CHILD_PROMPT) && !body_contains(request, SPAWN_CALL_ID)
+            })
+        {
+            break request;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for spawned child request with developer context");
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert!(body_contains(
+        &child_request,
+        "Parent developer instructions."
+    ));
+    assert!(body_contains(&child_request, CHILD_PROMPT));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+    }))?;
+    let spawn_turn = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-turn1-1"),
+            ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
+            ev_completed("resp-turn1-1"),
+        ]),
+    )
+    .await;
+
+    let _child_request_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, CHILD_PROMPT),
+        sse(vec![
+            ev_response_created("resp-child-1"),
+            ev_completed("resp-child-1"),
+        ]),
+    )
+    .await;
+
+    let _turn1_followup = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, "function_call_output") && body_contains(req, "/root/worker")
+        },
+        sse(vec![
+            ev_response_created("resp-turn1-2"),
+            ev_assistant_message("msg-turn1-2", "parent done"),
+            ev_completed("resp-turn1-2"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(err) = write_home_skill(home, "demo", "demo-skill", "demo skill") {
+                panic!("write home skill: {err}");
+            }
+        })
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.include_skill_instructions = false;
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+    let parent_request = spawn_turn.single_request();
+    assert!(!parent_request.body_contains_text("<skills_instructions>"));
+    assert!(!parent_request.body_contains_text("demo-skill"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let child_request = loop {
+        if let Some(request) = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|request| {
+                body_contains(request, CHILD_PROMPT) && !body_contains(request, SPAWN_CALL_ID)
+            })
+        {
+            break request;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for spawned child request");
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert!(!body_contains(&child_request, "<skills_instructions>"));
+    assert!(!body_contains(&child_request, "demo-skill"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -468,7 +626,7 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
                     "custom".to_string(),
                     AgentRoleConfig {
                         description: Some("Custom role".to_string()),
-                        config_file: Some(role_path),
+                        config_file: Some(role_path.to_path_buf()),
                         nickname_candidates: None,
                     },
                 );
@@ -516,7 +674,7 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
             "custom".to_string(),
             AgentRoleConfig {
                 description: Some("Custom role".to_string()),
-                config_file: Some(role_path),
+                config_file: Some(role_path.to_path_buf()),
                 nickname_candidates: None,
             },
         );
@@ -532,7 +690,7 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
         role_block(&agent_type_description, "custom").expect("custom role description");
     assert_eq!(
         custom_role_description,
-        "custom: {\nCustom role\n- This role's model is set to `gpt-5.1-codex-max` and its reasoning effort is set to `high`. These settings cannot be changed.\n}"
+        "custom: {\nCustom role\n- This role's model is set to `gpt-5.4` and its reasoning effort is set to `high`. These settings cannot be changed.\n}"
     );
 
     Ok(())

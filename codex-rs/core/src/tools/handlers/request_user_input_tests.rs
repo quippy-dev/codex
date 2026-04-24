@@ -1,12 +1,24 @@
 use super::*;
+use crate::collaboration_mode_policy::request_user_input_allowed_for_mode;
+use crate::collaboration_mode_policy::request_user_input_tool_description;
+use codex_protocol::config_types::ModeKind;
 use pretty_assertions::assert_eq;
 
 #[test]
 fn request_user_input_mode_availability_defaults_to_plan_only() {
-    assert!(ModeKind::Plan.allows_request_user_input());
-    assert!(!ModeKind::Default.allows_request_user_input());
-    assert!(!ModeKind::Execute.allows_request_user_input());
-    assert!(!ModeKind::PairProgramming.allows_request_user_input());
+    assert!(request_user_input_allowed_for_mode(ModeKind::Plan, false));
+    assert!(!request_user_input_allowed_for_mode(
+        ModeKind::Default,
+        false
+    ));
+    assert!(!request_user_input_allowed_for_mode(
+        ModeKind::Execute,
+        false
+    ));
+    assert!(!request_user_input_allowed_for_mode(
+        ModeKind::PairProgramming,
+        false
+    ));
 }
 
 #[test]

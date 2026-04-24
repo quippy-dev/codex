@@ -44,6 +44,7 @@ async fn submit_user_turn(
     let session_model = test.session_configured.model.clone();
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
@@ -51,7 +52,9 @@ async fn submit_user_turn(
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy,
+            approvals_reviewer: None,
             sandbox_policy,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -124,6 +127,7 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
     let session_model = test.session_configured.model.clone();
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "run shell command".into(),
                 text_elements: Vec::new(),
@@ -131,7 +135,9 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -166,7 +172,7 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config
             .features
             .enable(Feature::CollaborationModes)
@@ -221,7 +227,7 @@ async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config
             .features
             .enable(Feature::UnifiedExec)
@@ -280,7 +286,7 @@ async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> R
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config
             .features
             .enable(Feature::CollaborationModes)
@@ -335,7 +341,7 @@ async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config
             .features
             .enable(Feature::UnifiedExec)

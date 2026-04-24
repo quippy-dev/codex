@@ -10,14 +10,14 @@ use crate::render::renderable::Renderable;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_lines;
 
-/// Widget that displays pending steers plus follow-up messages held while a turn is in progress.
+/// Widget that displays pending steers plus follow-up inputs held while a turn is in progress.
 ///
 /// The widget renders pending steers first, then rejected steers that will be
 /// resubmitted at end of turn, then ordinary queued user messages. Pending
 /// steers explain that they will be submitted after the next tool/result
 /// boundary unless the user presses Esc to interrupt and send them
 /// immediately. The edit hint at the bottom only appears when there are actual
-/// queued user messages to pop back into the composer. Because some terminals
+/// queued user inputs to pop back into the composer. Because some terminals
 /// intercept certain modifier-key combinations, the displayed binding is
 /// configurable via [`set_edit_binding`](Self::set_edit_binding).
 pub(crate) struct PendingInputPreview {
@@ -128,7 +128,7 @@ impl PendingInputPreview {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
-            Self::push_section_header(&mut lines, width, "Queued follow-up messages".into());
+            Self::push_section_header(&mut lines, width, "Queued follow-up inputs".into());
 
             for message in &self.queued_messages {
                 let wrapped = adaptive_wrap_lines(
@@ -183,14 +183,14 @@ mod tests {
     #[test]
     fn desired_height_empty() {
         let queue = PendingInputPreview::new();
-        assert_eq!(queue.desired_height(40), 0);
+        assert_eq!(queue.desired_height(/*width*/ 40), 0);
     }
 
     #[test]
     fn desired_height_one_message() {
         let mut queue = PendingInputPreview::new();
         queue.queued_messages.push("Hello, world!".to_string());
-        assert_eq!(queue.desired_height(40), 3);
+        assert_eq!(queue.desired_height(/*width*/ 40), 3);
     }
 
     #[test]

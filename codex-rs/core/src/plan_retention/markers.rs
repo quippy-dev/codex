@@ -1,7 +1,7 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::compact::CompactTrigger;
 use crate::compact::SUMMARY_PREFIX;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_protocol::RetainedProposedPlan;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;

@@ -1,18 +1,18 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
 use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_tools::ToolName;
 use serde_json::Value;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -20,7 +20,6 @@ use tracing::warn;
 
 pub struct DynamicToolHandler;
 
-#[async_trait]
 impl ToolHandler for DynamicToolHandler {
     type Output = FunctionToolOutput;
 
@@ -72,13 +71,19 @@ impl ToolHandler for DynamicToolHandler {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "active turn checks and dynamic tool response registration must remain atomic"
+)]
 async fn request_dynamic_tool(
     session: &Session,
     turn_context: &TurnContext,
     call_id: String,
-    tool: String,
+    tool_name: ToolName,
     arguments: Value,
 ) -> Option<DynamicToolResponse> {
+    let namespace = tool_name.namespace;
+    let tool = tool_name.name;
     let turn_id = turn_context.sub_id.clone();
     let (tx_response, rx_response) = oneshot::channel();
     let event_id = call_id.clone();
@@ -100,6 +105,7 @@ async fn request_dynamic_tool(
     let event = EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
         call_id: call_id.clone(),
         turn_id: turn_id.clone(),
+        namespace: namespace.clone(),
         tool: tool.clone(),
         arguments: arguments.clone(),
     });
@@ -110,6 +116,7 @@ async fn request_dynamic_tool(
         Some(response) => EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent {
             call_id,
             turn_id,
+            namespace,
             tool,
             arguments,
             content_items: response.content_items.clone(),
@@ -120,6 +127,7 @@ async fn request_dynamic_tool(
         None => EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent {
             call_id,
             turn_id,
+            namespace,
             tool,
             arguments,
             content_items: Vec::new(),

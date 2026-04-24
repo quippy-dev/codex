@@ -1,5 +1,9 @@
 use super::*;
+use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::auth::AuthFileRuntime;
+use codex_core::config::ConfigBuilder;
+use codex_core::config_loader::CloudRequirementsLoader;
+use toml::Value as TomlValue;
 
 pub(crate) struct RuntimeBootstrap {
     pub(crate) cli_kv_overrides: Vec<(String, TomlValue)>,
@@ -47,7 +51,7 @@ pub(crate) async fn prepare_runtime_bootstrap(
             }
 
             let auth_runtime = AuthFileRuntime::new(
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 config.cli_auth_credentials_store_mode,
                 auth_file.clone(),
             )?;
@@ -55,7 +59,7 @@ pub(crate) async fn prepare_runtime_bootstrap(
             cloud_requirements_loader(
                 auth_manager,
                 config.chatgpt_base_url,
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
             )
         }
         Err(err) => {
@@ -77,17 +81,19 @@ pub(crate) async fn prepare_runtime_bootstrap(
         Err(err) => {
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
-            Config::load_default_with_cli_overrides(cli_kv_overrides.clone()).map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("error loading default config after config error: {e}"),
-                )
-            })?
+            Config::load_default_with_cli_overrides(cli_kv_overrides.clone())
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("error loading default config after config error: {e}"),
+                    )
+                })?
         }
     };
 
     let auth_storage_home = AuthFileRuntime::new(
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
         config.cli_auth_credentials_store_mode,
         auth_file,
     )?

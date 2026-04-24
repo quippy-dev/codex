@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use super::AuthCredentialsStoreMode;
 use super::AuthDotJson;
 use super::storage::create_auth_storage_with_auth_file;
 use super::validate_auth_file_override;
+use crate::AuthCredentialsStoreMode;
 
 pub fn logout_with_auth_file(
     codex_home: &Path,

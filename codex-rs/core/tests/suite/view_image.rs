@@ -1,10 +1,10 @@
 #![cfg(not(target_os = "windows"))]
 
+use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_core::CodexAuth;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_features::Feature;
+use codex_login::CodexAuth;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
@@ -31,16 +31,15 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
 use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
 use image::Rgba;
 use image::load_from_memory;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::io::Cursor;
-use std::path::Path;
 use std::path::PathBuf;
 use tokio::time::Duration;
 use wiremock::BodyPrintLimit;
@@ -50,28 +49,33 @@ use wiremock::ResponseTemplate;
 #[cfg(not(debug_assertions))]
 use wiremock::matchers::body_string_contains;
 
-fn find_image_message(body: &Value) -> Option<&Value> {
+const VIEW_IMAGE_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn image_messages(body: &Value) -> Vec<&Value> {
     body.get("input")
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find(|item| {
-                item.get("type").and_then(Value::as_str) == Some("message")
-                    && item
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .map(|content| {
-                            content.iter().any(|span| {
-                                span.get("type").and_then(Value::as_str) == Some("input_image")
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("message")
+                        && item
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .map(|content| {
+                                content.iter().any(|span| {
+                                    span.get("type").and_then(Value::as_str) == Some("input_image")
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-            })
+                            .unwrap_or(false)
+                })
+                .collect()
         })
+        .unwrap_or_default()
 }
 
-fn absolute_path(path: &Path) -> anyhow::Result<codex_utils_absolute_path::AbsolutePathBuf> {
-    codex_utils_absolute_path::AbsolutePathBuf::try_from(path.to_path_buf())
-        .map_err(|err| anyhow::anyhow!("invalid absolute path {}: {err}", path.display()))
+fn find_image_message(body: &Value) -> Option<&Value> {
+    image_messages(body).into_iter().next()
 }
 
 fn png_bytes(width: u32, height: u32, rgba: [u8; 4]) -> anyhow::Result<Vec<u8>> {
@@ -85,11 +89,12 @@ async fn create_workspace_directory(test: &TestCodex, rel_path: &str) -> anyhow:
     let abs_path = test.config.cwd.join(rel_path);
     test.fs()
         .create_directory(
-            &absolute_path(&abs_path)?,
+            &abs_path,
             CreateDirectoryOptions { recursive: true },
+            /*sandbox*/ None,
         )
         .await?;
-    Ok(abs_path)
+    Ok(abs_path.into_path_buf())
 }
 
 async fn write_workspace_file(
@@ -101,15 +106,16 @@ async fn write_workspace_file(
     if let Some(parent) = abs_path.parent() {
         test.fs()
             .create_directory(
-                &absolute_path(parent)?,
+                &parent,
                 CreateDirectoryOptions { recursive: true },
+                /*sandbox*/ None,
             )
             .await?;
     }
     test.fs()
-        .write_file(&absolute_path(&abs_path)?, contents)
+        .write_file(&abs_path, contents, /*sandbox*/ None)
         .await?;
-    Ok(abs_path)
+    Ok(abs_path.into_path_buf())
 }
 
 async fn write_workspace_png(
@@ -122,10 +128,10 @@ async fn write_workspace_png(
     write_workspace_file(test, rel_path, png_bytes(width, height, rgba)?).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
+async fn assert_user_turn_local_image_resizes_to(
+    original_dimensions: (u32, u32),
+    expected_dimensions: (u32, u32),
+) -> anyhow::Result<()> {
     let server = start_mock_server().await;
 
     let mut builder = test_codex();
@@ -137,8 +143,7 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
         ..
     } = &test;
 
-    let original_width = 2304;
-    let original_height = 864;
+    let (original_width, original_height) = original_dimensions;
     let local_image_dir = tempfile::tempdir()?;
     let abs_path = local_image_dir.path().join("example.png");
     let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([20u8, 40, 60, 255]));
@@ -155,13 +160,16 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::LocalImage {
                 path: abs_path.clone(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -175,13 +183,13 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
         codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         // Empirically, image attachment can be slow under Bazel/RBE.
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
     let body = mock.single_request().body_json();
     let image_message =
-        find_image_message(&body).expect("pending input image message not included in request");
+        find_image_message(&body).context("pending input image message not included in request")?;
     let image_url = image_message
         .get("content")
         .and_then(Value::as_array)
@@ -194,24 +202,35 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
                 }
             })
         })
-        .expect("image_url present");
+        .context("image_url present")?;
 
     let (prefix, encoded) = image_url
         .split_once(',')
-        .expect("image url contains data prefix");
+        .context("image url contains data prefix")?;
     assert_eq!(prefix, "data:image/png;base64");
 
     let decoded = BASE64_STANDARD
         .decode(encoded)
-        .expect("image data decodes from base64 for request");
-    let resized = load_from_memory(&decoded).expect("load resized image");
+        .context("image data decodes from base64 for request")?;
+    let resized = load_from_memory(&decoded).context("load resized image")?;
     let (width, height) = resized.dimensions();
-    assert!(width <= 2048);
-    assert!(height <= 768);
-    assert!(width < original_width);
-    assert!(height < original_height);
+    assert_eq!((width, height), expected_dimensions);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_user_turn_local_image_resizes_to((2304, 864), (2048, 768)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_with_vertical_local_image_resizes_to_square_bounds() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_user_turn_local_image_resizes_to((1024, 4096), (512, 2048)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -262,14 +281,17 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: cwd.clone(),
+            cwd: cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -292,7 +314,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         },
         // Empirically, we have seen this run slow when run under
         // Bazel on arm Linux.
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
@@ -340,10 +362,7 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert!(resized_width <= 2048);
-    assert!(resized_height <= 768);
-    assert!(resized_width < original_width);
-    assert!(resized_height < original_height);
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
@@ -354,14 +373,7 @@ async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("gpt-5.3-codex")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::ImageDetailOriginal)
-                .expect("test config should allow feature update");
-        });
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
@@ -402,14 +414,17 @@ async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please add the original screenshot".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             service_tier: None,
@@ -422,7 +437,7 @@ async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5
     wait_for_event_with_timeout(
         codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
@@ -461,14 +476,7 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("gpt-5.3-codex")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::ImageDetailOriginal)
-                .expect("test config should allow feature update");
-        });
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
@@ -478,7 +486,14 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
     } = &test;
 
     let rel_path = "assets/unsupported-detail.png";
-    write_workspace_png(&test, rel_path, 256, 128, [0u8, 80, 255, 255]).await?;
+    write_workspace_png(
+        &test,
+        rel_path,
+        /*width*/ 256,
+        /*height*/ 128,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
 
     let call_id = "view-image-unsupported-detail";
     let arguments = serde_json::json!({ "path": rel_path, "detail": "low" }).to_string();
@@ -500,14 +515,17 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please attach the image at low detail".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             service_tier: None,
@@ -517,7 +535,12 @@ async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyho
         })
         .await?;
 
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let req = mock.single_request();
     let body_with_tool_output = req.body_json();
@@ -543,14 +566,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("gpt-5.3-codex")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::ImageDetailOriginal)
-                .expect("test config should allow feature update");
-        });
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
@@ -591,14 +607,17 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please attach the image with a null detail".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             service_tier: None,
@@ -608,7 +627,12 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
         })
         .await?;
 
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let req = mock.single_request();
     let function_output = req.function_call_output(call_id);
@@ -617,7 +641,10 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
         .and_then(Value::as_array)
         .expect("function_call_output should be a content item array");
     assert_eq!(output_items.len(), 1);
-    assert_eq!(output_items[0].get("detail"), None);
+    assert_eq!(
+        output_items[0].get("detail").and_then(Value::as_str),
+        Some("high")
+    );
     let image_url = output_items[0]
         .get("image_url")
         .and_then(Value::as_str)
@@ -631,10 +658,7 @@ async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (width, height) = resized.dimensions();
-    assert!(width <= 2048);
-    assert!(height <= 768);
-    assert!(width < original_width);
-    assert!(height < original_height);
+    assert_eq!((width, height), (2048, 768));
 
     Ok(())
 }
@@ -644,12 +668,7 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
-        config
-            .features
-            .enable(Feature::ImageDetailOriginal)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex().with_model("gpt-5.2");
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
@@ -690,14 +709,17 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             service_tier: None,
@@ -710,7 +732,7 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
     wait_for_event_with_timeout(
         codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
@@ -721,7 +743,10 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
         .and_then(Value::as_array)
         .expect("function_call_output should be a content item array");
     assert_eq!(output_items.len(), 1);
-    assert_eq!(output_items[0].get("detail"), None);
+    assert_eq!(
+        output_items[0].get("detail").and_then(Value::as_str),
+        Some("high")
+    );
 
     let image_url = output_items[0]
         .get("image_url")
@@ -738,28 +763,18 @@ async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> a
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert!(resized_width <= 2048);
-    assert!(resized_height <= 768);
-    assert!(resized_width < original_width);
-    assert!(resized_height < original_height);
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_does_not_force_original_resolution_with_capability_feature_only()
+async fn view_image_tool_does_not_force_original_resolution_with_capability_only()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("gpt-5.3-codex")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::ImageDetailOriginal)
-                .expect("test config should allow feature update");
-        });
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex {
         codex,
@@ -800,14 +815,17 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_feat
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             service_tier: None,
@@ -820,7 +838,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_feat
     wait_for_event_with_timeout(
         codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
@@ -831,7 +849,10 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_feat
         .and_then(Value::as_array)
         .expect("function_call_output should be a content item array");
     assert_eq!(output_items.len(), 1);
-    assert_eq!(output_items[0].get("detail"), None);
+    assert_eq!(
+        output_items[0].get("detail").and_then(Value::as_str),
+        Some("high")
+    );
     let image_url = output_items[0]
         .get("image_url")
         .and_then(Value::as_str)
@@ -845,10 +866,7 @@ async fn view_image_tool_does_not_force_original_resolution_with_capability_feat
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert!(resized_width <= 2048);
-    assert!(resized_height <= 768);
-    assert!(resized_width < original_width);
-    assert!(resized_height < original_height);
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
@@ -901,6 +919,7 @@ await codex.emitImage(out);
     let session_model = session_configured.model.clone();
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "use js_repl to write an image and attach it".into(),
                 text_elements: Vec::new(),
@@ -908,7 +927,9 @@ await codex.emitImage(out);
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -929,7 +950,7 @@ await codex.emitImage(out);
             EventMsg::TurnComplete(_) => true,
             _ => false,
         },
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
     let tool_event = match tool_event {
@@ -943,21 +964,13 @@ await codex.emitImage(out);
     );
 
     let req = mock.single_request();
-    let (js_repl_output, js_repl_success) = req
-        .custom_tool_call_output_content_and_success(call_id)
-        .expect("custom tool output present");
-    let js_repl_output = js_repl_output.unwrap_or_default();
-    if js_repl_output.contains("Node runtime not found")
-        || js_repl_output.contains("Node runtime too old for js_repl")
-    {
-        eprintln!("Skipping js_repl image test: {js_repl_output}");
-        return Ok(());
-    }
-    assert_ne!(
-        js_repl_success,
-        Some(false),
-        "js_repl call failed unexpectedly: {js_repl_output}"
+    let body = req.body_json();
+    assert_eq!(
+        image_messages(&body).len(),
+        0,
+        "js_repl view_image should not inject a pending input image message"
     );
+
     let custom_output = req.custom_tool_call_output(call_id);
     let output_items = custom_output
         .get("output")
@@ -973,8 +986,9 @@ await codex.emitImage(out);
         .expect("image_url present in js_repl custom tool output");
     assert!(
         image_url.starts_with("data:image/png;base64,"),
-        "expected png data URL image_url, got {image_url}"
+        "expected png data URL, got {image_url}"
     );
+
     Ok(())
 }
 
@@ -1027,6 +1041,7 @@ console.log(out.type);
     let session_model = session_configured.model.clone();
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "use js_repl to write an image but do not emit it".into(),
                 text_elements: Vec::new(),
@@ -1034,7 +1049,9 @@ console.log(out.type);
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             service_tier: None,
@@ -1055,7 +1072,7 @@ console.log(out.type);
             EventMsg::TurnComplete(_) => true,
             _ => false,
         },
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
     let tool_event = match tool_event {
@@ -1119,14 +1136,17 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please attach the folder".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -1136,7 +1156,12 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
         })
         .await?;
 
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let req = mock.single_request();
     let body_with_tool_output = req.body_json();
@@ -1194,14 +1219,17 @@ async fn view_image_tool_errors_for_non_image_files() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please use the view_image tool to read the json file".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -1211,7 +1239,12 @@ async fn view_image_tool_errors_for_non_image_files() -> anyhow::Result<()> {
         })
         .await?;
 
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let request = mock.single_request();
     assert!(
@@ -1274,14 +1307,17 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please attach the missing image".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -1291,7 +1327,12 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
         })
         .await?;
 
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let req = mock.single_request();
     let body_with_tool_output = req.body_json();
@@ -1342,6 +1383,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -1352,10 +1394,11 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
+        max_context_window: None,
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -1377,7 +1420,14 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
     let TestCodex { codex, config, .. } = &test;
 
     let rel_path = "assets/example.png";
-    write_workspace_png(&test, rel_path, 20, 20, [255u8, 0, 0, 255]).await?;
+    write_workspace_png(
+        &test,
+        rel_path,
+        /*width*/ 20,
+        /*height*/ 20,
+        [255u8, 0, 0, 255],
+    )
+    .await?;
 
     let call_id = "view-image-unsupported-model";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -1396,14 +1446,17 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please attach the image".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: model_slug.to_string(),
             effort: None,
             summary: None,
@@ -1413,7 +1466,12 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         })
         .await?;
 
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let output_text = mock
         .single_request()
@@ -1471,13 +1529,16 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::LocalImage {
                 path: abs_path.clone(),
             }],
             final_output_json_schema: None,
-            cwd: config.cwd.clone(),
+            cwd: config.cwd.to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -1487,7 +1548,12 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
         })
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let first_body = invalid_image_mock.single_request().body_json();
     assert!(
@@ -1506,3 +1572,4 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
 
     Ok(())
 }
+use codex_features::Feature;

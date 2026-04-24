@@ -2,7 +2,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::AuthCredentialsStoreMode;
 use super::AuthDotJson;
 use super::AuthManager;
 use super::CodexAuth;
@@ -12,6 +11,7 @@ use super::read_codex_api_key_from_env;
 use super::resolve_auth_storage_home;
 use super::storage::create_auth_storage_with_auth_file;
 use super::validate_auth_file_override;
+use crate::AuthCredentialsStoreMode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthFileRuntime {
