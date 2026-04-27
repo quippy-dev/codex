@@ -10,6 +10,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
+use core_test_support::PathBufExt;
 use core_test_support::assert_regex_match;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -46,7 +47,7 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
     let server = start_mock_server().await;
     let cwd_path = cwd.path().to_path_buf();
     let mut builder = test_codex().with_config(move |config| {
-        config.cwd = cwd_path;
+        config.cwd = cwd_path.abs();
     });
     let codex = builder
         .build(&server)
@@ -140,7 +141,7 @@ async fn user_shell_cmd_can_be_interrupted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.1");
+    let mut builder = test_codex().with_model("gpt-5.4");
     let fixture = builder.build(&server).await?;
 
     let call_id = "active-turn-shell-call";
@@ -169,6 +170,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
     fixture
         .codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "run model shell command".to_string(),
                 text_elements: Vec::new(),
@@ -176,7 +178,9 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
             final_output_json_schema: None,
             cwd: fixture.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: fixture.session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -348,13 +352,22 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
         .submit(Op::RunUserShellCommand { command })
         .await?;
 
-    let end_event = wait_for_event_match(&test.codex, |ev| match ev {
+    let ExecCommandEndEvent {
+        exit_code,
+        stdout,
+        stderr,
+        ..
+    } = wait_for_event_match(&test.codex, |ev| match ev {
         EventMsg::ExecCommandEnd(event) => Some(event.clone()),
         _ => None,
     })
     .await;
-    assert_eq!(end_event.exit_code, 0);
-    assert_eq!(end_event.stdout.trim(), "not-set");
+
+    assert_eq!(
+        exit_code, 0,
+        "shell command should execute successfully. stdout=`{stdout}`, stderr=`{stderr}`",
+    );
+    assert_eq!(stdout.trim(), "not-set");
 
     Ok(())
 }
@@ -428,11 +441,9 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex()
-        .with_model("gpt-5.1-codex")
-        .with_config(|config| {
-            config.tool_output_token_limit = Some(100);
-        });
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config.tool_output_token_limit = Some(100);
+    });
     let fixture = builder.build(&server).await?;
 
     let call_id = "user-shell-double-truncation";

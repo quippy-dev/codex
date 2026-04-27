@@ -7,7 +7,6 @@
 //! which role to use; the multi-agent tool handler owns that orchestration.
 
 use crate::config::AgentRoleConfig;
-use crate::config::AgentRoleSpawnMode;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::agent_roles::parse_agent_role_file_contents;
@@ -18,6 +17,8 @@ use crate::config_loader::ConfigLayerStackOrdering;
 use crate::config_loader::resolve_relative_paths_in_config_toml;
 use anyhow::anyhow;
 use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::config_toml::ConfigToml;
+use codex_exec_server::LOCAL_FS;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -27,16 +28,6 @@ use toml::Value as TomlValue;
 /// The role name used when a caller omits `agent_type`.
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
-
-pub(crate) fn default_spawn_mode_for_role(
-    config: &Config,
-    role_name: Option<&str>,
-) -> AgentRoleSpawnMode {
-    let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
-    resolve_role_config(config, role_name)
-        .and_then(|role| role.spawn_mode)
-        .unwrap_or_default()
-}
 
 /// Applies a named role layer to `config` while preserving caller-owned model selection.
 ///
@@ -71,17 +62,14 @@ async fn apply_role_to_config_inner(
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        if let Some(model) = &role.model {
-            config.model = Some(model.clone());
-        }
         return Ok(());
     };
-    let mut role_layer_toml =
-        load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
-    if let Some(model) = &role.model
-        && let Some(table) = role_layer_toml.as_table_mut()
+    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+    if role_layer_toml
+        .as_table()
+        .is_some_and(toml::map::Map::is_empty)
     {
-        table.insert("model".to_string(), TomlValue::String(model.clone()));
+        return Ok(());
     }
     let (preserve_current_profile, preserve_current_provider) =
         preservation_policy(config, &role_layer_toml);
@@ -91,7 +79,8 @@ async fn apply_role_to_config_inner(
         role_layer_toml,
         preserve_current_profile,
         preserve_current_provider,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -121,6 +110,7 @@ async fn load_role_layer_toml(
         .config;
         (role_config_toml, role_config_base)
     };
+
     deserialize_config_toml_with_base(role_config_toml.clone(), role_config_base)?;
     Ok(resolve_relative_paths_in_config_toml(
         role_config_toml,
@@ -162,7 +152,7 @@ fn preservation_policy(config: &Config, role_layer_toml: &TomlValue) -> (bool, b
 mod reload {
     use super::*;
 
-    pub(super) fn build_next_config(
+    pub(super) async fn build_next_config(
         config: &Config,
         role_layer_toml: TomlValue,
         preserve_current_profile: bool,
@@ -179,11 +169,13 @@ mod reload {
         }
 
         let mut next_config = Config::load_config_with_layer_stack(
+            LOCAL_FS.as_ref(),
             merged_config,
             reload_overrides(config, preserve_current_provider),
             config.codex_home.clone(),
             config_layer_stack,
-        )?;
+        )
+        .await?;
         if preserve_current_profile {
             next_config.active_profile = config.active_profile.clone();
         }
@@ -240,7 +232,7 @@ mod reload {
     fn deserialize_effective_config(
         config: &Config,
         config_layer_stack: &ConfigLayerStack,
-    ) -> anyhow::Result<crate::config::ConfigToml> {
+    ) -> anyhow::Result<ConfigToml> {
         Ok(deserialize_config_toml_with_base(
             config_layer_stack.effective_config(),
             &config.codex_home,
@@ -271,11 +263,10 @@ mod reload {
 
     fn reload_overrides(config: &Config, preserve_current_provider: bool) -> ConfigOverrides {
         ConfigOverrides {
-            cwd: Some(config.cwd.clone()),
+            cwd: Some(config.cwd.to_path_buf()),
             model_provider: preserve_current_provider.then(|| config.model_provider_id.clone()),
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
             main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
-            js_repl_node_path: config.js_repl_node_path.clone(),
             ..Default::default()
         }
     }
@@ -315,58 +306,45 @@ pub(crate) mod spawn_tool_spec {
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
-        let has_inline_metadata = declaration.model.is_some() || declaration.spawn_mode.is_some();
-        let locked_settings_note = declaration
-            .config_file
-            .as_ref()
-            .and_then(|config_file| {
-                built_in::config_file_contents(config_file)
-                    .map(str::to_owned)
-                    .or_else(|| std::fs::read_to_string(config_file).ok())
-            })
-            .and_then(|contents| toml::from_str::<TomlValue>(&contents).ok())
-            .map(|role_toml| {
-                let model = role_toml.get("model").and_then(TomlValue::as_str);
-                let reasoning_effort = role_toml
-                    .get("model_reasoning_effort")
-                    .and_then(TomlValue::as_str);
+        if let Some(description) = &declaration.description {
+            let locked_settings_note = declaration
+                .config_file
+                .as_ref()
+                .and_then(|config_file| {
+                    built_in::config_file_contents(config_file)
+                        .map(str::to_owned)
+                        .or_else(|| std::fs::read_to_string(config_file).ok())
+                })
+                .and_then(|contents| toml::from_str::<TomlValue>(&contents).ok())
+                .map(|role_toml| {
+                    let model = role_toml
+                        .get("model")
+                        .and_then(TomlValue::as_str);
+                    let reasoning_effort = role_toml
+                        .get("model_reasoning_effort")
+                        .and_then(TomlValue::as_str);
 
-                match (model, reasoning_effort) {
-                    (Some(model), Some(reasoning_effort)) => format!(
-                        "- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
-                    ),
-                    (Some(model), None) => {
-                        format!("- This role's model is set to `{model}` and cannot be changed.")
+                    match (model, reasoning_effort) {
+                        (Some(model), Some(reasoning_effort)) => format!(
+                            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+                        ),
+                        (Some(model), None) => {
+                            format!(
+                                "\n- This role's model is set to `{model}` and cannot be changed."
+                            )
+                        }
+                        (None, Some(reasoning_effort)) => {
+                            format!(
+                                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
+                            )
+                        }
+                        (None, None) => String::new(),
                     }
-                    (None, Some(reasoning_effort)) => format!(
-                        "- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
-                    ),
-                    (None, None) => String::new(),
-                }
-            })
-            .filter(|note| !note.is_empty());
-        if declaration.description.is_none()
-            && !has_inline_metadata
-            && locked_settings_note.is_none()
-        {
-            format!("{name}: no description")
+                })
+                .unwrap_or_default();
+            format!("{name}: {{\n{description}{locked_settings_note}\n}}")
         } else {
-            let mut body = Vec::new();
-            if let Some(description) = &declaration.description {
-                body.push(description.clone());
-            }
-            let default_spawn_mode = match declaration.spawn_mode.unwrap_or_default() {
-                AgentRoleSpawnMode::Spawn => "spawn",
-                AgentRoleSpawnMode::Fork => "fork",
-            };
-            body.push(format!("Default spawn mode: {default_spawn_mode}"));
-            if let Some(model) = &declaration.model {
-                body.push(format!("Model override: {model}"));
-            }
-            if let Some(locked_settings_note) = locked_settings_note {
-                body.push(locked_settings_note);
-            }
-            format!("{name}: {{\n{}\n}}", body.join("\n"))
+            format!("{name}: no description")
         }
     }
 }
@@ -383,8 +361,6 @@ mod built_in {
                     AgentRoleConfig {
                         description: Some("Default agent.".to_string()),
                         config_file: None,
-                        model: None,
-                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 ),
@@ -398,27 +374,7 @@ Rules:
 - In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
 - You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.
 - Reuse existing explorers for related questions."#.to_string()),
-                        model: None,
                         config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
-                        spawn_mode: None,
-                        nickname_candidates: None,
-                    }
-                ),
-                (
-                    "fast-worker".to_string(),
-                    AgentRoleConfig {
-                        description: Some(r#"Use `fast-worker` for tightly constrained problems.
-Typical tasks:
-- Make a small, localized code change
-- Execute a narrowly scoped command sequence
-- Handle an isolated fix from a self-contained prompt
-Rules:
-- Keep scope tight and avoid broad repo exploration.
-- Treat the prompt as self-contained and do not assume shared context.
-- Prefer direct execution over extended analysis."#.to_string()),
-                        config_file: None,
-                        model: None,
-                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 ),
@@ -434,8 +390,6 @@ Rules:
 - Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
 - Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
                         config_file: None,
-                        model: None,
-                        spawn_mode: None,
                         nickname_candidates: None,
                     }
                 ),
@@ -450,15 +404,13 @@ This includes, but not only:
 
 Rules:
 - When an awaiter is running, you can work on something else. If you need to wait for its completion, use the largest possible timeout.
-- Be patient with the `awaiter`.
-- Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
-- Close the awaiter when you're done with it."#.to_string()),
+                        - Be patient with the `awaiter`.
+                        - Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
+                        - Close the awaiter when you're done with it."#.to_string()),
                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
-                        model: None,
-                        spawn_mode: None,
                         nickname_candidates: None,
                     }
-                ),
+                )
             ])
         });
         &CONFIG

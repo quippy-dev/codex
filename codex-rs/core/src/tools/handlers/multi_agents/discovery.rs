@@ -4,6 +4,35 @@ pub(crate) mod compact_parent_context {
     use super::*;
     use std::sync::Arc;
 
+    pub(crate) struct Handler;
+
+    impl ToolHandler for Handler {
+        type Output = FunctionToolOutput;
+
+        fn kind(&self) -> ToolKind {
+            ToolKind::Function
+        }
+
+        fn matches_kind(&self, payload: &ToolPayload) -> bool {
+            matches!(payload, ToolPayload::Function { .. })
+        }
+
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+        ) -> Result<Self::Output, FunctionCallError> {
+            let ToolInvocation {
+                session,
+                turn,
+                payload,
+                call_id,
+                ..
+            } = invocation;
+            let arguments = function_arguments(payload)?;
+            handle(session, turn, call_id, arguments).await
+        }
+    }
+
     #[derive(Debug, Deserialize)]
     struct CompactParentContextArgs {
         reason: Option<String>,
@@ -38,7 +67,7 @@ pub(crate) mod compact_parent_context {
             .agent_control
             .compact_parent_for_watchdog_helper(helper_thread_id)
             .await
-            .map_err(|err| multi_agent_tool_error(helper_thread_id, err))?;
+            .map_err(|err| collab_agent_error(helper_thread_id, err))?;
 
         let (parent_thread_id, submission_id) = match result {
             WatchdogParentCompactionResult::NotWatchdogHelper => {
@@ -77,9 +106,51 @@ pub(crate) mod compact_parent_context {
     }
 }
 
+fn thread_spawn_parent_thread_id(
+    session_source: &codex_protocol::protocol::SessionSource,
+) -> Option<ThreadId> {
+    match session_source {
+        codex_protocol::protocol::SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            },
+        ) => Some(*parent_thread_id),
+        _ => None,
+    }
+}
+
 pub(crate) mod list_agents {
     use super::*;
     use std::sync::Arc;
+
+    pub(crate) struct Handler;
+
+    impl ToolHandler for Handler {
+        type Output = FunctionToolOutput;
+
+        fn kind(&self) -> ToolKind {
+            ToolKind::Function
+        }
+
+        fn matches_kind(&self, payload: &ToolPayload) -> bool {
+            matches!(payload, ToolPayload::Function { .. })
+        }
+
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+        ) -> Result<Self::Output, FunctionCallError> {
+            let ToolInvocation {
+                session,
+                turn,
+                payload,
+                call_id,
+                ..
+            } = invocation;
+            let arguments = function_arguments(payload)?;
+            handle(session, turn, call_id, arguments).await
+        }
+    }
 
     #[derive(Debug, Deserialize)]
     struct ListAgentsArgs {
@@ -101,6 +172,7 @@ pub(crate) mod list_agents {
         parent_id: String,
         status: AgentStatus,
         depth: usize,
+        spawn_mode: Option<AgentSpawnMode>,
     }
 
     fn default_recursive() -> bool {
@@ -109,20 +181,33 @@ pub(crate) mod list_agents {
 
     pub async fn handle(
         session: Arc<Session>,
-        _turn: Arc<TurnContext>,
+        turn: Arc<TurnContext>,
         _call_id: String,
         arguments: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
-        let owner_thread_id =
-            resolve_owner_thread_id(session.as_ref(), args.id.as_deref().map(str::trim)).await?;
+        let owner_thread_id = resolve_owner_thread_id(
+            session.as_ref(),
+            &turn.session_source,
+            args.id.as_deref().map(str::trim),
+        )
+        .await?;
 
         let listings = session
             .services
             .agent_control
-            .list_agents(owner_thread_id, args.recursive, args.all)
+            .list_agent_status_entries(owner_thread_id, args.recursive, args.all)
             .await
-            .map_err(multi_agent_spawn_error)?;
+            .map_err(collab_spawn_error)?;
+        let listing_thread_ids = listings
+            .iter()
+            .map(|entry| entry.thread_id)
+            .collect::<Vec<_>>();
+        let watchdog_target_ids = session
+            .services
+            .agent_control
+            .watchdog_targets(&listing_thread_ids)
+            .await;
 
         let agents = listings
             .into_iter()
@@ -134,6 +219,9 @@ pub(crate) mod list_agents {
                     .unwrap_or_default(),
                 status: entry.status,
                 depth: entry.depth,
+                spawn_mode: watchdog_target_ids
+                    .contains(&entry.thread_id)
+                    .then_some(AgentSpawnMode::Watchdog),
             })
             .collect();
 
@@ -149,6 +237,35 @@ pub(crate) mod peek_agents {
     use super::*;
     use crate::agent::AgentProgressSnapshot;
     use std::sync::Arc;
+
+    pub(crate) struct Handler;
+
+    impl ToolHandler for Handler {
+        type Output = FunctionToolOutput;
+
+        fn kind(&self) -> ToolKind {
+            ToolKind::Function
+        }
+
+        fn matches_kind(&self, payload: &ToolPayload) -> bool {
+            matches!(payload, ToolPayload::Function { .. })
+        }
+
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+        ) -> Result<Self::Output, FunctionCallError> {
+            let ToolInvocation {
+                session,
+                turn,
+                payload,
+                call_id,
+                ..
+            } = invocation;
+            let arguments = function_arguments(payload)?;
+            handle(session, turn, call_id, arguments).await
+        }
+    }
 
     const DEFAULT_PEEK_LIMIT: usize = 20;
     const MAX_PEEK_LIMIT: usize = 200;
@@ -192,14 +309,18 @@ pub(crate) mod peek_agents {
         arguments: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args: PeekAgentsArgs = parse_arguments(&arguments)?;
-        let owner_thread_id =
-            resolve_owner_thread_id(session.as_ref(), args.id.as_deref().map(str::trim)).await?;
+        let owner_thread_id = resolve_owner_thread_id(
+            session.as_ref(),
+            &turn.session_source,
+            args.id.as_deref().map(str::trim),
+        )
+        .await?;
         let listings = session
             .services
             .agent_control
-            .list_agents(owner_thread_id, args.recursive, /*all*/ false)
+            .list_agent_status_entries(owner_thread_id, args.recursive, /*all*/ false)
             .await
-            .map_err(multi_agent_spawn_error)?;
+            .map_err(collab_spawn_error)?;
         let thread_ids = listings
             .iter()
             .map(|entry| entry.thread_id)
@@ -296,7 +417,9 @@ pub(crate) mod peek_agents {
                     thread_id: *receiver_thread_id,
                     agent_nickname,
                     agent_role,
-                    spawn_mode: watchdog_ref_spawn_mode(&watchdog_target_ids, *receiver_thread_id),
+                    spawn_mode: watchdog_target_ids
+                        .contains(receiver_thread_id)
+                        .then_some(AgentSpawnMode::Watchdog),
                 });
             }
             session
@@ -361,5 +484,26 @@ pub(crate) mod peek_agents {
             latest_message_preview,
             terminal_summary,
         }
+    }
+}
+
+async fn resolve_owner_thread_id(
+    session: &Session,
+    session_source: &codex_protocol::protocol::SessionSource,
+    owner_alias: Option<&str>,
+) -> Result<ThreadId, FunctionCallError> {
+    match owner_alias {
+        Some("parent") => {
+            Ok(thread_spawn_parent_thread_id(session_source).unwrap_or(session.conversation_id))
+        }
+        Some("root") => Ok(session
+            .services
+            .agent_control
+            .resolve_root_thread_id(session.conversation_id)
+            .await),
+        Some(alias) if !alias.is_empty() && !matches!(alias, "self") => {
+            parse_agent_id_target(alias)
+        }
+        _ => Ok(session.conversation_id),
     }
 }

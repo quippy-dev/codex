@@ -1,17 +1,20 @@
+//! Helpers for rendering and navigating multi-agent state in the TUI.
+//!
+//! This module owns the shared presentation contracts for multi-agent history rows, `/agent` picker
+//! entries, and the fast-switch keyboard shortcuts. Higher-level coordination, such as deciding
+//! which thread becomes active or when a thread closes, stays in [`crate::app::App`].
+
 use crate::history_cell::PlainHistoryCell;
 use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::AgentSpawnMode;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseEndEvent;
-use codex_protocol::protocol::CollabCloseResult;
-use codex_protocol::protocol::CollabPeekEndEvent;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
@@ -35,15 +38,12 @@ pub(crate) const AGENT_PICKER_SELECTION_VIEW_ID: &str = "agent_picker";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentPickerThreadEntry {
+    /// Human-friendly nickname shown in picker rows and footer labels.
     pub(crate) agent_nickname: Option<String>,
+    /// Agent type shown in brackets when present, for example `worker`.
     pub(crate) agent_role: Option<String>,
+    /// Whether the thread has emitted a close event and should render dimmed.
     pub(crate) is_closed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SpawnRequestSummary {
-    pub(crate) model: String,
-    pub(crate) reasoning_effort: ReasoningEffortConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -51,7 +51,12 @@ struct AgentLabel<'a> {
     thread_id: Option<ThreadId>,
     nickname: Option<&'a str>,
     role: Option<&'a str>,
-    spawn_mode: Option<AgentSpawnMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnRequestSummary {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: ReasoningEffortConfig,
 }
 
 pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>> {
@@ -169,7 +174,7 @@ fn next_agent_word_motion_fallback(
 
 pub(crate) fn spawn_end(
     ev: CollabAgentSpawnEndEvent,
-    _request: Option<&SpawnRequestSummary>,
+    _spawn_request: Option<&SpawnRequestSummary>,
 ) -> PlainHistoryCell {
     let CollabAgentSpawnEndEvent {
         call_id: _,
@@ -180,35 +185,27 @@ pub(crate) fn spawn_end(
         prompt,
         model,
         reasoning_effort,
-        spawn_mode,
         status: _,
         ..
     } = ev;
     // Branch divergence: prefer effective spawn-end metadata so omitted request-time model slugs
     // still render the actual child config in the TUI. Revert to upstream's canonical shape if
     // upstream lands its own fix for this display path.
-    let effective_request = SpawnRequestSummary {
+    let effective_spawn_request = SpawnRequestSummary {
         model,
         reasoning_effort,
     };
 
     let title = match new_thread_id {
-        Some(thread_id) => {
-            let mut title = title_with_agent(
-                "Spawned",
-                AgentLabel {
-                    thread_id: Some(thread_id),
-                    nickname: new_agent_nickname.as_deref(),
-                    role: new_agent_role.as_deref(),
-                    spawn_mode: Some(spawn_mode),
-                },
-            );
-            title.spans.push(Span::from(format!(
-                " ({})",
-                format_spawn_request_summary(&effective_request)
-            )));
-            title
-        }
+        Some(thread_id) => title_with_agent(
+            "Spawned",
+            AgentLabel {
+                thread_id: Some(thread_id),
+                nickname: new_agent_nickname.as_deref(),
+                role: new_agent_role.as_deref(),
+            },
+            Some(&effective_spawn_request),
+        ),
         None => title_text("Agent spawn failed"),
     };
 
@@ -216,7 +213,7 @@ pub(crate) fn spawn_end(
     if let Some(line) = prompt_line(&prompt) {
         details.push(line);
     }
-    agent_event(title, details)
+    collab_event(title, details)
 }
 
 pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistoryCell {
@@ -236,15 +233,15 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
             thread_id: Some(receiver_thread_id),
             nickname: receiver_agent_nickname.as_deref(),
             role: receiver_agent_role.as_deref(),
-            spawn_mode: None,
         },
+        /*spawn_request*/ None,
     );
 
     let mut details = Vec::new();
     if let Some(line) = prompt_line(&prompt) {
         details.push(line);
     }
-    agent_event(title, details)
+    collab_event(title, details)
 }
 
 pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
@@ -257,7 +254,11 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
     let receiver_agents = merge_wait_receivers(&receiver_thread_ids, receiver_agents);
 
     let title = match receiver_agents.as_slice() {
-        [receiver] => title_with_agent("Waiting for", agent_label_from_ref(receiver)),
+        [receiver] => title_with_agent(
+            "Waiting for",
+            agent_label_from_ref(receiver),
+            /*spawn_request*/ None,
+        ),
         [] => title_text("Waiting for agents"),
         _ => title_text(format!("Waiting for {} agents", receiver_agents.len())),
     };
@@ -271,7 +272,7 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
         Vec::new()
     };
 
-    agent_event(title, details)
+    collab_event(title, details)
 }
 
 pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
@@ -282,33 +283,7 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         statuses,
     } = ev;
     let details = wait_complete_lines(&statuses, &agent_statuses);
-    agent_event(title_text("Finished waiting"), details)
-}
-
-pub(crate) fn peek_end(ev: CollabPeekEndEvent) -> PlainHistoryCell {
-    let CollabPeekEndEvent {
-        sender_thread_id: _,
-        receiver_thread_ids,
-        receiver_agents,
-        call_id: _,
-    } = ev;
-    let receiver_agents = merge_wait_receivers(&receiver_thread_ids, receiver_agents);
-
-    let title = match receiver_agents.as_slice() {
-        [receiver] => title_with_agent("Peeked at", agent_label_from_ref(receiver)),
-        _ => title_text(format!("Peeked at {} agents", receiver_agents.len())),
-    };
-
-    let details = if receiver_agents.len() > 1 {
-        receiver_agents
-            .iter()
-            .map(|receiver| agent_label_line(agent_label_from_ref(receiver)))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    agent_event(title, details)
+    collab_event(title_text("Finished waiting"), details)
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -318,22 +293,21 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
-        receiver_spawn_mode,
         status: _,
-        close_result,
+        ..
     } = ev;
 
-    agent_event(
+    collab_event(
         title_with_agent(
             "Closed",
             AgentLabel {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
-                spawn_mode: receiver_spawn_mode,
             },
+            /*spawn_request*/ None,
         ),
-        vec![Line::from(close_result_text(close_result))],
+        Vec::new(),
     )
 }
 
@@ -344,18 +318,18 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
-        receiver_spawn_mode,
+        ..
     } = ev;
 
-    agent_event(
+    collab_event(
         title_with_agent(
             "Resuming",
             AgentLabel {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
-                spawn_mode: receiver_spawn_mode,
             },
+            /*spawn_request*/ None,
         ),
         Vec::new(),
     )
@@ -368,28 +342,25 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
-        receiver_spawn_mode,
         status,
+        ..
     } = ev;
 
-    agent_event(
+    collab_event(
         title_with_agent(
             "Resumed",
             AgentLabel {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
-                spawn_mode: receiver_spawn_mode,
             },
+            /*spawn_request*/ None,
         ),
-        vec![status_summary_line(
-            &status,
-            receiver_spawn_mode == Some(AgentSpawnMode::Watchdog),
-        )],
+        vec![status_summary_line(&status)],
     )
 }
 
-fn agent_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell {
+fn collab_event(title: Line<'static>, details: Vec<Line<'static>>) -> PlainHistoryCell {
     let mut lines: Vec<Line<'static>> = vec![title];
     if !details.is_empty() {
         lines.extend(prefix_lines(details, "  └ ".dim(), "    ".into()));
@@ -401,9 +372,14 @@ fn title_text(title: impl Into<String>) -> Line<'static> {
     title_spans_line(vec![Span::from(title.into()).bold()])
 }
 
-fn title_with_agent(prefix: &str, agent: AgentLabel<'_>) -> Line<'static> {
+fn title_with_agent(
+    prefix: &str,
+    agent: AgentLabel<'_>,
+    spawn_request: Option<&SpawnRequestSummary>,
+) -> Line<'static> {
     let mut spans = vec![Span::from(format!("{prefix} ")).bold()];
     spans.extend(agent_label_spans(agent));
+    spans.extend(spawn_request_spans(spawn_request));
     title_spans_line(spans)
 }
 
@@ -419,7 +395,6 @@ fn agent_label_from_ref(agent: &CollabAgentRef) -> AgentLabel<'_> {
         thread_id: Some(agent.thread_id),
         nickname: agent.agent_nickname.as_deref(),
         role: agent.agent_role.as_deref(),
-        spawn_mode: agent.spawn_mode,
     }
 }
 
@@ -443,15 +418,31 @@ fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>> {
         spans.push(Span::from("agent").cyan());
     }
 
-    if agent.spawn_mode == Some(AgentSpawnMode::Watchdog) {
-        spans.push(Span::from(" ").dim());
-        spans.push(Span::from("[watchdog]"));
-    } else if let Some(role) = role {
+    if let Some(role) = role {
         spans.push(Span::from(" ").dim());
         spans.push(Span::from(format!("[{role}]")));
     }
 
     spans
+}
+
+fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<'static>> {
+    let Some(spawn_request) = spawn_request else {
+        return Vec::new();
+    };
+
+    let model = spawn_request.model.trim();
+    if model.is_empty() && spawn_request.reasoning_effort == ReasoningEffortConfig::default() {
+        return Vec::new();
+    }
+
+    let details = if model.is_empty() {
+        format!("({})", spawn_request.reasoning_effort)
+    } else {
+        format!("({model} {})", spawn_request.reasoning_effort)
+    };
+
+    vec![Span::from(" ").dim(), Span::from(details).magenta()]
 }
 
 fn prompt_line(prompt: &str) -> Option<Line<'static>> {
@@ -463,29 +454,6 @@ fn prompt_line(prompt: &str) -> Option<Line<'static>> {
             trimmed,
             COLLAB_PROMPT_PREVIEW_GRAPHEMES,
         ))))
-    }
-}
-
-fn format_spawn_request_summary(summary: &SpawnRequestSummary) -> String {
-    if summary.model.starts_with("codex-auto-") {
-        summary.model.clone()
-    } else {
-        format!(
-            "{} {}",
-            summary.model,
-            reasoning_label(summary.reasoning_effort)
-        )
-    }
-}
-
-fn reasoning_label(reasoning_effort: ReasoningEffortConfig) -> &'static str {
-    match reasoning_effort {
-        ReasoningEffortConfig::Minimal => "minimal",
-        ReasoningEffortConfig::Low => "low",
-        ReasoningEffortConfig::Medium => "medium",
-        ReasoningEffortConfig::High => "high",
-        ReasoningEffortConfig::XHigh => "xhigh",
-        ReasoningEffortConfig::None => "default",
     }
 }
 
@@ -541,7 +509,7 @@ fn wait_complete_lines(
                 status: status.clone(),
             })
             .collect::<Vec<_>>();
-        entries.sort_by_key(|left| left.thread_id.to_string());
+        entries.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
         entries
     } else {
         let mut entries = agent_statuses.to_vec();
@@ -560,7 +528,7 @@ fn wait_complete_lines(
                 status: status.clone(),
             })
             .collect::<Vec<_>>();
-        extras.sort_by_key(|left| left.thread_id.to_string());
+        extras.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
         entries.extend(extras);
         entries
     };
@@ -572,34 +540,31 @@ fn wait_complete_lines(
                 thread_id,
                 agent_nickname,
                 agent_role,
-                spawn_mode,
                 status,
+                ..
             } = entry;
-            let is_watchdog = spawn_mode == Some(AgentSpawnMode::Watchdog);
             let mut spans = agent_label_spans(AgentLabel {
                 thread_id: Some(thread_id),
                 nickname: agent_nickname.as_deref(),
                 role: agent_role.as_deref(),
-                spawn_mode,
             });
             spans.push(Span::from(": ").dim());
-            spans.extend(status_summary_spans(&status, is_watchdog));
+            spans.extend(status_summary_spans(&status));
             spans.into()
         })
         .collect()
 }
 
-fn status_summary_line(status: &AgentStatus, is_watchdog: bool) -> Line<'static> {
-    status_summary_spans(status, is_watchdog).into()
+fn status_summary_line(status: &AgentStatus) -> Line<'static> {
+    status_summary_spans(status).into()
 }
 
-// Allow `.yellow()`
-#[allow(clippy::disallowed_methods)]
-fn status_summary_spans(status: &AgentStatus, is_watchdog: bool) -> Vec<Span<'static>> {
+fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
     match status {
-        AgentStatus::PendingInit if is_watchdog => vec![Span::from("Idle").cyan()],
         AgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
         AgentStatus::Running => vec![Span::from("Running").cyan().bold()],
+        // Allow `.yellow()`
+        #[allow(clippy::disallowed_methods)]
         AgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
         AgentStatus::Completed(message) => {
             let mut spans = vec![Span::from("Completed").green()];
@@ -632,14 +597,6 @@ fn status_summary_spans(status: &AgentStatus, is_watchdog: bool) -> Vec<Span<'st
     }
 }
 
-fn close_result_text(close_result: CollabCloseResult) -> &'static str {
-    match close_result {
-        CollabCloseResult::Closed => "Closed",
-        CollabCloseResult::AlreadyClosed => "Already closed",
-        CollabCloseResult::NotFound => "Not found",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,7 +611,7 @@ mod tests {
     use ratatui::style::Modifier;
 
     #[test]
-    fn agent_events_snapshot() {
+    fn collab_events_snapshot() {
         let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
             .expect("valid sender thread id");
         let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
@@ -670,9 +627,9 @@ mod tests {
                 new_agent_nickname: Some("Robie".to_string()),
                 new_agent_role: Some("explorer".to_string()),
                 prompt: "Compute 11! and reply with just the integer result.".to_string(),
-                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
                 model: "gpt-5".to_string(),
                 reasoning_effort: ReasoningEffortConfig::High,
+                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
                 status: AgentStatus::PendingInit,
             },
             Some(&SpawnRequestSummary {
@@ -701,18 +658,6 @@ mod tests {
                 spawn_mode: None,
             }],
             call_id: "call-wait".to_string(),
-        });
-
-        let peek = peek_end(CollabPeekEndEvent {
-            sender_thread_id,
-            receiver_thread_ids: vec![robie_id],
-            receiver_agents: vec![CollabAgentRef {
-                thread_id: robie_id,
-                agent_nickname: Some("Robie".to_string()),
-                agent_role: Some("explorer".to_string()),
-                spawn_mode: None,
-            }],
-            call_id: "call-peek".to_string(),
         });
 
         let mut statuses = HashMap::new();
@@ -750,36 +695,65 @@ mod tests {
             receiver_agent_nickname: Some("Robie".to_string()),
             receiver_agent_role: Some("explorer".to_string()),
             receiver_spawn_mode: None,
+            close_result: codex_protocol::protocol::CollabCloseResult::Closed,
             status: AgentStatus::Completed(Some("39916800".to_string())),
-            close_result: CollabCloseResult::Closed,
         });
 
-        let snapshot = [spawn, send, peek, waiting, finished, close]
+        let snapshot = [spawn, send, waiting, finished, close]
             .iter()
             .map(cell_to_text)
             .collect::<Vec<_>>()
             .join("\n\n");
-        assert_snapshot!("agent_transcript", snapshot);
+        assert_snapshot!("collab_agent_transcript", snapshot);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn agent_shortcut_matches_option_arrow_word_motion_fallbacks() {
+    fn agent_shortcut_matches_option_arrow_word_motion_fallbacks_only_when_allowed() {
+        assert!(previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            /*allow_word_motion_fallback*/ false,
+        ));
+        assert!(next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            /*allow_word_motion_fallback*/ false,
+        ));
         assert!(previous_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
-            true,
+            /*allow_word_motion_fallback*/ true,
         ));
         assert!(next_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
-            true,
+            /*allow_word_motion_fallback*/ true,
         ));
         assert!(!previous_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
-            false,
+            /*allow_word_motion_fallback*/ false,
         ));
         assert!(!next_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
-            false,
+            /*allow_word_motion_fallback*/ false,
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn agent_shortcut_matches_option_arrows_only() {
+        assert!(previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
+        ));
+        assert!(next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
+        ));
+        assert!(!previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('b'), crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
+        ));
+        assert!(!next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('f'), crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
         ));
     }
 
@@ -797,15 +771,18 @@ mod tests {
                 new_agent_nickname: Some("Robie".to_string()),
                 new_agent_role: Some("explorer".to_string()),
                 prompt: String::new(),
-                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
                 model: "gpt-5".to_string(),
                 reasoning_effort: ReasoningEffortConfig::High,
+                spawn_mode: codex_protocol::protocol::AgentSpawnMode::Spawn,
                 status: AgentStatus::PendingInit,
             },
-            None,
+            Some(&SpawnRequestSummary {
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::High,
+            }),
         );
 
-        let lines = cell.display_lines(200);
+        let lines = cell.display_lines(/*width*/ 200);
         let title = &lines[0];
         assert_eq!(title.spans[2].content.as_ref(), "Robie");
         assert_eq!(title.spans[2].style.fg, Some(Color::Cyan));
@@ -813,6 +790,8 @@ mod tests {
         assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
         assert_eq!(title.spans[4].style.fg, None);
         assert!(!title.spans[4].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(title.spans[6].content.as_ref(), "(gpt-5 high)");
+        assert_eq!(title.spans[6].style.fg, Some(Color::Magenta));
     }
 
     #[test]
@@ -835,49 +814,8 @@ mod tests {
         assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
     }
 
-    #[test]
-    fn collab_resume_watchdog_idle_snapshot() {
-        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
-            .expect("valid sender thread id");
-        let watchdog_id = ThreadId::from_string("00000000-0000-0000-0000-0000000000aa")
-            .expect("valid watchdog thread id");
-
-        let cell = resume_end(CollabResumeEndEvent {
-            call_id: "call-resume".to_string(),
-            sender_thread_id,
-            receiver_thread_id: watchdog_id,
-            receiver_agent_nickname: Some("Watchful".to_string()),
-            receiver_agent_role: Some("worker".to_string()),
-            receiver_spawn_mode: Some(AgentSpawnMode::Watchdog),
-            status: AgentStatus::PendingInit,
-        });
-
-        assert_snapshot!("collab_resume_watchdog_idle", cell_to_text(&cell));
-    }
-
-    #[test]
-    fn collab_close_watchdog_already_closed_snapshot() {
-        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
-            .expect("valid sender thread id");
-        let watchdog_id = ThreadId::from_string("00000000-0000-0000-0000-0000000000aa")
-            .expect("valid watchdog thread id");
-
-        let cell = close_end(CollabCloseEndEvent {
-            call_id: "call-close".to_string(),
-            sender_thread_id,
-            receiver_thread_id: watchdog_id,
-            receiver_agent_nickname: Some("Watchful".to_string()),
-            receiver_agent_role: Some("worker".to_string()),
-            receiver_spawn_mode: Some(AgentSpawnMode::Watchdog),
-            status: AgentStatus::Completed(None),
-            close_result: CollabCloseResult::AlreadyClosed,
-        });
-
-        assert_snapshot!("collab_close_watchdog_already_closed", cell_to_text(&cell));
-    }
-
     fn cell_to_text(cell: &PlainHistoryCell) -> String {
-        cell.display_lines(200)
+        cell.display_lines(/*width*/ 200)
             .iter()
             .map(line_to_text)
             .collect::<Vec<_>>()

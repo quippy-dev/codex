@@ -1,26 +1,20 @@
 //! Session-wide mutable state.
 
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::codex::DeferredCollabEnqueueError;
-use crate::codex::PreviousTurnSettings;
-use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
-use crate::protocol::RateLimitSnapshot;
-use crate::protocol::TokenUsage;
-use crate::protocol::TokenUsageInfo;
-use crate::sandboxing::merge_permission_profiles;
+use crate::session::PreviousTurnSettings;
+use crate::session::session::SessionConfiguration;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
-use crate::truncate::TruncationPolicy;
-use codex_protocol::models::ResponseInputItem;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
-use tracing::warn;
-
-const DEFERRED_COLLAB_ITEMS_MAX: usize = 8192;
-const DEFERRED_COLLAB_BYTES_MAX: usize = 64 * 1024 * 1024;
+use codex_utils_output_truncation::TruncationPolicy;
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
@@ -40,13 +34,8 @@ pub(crate) struct SessionState {
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
-    granted_permissions: Option<PermissionProfile>,
-    post_interrupt_collab_hold_armed: bool,
-    deferred_collab_items: Vec<ResponseInputItem>,
-    deferred_collab_items_bytes: usize,
-    post_turn_agent_items: Vec<ResponseInputItem>,
-    post_turn_agent_items_bytes: usize,
-    post_turn_agent_flush_pending: bool,
+    granted_permissions: Option<AdditionalPermissionProfile>,
+    next_turn_is_first: bool,
 }
 
 impl SessionState {
@@ -66,12 +55,7 @@ impl SessionState {
             active_connector_selection: HashSet::new(),
             pending_session_start_source: None,
             granted_permissions: None,
-            post_interrupt_collab_hold_armed: false,
-            deferred_collab_items: Vec::new(),
-            deferred_collab_items_bytes: 0,
-            post_turn_agent_items: Vec::new(),
-            post_turn_agent_items_bytes: 0,
-            post_turn_agent_flush_pending: false,
+            next_turn_is_first: true,
         }
     }
 
@@ -100,6 +84,16 @@ impl SessionState {
 
     pub(crate) fn set_latest_proposed_plan_text(&mut self, plan_text: Option<String>) {
         self.latest_proposed_plan_text = plan_text;
+    }
+
+    pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
+        self.next_turn_is_first = value;
+    }
+
+    pub(crate) fn take_next_turn_is_first(&mut self) -> bool {
+        let is_first_turn = self.next_turn_is_first;
+        self.next_turn_is_first = false;
+        is_first_turn
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {
@@ -222,218 +216,6 @@ impl SessionState {
         self.active_connector_selection.clear();
     }
 
-    pub(crate) fn arm_post_interrupt_collab_hold(&mut self) -> bool {
-        let was_armed = self.post_interrupt_collab_hold_armed;
-        self.post_interrupt_collab_hold_armed = true;
-        !was_armed
-    }
-
-    pub(crate) fn post_interrupt_collab_hold_armed(&self) -> bool {
-        self.post_interrupt_collab_hold_armed
-    }
-
-    pub(crate) fn clear_post_interrupt_collab_hold_if_no_deferred_items(&mut self) -> bool {
-        if self.deferred_collab_items.is_empty() {
-            self.post_interrupt_collab_hold_armed = false;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn enqueue_deferred_collab_items(
-        &mut self,
-        items: Vec<ResponseInputItem>,
-    ) -> Result<(), DeferredCollabEnqueueError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let existing_items = self.deferred_collab_items.len();
-        let incoming_items = items.len();
-        if existing_items.saturating_add(incoming_items) > DEFERRED_COLLAB_ITEMS_MAX {
-            return Err(DeferredCollabEnqueueError::TooManyItems {
-                existing_items,
-                incoming_items,
-                max_items: DEFERRED_COLLAB_ITEMS_MAX,
-            });
-        }
-
-        let incoming_bytes = match serialized_response_input_items_bytes(&items) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return Err(DeferredCollabEnqueueError::Serialization {
-                    message: err.to_string(),
-                });
-            }
-        };
-        if self
-            .deferred_collab_items_bytes
-            .saturating_add(incoming_bytes)
-            > DEFERRED_COLLAB_BYTES_MAX
-        {
-            return Err(DeferredCollabEnqueueError::TooManyBytes {
-                existing_bytes: self.deferred_collab_items_bytes,
-                incoming_bytes,
-                max_bytes: DEFERRED_COLLAB_BYTES_MAX,
-            });
-        }
-
-        self.deferred_collab_items.extend(items);
-        self.deferred_collab_items_bytes += incoming_bytes;
-        Ok(())
-    }
-
-    pub(crate) fn take_deferred_collab_items(&mut self) -> Vec<ResponseInputItem> {
-        if self.deferred_collab_items.is_empty() {
-            return Vec::with_capacity(0);
-        }
-
-        self.deferred_collab_items_bytes = 0;
-        std::mem::take(&mut self.deferred_collab_items)
-    }
-
-    pub(crate) fn restore_deferred_collab_items(&mut self, items: Vec<ResponseInputItem>) {
-        if items.is_empty() {
-            return;
-        }
-
-        let mut restored_items = items;
-        restored_items.append(&mut self.deferred_collab_items);
-
-        let initial_count = restored_items.len();
-        if initial_count > DEFERRED_COLLAB_ITEMS_MAX {
-            let dropped_items = initial_count - DEFERRED_COLLAB_ITEMS_MAX;
-            restored_items.truncate(DEFERRED_COLLAB_ITEMS_MAX);
-            warn!(
-                dropped_items,
-                kept_items = restored_items.len(),
-                max_items = DEFERRED_COLLAB_ITEMS_MAX,
-                "trimmed deferred collab items during restore to enforce item cap"
-            );
-        }
-
-        let mut total_bytes = 0usize;
-        let mut keep_prefix_len = restored_items.len();
-        for (idx, item) in restored_items.iter().enumerate() {
-            let item_bytes = match serde_json::to_vec(item).map(|serialized| serialized.len()) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    keep_prefix_len = idx;
-                    warn!(
-                        dropped_items = restored_items.len().saturating_sub(idx),
-                        error = %err,
-                        "dropping deferred collab items during restore due to serialization failure"
-                    );
-                    break;
-                }
-            };
-
-            if total_bytes.saturating_add(item_bytes) > DEFERRED_COLLAB_BYTES_MAX {
-                keep_prefix_len = idx;
-                warn!(
-                    dropped_items = restored_items.len().saturating_sub(idx),
-                    kept_items = idx,
-                    kept_bytes = total_bytes,
-                    max_bytes = DEFERRED_COLLAB_BYTES_MAX,
-                    "trimmed deferred collab items during restore to enforce byte cap"
-                );
-                break;
-            }
-
-            total_bytes += item_bytes;
-        }
-
-        restored_items.truncate(keep_prefix_len);
-        self.deferred_collab_items = restored_items;
-        self.deferred_collab_items_bytes = total_bytes;
-    }
-
-    pub(crate) fn deferred_collab_stats(&self) -> (usize, usize) {
-        (
-            self.deferred_collab_items.len(),
-            self.deferred_collab_items_bytes,
-        )
-    }
-
-    pub(crate) fn enqueue_post_turn_agent_items(
-        &mut self,
-        items: Vec<ResponseInputItem>,
-    ) -> Result<(), DeferredCollabEnqueueError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let existing_items = self.post_turn_agent_items.len();
-        let incoming_items = items.len();
-        if existing_items.saturating_add(incoming_items) > DEFERRED_COLLAB_ITEMS_MAX {
-            return Err(DeferredCollabEnqueueError::TooManyItems {
-                existing_items,
-                incoming_items,
-                max_items: DEFERRED_COLLAB_ITEMS_MAX,
-            });
-        }
-
-        let incoming_bytes = match serialized_response_input_items_bytes(&items) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return Err(DeferredCollabEnqueueError::Serialization {
-                    message: err.to_string(),
-                });
-            }
-        };
-        if self
-            .post_turn_agent_items_bytes
-            .saturating_add(incoming_bytes)
-            > DEFERRED_COLLAB_BYTES_MAX
-        {
-            return Err(DeferredCollabEnqueueError::TooManyBytes {
-                existing_bytes: self.post_turn_agent_items_bytes,
-                incoming_bytes,
-                max_bytes: DEFERRED_COLLAB_BYTES_MAX,
-            });
-        }
-
-        self.post_turn_agent_items.extend(items);
-        self.post_turn_agent_items_bytes += incoming_bytes;
-        Ok(())
-    }
-
-    pub(crate) fn take_post_turn_agent_items(&mut self) -> Vec<ResponseInputItem> {
-        if self.post_turn_agent_items.is_empty() {
-            self.post_turn_agent_flush_pending = false;
-            return Vec::with_capacity(0);
-        }
-
-        self.post_turn_agent_items_bytes = 0;
-        self.post_turn_agent_flush_pending = false;
-        std::mem::take(&mut self.post_turn_agent_items)
-    }
-
-    pub(crate) fn arm_post_turn_agent_flush_if_items(&mut self) -> bool {
-        self.post_turn_agent_flush_pending = !self.post_turn_agent_items.is_empty();
-        self.post_turn_agent_flush_pending
-    }
-
-    pub(crate) fn post_turn_agent_flush_pending(&self) -> bool {
-        self.post_turn_agent_flush_pending
-    }
-
-    pub(crate) fn clear_post_turn_agent_items(&mut self) {
-        self.post_turn_agent_items.clear();
-        self.post_turn_agent_items_bytes = 0;
-        self.post_turn_agent_flush_pending = false;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn post_turn_agent_stats(&self) -> (usize, usize, bool) {
-        (
-            self.post_turn_agent_items.len(),
-            self.post_turn_agent_items_bytes,
-            self.post_turn_agent_flush_pending,
-        )
-    }
-
     pub(crate) fn set_pending_session_start_source(
         &mut self,
         value: Option<codex_hooks::SessionStartSource>,
@@ -447,22 +229,14 @@ impl SessionState {
         self.pending_session_start_source.take()
     }
 
-    pub(crate) fn record_granted_permissions(&mut self, permissions: PermissionProfile) {
+    pub(crate) fn record_granted_permissions(&mut self, permissions: AdditionalPermissionProfile) {
         self.granted_permissions =
             merge_permission_profiles(self.granted_permissions.as_ref(), Some(&permissions));
     }
 
-    pub(crate) fn granted_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) fn granted_permissions(&self) -> Option<AdditionalPermissionProfile> {
         self.granted_permissions.clone()
     }
-}
-
-fn serialized_response_input_items_bytes(
-    items: &[ResponseInputItem],
-) -> Result<usize, serde_json::Error> {
-    items.iter().try_fold(0usize, |acc, item| {
-        serde_json::to_vec(item).map(|serialized| acc.saturating_add(serialized.len()))
-    })
 }
 
 // Sometimes new snapshots don't include credits or plan information.

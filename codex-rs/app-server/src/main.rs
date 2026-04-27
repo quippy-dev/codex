@@ -1,5 +1,6 @@
 use clap::Parser;
 use codex_app_server::AppServerTransport;
+use codex_app_server::AppServerWebsocketAuthArgs;
 use codex_app_server::run_main_with_transport;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
@@ -16,11 +17,13 @@ const MANAGED_CONFIG_PATH_ENV_VAR: &str = "CODEX_APP_SERVER_MANAGED_CONFIG_PATH"
 const IGNORE_SYSTEM_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_IGNORE_SYSTEM_CONFIG";
 #[cfg(debug_assertions)]
 const IGNORE_SYSTEM_REQUIREMENTS_ENV_VAR: &str = "CODEX_APP_SERVER_IGNORE_SYSTEM_REQUIREMENTS";
+#[cfg(debug_assertions)]
+const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 
 #[derive(Debug, Parser)]
 struct AppServerArgs {
     /// Transport endpoint URL. Supported values: `stdio://` (default),
-    /// `ws://IP:PORT`.
+    /// `unix://`, `unix://PATH`, `ws://IP:PORT`, `off`.
     #[arg(
         long = "listen",
         value_name = "URL",
@@ -41,20 +44,26 @@ struct AppServerArgs {
         value_parser = SessionSource::from_startup_arg
     )]
     session_source: SessionSource,
+
+    #[command(flatten)]
+    auth: AppServerWebsocketAuthArgs,
 }
 
 fn main() -> anyhow::Result<()> {
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         let args = AppServerArgs::parse();
-        let managed_config_path = managed_config_path_from_debug_env();
-        let loader_overrides = LoaderOverrides {
-            managed_config_path,
-            ignore_system_config: ignore_system_config_from_debug_env(),
-            ignore_system_requirements: ignore_system_requirements_from_debug_env(),
-            ..Default::default()
+        let mut loader_overrides = if disable_managed_config_from_debug_env() {
+            LoaderOverrides::without_managed_config_for_tests()
+        } else {
+            managed_config_path_from_debug_env()
+                .map(LoaderOverrides::with_managed_config_path_for_tests)
+                .unwrap_or_default()
         };
+        loader_overrides.ignore_system_config = ignore_system_config_from_debug_env();
+        loader_overrides.ignore_system_requirements = ignore_system_requirements_from_debug_env();
         let transport = args.listen;
         let session_source = args.session_source;
+        let auth = args.auth.try_into_settings()?;
 
         run_main_with_transport(
             arg0_paths,
@@ -64,12 +73,23 @@ fn main() -> anyhow::Result<()> {
             args.auth_file,
             transport,
             session_source,
+            auth,
         )
         .await?;
         Ok(())
     })
 }
 
+fn disable_managed_config_from_debug_env() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(value) = std::env::var(DISABLE_MANAGED_CONFIG_ENV_VAR) {
+            return matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+    }
+
+    false
+}
 #[cfg(debug_assertions)]
 fn managed_config_path_from_debug_env() -> Option<PathBuf> {
     if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {

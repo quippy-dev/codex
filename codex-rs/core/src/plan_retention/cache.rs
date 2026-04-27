@@ -1,5 +1,5 @@
-use crate::codex::Session;
 use crate::plan_retention_invariants::completed_plan_text_for_manual_compaction;
+use crate::session::session::Session;
 use codex_protocol::items::TurnItem;
 
 pub(crate) async fn cache_completed_plan_item(sess: &Session, item: &TurnItem) {

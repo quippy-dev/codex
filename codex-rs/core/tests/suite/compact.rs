@@ -1,11 +1,12 @@
 #![allow(clippy::expect_used)]
-use codex_core::CodexAuth;
-use codex_core::ModelProviderInfo;
-use codex_core::built_in_model_providers;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
 use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::built_in_model_providers;
+use codex_models_manager::bundled_models_response;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
@@ -98,7 +99,8 @@ fn json_fragment(text: &str) -> String {
 }
 
 fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
-    let mut provider = built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
+    let mut provider =
+        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
     provider.name = "OpenAI (test)".into();
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider.supports_websockets = false;
@@ -106,8 +108,8 @@ fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
 }
 
 fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
-    let models_response: ModelsResponse =
-        serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+    let models_response = bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
     let mut model_info = models_response
         .models
         .into_iter()
@@ -242,11 +244,13 @@ async fn summarize_context_three_requests_and_instructions() {
     // 1) Normal user input – should hit server once.
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello world".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -264,11 +268,13 @@ async fn summarize_context_three_requests_and_instructions() {
     // 3) Next user input – third hit; history should include only the summary.
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: THIRD_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -455,7 +461,9 @@ async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
             }],
             cwd: std::env::current_dir().expect("cwd"),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model,
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -463,6 +471,7 @@ async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
             final_output_json_schema: None,
             collaboration_mode: Some(plan_mode),
             personality: None,
+            environments: None,
         })
         .await
         .expect("submit plan turn");
@@ -478,7 +487,9 @@ async fn manual_plan_mode_compact_retains_latest_proposed_plan_for_follow_up() {
                 text: "Implement the plan.".to_string(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit follow-up turn");
@@ -558,7 +569,9 @@ async fn manual_plan_mode_compact_drops_stale_proposed_plan_after_plain_assistan
             }],
             cwd: std::env::current_dir().expect("cwd"),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model.clone(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -566,6 +579,7 @@ async fn manual_plan_mode_compact_drops_stale_proposed_plan_after_plain_assistan
             final_output_json_schema: None,
             collaboration_mode: Some(plan_mode.clone()),
             personality: None,
+            environments: None,
         })
         .await
         .expect("submit initial plan turn");
@@ -579,7 +593,9 @@ async fn manual_plan_mode_compact_drops_stale_proposed_plan_after_plain_assistan
             }],
             cwd: std::env::current_dir().expect("cwd"),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model,
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -587,6 +603,7 @@ async fn manual_plan_mode_compact_drops_stale_proposed_plan_after_plain_assistan
             final_output_json_schema: None,
             collaboration_mode: Some(plan_mode),
             personality: None,
+            environments: None,
         })
         .await
         .expect("submit clarification turn");
@@ -602,7 +619,9 @@ async fn manual_plan_mode_compact_drops_stale_proposed_plan_after_plain_assistan
                 text: "Implement the plan.".to_string(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit follow-up turn");
@@ -637,11 +656,11 @@ async fn manual_compact_uses_custom_prompt() {
     let server = start_mock_server().await;
     let first_turn = sse(vec![
         ev_assistant_message("m0", FIRST_REPLY),
-        ev_completed_with_tokens("r0", 80),
+        ev_completed_with_tokens("r0", /*total_tokens*/ 80),
     ]);
     let compact_turn = sse(vec![
         ev_assistant_message("m1", SUMMARY_TEXT),
-        ev_completed_with_tokens("r1", 100),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 100),
     ]);
     let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn]).await;
 
@@ -660,11 +679,13 @@ async fn manual_compact_uses_custom_prompt() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit first user turn");
@@ -760,7 +781,9 @@ async fn manual_compact_keeps_real_user_message_matching_compact_prompt() {
                 text: compact_prompt.to_string(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit first user turn");
@@ -776,7 +799,9 @@ async fn manual_compact_keeps_real_user_message_matching_compact_prompt() {
                 text: follow_up_message.to_string(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit follow-up turn");
@@ -817,7 +842,7 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     // history.
     let sse_compact = sse(vec![
         ev_assistant_message("m1", SUMMARY_TEXT),
-        ev_completed_with_tokens("r1", 0),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 0),
     ]);
     mount_sse_once(&server, sse_compact).await;
 
@@ -886,11 +911,13 @@ async fn manual_compact_emits_context_compaction_items() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "manual compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -1050,11 +1077,13 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     // Start the conversation with the user message
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit user input");
@@ -1518,21 +1547,21 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 70_000),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
     ]);
 
     let sse2 = sse(vec![
         ev_assistant_message("m2", "SECOND_REPLY"),
-        ev_completed_with_tokens("r2", 330_000),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
 
     let sse3 = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
     ]);
     let prefixed_auto_summary = AUTO_SUMMARY_TEXT;
 
@@ -1549,11 +1578,13 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: FIRST_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -1562,11 +1593,13 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: SECOND_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -1575,11 +1608,13 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: POST_AUTO_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -1745,7 +1780,9 @@ async fn auto_compact_keeps_last_real_user_message_when_prompt_is_summary_shaped
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
+                environments: None,
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await
             .unwrap();
@@ -1808,19 +1845,19 @@ async fn auto_compact_emits_context_compaction_items() {
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 70_000),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
     ]);
     let sse2 = sse(vec![
         ev_assistant_message("m2", "SECOND_REPLY"),
-        ev_completed_with_tokens("r2", 330_000),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
     let sse3 = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
     ]);
 
     mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
@@ -1840,11 +1877,13 @@ async fn auto_compact_emits_context_compaction_items() {
     for user in [FIRST_AUTO_MSG, SECOND_AUTO_MSG, POST_AUTO_USER_MSG] {
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await
             .unwrap();
@@ -1891,19 +1930,19 @@ async fn auto_compact_starts_after_turn_started() {
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 70_000),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
     ]);
     let sse2 = sse(vec![
         ev_assistant_message("m2", "SECOND_REPLY"),
-        ev_completed_with_tokens("r2", 330_000),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
     let sse3 = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", 200),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
     ]);
 
     mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
@@ -1918,11 +1957,13 @@ async fn auto_compact_starts_after_turn_started() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: FIRST_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -1930,11 +1971,13 @@ async fn auto_compact_starts_after_turn_started() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: SECOND_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -1942,11 +1985,13 @@ async fn auto_compact_starts_after_turn_started() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: POST_AUTO_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2055,6 +2100,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     resumed
         .codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: follow_up_user.into(),
                 text_elements: Vec::new(),
@@ -2062,7 +2108,9 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
             final_output_json_schema: None,
             cwd: resumed.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: resumed.session_configured.model.clone(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -2100,15 +2148,15 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.2-codex";
-    let next_model = "gpt-5.1-codex-max";
+    let previous_model = "gpt-5.3-codex";
+    let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
         &server,
         ModelsResponse {
             models: vec![
-                model_info_with_context_window(previous_model, 273_000),
-                model_info_with_context_window(next_model, 125_000),
+                model_info_with_context_window(previous_model, /*context_window*/ 273_000),
+                model_info_with_context_window(next_model, /*context_window*/ 125_000),
             ],
         },
     )
@@ -2119,15 +2167,15 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         vec![
             sse(vec![
                 ev_assistant_message("m1", "before switch"),
-                ev_completed_with_tokens("r1", 120_000),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
             ]),
             sse(vec![
                 ev_assistant_message("m2", "PRE_SAMPLING_SUMMARY"),
-                ev_completed_with_tokens("r2", 10),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
             ]),
             sse(vec![
                 ev_assistant_message("m3", "after switch"),
-                ev_completed_with_tokens("r3", 100),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
             ]),
         ],
     )
@@ -2145,6 +2193,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "before switch".into(),
                 text_elements: Vec::new(),
@@ -2152,7 +2201,9 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             final_output_json_schema: None,
             cwd: test.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -2169,6 +2220,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after switch".into(),
                 text_elements: Vec::new(),
@@ -2176,7 +2228,9 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
             final_output_json_schema: None,
             cwd: test.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -2224,15 +2278,15 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let previous_model = "gpt-5.2-codex";
-    let next_model = "gpt-5.1-codex-max";
+    let previous_model = "gpt-5.3-codex";
+    let next_model = "gpt-5.2";
 
     let models_mock = mount_models_once(
         &server,
         ModelsResponse {
             models: vec![
-                model_info_with_context_window(previous_model, 273_000),
-                model_info_with_context_window(next_model, 125_000),
+                model_info_with_context_window(previous_model, /*context_window*/ 273_000),
+                model_info_with_context_window(next_model, /*context_window*/ 125_000),
             ],
         },
     )
@@ -2243,15 +2297,15 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
         vec![
             sse(vec![
                 ev_assistant_message("m1", "before resume"),
-                ev_completed_with_tokens("r1", 120_000),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
             ]),
             sse(vec![
                 ev_assistant_message("m2", "PRE_SAMPLING_SUMMARY"),
-                ev_completed_with_tokens("r2", 10),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10),
             ]),
             sse(vec![
                 ev_assistant_message("m3", "after resume"),
-                ev_completed_with_tokens("r3", 100),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
             ]),
         ],
     )
@@ -2279,6 +2333,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     initial
         .codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "before resume".into(),
                 text_elements: Vec::new(),
@@ -2286,7 +2341,9 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
             final_output_json_schema: None,
             cwd: initial.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -2327,6 +2384,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     resumed
         .codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after resume".into(),
                 text_elements: Vec::new(),
@@ -2334,7 +2392,9 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
             final_output_json_schema: None,
             cwd: resumed.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -2370,22 +2430,22 @@ async fn auto_compact_persists_rollout_entries() {
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 70_000),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
     ]);
 
     let sse2 = sse(vec![
         ev_assistant_message("m2", "SECOND_REPLY"),
-        ev_completed_with_tokens("r2", 330_000),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
 
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let sse3 = sse(vec![
         ev_assistant_message("m3", &auto_summary_payload),
-        ev_completed_with_tokens("r3", 200),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 120),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
     ]);
 
     let first_matcher = |req: &wiremock::Request| {
@@ -2429,11 +2489,13 @@ async fn auto_compact_persists_rollout_entries() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: FIRST_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2441,11 +2503,13 @@ async fn auto_compact_persists_rollout_entries() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: SECOND_AUTO_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2453,11 +2517,13 @@ async fn auto_compact_persists_rollout_entries() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: POST_AUTO_USER_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2539,11 +2605,13 @@ async fn manual_compact_retries_after_context_window_error() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "first turn".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2657,7 +2725,9 @@ async fn manual_compact_retry_trimming_preserves_full_persisted_user_messages() 
                 text: first_user_message.to_string(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit first user turn");
@@ -2672,7 +2742,9 @@ async fn manual_compact_retry_trimming_preserves_full_persisted_user_messages() 
                 text: follow_up_user_message.to_string(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit follow-up turn");
@@ -2750,11 +2822,13 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "first turn".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit user input");
@@ -2842,11 +2916,13 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2857,11 +2933,13 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2872,11 +2950,13 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: final_user_message.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -2991,29 +3071,29 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 500),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 500),
     ]);
     let first_summary_payload = auto_summary(FIRST_AUTO_SUMMARY);
     let sse2 = sse(vec![
         ev_assistant_message("m2", &first_summary_payload),
-        ev_completed_with_tokens("r2", 50),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 50),
     ]);
     let sse3 = sse(vec![
         ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
-        ev_completed_with_tokens("r3", 150),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 150),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", SECOND_LARGE_REPLY),
-        ev_completed_with_tokens("r4", 450),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 450),
     ]);
     let second_summary_payload = auto_summary(SECOND_AUTO_SUMMARY);
     let sse5 = sse(vec![
         ev_assistant_message("m5", &second_summary_payload),
-        ev_completed_with_tokens("r5", 60),
+        ev_completed_with_tokens("r5", /*total_tokens*/ 60),
     ]);
     let sse6 = sse(vec![
         ev_assistant_message("m6", FINAL_REPLY),
-        ev_completed_with_tokens("r6", 120),
+        ev_completed_with_tokens("r6", /*total_tokens*/ 120),
     ]);
     let follow_up_user = "FOLLOW_UP_AUTO_COMPACT";
     let final_user = "FINAL_AUTO_COMPACT";
@@ -3033,11 +3113,13 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     for user in [MULTI_AUTO_MSG, follow_up_user, final_user] {
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await
             .unwrap();
@@ -3111,11 +3193,11 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m2", &auto_summary_payload),
-        ev_completed_with_tokens("r3", 10),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 10),
     ]);
     let post_auto_compact_turn = sse(vec![
         ev_assistant_message("m3", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 10),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 10),
     ]);
 
     // Mount responses in order and keep mocks only for the ones we assert on.
@@ -3135,11 +3217,13 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: FUNCTION_CALL_LIMIT_MSG.into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();
@@ -3215,9 +3299,11 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
     let auto_summary_payload = auto_summary(AUTO_SUMMARY_TEXT);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m2", &auto_summary_payload),
-        ev_completed_with_tokens("r2", 10),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
     ]);
-    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens("r3", 10)]);
+    let post_auto_compact_turn = sse(vec![ev_completed_with_tokens(
+        "r3", /*total_tokens*/ 10,
+    )]);
 
     let first_turn_mock = mount_sse_once(&server, first_turn).await;
     let auto_compact_mock = mount_sse_once(&server, auto_compact_turn).await;
@@ -3271,15 +3357,15 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
 
     let first_turn = sse(vec![
         ev_reasoning_item("pre-reasoning", &["pre"], &[&pre_last_reasoning_content]),
-        ev_completed_with_tokens("r1", 10),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 10),
     ]);
     let second_turn = sse(vec![
         ev_reasoning_item("post-reasoning", &["post"], &[&post_last_reasoning_content]),
-        ev_completed_with_tokens("r2", 80),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 80),
     ]);
     let third_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 1),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 1),
     ]);
 
     let request_log = mount_sse_sequence(
@@ -3311,10 +3397,12 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     ];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+    let chatgpt_base_url = format!("{}/backend-api", server.uri());
 
     let codex = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
+        .with_config(move |config| {
+            config.chatgpt_base_url = chatgpt_base_url;
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(300);
         })
@@ -3329,11 +3417,13 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     {
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await
             .unwrap();
@@ -3397,15 +3487,15 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
 
     let first_turn = sse(vec![
         ev_reasoning_item("pre-reasoning", &["pre"], &[&pre_last_reasoning_content]),
-        ev_completed_with_tokens("r1", 10),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 10),
     ]);
     let second_turn = sse(vec![
         ev_reasoning_item("post-reasoning", &["post"], &[&post_last_reasoning_content]),
-        ev_completed_with_tokens("r2", 80),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 80),
     ]);
     let third_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 1),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 1),
     ]);
 
     let responses = vec![
@@ -3446,11 +3536,13 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
     for user in [first_user, second_user, third_user] {
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.into(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await
             .unwrap();
@@ -3474,19 +3566,19 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 60),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 60),
     ]);
     let sse2 = sse(vec![
         ev_assistant_message("m2", "SECOND_REPLY"),
-        ev_completed_with_tokens("r2", 500),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 500),
     ]);
     let sse3 = sse(vec![
         ev_assistant_message("m3", "PRE_TURN_SUMMARY"),
-        ev_completed_with_tokens("r3", 100),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 100),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", 80),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 80),
     ]);
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
@@ -3505,11 +3597,13 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     for user in ["USER_ONE", "USER_TWO"] {
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.to_string(),
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await
             .expect("submit user input");
@@ -3521,6 +3615,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -3535,6 +3630,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
         .to_string();
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![
                 UserInput::Image {
                     image_url: image_url.clone(),
@@ -3545,6 +3641,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
                 },
             ],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit user input");
@@ -3591,23 +3688,23 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
     skip_if_no_network!();
 
     let server = start_mock_server().await;
-    let previous_model = "gpt-5.1-codex-max";
-    let next_model = "gpt-5.2-codex";
+    let previous_model = "gpt-5.4";
+    let next_model = "gpt-5.3-codex";
 
     let request_log = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
                 ev_assistant_message("m1", "BEFORE_SWITCH_REPLY"),
-                ev_completed_with_tokens("r1", 500),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 500),
             ]),
             sse(vec![
                 ev_assistant_message("m2", "PRETURN_SWITCH_SUMMARY"),
-                ev_completed_with_tokens("r2", 100),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 100),
             ]),
             sse(vec![
                 ev_assistant_message("m3", "AFTER_SWITCH_REPLY"),
-                ev_completed_with_tokens("r3", 100),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
             ]),
         ],
     )
@@ -3629,6 +3726,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "BEFORE_SWITCH_USER".into(),
                 text_elements: Vec::new(),
@@ -3636,7 +3734,9 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
             final_output_json_schema: None,
             cwd: test.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -3653,6 +3753,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "AFTER_SWITCH_USER".into(),
                 text_elements: Vec::new(),
@@ -3660,7 +3761,9 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
             final_output_json_schema: None,
             cwd: test.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
@@ -3719,7 +3822,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", 500),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 500),
     ]);
     let mut responses = vec![first_turn];
     responses.extend(
@@ -3748,11 +3851,13 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit first user");
@@ -3760,11 +3865,13 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit second user");
@@ -3806,11 +3913,11 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
 
     let compact_turn = sse(vec![
         ev_assistant_message("m1", "MANUAL_EMPTY_SUMMARY"),
-        ev_completed_with_tokens("r1", 90),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 90),
     ]);
     let follow_up_turn = sse(vec![
         ev_assistant_message("m2", FINAL_REPLY),
-        ev_completed_with_tokens("r2", 80),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 80),
     ]);
     let request_log = mount_sse_sequence(&server, vec![compact_turn, follow_up_turn]).await;
 
@@ -3830,11 +3937,13 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "AFTER_MANUAL_EMPTY_COMPACT".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit follow-up user input");

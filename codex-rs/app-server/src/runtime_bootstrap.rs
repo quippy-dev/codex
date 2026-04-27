@@ -1,5 +1,10 @@
 use super::*;
+use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::auth::AuthFileRuntime;
+use codex_core::config::ConfigBuilder;
+use codex_core::config_loader::CloudRequirementsLoader;
+use codex_login::AuthManager;
+use toml::Value as TomlValue;
 
 pub(crate) struct RuntimeBootstrap {
     pub(crate) cli_kv_overrides: Vec<(String, TomlValue)>,
@@ -46,16 +51,15 @@ pub(crate) async fn prepare_runtime_bootstrap(
                 }
             }
 
-            let auth_runtime = AuthFileRuntime::new(
-                config.codex_home.clone(),
-                config.cli_auth_credentials_store_mode,
+            let auth_manager = AuthManager::shared_from_config_with_auth_file(
+                &config,
+                /*enable_codex_api_key_env*/ false,
                 auth_file.clone(),
             )?;
-            let auth_manager = auth_runtime.shared_auth_manager(false)?;
             cloud_requirements_loader(
                 auth_manager,
                 config.chatgpt_base_url,
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
             )
         }
         Err(err) => {
@@ -77,23 +81,19 @@ pub(crate) async fn prepare_runtime_bootstrap(
         Err(err) => {
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
-            Config::load_default_with_cli_overrides_and_loader_overrides(
-                cli_kv_overrides.clone(),
-                loader_overrides_for_config_api.clone(),
-                cloud_requirements.clone(),
-            )
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("error loading default config after config error: {e}"),
-                )
-            })?
+            Config::load_default_with_cli_overrides(cli_kv_overrides.clone())
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("error loading default config after config error: {e}"),
+                    )
+                })?
         }
     };
 
     let auth_storage_home = AuthFileRuntime::new(
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
         config.cli_auth_credentials_store_mode,
         auth_file,
     )?
@@ -107,93 +107,4 @@ pub(crate) async fn prepare_runtime_bootstrap(
         auth_storage_home,
         loader_overrides_for_config_api,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_app_server_protocol::ConfigLayerSource;
-    use codex_core::config::CONFIG_TOML_FILE;
-    use codex_core::config_loader::ConfigLayerStackOrdering;
-    use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.take() {
-                unsafe { std::env::set_var(self.key, original) };
-            } else {
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn prepare_runtime_bootstrap_preserves_loader_overrides_on_default_fallback()
-    -> std::io::Result<()> {
-        let codex_home = TempDir::new()?;
-        let managed_config = TempDir::new()?;
-        let managed_config_path = managed_config.path().join("managed_config.toml");
-        std::fs::write(&managed_config_path, "invalid = [")?;
-        std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), "invalid = [")?;
-        let _guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().to_string_lossy().as_ref());
-        let loader_overrides = LoaderOverrides {
-            managed_config_path: Some(managed_config_path.clone()),
-            ..LoaderOverrides::default()
-        };
-
-        let bootstrap = prepare_runtime_bootstrap(
-            &CliConfigOverrides::default(),
-            loader_overrides.clone(),
-            None,
-        )
-        .await?;
-
-        assert_eq!(
-            bootstrap
-                .loader_overrides_for_config_api
-                .managed_config_path,
-            loader_overrides.managed_config_path,
-        );
-        assert!(
-            bootstrap
-                .config_warnings
-                .iter()
-                .any(|warning| warning.summary.contains("using defaults")),
-            "fallback should warn and continue"
-        );
-        assert!(
-            bootstrap
-                .config
-                .config_layer_stack
-                .get_layers(
-                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                    /*include_disabled*/ false,
-                )
-                .iter()
-                .any(|layer| {
-                    matches!(
-                        &layer.name,
-                        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file }
-                            if file.as_path() == managed_config_path.as_path()
-                    )
-                }),
-            "managed config layer should survive default fallback"
-        );
-
-        Ok(())
-    }
 }

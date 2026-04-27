@@ -15,15 +15,15 @@ use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use codex_backend_client::Client as BackendClient;
-use codex_core::AuthManager;
-use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::CodexAuth;
-use codex_core::auth::RefreshTokenError;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config_loader::CloudRequirementsLoadError;
 use codex_core::config_loader::CloudRequirementsLoadErrorCode;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::util::backoff;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
 use codex_protocol::account::PlanType;
 use hmac::Hmac;
 use hmac::Mac;
@@ -50,8 +50,16 @@ const CLOUD_REQUIREMENTS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const CLOUD_REQUIREMENTS_FETCH_ATTEMPT_METRIC: &str = "codex.cloud_requirements.fetch_attempt";
 const CLOUD_REQUIREMENTS_FETCH_FINAL_METRIC: &str = "codex.cloud_requirements.fetch_final";
 const CLOUD_REQUIREMENTS_LOAD_METRIC: &str = "codex.cloud_requirements.load";
-const CLOUD_REQUIREMENTS_LOAD_FAILED_MESSAGE: &str = "failed to load your workspace-managed config";
-const CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE: &str = "Your authentication session could not be refreshed automatically. Please log out and sign in again.";
+const CLOUD_REQUIREMENTS_LOAD_FAILED_MESSAGE: &str =
+    "Failed to load cloud requirements (workspace-managed policies).";
+const CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE: &str = concat!(
+    "Cloud requirements (workspace-managed policies) are invalid and could not be parsed. ",
+    "Please contact your workspace admin."
+);
+const CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE: &str = concat!(
+    "Your authentication session could not be refreshed automatically. ",
+    "Please log out and sign in again."
+);
 const CLOUD_REQUIREMENTS_CACHE_WRITE_HMAC_KEY: &[u8] =
     b"codex-cloud-requirements-cache-v3-064f8542-75b4-494c-a294-97d3ce597271";
 const CLOUD_REQUIREMENTS_CACHE_READ_HMAC_KEYS: &[&[u8]] =
@@ -168,13 +176,7 @@ fn verify_cache_signature(payload_bytes: &[u8], signature: &str) -> bool {
 }
 
 fn auth_identity(auth: &CodexAuth) -> (Option<String>, Option<String>) {
-    let token_data = auth.get_token_data().ok();
-    let chatgpt_user_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.id_token.chatgpt_user_id.as_deref())
-        .map(str::to_owned);
-    let account_id = auth.get_account_id();
-    (chatgpt_user_id, account_id)
+    (auth.get_chatgpt_user_id(), auth.get_account_id())
 }
 
 fn cache_payload_bytes(payload: &CloudRequirementsCacheSignedPayload) -> Option<Vec<u8>> {
@@ -327,11 +329,11 @@ impl CloudRequirementsService {
         let Some(auth) = self.auth_manager.auth().await else {
             return Ok(None);
         };
-        if !auth.is_chatgpt_auth()
-            || !matches!(
-                auth.account_plan_type(),
-                Some(PlanType::Business | PlanType::Enterprise)
-            )
+        let Some(plan_type) = auth.account_plan_type() else {
+            return Ok(None);
+        };
+        if !auth.uses_codex_backend()
+            || !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise))
         {
             return Ok(None);
         }
@@ -491,7 +493,7 @@ impl CloudRequirementsService {
                         return Err(CloudRequirementsLoadError::new(
                             CloudRequirementsLoadErrorCode::Parse,
                             /*status_code*/ None,
-                            CLOUD_REQUIREMENTS_LOAD_FAILED_MESSAGE,
+                            format_cloud_requirements_parse_failed_message(contents, &err),
                         ));
                     }
                 },
@@ -547,11 +549,11 @@ impl CloudRequirementsService {
         let Some(auth) = self.auth_manager.auth().await else {
             return false;
         };
-        if !auth.is_chatgpt_auth()
-            || !matches!(
-                auth.account_plan_type(),
-                Some(PlanType::Business | PlanType::Enterprise)
-            )
+        let Some(plan_type) = auth.account_plan_type() else {
+            return false;
+        };
+        if !auth.uses_codex_backend()
+            || !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise))
         {
             return false;
         }
@@ -730,6 +732,7 @@ pub fn cloud_requirements_loader_for_storage(
         codex_home.clone(),
         enable_codex_api_key_env,
         credentials_store_mode,
+        Some(chatgpt_base_url.clone()),
     );
     cloud_requirements_loader(auth_manager, chatgpt_base_url, codex_home)
 }
@@ -747,6 +750,13 @@ fn parse_cloud_requirements(
     } else {
         Ok(Some(requirements))
     }
+}
+
+fn format_cloud_requirements_parse_failed_message(
+    _contents: &str,
+    err: &toml::de::Error,
+) -> String {
+    format!("{CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE}\n\nDetails:\n{err}")
 }
 
 fn emit_fetch_attempt_metric(
@@ -806,7 +816,7 @@ fn status_code_tag(status_code: Option<u16>) -> String {
 }
 
 fn emit_metric(metric_name: &str, tags: Vec<(&str, String)>) {
-    if let Some(metrics) = codex_otel::metrics::global() {
+    if let Some(metrics) = codex_otel::global() {
         let tag_refs = tags
             .iter()
             .map(|(key, value)| (*key, value.as_str()))
@@ -820,7 +830,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use codex_core::auth::AuthCredentialsStoreMode;
+    use codex_config::types::AuthCredentialsStoreMode;
     use codex_protocol::protocol::AskForApproval;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -848,8 +858,9 @@ mod tests {
         write_auth_json(tmp.path(), auth_json).expect("write auth");
         Arc::new(AuthManager::new(
             tmp.path().to_path_buf(),
-            false,
+            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
         ))
     }
 
@@ -872,8 +883,9 @@ mod tests {
         .expect("write auth");
         Arc::new(AuthManager::new(
             tmp.path().to_path_buf(),
-            false,
+            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
         ))
     }
 
@@ -884,13 +896,32 @@ mod tests {
         access_token: &str,
         refresh_token: &str,
     ) -> serde_json::Value {
+        chatgpt_auth_json_with_last_refresh(
+            plan_type,
+            chatgpt_user_id,
+            account_id,
+            access_token,
+            refresh_token,
+            "2025-01-01T00:00:00Z",
+        )
+    }
+
+    fn chatgpt_auth_json_with_last_refresh(
+        plan_type: &str,
+        chatgpt_user_id: Option<&str>,
+        account_id: Option<&str>,
+        access_token: &str,
+        refresh_token: &str,
+        last_refresh: &str,
+    ) -> serde_json::Value {
         chatgpt_auth_json_with_mode(
             plan_type,
             chatgpt_user_id,
             account_id,
             access_token,
             refresh_token,
-            None,
+            last_refresh,
+            /*auth_mode*/ None,
         )
     }
 
@@ -900,6 +931,7 @@ mod tests {
         account_id: Option<&str>,
         access_token: &str,
         refresh_token: &str,
+        last_refresh: &str,
         auth_mode: Option<&str>,
     ) -> serde_json::Value {
         let header = json!({ "alg": "none", "typ": "JWT" });
@@ -925,7 +957,7 @@ mod tests {
                 "refresh_token": refresh_token,
                 "account_id": account_id,
             },
-            "last_refresh": "2025-01-01T00:00:00Z",
+            "last_refresh": last_refresh,
         });
         if let Some(auth_mode) = auth_mode {
             auth_json["auth_mode"] = serde_json::Value::String(auth_mode.to_string());
@@ -960,8 +992,9 @@ mod tests {
         ManagedAuthContext {
             manager: Arc::new(AuthManager::new(
                 home.path().to_path_buf(),
-                false,
+                /*enable_codex_api_key_env*/ false,
                 AuthCredentialsStoreMode::File,
+                /*chatgpt_base_url*/ None,
             )),
             _home: home,
         }
@@ -1106,6 +1139,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_cloud_requirements_skips_team_like_usage_based_plan() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("self_serve_business_usage_based"),
+            Arc::new(StaticFetcher {
+                contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+        assert_eq!(service.fetch().await, Ok(None));
+    }
+
+    #[tokio::test]
     async fn fetch_cloud_requirements_allows_business_plan() {
         let codex_home = tempdir().expect("tempdir");
         let service = CloudRequirementsService::new(
@@ -1120,22 +1167,90 @@ mod tests {
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_requirements_allows_business_like_usage_based_plan() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("enterprise_cbp_usage_based"),
+            Arc::new(StaticFetcher {
+                contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+        assert_eq!(
+            service.fetch().await,
+            Ok(Some(ConfigRequirementsToml {
+                allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
+                allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
+                allowed_web_search_modes: None,
+                guardian_policy_config: None,
+                feature_requirements: None,
+                hooks: None,
+                mcp_servers: None,
+                apps: None,
+                rules: None,
+                enforce_residency: None,
+                network: None,
+                permissions: None,
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_requirements_allows_hc_plan_as_enterprise() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("hc"),
+            Arc::new(StaticFetcher {
+                contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+        assert_eq!(
+            service.fetch().await,
+            Ok(Some(ConfigRequirementsToml {
+                allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
+                allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
+                allowed_web_search_modes: None,
+                guardian_policy_config: None,
+                feature_requirements: None,
+                hooks: None,
+                mcp_servers: None,
+                apps: None,
+                rules: None,
+                enforce_residency: None,
+                network: None,
+                permissions: None,
             }))
         );
     }
 
     #[tokio::test]
     async fn fetch_cloud_requirements_handles_missing_contents() {
-        let result = parse_for_fetch(None);
+        let result = parse_for_fetch(/*contents*/ None);
         assert!(result.is_none());
     }
 
@@ -1165,15 +1280,19 @@ mod tests {
             result,
             Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             })
         );
     }
@@ -1246,15 +1365,19 @@ enabled = false
             handle.await.expect("cloud requirements task"),
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
@@ -1262,24 +1385,44 @@ enabled = false
 
     #[tokio::test]
     async fn fetch_cloud_requirements_recovers_after_unauthorized_reload() {
-        let auth = managed_auth_context(
-            "business",
-            Some("user-12345"),
-            Some("account-12345"),
-            "stale-access-token",
-            "test-refresh-token",
-        );
+        let auth_home = tempdir().expect("tempdir");
         write_auth_json(
-            auth._home.path(),
-            chatgpt_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
+                "business",
+                Some("user-12345"),
+                Some("account-12345"),
+                "stale-access-token",
+                "test-refresh-token",
+                // Keep auth "fresh" so the first request hits unauthorized recovery
+                // instead of AuthManager::auth() proactively reloading from disk.
+                "3025-01-01T00:00:00Z",
+            ),
+        )
+        .expect("write initial auth");
+        let auth_manager = Arc::new(AuthManager::new(
+            auth_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
+        ));
+
+        write_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
                 "business",
                 Some("user-12345"),
                 Some("account-12345"),
                 "fresh-access-token",
                 "test-refresh-token",
+                "3025-01-01T00:00:00Z",
             ),
         )
         .expect("write refreshed auth");
+        let auth = ManagedAuthContext {
+            _home: auth_home,
+            manager: auth_manager,
+        };
 
         let fetcher = Arc::new(TokenFetcher {
             expected_token: "fresh-access-token".to_string(),
@@ -1298,15 +1441,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
@@ -1314,24 +1461,42 @@ enabled = false
 
     #[tokio::test]
     async fn fetch_cloud_requirements_recovers_after_unauthorized_reload_updates_cache_identity() {
-        let auth = managed_auth_context(
-            "business",
-            Some("user-12345"),
-            Some("account-12345"),
-            "stale-access-token",
-            "test-refresh-token",
-        );
+        let auth_home = tempdir().expect("tempdir");
         write_auth_json(
-            auth._home.path(),
-            chatgpt_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
+                "business",
+                Some("user-12345"),
+                Some("account-12345"),
+                "stale-access-token",
+                "test-refresh-token",
+                "3025-01-01T00:00:00Z",
+            ),
+        )
+        .expect("write initial auth");
+        let auth_manager = Arc::new(AuthManager::new(
+            auth_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
+        ));
+
+        write_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
                 "business",
                 Some("user-99999"),
                 Some("account-12345"),
                 "fresh-access-token",
                 "test-refresh-token",
+                "3025-01-01T00:00:00Z",
             ),
         )
         .expect("write refreshed auth");
+        let auth = ManagedAuthContext {
+            _home: auth_home,
+            manager: auth_manager,
+        };
 
         let fetcher = Arc::new(TokenFetcher {
             expected_token: "fresh-access-token".to_string(),
@@ -1350,15 +1515,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
 
@@ -1432,14 +1601,16 @@ enabled = false
                 Some("account-12345"),
                 "test-access-token",
                 "test-refresh-token",
+                "2025-01-01T00:00:00Z",
                 Some("chatgptAuthTokens"),
             ),
         )
         .expect("write auth");
         let auth_manager = Arc::new(AuthManager::new(
             auth_home.path().to_path_buf(),
-            false,
+            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
         ));
 
         let fetcher = Arc::new(UnauthorizedFetcher {
@@ -1483,8 +1654,41 @@ enabled = false
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert!(service.fetch().await.is_err());
+        let err = service
+            .fetch()
+            .await
+            .expect_err("parse error should fail closed");
+        let err_text = err.to_string();
+        assert!(err_text.contains(CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE));
+        assert!(err_text.contains("Details:"));
+        assert!(err_text.contains("not = ["));
+        assert_eq!(err.code(), CloudRequirementsLoadErrorCode::Parse);
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_requirements_invalid_enum_value_surfaces_field_name() {
+        let fetcher = Arc::new(SequenceFetcher::new(vec![Ok(Some(
+            "allowed_approval_policies = [\"definitely-not-valid\"]".to_string(),
+        ))]));
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("business"),
+            fetcher,
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+
+        let err = service
+            .fetch()
+            .await
+            .expect_err("invalid enum value should fail closed");
+        let err_text = err.to_string();
+        assert!(err_text.contains(CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE));
+        assert!(err_text.contains("allowed_approval_policies"));
+        assert!(err_text.contains("definitely-not-valid"));
+        assert!(err_text.contains("unknown variant"));
+        assert_eq!(err.code(), CloudRequirementsLoadErrorCode::Parse);
     }
 
     #[tokio::test]
@@ -1512,15 +1716,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
@@ -1530,7 +1738,11 @@ enabled = false
     async fn fetch_cloud_requirements_writes_cache_when_identity_is_incomplete() {
         let codex_home = tempdir().expect("tempdir");
         let service = CloudRequirementsService::new(
-            auth_manager_with_plan_and_identity("business", None, Some("account-12345")),
+            auth_manager_with_plan_and_identity(
+                "business",
+                /*chatgpt_user_id*/ None,
+                Some("account-12345"),
+            ),
             Arc::new(StaticFetcher {
                 contents: Some("allowed_approval_policies = [\"never\"]".to_string()),
             }),
@@ -1542,15 +1754,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
 
@@ -1582,7 +1798,11 @@ enabled = false
             "allowed_approval_policies = [\"on-request\"]".to_string(),
         ))]));
         let service = CloudRequirementsService::new(
-            auth_manager_with_plan_and_identity("business", None, Some("account-12345")),
+            auth_manager_with_plan_and_identity(
+                "business",
+                /*chatgpt_user_id*/ None,
+                Some("account-12345"),
+            ),
             fetcher.clone(),
             codex_home.path().to_path_buf(),
             CLOUD_REQUIREMENTS_TIMEOUT,
@@ -1592,15 +1812,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -1641,15 +1865,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -1694,15 +1922,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -1748,15 +1980,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -1802,15 +2038,19 @@ enabled = false
                 .and_then(|contents| parse_cloud_requirements(contents).ok().flatten()),
             Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             })
         );
         let payload_bytes = cache_payload_bytes(&cache_file.signed_payload).expect("payload bytes");
@@ -1858,10 +2098,7 @@ enabled = false
             .await
             .expect("cloud requirements task")
             .expect_err("cloud requirements retry exhaustion should fail closed");
-        assert_eq!(
-            err.to_string(),
-            "failed to load your workspace-managed config"
-        );
+        assert_eq!(err.to_string(), CLOUD_REQUIREMENTS_LOAD_FAILED_MESSAGE);
         assert_eq!(err.code(), CloudRequirementsLoadErrorCode::RequestFailed);
         assert_eq!(
             fetcher.request_count.load(Ordering::SeqCst),
@@ -1889,15 +2126,19 @@ enabled = false
             service.fetch().await,
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
 
@@ -1915,15 +2156,19 @@ enabled = false
                 .and_then(|contents| parse_cloud_requirements(contents).ok().flatten()),
             Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
+                remote_sandbox_config: None,
                 allowed_web_search_modes: None,
-                guardian_developer_instructions: None,
+                guardian_policy_config: None,
                 feature_requirements: None,
+                hooks: None,
                 mcp_servers: None,
                 apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             })
         );
     }

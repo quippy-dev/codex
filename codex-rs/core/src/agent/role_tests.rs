@@ -1,12 +1,14 @@
 use super::*;
+use crate::SkillsManager;
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigBuilder;
 use crate::config_loader::ConfigLayerStackOrdering;
 use crate::plugins::PluginsManager;
-use crate::skills::SkillsManager;
+use crate::skills_load_input_from_config;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::PathBuf;
@@ -39,7 +41,10 @@ async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBu
 fn session_flags_layer_count(config: &Config) -> usize {
     config
         .config_layer_stack
-        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
+        .get_layers(
+            ConfigLayerStackOrdering::LowestPrecedenceFirst,
+            /*include_disabled*/ true,
+        )
         .into_iter()
         .filter(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .count()
@@ -50,7 +55,7 @@ async fn apply_role_defaults_to_default_and_leaves_config_unchanged() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let before = config.clone();
 
-    apply_role_to_config(&mut config, None)
+    apply_role_to_config(&mut config, /*role_name*/ None)
         .await
         .expect("default role should apply");
 
@@ -69,53 +74,34 @@ async fn apply_role_returns_error_for_unknown_role() {
 }
 
 #[tokio::test]
-async fn apply_explorer_role_adds_session_flags_layer_without_overriding_model() {
+#[ignore = "No role requiring it for now"]
+async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    let before_model = config.model.clone();
-    let before_reasoning_effort = config.model_reasoning_effort;
     let before_layers = session_flags_layer_count(&config);
 
     apply_role_to_config(&mut config, Some("explorer"))
         .await
         .expect("explorer role should apply");
 
-    assert_eq!(config.model, before_model);
-    assert_eq!(config.model_reasoning_effort, before_reasoning_effort);
-    assert_eq!(session_flags_layer_count(&config), before_layers);
+    assert_eq!(config.model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
 #[tokio::test]
-async fn default_spawn_mode_for_role_defaults_to_spawn_and_honors_role_overrides() {
+async fn apply_empty_explorer_role_preserves_current_model_and_reasoning_effort() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    config.agent_roles.insert(
-        "researcher".to_string(),
-        AgentRoleConfig {
-            description: Some("Research role".to_string()),
-            spawn_mode: Some(AgentRoleSpawnMode::Fork),
-            ..Default::default()
-        },
-    );
+    let before_layers = session_flags_layer_count(&config);
+    config.model = Some("gpt-5.4-mini".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
 
-    assert_eq!(
-        default_spawn_mode_for_role(&config, None),
-        AgentRoleSpawnMode::Spawn
-    );
-    assert_eq!(
-        default_spawn_mode_for_role(&config, Some("worker")),
-        AgentRoleSpawnMode::Spawn
-    );
-    assert_eq!(
-        default_spawn_mode_for_role(&config, Some("explorer")),
-        AgentRoleSpawnMode::Spawn
-    );
-    assert_eq!(
-        default_spawn_mode_for_role(&config, Some("fast-worker")),
-        AgentRoleSpawnMode::Spawn
-    );
-    assert_eq!(
-        default_spawn_mode_for_role(&config, Some("researcher")),
-        AgentRoleSpawnMode::Fork
-    );
+    apply_role_to_config(&mut config, Some("explorer"))
+        .await
+        .expect("explorer role should apply");
+
+    assert_eq!(config.model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(session_flags_layer_count(&config), before_layers);
 }
 
 #[tokio::test]
@@ -127,7 +113,6 @@ async fn apply_role_returns_unavailable_for_missing_user_role_file() {
             description: None,
             config_file: Some(PathBuf::from("/path/does/not/exist.toml")),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -148,7 +133,6 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -178,9 +162,7 @@ model = "role-model"
         "custom".to_string(),
         AgentRoleConfig {
             description: None,
-            model: None,
             config_file: Some(role_path),
-            spawn_mode: None,
             nickname_candidates: None,
         },
     );
@@ -213,7 +195,6 @@ async fn apply_role_preserves_unspecified_keys() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -273,7 +254,6 @@ model_provider = "test-provider"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -326,9 +306,7 @@ model_verbosity = "high"
         "custom".to_string(),
         AgentRoleConfig {
             description: None,
-            model: None,
             config_file: Some(role_path),
-            spawn_mode: None,
             nickname_candidates: None,
         },
     );
@@ -396,7 +374,6 @@ model_provider = "role-provider"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -455,7 +432,6 @@ model_provider = "base-provider"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -520,7 +496,6 @@ model_reasoning_effort = "high"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -565,7 +540,6 @@ writable_roots = ["./sandbox-root"]
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
-            ..Default::default()
         },
     );
 
@@ -575,7 +549,10 @@ writable_roots = ["./sandbox-root"]
 
     let role_layer = config
         .config_layer_stack
-        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
+        .get_layers(
+            ConfigLayerStackOrdering::LowestPrecedenceFirst,
+            /*include_disabled*/ true,
+        )
         .into_iter()
         .rfind(|layer| layer.name == ConfigLayerSource::SessionFlags)
         .expect("expected a session flags layer");
@@ -623,9 +600,7 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
         "custom".to_string(),
         AgentRoleConfig {
             description: None,
-            model: None,
             config_file: Some(role_path),
-            spawn_mode: None,
             nickname_candidates: None,
         },
     );
@@ -668,9 +643,7 @@ enabled = false
         "custom".to_string(),
         AgentRoleConfig {
             description: None,
-            model: None,
             config_file: Some(role_path),
-            spawn_mode: None,
             nickname_candidates: None,
         },
     );
@@ -680,8 +653,17 @@ enabled = false
         .expect("custom role should apply");
 
     let plugins_manager = Arc::new(PluginsManager::new(home.path().to_path_buf()));
-    let skills_manager = SkillsManager::new(home.path().to_path_buf(), plugins_manager, true);
-    let outcome = skills_manager.skills_for_config(&config);
+    let skills_manager =
+        SkillsManager::new(home.path().abs(), /*bundled_skills_enabled*/ true);
+    let plugin_outcome = plugins_manager.plugins_for_config(&config).await;
+    let effective_skill_roots = plugin_outcome.effective_skill_roots();
+    let skills_input = skills_load_input_from_config(&config, effective_skill_roots);
+    let outcome = skills_manager
+        .skills_for_config(
+            &skills_input,
+            Some(Arc::clone(&codex_exec_server::LOCAL_FS)),
+        )
+        .await;
     let skill = outcome
         .skills
         .iter()
@@ -700,7 +682,6 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
                 description: Some("user override".to_string()),
                 config_file: None,
                 nickname_candidates: None,
-                ..Default::default()
             },
         ),
         ("researcher".to_string(), AgentRoleConfig::default()),
@@ -709,8 +690,8 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains("researcher: no description"));
-    assert!(spec.contains("explorer: {\nuser override\nDefault spawn mode: spawn\n}"));
-    assert!(spec.contains("default: {\nDefault agent.\nDefault spawn mode: spawn\n}"));
+    assert!(spec.contains("explorer: {\nuser override\n}"));
+    assert!(spec.contains("default: {\nDefault agent.\n}"));
     assert!(!spec.contains("Explorers are fast and authoritative."));
 }
 
@@ -722,16 +703,13 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
             description: Some("first".to_string()),
             config_file: None,
             nickname_candidates: None,
-            ..Default::default()
         },
     )]);
 
     let spec = spawn_tool_spec::build(&user_defined_roles);
-    let user_index = spec
-        .find("aaa: {\nfirst\nDefault spawn mode: spawn\n}")
-        .expect("find user role");
+    let user_index = spec.find("aaa: {\nfirst\n}").expect("find user role");
     let built_in_index = spec
-        .find("default: {\nDefault agent.\nDefault spawn mode: spawn\n}")
+        .find("default: {\nDefault agent.\n}")
         .expect("find built-in role");
 
     assert!(user_index < built_in_index);
@@ -750,9 +728,7 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
         "researcher".to_string(),
         AgentRoleConfig {
             description: Some("Research carefully.".to_string()),
-            model: None,
             config_file: Some(role_path),
-            spawn_mode: None,
             nickname_candidates: None,
         },
     )]);
@@ -760,7 +736,7 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Research carefully.\nDefault spawn mode: spawn\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
+            "Research carefully.\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
         ));
 }
 
@@ -777,9 +753,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
         "reviewer".to_string(),
         AgentRoleConfig {
             description: Some("Review carefully.".to_string()),
-            model: None,
             config_file: Some(role_path),
-            spawn_mode: None,
             nickname_candidates: None,
         },
     )]);
@@ -787,14 +761,21 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Review carefully.\nDefault spawn mode: spawn\n- This role's reasoning effort is set to `medium` and cannot be changed."
+            "Review carefully.\n- This role's reasoning effort is set to `medium` and cannot be changed."
         ));
 }
 
 #[test]
 fn built_in_config_file_contents_resolves_explorer_and_awaiter() {
-    assert!(built_in::config_file_contents(Path::new("explorer.toml")).is_some());
-    assert!(built_in::config_file_contents(Path::new("awaiter.toml")).is_some());
+    assert!(
+        built_in::config_file_contents(Path::new("explorer.toml")).is_some(),
+        "explorer role config should resolve"
+    );
+
+    let awaiter = built_in::config_file_contents(Path::new("awaiter.toml"))
+        .expect("awaiter role config should resolve");
+    assert!(awaiter.contains("awaiter"));
+
     assert_eq!(
         built_in::config_file_contents(Path::new("missing.toml")),
         None

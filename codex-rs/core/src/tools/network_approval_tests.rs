@@ -1,6 +1,10 @@
 use super::*;
+use crate::sandboxing::SandboxPermissions;
 use codex_network_proxy::BlockedRequestArgs;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SandboxPolicy;
+use core_test_support::PathBufExt;
+use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -179,6 +183,19 @@ fn only_never_policy_disables_network_approval_flow() {
     assert!(allows_network_approval_flow(AskForApproval::UnlessTrusted));
 }
 
+#[test]
+fn network_approval_flow_is_limited_to_restricted_sandbox_modes() {
+    assert!(sandbox_policy_allows_network_approval_flow(
+        &SandboxPolicy::new_read_only_policy()
+    ));
+    assert!(sandbox_policy_allows_network_approval_flow(
+        &SandboxPolicy::new_workspace_write_policy()
+    ));
+    assert!(!sandbox_policy_allows_network_approval_flow(
+        &SandboxPolicy::DangerFullAccess
+    ));
+}
+
 fn denied_blocked_request(host: &str) -> BlockedRequest {
     BlockedRequest::new(BlockedRequestArgs {
         host: host.to_string(),
@@ -193,12 +210,65 @@ fn denied_blocked_request(host: &str) -> BlockedRequest {
     })
 }
 
+async fn register_call_with_default_shell_trigger(
+    service: &NetworkApprovalService,
+    registration_id: &str,
+) {
+    service
+        .register_call(
+            registration_id.to_string(),
+            "turn-1".to_string(),
+            GuardianNetworkAccessTrigger {
+                call_id: "call-1".to_string(),
+                tool_name: "shell".to_string(),
+                command: vec!["curl".to_string(), "https://example.com".to_string()],
+                cwd: test_path_buf("/tmp").abs(),
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                justification: None,
+                tty: None,
+            },
+            "curl https://example.com".to_string(),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn active_call_preserves_triggering_command_context() {
+    let service = NetworkApprovalService::default();
+    let expected = GuardianNetworkAccessTrigger {
+        call_id: "call-1".to_string(),
+        tool_name: "shell".to_string(),
+        command: vec!["curl".to_string(), "https://example.com".to_string()],
+        cwd: test_path_buf("/repo").abs(),
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        justification: Some("fetch release metadata".to_string()),
+        tty: None,
+    };
+
+    service
+        .register_call(
+            "registration-1".to_string(),
+            "turn-1".to_string(),
+            expected.clone(),
+            "curl https://example.com".to_string(),
+        )
+        .await;
+
+    let call = service
+        .resolve_single_active_call()
+        .await
+        .expect("single active call should resolve");
+
+    assert_eq!(&call.trigger, &expected);
+    assert_eq!(call.command, "curl https://example.com");
+}
+
 #[tokio::test]
 async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
     let service = NetworkApprovalService::default();
-    service
-        .register_call("registration-1".to_string(), "turn-1".to_string())
-        .await;
+    register_call_with_default_shell_trigger(&service, "registration-1").await;
 
     service
         .record_blocked_request(denied_blocked_request("example.com"))
@@ -215,9 +285,7 @@ async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
 #[tokio::test]
 async fn blocked_request_policy_does_not_override_user_denial_outcome() {
     let service = NetworkApprovalService::default();
-    service
-        .register_call("registration-1".to_string(), "turn-1".to_string())
-        .await;
+    register_call_with_default_shell_trigger(&service, "registration-1").await;
 
     service
         .record_call_outcome("registration-1", NetworkApprovalOutcome::DeniedByUser)
@@ -235,12 +303,8 @@ async fn blocked_request_policy_does_not_override_user_denial_outcome() {
 #[tokio::test]
 async fn record_blocked_request_ignores_ambiguous_unattributed_blocked_requests() {
     let service = NetworkApprovalService::default();
-    service
-        .register_call("registration-1".to_string(), "turn-1".to_string())
-        .await;
-    service
-        .register_call("registration-2".to_string(), "turn-1".to_string())
-        .await;
+    register_call_with_default_shell_trigger(&service, "registration-1").await;
+    register_call_with_default_shell_trigger(&service, "registration-2").await;
 
     service
         .record_blocked_request(denied_blocked_request("example.com"))

@@ -1,21 +1,21 @@
 use crate::Prompt;
 use crate::RolloutRecorder;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::config::Config;
-use crate::config::types::MemoriesConfig;
-use crate::contextual_user_message::is_memory_excluded_contextual_user_fragment;
-use crate::error::CodexErr;
+use crate::context::is_memory_excluded_contextual_user_fragment;
 use crate::memories::metrics;
 use crate::memories::phase_one;
 use crate::memories::phase_one::PRUNE_BATCH_SIZE;
 use crate::memories::prompts::build_stage_one_input_message;
 use crate::rollout::INTERACTIVE_SESSION_SOURCES;
 use crate::rollout::policy::should_persist_response_item_for_memories;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_api::ResponseEvent;
+use codex_config::types::MemoriesConfig;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -23,6 +23,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout_trace::InferenceTraceContext;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -228,7 +229,7 @@ async fn build_request_context(session: &Arc<Session>, config: &Config) -> Reque
     let model = session
         .services
         .models_manager
-        .get_model_info(&model_name, config)
+        .get_model_info(&model_name, &config.to_models_manager_config())
         .await;
     let turn_context = session.new_default_turn().await;
     RequestContext::from_turn_context(
@@ -341,6 +342,7 @@ mod job {
             },
             personality: None,
             output_schema: Some(output_schema()),
+            output_schema_strict: true,
         };
 
         let mut client_session = session.services.model_client.new_session();
@@ -353,6 +355,7 @@ mod job {
                 stage_one_context.reasoning_summary,
                 stage_one_context.service_tier,
                 stage_one_context.turn_metadata_header.as_deref(),
+                &InferenceTraceContext::disabled(),
             )
             .await?;
 
@@ -466,7 +469,7 @@ mod job {
     /// Serializes filtered stage-1 memory items for prompt inclusion.
     pub(super) fn serialize_filtered_rollout_response_items(
         items: &[RolloutItem],
-    ) -> crate::error::Result<String> {
+    ) -> codex_protocol::error::Result<String> {
         let filtered = items
             .iter()
             .filter_map(|item| {
@@ -477,9 +480,10 @@ mod job {
                 }
             })
             .collect::<Vec<_>>();
-        serde_json::to_string(&filtered).map_err(|err| {
+        let serialized = serde_json::to_string(&filtered).map_err(|err| {
             CodexErr::InvalidRequest(format!("failed to serialize rollout memory: {err}"))
-        })
+        })?;
+        Ok(redact_secrets(serialized))
     }
 
     fn sanitize_response_item_for_memories(item: &ResponseItem) -> Option<ResponseItem> {

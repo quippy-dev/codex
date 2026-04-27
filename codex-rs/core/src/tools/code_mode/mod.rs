@@ -2,10 +2,11 @@ mod execute_handler;
 mod response_adapter;
 mod wait_handler;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeTurnHost;
 use codex_code_mode::RuntimeResponse;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -14,12 +15,12 @@ use codex_protocol::models::ResponseInputItem;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
-use crate::client_common::tools::ToolSpec;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::original_image_detail::can_request_original_image_detail;
+use crate::original_image_detail::sanitize_original_image_detail as sanitize_image_detail_items;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::ToolRouter;
-use crate::tools::code_mode_description::augment_tool_spec_for_code_mode;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
@@ -27,11 +28,14 @@ use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouterParams;
-use crate::truncate::TruncationPolicy;
-use crate::truncate::formatted_truncate_text_content_items_with_policy;
-use crate::truncate::truncate_function_output_items_with_policy;
 use crate::unified_exec::resolve_max_tokens;
 use codex_features::Feature;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
+use codex_tools::collect_code_mode_tool_definitions;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
+use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
@@ -40,6 +44,11 @@ pub(crate) use wait_handler::CodeModeWaitHandler;
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
 pub(crate) const DEFAULT_WAIT_YIELD_TIME_MS: u64 = codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS;
+
+/// Returns true for the un-namespaced code-mode `exec` tool.
+pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
+    tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME
+}
 
 #[derive(Clone)]
 pub(crate) struct ExecContext {
@@ -52,7 +61,7 @@ pub(crate) struct CodeModeService {
 }
 
 impl CodeModeService {
-    pub(crate) fn new(_js_repl_node_path: Option<PathBuf>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: codex_code_mode::CodeModeService::new(),
         }
@@ -69,6 +78,10 @@ impl CodeModeService {
         self.inner.replace_stored_values(values).await;
     }
 
+    pub(crate) fn allocate_cell_id(&self) -> String {
+        self.inner.allocate_cell_id()
+    }
+
     pub(crate) async fn execute(
         &self,
         request: codex_code_mode::ExecuteRequest,
@@ -79,7 +92,7 @@ impl CodeModeService {
     pub(crate) async fn wait(
         &self,
         request: codex_code_mode::WaitRequest,
-    ) -> Result<RuntimeResponse, String> {
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
         self.inner.wait(request).await
     }
 
@@ -114,15 +127,13 @@ struct CoreTurnHost {
 impl CodeModeTurnHost for CoreTurnHost {
     async fn invoke_tool(
         &self,
-        tool_name: String,
-        input: Option<JsonValue>,
+        invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
     ) -> Result<JsonValue, String> {
         call_nested_tool(
             self.exec.clone(),
             self.tool_runtime.clone(),
-            tool_name,
-            input,
+            invocation,
             cancellation_token,
         )
         .await
@@ -158,12 +169,14 @@ pub(super) async fn handle_runtime_response(
     match response {
         RuntimeResponse::Yielded { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
+            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
+            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             content_items = truncate_code_mode_result(content_items, max_output_tokens);
             prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
@@ -175,6 +188,7 @@ pub(super) async fn handle_runtime_response(
             ..
         } => {
             let mut content_items = into_function_call_output_content_items(content_items);
+            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             exec.session
                 .services
                 .code_mode_service
@@ -194,6 +208,10 @@ pub(super) async fn handle_runtime_response(
             ))
         }
     }
+}
+
+fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
+    sanitize_image_detail_items(can_request_original_image_detail(&turn.model_info), items);
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
@@ -244,64 +262,44 @@ pub(super) async fn build_enabled_tools(
     exec: &ExecContext,
 ) -> Vec<codex_code_mode::ToolDefinition> {
     let router = build_nested_router(exec).await;
-    let mut out = router
-        .specs()
-        .into_iter()
-        .map(|spec| augment_tool_spec_for_code_mode(spec, /*code_mode_enabled*/ true))
-        .filter_map(enabled_tool_from_spec)
-        .collect::<Vec<_>>();
-    out.sort_by(|left, right| left.name.cmp(&right.name));
-    out.dedup_by(|left, right| left.name == right.name);
-    out
+    let specs = router.specs();
+    collect_code_mode_tool_definitions(&specs)
 }
 
-fn enabled_tool_from_spec(spec: ToolSpec) -> Option<codex_code_mode::ToolDefinition> {
-    let tool_name = spec.name().to_string();
-    if !codex_code_mode::is_code_mode_nested_tool(&tool_name) {
-        return None;
-    }
-
-    match spec {
-        ToolSpec::Function(tool) => Some(codex_code_mode::ToolDefinition {
-            name: tool_name,
-            description: tool.description,
-            kind: codex_code_mode::CodeModeToolKind::Function,
-            input_schema: serde_json::to_value(&tool.parameters).ok(),
-            output_schema: tool.output_schema,
-        }),
-        ToolSpec::Freeform(tool) => Some(codex_code_mode::ToolDefinition {
-            name: tool_name,
-            description: tool.description,
-            kind: codex_code_mode::CodeModeToolKind::Freeform,
-            input_schema: None,
-            output_schema: None,
-        }),
-        ToolSpec::LocalShell {}
-        | ToolSpec::ImageGeneration { .. }
-        | ToolSpec::ToolSearch { .. }
-        | ToolSpec::WebSearch { .. } => None,
-    }
-}
-
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "nested tool router construction reads through the session-owned manager guard"
+)]
 async fn build_nested_router(exec: &ExecContext) -> ToolRouter {
     let nested_tools_config = exec.turn.tools_config.for_code_mode_nested_tools();
-    let mcp_tools = exec
+    let listed_mcp_tools = exec
         .session
         .services
         .mcp_connection_manager
         .read()
         .await
         .list_all_tools()
-        .await
-        .into_iter()
-        .map(|(name, tool_info)| (name, tool_info.tool))
-        .collect();
+        .await;
+    let parallel_mcp_server_names = exec
+        .turn
+        .config
+        .mcp_servers
+        .get()
+        .iter()
+        .filter_map(|(server_name, server_config)| {
+            server_config
+                .supports_parallel_tool_calls
+                .then_some(server_name.clone())
+        })
+        .collect::<HashSet<_>>();
 
     ToolRouter::from_config(
         &nested_tools_config,
         ToolRouterParams {
-            mcp_tools: Some(mcp_tools),
-            app_tools: None,
+            deferred_mcp_tools: None,
+            mcp_tools: Some(listed_mcp_tools),
+            unavailable_called_tools: Vec::new(),
+            parallel_mcp_server_names,
             discoverable_tools: None,
             dynamic_tools: exec.turn.dynamic_tools.as_slice(),
         },
@@ -311,41 +309,56 @@ async fn build_nested_router(exec: &ExecContext) -> ToolRouter {
 async fn call_nested_tool(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
-    tool_name: String,
-    input: Option<JsonValue>,
+    invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
 ) -> Result<JsonValue, FunctionCallError> {
-    if tool_name == PUBLIC_TOOL_NAME {
+    let CodeModeNestedToolCall {
+        cell_id,
+        runtime_tool_call_id,
+        tool_name,
+        input,
+    } = invocation;
+    if is_exec_tool_name(&tool_name) {
         return Err(FunctionCallError::RespondToModel(format!(
             "{PUBLIC_TOOL_NAME} cannot invoke itself"
         )));
     }
 
-    let payload =
-        if let Some((server, tool)) = exec.session.parse_mcp_tool_name(&tool_name, &None).await {
-            match serialize_function_tool_arguments(&tool_name, input) {
-                Ok(raw_arguments) => ToolPayload::Mcp {
-                    server,
-                    tool,
+    let (tool_call_name, payload) =
+        if let Some(tool_info) = exec.session.resolve_mcp_tool_info(&tool_name).await {
+            let raw_arguments = match serialize_function_tool_arguments(&tool_name, input) {
+                Ok(raw_arguments) => raw_arguments,
+                Err(error) => return Err(FunctionCallError::RespondToModel(error)),
+            };
+            (
+                tool_info.canonical_tool_name(),
+                ToolPayload::Mcp {
+                    server: tool_info.server_name,
+                    tool: tool_info.tool.name.to_string(),
                     raw_arguments,
                 },
-                Err(error) => return Err(FunctionCallError::RespondToModel(error)),
-            }
+            )
         } else {
             match build_nested_tool_payload(tool_runtime.find_spec(&tool_name), &tool_name, input) {
-                Ok(payload) => payload,
+                Ok(payload) => (tool_name, payload),
                 Err(error) => return Err(FunctionCallError::RespondToModel(error)),
             }
         };
 
     let call = ToolCall {
-        tool_name: tool_name.clone(),
+        tool_name: tool_call_name,
         call_id: format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4()),
-        tool_namespace: None,
         payload,
     };
     let result = tool_runtime
-        .handle_tool_call_with_source(call, ToolCallSource::CodeMode, cancellation_token)
+        .handle_tool_call_with_source(
+            call,
+            ToolCallSource::CodeMode {
+                cell_id,
+                runtime_tool_call_id,
+            },
+            cancellation_token,
+        )
         .await?;
     Ok(result.code_mode_result())
 }
@@ -360,7 +373,7 @@ fn tool_kind_for_spec(spec: &ToolSpec) -> codex_code_mode::CodeModeToolKind {
 
 fn tool_kind_for_name(
     spec: Option<ToolSpec>,
-    tool_name: &str,
+    tool_name: &ToolName,
 ) -> Result<codex_code_mode::CodeModeToolKind, String> {
     spec.as_ref()
         .map(tool_kind_for_spec)
@@ -369,7 +382,7 @@ fn tool_kind_for_name(
 
 fn build_nested_tool_payload(
     spec: Option<ToolSpec>,
-    tool_name: &str,
+    tool_name: &ToolName,
     input: Option<JsonValue>,
 ) -> Result<ToolPayload, String> {
     let actual_kind = tool_kind_for_name(spec, tool_name)?;
@@ -384,7 +397,7 @@ fn build_nested_tool_payload(
 }
 
 fn build_function_tool_payload(
-    tool_name: &str,
+    tool_name: &ToolName,
     input: Option<JsonValue>,
 ) -> Result<ToolPayload, String> {
     let arguments = serialize_function_tool_arguments(tool_name, input)?;
@@ -392,7 +405,7 @@ fn build_function_tool_payload(
 }
 
 fn serialize_function_tool_arguments(
-    tool_name: &str,
+    tool_name: &ToolName,
     input: Option<JsonValue>,
 ) -> Result<String, String> {
     match input {
@@ -406,7 +419,7 @@ fn serialize_function_tool_arguments(
 }
 
 fn build_freeform_tool_payload(
-    tool_name: &str,
+    tool_name: &ToolName,
     input: Option<JsonValue>,
 ) -> Result<ToolPayload, String> {
     match input {

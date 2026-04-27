@@ -20,7 +20,6 @@ use codex_app_server_protocol::FsWriteFileResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_exec_server::Environment;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
 use std::io;
@@ -31,22 +30,18 @@ pub(crate) struct FsApi {
     file_system: Arc<dyn ExecutorFileSystem>,
 }
 
-impl Default for FsApi {
-    fn default() -> Self {
-        Self {
-            file_system: Environment::default().get_filesystem(),
-        }
-    }
-}
-
 impl FsApi {
+    pub(crate) fn new(file_system: Arc<dyn ExecutorFileSystem>) -> Self {
+        Self { file_system }
+    }
+
     pub(crate) async fn read_file(
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
         let bytes = self
             .file_system
-            .read_file(&params.path)
+            .read_file(&params.path, /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
         Ok(FsReadFileResponse {
@@ -64,7 +59,7 @@ impl FsApi {
             ))
         })?;
         self.file_system
-            .write_file(&params.path, bytes)
+            .write_file(&params.path, bytes, /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
         Ok(FsWriteFileResponse {})
@@ -80,6 +75,7 @@ impl FsApi {
                 CreateDirectoryOptions {
                     recursive: params.recursive.unwrap_or(true),
                 },
+                /*sandbox*/ None,
             )
             .await
             .map_err(map_fs_error)?;
@@ -92,12 +88,13 @@ impl FsApi {
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
         let metadata = self
             .file_system
-            .get_metadata(&params.path)
+            .get_metadata(&params.path, /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
         Ok(FsGetMetadataResponse {
             is_directory: metadata.is_directory,
             is_file: metadata.is_file,
+            is_symlink: metadata.is_symlink,
             created_at_ms: metadata.created_at_ms,
             modified_at_ms: metadata.modified_at_ms,
         })
@@ -109,7 +106,7 @@ impl FsApi {
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
         let entries = self
             .file_system
-            .read_directory(&params.path)
+            .read_directory(&params.path, /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
         Ok(FsReadDirectoryResponse {
@@ -135,6 +132,7 @@ impl FsApi {
                     recursive: params.recursive.unwrap_or(true),
                     force: params.force.unwrap_or(true),
                 },
+                /*sandbox*/ None,
             )
             .await
             .map_err(map_fs_error)?;
@@ -152,6 +150,7 @@ impl FsApi {
                 CopyOptions {
                     recursive: params.recursive,
                 },
+                /*sandbox*/ None,
             )
             .await
             .map_err(map_fs_error)?;
@@ -159,7 +158,7 @@ impl FsApi {
     }
 }
 
-fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
+pub(crate) fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
     JSONRPCErrorError {
         code: INVALID_REQUEST_ERROR_CODE,
         message: message.into(),
@@ -167,7 +166,7 @@ fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
     }
 }
 
-fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
+pub(crate) fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     if err.kind() == io::ErrorKind::InvalidInput {
         invalid_request(err.to_string())
     } else {

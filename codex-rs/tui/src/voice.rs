@@ -1,16 +1,16 @@
+#![allow(dead_code)]
+
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::audio_device::preferred_input_config;
 use crate::audio_device::select_configured_input_device_and_config;
+use crate::legacy_core::config::Config;
 use base64::Engine;
 use codex_client::build_reqwest_client_with_custom_ca;
-use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::config::Config;
-use codex_core::default_client::get_codex_user_agent;
 use codex_login::AuthMode;
 use codex_login::CodexAuth;
+use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::protocol::ConversationAudioParams;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use cpal::traits::DeviceTrait;
 use cpal::traits::HostTrait;
@@ -485,17 +485,15 @@ fn send_realtime_audio_chunk(
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     let samples_per_channel = (samples.len() / usize::from(MODEL_AUDIO_CHANNELS)) as u32;
 
-    tx.send(AppEvent::CodexOp(Op::RealtimeConversationAudio(
-        ConversationAudioParams {
-            frame: RealtimeAudioFrame {
-                data: encoded,
-                sample_rate: MODEL_AUDIO_SAMPLE_RATE,
-                num_channels: MODEL_AUDIO_CHANNELS,
-                samples_per_channel: Some(samples_per_channel),
-                item_id: None,
-            },
+    tx.realtime_conversation_audio(ConversationAudioParams {
+        frame: RealtimeAudioFrame {
+            data: encoded,
+            sample_rate: MODEL_AUDIO_SAMPLE_RATE,
+            num_channels: MODEL_AUDIO_CHANNELS,
+            samples_per_channel: Some(samples_per_channel),
+            item_id: None,
         },
-    )));
+    });
 }
 
 #[inline]
@@ -933,7 +931,7 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
     let auth_input = transcription_auth_input()?;
     let auth = CodexAuth::from_auth_storage(
         &auth_input.auth_storage_home,
-        AuthCredentialsStoreMode::Auto,
+        auth_input.auth_credentials_store_mode,
     )
     .map_err(|e| format!("failed to read auth.json: {e}"))?
     .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
@@ -1047,6 +1045,7 @@ mod tests {
     use super::session_context::current_transcription_session_context;
     use super::set_transcription_session_context;
     use super::should_send_realtime_input;
+    use codex_login::AuthCredentialsStoreMode;
     use pretty_assertions::assert_eq;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -1090,6 +1089,7 @@ mod tests {
         let expected_chatgpt_base_url = "https://chatgpt.example.com/backend-api".to_string();
         set_transcription_session_context(
             expected_auth_storage_home.clone(),
+            AuthCredentialsStoreMode::File,
             expected_chatgpt_base_url.clone(),
         );
 
@@ -1099,6 +1099,7 @@ mod tests {
             stored,
             Some(TranscriptionSessionContext {
                 auth_storage_home: expected_auth_storage_home,
+                auth_credentials_store_mode: AuthCredentialsStoreMode::File,
                 chatgpt_base_url: expected_chatgpt_base_url,
             })
         );

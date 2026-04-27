@@ -1,8 +1,111 @@
 use super::*;
-use std::sync::Arc;
+use crate::agent::control::render_input_preview;
+
+pub(crate) struct Handler;
+
+impl ToolHandler for Handler {
+    type Output = SendInputResult;
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
+    }
+
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
+    }
+
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+        let ToolInvocation {
+            session,
+            turn,
+            payload,
+            call_id,
+            ..
+        } = invocation;
+        let arguments = function_arguments(payload)?;
+        let args: SendInputArgs = parse_arguments(&arguments)?;
+        let receiver_thread_id =
+            resolve_send_input_target(session.conversation_id, &turn.session_source, &args)?;
+        if session
+            .services
+            .agent_control
+            .watchdog_targets(&[receiver_thread_id])
+            .await
+            .contains(&receiver_thread_id)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "send_input cannot target watchdog handles".to_string(),
+            ));
+        }
+        let input_items = parse_collab_input(args.message, args.items)?;
+        let prompt = render_input_preview(&input_items);
+        let receiver_agent = session
+            .services
+            .agent_control
+            .get_agent_metadata(receiver_thread_id)
+            .unwrap_or_default();
+        if args.interrupt {
+            session
+                .services
+                .agent_control
+                .interrupt_agent(receiver_thread_id)
+                .await
+                .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+        }
+        session
+            .send_event(
+                &turn,
+                CollabAgentInteractionBeginEvent {
+                    call_id: call_id.clone(),
+                    sender_thread_id: session.conversation_id,
+                    receiver_thread_id,
+                    prompt: prompt.clone(),
+                }
+                .into(),
+            )
+            .await;
+        let agent_control = session.services.agent_control.clone();
+        let result = agent_control
+            .send_input(receiver_thread_id, input_items)
+            .await
+            .map_err(|err| collab_agent_error(receiver_thread_id, err));
+        let status = session
+            .services
+            .agent_control
+            .get_status(receiver_thread_id)
+            .await;
+        session
+            .send_event(
+                &turn,
+                CollabAgentInteractionEndEvent {
+                    call_id,
+                    sender_thread_id: session.conversation_id,
+                    receiver_thread_id,
+                    receiver_agent_nickname: receiver_agent.agent_nickname,
+                    receiver_agent_role: receiver_agent.agent_role,
+                    prompt,
+                    status,
+                }
+                .into(),
+            )
+            .await;
+        let submission_id = result?;
+        session
+            .services
+            .agent_control
+            .mark_watchdog_helper_notified_owner_if_match(
+                session.conversation_id,
+                receiver_thread_id,
+            )
+            .await;
+
+        Ok(SendInputResult { submission_id })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SendInputArgs {
+    target: Option<String>,
     id: Option<String>,
     message: Option<String>,
     items: Option<Vec<UserInput>>,
@@ -10,130 +113,49 @@ struct SendInputArgs {
     interrupt: bool,
 }
 
+fn resolve_send_input_target(
+    current_thread_id: ThreadId,
+    session_source: &codex_protocol::protocol::SessionSource,
+    args: &SendInputArgs,
+) -> Result<ThreadId, FunctionCallError> {
+    let target = args
+        .target
+        .as_deref()
+        .or(args.id.as_deref())
+        .map(str::trim)
+        .filter(|target| !target.is_empty());
+    match target {
+        None | Some("parent") | Some("root") => match session_source {
+            codex_protocol::protocol::SessionSource::SubAgent(
+                codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                    parent_thread_id, ..
+                },
+            ) => Ok(*parent_thread_id),
+            _ => Ok(current_thread_id),
+        },
+        Some(target) => parse_agent_id_target(target),
+    }
+}
+
 #[derive(Debug, Serialize)]
-struct SendInputResult {
+pub(crate) struct SendInputResult {
     submission_id: String,
 }
 
-pub async fn handle(
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    call_id: String,
-    arguments: String,
-) -> Result<FunctionToolOutput, FunctionCallError> {
-    let args: SendInputArgs = parse_arguments(&arguments)?;
-    let receiver_thread_id = match args.id.as_deref().map(str::trim) {
-        Some(id) if !id.is_empty() && !matches!(id, "parent" | "root") => agent_id(id)?,
-        _ => session.parent_thread_id().await.ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "send_input requires an id when no parent agent is available".to_string(),
-            )
-        })?,
-    };
-    let watchdog_targets = session
-        .services
-        .agent_control
-        .watchdog_targets(&[receiver_thread_id])
-        .await;
-    if watchdog_targets.contains(&receiver_thread_id) {
-        return Err(FunctionCallError::RespondToModel(
-            "send_input cannot target watchdog handles. Send the message to the parent/root agent instead."
-                .to_string(),
-        ));
+impl ToolOutput for SendInputResult {
+    fn log_preview(&self) -> String {
+        tool_output_json_text(self, "send_input")
     }
-    let input_items = parse_multi_agent_input(args.message, args.items)?;
-    let prompt = input_preview(&input_items);
-    let (receiver_agent_nickname, receiver_agent_role) = session
-        .services
-        .agent_control
-        .get_agent_nickname_and_role(receiver_thread_id)
-        .await
-        .unwrap_or((None, None));
-    if args.interrupt {
-        session
-            .services
-            .agent_control
-            .interrupt_agent(receiver_thread_id)
-            .await
-            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))?;
-        let _ = session
-            .services
-            .agent_control
-            .drop_pending_input(receiver_thread_id)
-            .await
-            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))?;
+
+    fn success_for_logging(&self) -> bool {
+        true
     }
-    session
-        .send_event(
-            &turn,
-            CollabAgentInteractionBeginEvent {
-                call_id: call_id.clone(),
-                sender_thread_id: session.conversation_id,
-                receiver_thread_id,
-                prompt: prompt.clone(),
-            }
-            .into(),
-        )
-        .await;
-    let sender_is_watchdog_helper_for_receiver = session
-        .services
-        .agent_control
-        .watchdog_owner_for_active_helper(session.conversation_id)
-        .await
-        == Some(receiver_thread_id);
-    let result = if sender_is_watchdog_helper_for_receiver {
-        session
-            .services
-            .agent_control
-            .send_watchdog_wakeup(receiver_thread_id, session.conversation_id, prompt.clone())
-            .await
-            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
-    } else if let Some(message) = single_text_input(&input_items) {
-        session
-            .services
-            .agent_control
-            .send_agent_message(receiver_thread_id, session.conversation_id, message)
-            .await
-            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
-    } else {
-        session
-            .services
-            .agent_control
-            .send_input(receiver_thread_id, input_items)
-            .await
-            .map_err(|err| multi_agent_tool_error(receiver_thread_id, err))
-    };
-    let status = session
-        .services
-        .agent_control
-        .get_status(receiver_thread_id)
-        .await;
-    session
-        .send_event(
-            &turn,
-            CollabAgentInteractionEndEvent {
-                call_id,
-                sender_thread_id: session.conversation_id,
-                receiver_thread_id,
-                receiver_agent_nickname,
-                receiver_agent_role,
-                prompt: prompt.clone(),
-                status,
-            }
-            .into(),
-        )
-        .await;
-    let submission_id = result?;
-    session
-        .services
-        .agent_control
-        .record_prompt_preview(receiver_thread_id, &prompt)
-        .await;
-    session.mark_turn_used_agent_send_input();
 
-    let content = serde_json::to_string(&SendInputResult { submission_id }).map_err(|err| {
-        FunctionCallError::Fatal(format!("failed to serialize send_input result: {err}"))
-    })?;
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        tool_output_response_item(call_id, payload, self, Some(true), "send_input")
+    }
 
-    Ok(FunctionToolOutput::from_text(content, Some(true)))
+    fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+        tool_output_code_mode_result(self, "send_input")
+    }
 }

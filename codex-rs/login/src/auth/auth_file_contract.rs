@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use super::AuthCredentialsStoreMode;
+use crate::AuthCredentialsStoreMode;
 
 pub fn validate_auth_file_override(
     auth_credentials_store_mode: AuthCredentialsStoreMode,

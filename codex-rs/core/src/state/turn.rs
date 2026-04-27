@@ -1,8 +1,8 @@
 //! Turn-scoped state and active turn metadata scaffolding.
 
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use indexmap::IndexMap;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -11,24 +11,46 @@ use tokio_util::task::AbortOnDropHandle;
 
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
-use crate::codex::TurnContext;
-use crate::protocol::ReviewDecision;
-use crate::protocol::TokenUsage;
-use crate::sandboxing::merge_permission_profiles;
-use crate::tasks::SessionTask;
-use codex_protocol::models::PermissionProfile;
+use crate::session::turn_context::TurnContext;
+use crate::tasks::AnySessionTask;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::TokenUsage;
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
     pub(crate) current_turn_context: Option<Arc<TurnContext>>,
     pub(crate) tasks: IndexMap<String, RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+}
+
+/// Whether mailbox deliveries should still be folded into the current turn.
+///
+/// State machine:
+/// - A turn starts in `CurrentTurn`, so queued child mail can join the next
+///   model request for that turn.
+/// - After user-visible terminal output is recorded, we switch to `NextTurn`
+///   to leave late child mail queued instead of extending an already shown
+///   answer.
+/// - If the same task later gets explicit same-turn work again (a steered user
+///   prompt or a tool call after an untagged preamble), we reopen `CurrentTurn`
+///   so that pending child mail is drained into that follow-up request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MailboxDeliveryPhase {
+    /// Incoming mailbox messages can still be consumed by the current turn.
+    #[default]
+    CurrentTurn,
+    /// The current turn already emitted visible final answer text; mailbox
+    /// messages should remain queued for a later turn.
+    NextTurn,
 }
 
 impl Default for ActiveTurn {
@@ -51,18 +73,18 @@ pub(crate) enum TaskKind {
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
-    pub(crate) task: Arc<dyn SessionTask>,
+    pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: Arc<AbortOnDropHandle<()>>,
-    pub(crate) initial_turn_context: Arc<TurnContext>,
+    pub(crate) turn_context: Arc<TurnContext>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
 }
 
 impl ActiveTurn {
     pub(crate) fn add_task(&mut self, task: RunningTask) {
-        self.current_turn_context = Some(Arc::clone(&task.initial_turn_context));
-        let sub_id = task.initial_turn_context.sub_id.clone();
+        self.current_turn_context = Some(Arc::clone(&task.turn_context));
+        let sub_id = task.turn_context.sub_id.clone();
         self.tasks.insert(sub_id, task);
     }
 
@@ -76,65 +98,42 @@ impl ActiveTurn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PendingInputItem {
-    pub(crate) item: ResponseInputItem,
-    pub(crate) raw_response_item_emitted_live: bool,
-}
-
-impl PendingInputItem {
-    pub(crate) fn queued(item: ResponseInputItem) -> Self {
-        Self {
-            item,
-            raw_response_item_emitted_live: false,
-        }
-    }
-
-    pub(crate) fn live_emitted(item: ResponseInputItem) -> Self {
-        Self {
-            item,
-            raw_response_item_emitted_live: true,
-        }
-    }
-}
-
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
-    pending_approvals: HashMap<String, PendingApproval>,
-    pending_request_permissions: HashMap<String, oneshot::Sender<RequestPermissionsResponse>>,
+    pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
+    pending_request_permissions: HashMap<String, PendingRequestPermissions>,
     pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
-    pending_input: Vec<PendingInputItem>,
-    live_emitted_agent_inbox_messages: HashSet<(String, String)>,
-    sampling_completed: bool,
-    granted_permissions: Option<PermissionProfile>,
+    pending_input: Vec<ResponseInputItem>,
+    mailbox_delivery_phase: MailboxDeliveryPhase,
+    granted_permissions: Option<AdditionalPermissionProfile>,
+    strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
+    pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
 }
 
-pub(crate) struct PendingApproval {
-    pub(crate) tx: oneshot::Sender<ReviewDecision>,
-    pub(crate) turn_id: String,
+pub(crate) struct PendingRequestPermissions {
+    pub(crate) tx_response: oneshot::Sender<RequestPermissionsResponse>,
+    pub(crate) requested_permissions: RequestPermissionProfile,
+    pub(crate) cwd: AbsolutePathBuf,
 }
 
 impl TurnState {
     pub(crate) fn insert_pending_approval(
         &mut self,
         key: String,
-        approval: PendingApproval,
-    ) -> Option<PendingApproval> {
-        self.pending_approvals.insert(key, approval)
+        tx: oneshot::Sender<ReviewDecision>,
+    ) -> Option<oneshot::Sender<ReviewDecision>> {
+        self.pending_approvals.insert(key, tx)
     }
 
-    pub(crate) fn pending_approval_turn_id(&self, key: &str) -> Option<&str> {
-        self.pending_approvals
-            .get(key)
-            .map(|approval| approval.turn_id.as_str())
-    }
-
-    pub(crate) fn remove_pending_approval(&mut self, key: &str) -> Option<PendingApproval> {
+    pub(crate) fn remove_pending_approval(
+        &mut self,
+        key: &str,
+    ) -> Option<oneshot::Sender<ReviewDecision>> {
         self.pending_approvals.remove(key)
     }
 
@@ -145,21 +144,21 @@ impl TurnState {
         self.pending_elicitations.clear();
         self.pending_dynamic_tools.clear();
         self.pending_input.clear();
-        self.live_emitted_agent_inbox_messages.clear();
     }
 
     pub(crate) fn insert_pending_request_permissions(
         &mut self,
         key: String,
-        tx: oneshot::Sender<RequestPermissionsResponse>,
-    ) -> Option<oneshot::Sender<RequestPermissionsResponse>> {
-        self.pending_request_permissions.insert(key, tx)
+        pending_request_permissions: PendingRequestPermissions,
+    ) -> Option<PendingRequestPermissions> {
+        self.pending_request_permissions
+            .insert(key, pending_request_permissions)
     }
 
     pub(crate) fn remove_pending_request_permissions(
         &mut self,
         key: &str,
-    ) -> Option<oneshot::Sender<RequestPermissionsResponse>> {
+    ) -> Option<PendingRequestPermissions> {
         self.pending_request_permissions.remove(key)
     }
 
@@ -213,51 +212,10 @@ impl TurnState {
     }
 
     pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {
-        self.pending_input.push(PendingInputItem::queued(input));
+        self.pending_input.push(input);
     }
 
-    pub(crate) fn push_live_emitted_pending_input(&mut self, input: ResponseInputItem) {
-        self.pending_input
-            .push(PendingInputItem::live_emitted(input));
-    }
-
-    pub(crate) fn record_live_emitted_agent_inbox_message(
-        &mut self,
-        canonical_sender: String,
-        message: String,
-    ) {
-        self.live_emitted_agent_inbox_messages
-            .insert((canonical_sender, message));
-    }
-
-    pub(crate) fn has_live_emitted_agent_inbox_message(
-        &self,
-        canonical_sender: &str,
-        message: &str,
-    ) -> bool {
-        self.live_emitted_agent_inbox_messages
-            .contains(&(canonical_sender.to_string(), message.to_string()))
-    }
-
-    pub(crate) fn mark_sampling_completed(&mut self) {
-        self.sampling_completed = true;
-    }
-
-    pub(crate) fn sampling_completed(&self) -> bool {
-        self.sampling_completed
-    }
-
-    #[cfg(test)]
     pub(crate) fn prepend_pending_input(&mut self, mut input: Vec<ResponseInputItem>) {
-        if input.is_empty() {
-            return;
-        }
-
-        let pending_input = input.drain(..).map(PendingInputItem::queued).collect();
-        self.prepend_pending_input_entries(pending_input);
-    }
-
-    pub(crate) fn prepend_pending_input_entries(&mut self, mut input: Vec<PendingInputItem>) {
         if input.is_empty() {
             return;
         }
@@ -267,13 +225,6 @@ impl TurnState {
     }
 
     pub(crate) fn take_pending_input(&mut self) -> Vec<ResponseInputItem> {
-        self.take_pending_input_entries()
-            .into_iter()
-            .map(|pending| pending.item)
-            .collect()
-    }
-
-    pub(crate) fn take_pending_input_entries(&mut self) -> Vec<PendingInputItem> {
         if self.pending_input.is_empty() {
             Vec::with_capacity(0)
         } else {
@@ -287,13 +238,33 @@ impl TurnState {
         !self.pending_input.is_empty()
     }
 
-    pub(crate) fn record_granted_permissions(&mut self, permissions: PermissionProfile) {
+    pub(crate) fn accept_mailbox_delivery_for_current_turn(&mut self) {
+        self.set_mailbox_delivery_phase(MailboxDeliveryPhase::CurrentTurn);
+    }
+
+    pub(crate) fn accepts_mailbox_delivery_for_current_turn(&self) -> bool {
+        self.mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn
+    }
+
+    pub(crate) fn set_mailbox_delivery_phase(&mut self, phase: MailboxDeliveryPhase) {
+        self.mailbox_delivery_phase = phase;
+    }
+
+    pub(crate) fn record_granted_permissions(&mut self, permissions: AdditionalPermissionProfile) {
         self.granted_permissions =
             merge_permission_profiles(self.granted_permissions.as_ref(), Some(&permissions));
     }
 
-    pub(crate) fn granted_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) fn granted_permissions(&self) -> Option<AdditionalPermissionProfile> {
         self.granted_permissions.clone()
+    }
+
+    pub(crate) fn enable_strict_auto_review(&mut self) {
+        self.strict_auto_review_enabled = true;
+    }
+
+    pub(crate) fn strict_auto_review_enabled(&self) -> bool {
+        self.strict_auto_review_enabled
     }
 }
 

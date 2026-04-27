@@ -14,6 +14,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_image_generation_call;
@@ -84,8 +85,10 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![expected_input.clone()],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -137,11 +140,13 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please summarize results".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -195,11 +200,13 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "explain your reasoning".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -254,11 +261,13 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "find the weather".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -318,11 +327,13 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a tiny blue square".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -343,8 +354,8 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
     assert_eq!(end.revised_prompt, Some("A tiny blue square".to_string()));
     assert_eq!(end.result, "Zm9v");
     assert_eq!(
-        end.saved_path,
-        Some(expected_saved_path.to_string_lossy().into_owned())
+        end.saved_path.as_ref().map(AbsolutePathBuf::as_path),
+        Some(expected_saved_path.as_path())
     );
     assert_eq!(std::fs::read(&expected_saved_path)?, b"foo");
     let _ = std::fs::remove_file(&expected_saved_path);
@@ -380,11 +391,13 @@ async fn image_generation_call_event_is_emitted_when_image_save_fails() -> anyho
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate an image".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -433,11 +446,13 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please stream text".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -515,6 +530,7 @@ async fn plan_mode_emits_plan_item_from_proposed_plan_block() -> anyhow::Result<
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please plan".into(),
                 text_elements: Vec::new(),
@@ -522,7 +538,9 @@ async fn plan_mode_emits_plan_item_from_proposed_plan_block() -> anyhow::Result<
             final_output_json_schema: None,
             cwd: std::env::current_dir()?,
             approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -591,6 +609,7 @@ async fn plan_mode_strips_plan_from_agent_messages() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please plan".into(),
                 text_elements: Vec::new(),
@@ -598,7 +617,9 @@ async fn plan_mode_strips_plan_from_agent_messages() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: std::env::current_dir()?,
             approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -699,6 +720,7 @@ async fn plan_mode_streaming_citations_are_stripped_across_added_deltas_and_done
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please plan with citations".into(),
                 text_elements: Vec::new(),
@@ -706,7 +728,9 @@ async fn plan_mode_streaming_citations_are_stripped_across_added_deltas_and_done
             final_output_json_schema: None,
             cwd: std::env::current_dir()?,
             approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -885,6 +909,7 @@ async fn plan_mode_streaming_proposed_plan_tag_split_across_added_and_delta_is_p
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please plan".into(),
                 text_elements: Vec::new(),
@@ -892,7 +917,9 @@ async fn plan_mode_streaming_proposed_plan_tag_split_across_added_and_delta_is_p
             final_output_json_schema: None,
             cwd: std::env::current_dir()?,
             approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -998,6 +1025,7 @@ async fn plan_mode_handles_missing_plan_close_tag() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "please plan".into(),
                 text_elements: Vec::new(),
@@ -1005,7 +1033,9 @@ async fn plan_mode_handles_missing_plan_close_tag() -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: std::env::current_dir()?,
             approval_policy: codex_protocol::protocol::AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_configured.model.clone(),
             effort: None,
             summary: None,
@@ -1075,11 +1105,13 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "reason through it".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 
@@ -1134,11 +1166,13 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "show raw reasoning".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
 

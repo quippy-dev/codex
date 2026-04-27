@@ -1,18 +1,17 @@
-use super::agent_delivery::completed_message_for_agent_fallback;
 use super::control::AgentControl;
-use super::guards::Guards;
-use super::guards::exceeds_thread_spawn_depth_limit;
+use super::control::SpawnAgentForkMode;
+use super::control::SpawnAgentOptions;
+use super::exceeds_thread_spawn_depth_limit;
 use super::status::is_final;
-use crate::codex::load_watchdog_prompt;
 use crate::config::Config;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::thread_manager::ThreadManagerState;
-use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -29,7 +28,7 @@ use tracing::warn;
 
 pub(crate) const DEFAULT_WATCHDOG_INTERVAL_S: i64 = 60;
 
-const WATCHDOG_TICK_SECONDS: i64 = 1;
+const WATCHDOG_TICK_SECONDS: u64 = 1;
 
 #[derive(Clone)]
 pub(crate) struct WatchdogRegistration {
@@ -39,6 +38,7 @@ pub(crate) struct WatchdogRegistration {
     pub(crate) interval_s: i64,
     pub(crate) prompt: String,
     pub(crate) config: Config,
+    pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,9 +60,21 @@ struct WatchdogEntry {
     generation: i64,
 }
 
+#[derive(Clone)]
+struct WatchdogSnapshot {
+    owner_thread_id: ThreadId,
+    child_depth: i32,
+    prompt: String,
+    config: Config,
+    environments: Option<Vec<TurnEnvironmentSelection>>,
+    interval: Duration,
+    last_trigger: Instant,
+    active_helper_id: Option<ThreadId>,
+    owner_idle_since: Option<Instant>,
+}
+
 pub(crate) struct WatchdogManager {
     manager: Weak<ThreadManagerState>,
-    guards: Arc<Guards>,
     registrations: Mutex<HashMap<ThreadId, WatchdogEntry>>,
     preserved_helper_owners: Mutex<HashMap<ThreadId, ThreadId>>,
     helpers_that_notified_owner: Mutex<HashSet<ThreadId>>,
@@ -72,10 +84,9 @@ pub(crate) struct WatchdogManager {
 }
 
 impl WatchdogManager {
-    pub(crate) fn new(manager: Weak<ThreadManagerState>, guards: Arc<Guards>) -> Arc<Self> {
+    pub(crate) fn new(manager: Weak<ThreadManagerState>) -> Arc<Self> {
         Arc::new(Self {
             manager,
-            guards,
             registrations: Mutex::new(HashMap::new()),
             preserved_helper_owners: Mutex::new(HashMap::new()),
             helpers_that_notified_owner: Mutex::new(HashSet::new()),
@@ -85,7 +96,7 @@ impl WatchdogManager {
         })
     }
 
-    pub(crate) fn start(self: &Arc<Self>) {
+    pub(crate) fn start(self: &Arc<Self>, control: AgentControl) {
         if self
             .started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -96,8 +107,39 @@ impl WatchdogManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.run_loop().await;
+            manager.run_loop(control).await;
         });
+    }
+
+    async fn run_loop(self: Arc<Self>, control: AgentControl) {
+        loop {
+            self.run_once(&control).await;
+            if self.manager.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(WATCHDOG_TICK_SECONDS)).await;
+        }
+    }
+
+    pub(crate) async fn run_once(self: &Arc<Self>, control: &AgentControl) {
+        let Some(manager_state) = self.manager.upgrade() else {
+            self.registrations.lock().await.clear();
+            return;
+        };
+
+        let snapshots: Vec<(ThreadId, i64)> = {
+            let registrations = self.registrations.lock().await;
+            registrations
+                .iter()
+                .map(|(target_id, entry)| (*target_id, entry.generation))
+                .collect()
+        };
+        let now = Instant::now();
+
+        for (target_id, generation) in snapshots {
+            self.evaluate(control, &manager_state, target_id, generation, now)
+                .await;
+        }
     }
 
     pub(crate) async fn register(
@@ -151,40 +193,9 @@ impl WatchdogManager {
         Ok(superseded)
     }
 
-    async fn run_loop(self: Arc<Self>) {
-        let tick = tick_duration();
-        loop {
-            self.run_once().await;
-            if self.manager.upgrade().is_none() {
-                break;
-            }
-            tokio::time::sleep(tick).await;
-        }
-    }
-
-    pub(crate) async fn run_once(self: &Arc<Self>) {
-        let Some(manager_state) = self.manager.upgrade() else {
-            self.registrations.lock().await.clear();
-            return;
-        };
-
-        let snapshots: Vec<(ThreadId, i64)> = {
-            let registrations = self.registrations.lock().await;
-            registrations
-                .iter()
-                .map(|(target_id, entry)| (*target_id, entry.generation))
-                .collect()
-        };
-        let now = Instant::now();
-
-        for (target_id, generation) in snapshots {
-            self.evaluate(&manager_state, target_id, generation, now)
-                .await;
-        }
-    }
-
     async fn evaluate(
         self: &Arc<Self>,
+        control: &AgentControl,
         manager_state: &Arc<ThreadManagerState>,
         target_thread_id: ThreadId,
         generation: i64,
@@ -199,13 +210,8 @@ impl WatchdogManager {
             Ok(thread) => thread.agent_status().await,
             Err(_) => AgentStatus::NotFound,
         };
-        let control_for_spawn = AgentControl::from_parts(
-            self.manager.clone(),
-            Arc::clone(&self.guards),
-            Arc::clone(self),
-        );
         if is_watchdog_terminated(&owner_status) {
-            match control_for_spawn.shutdown_agent(target_thread_id).await {
+            match control.shutdown_live_agent(target_thread_id).await {
                 Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {}
                 Err(err) => {
                     warn!(
@@ -217,24 +223,14 @@ impl WatchdogManager {
             }
             return;
         }
+
         let force_due = self
             .take_force_due_if_generation(target_thread_id, generation)
             .await;
-        let (owner_has_active_turn, owner_post_interrupt_collab_hold_armed) = match owner_thread {
-            Ok(thread) => (
-                thread.has_active_turn().await,
-                thread
-                    .codex
-                    .session
-                    .post_interrupt_collab_hold_armed()
-                    .await,
-            ),
-            Err(_) => (false, false),
+        let owner_running = match owner_thread {
+            Ok(_) => agent_status_is_active(&owner_status) && !force_due,
+            Err(_) => false,
         };
-        let owner_running = owner_has_active_turn
-            && !owner_post_interrupt_collab_hold_armed
-            && !matches!(owner_status, AgentStatus::Interrupted)
-            && !force_due;
         let (owner_idle_since, idle_episode_satisfied) = self
             .update_owner_idle_state_if_generation(
                 target_thread_id,
@@ -245,82 +241,14 @@ impl WatchdogManager {
             )
             .await;
         if let Some(helper_id) = snapshot.active_helper_id {
-            let mut helper_status = get_status(manager_state, helper_id).await;
-            if !is_final(&helper_status) {
-                helper_status = match manager_state.get_thread(helper_id).await {
-                    Ok(helper_thread) if helper_thread.has_active_turn().await => return,
-                    Ok(helper_thread)
-                        if helper_thread
-                            .codex
-                            .session
-                            .last_completed_turn_used_agent_send_input() =>
-                    {
-                        AgentStatus::Completed(None)
-                    }
-                    Ok(_) => return,
-                    Err(_) => AgentStatus::NotFound,
-                };
-            }
-            if !self.try_claim_helper_completion(helper_id).await {
-                return;
-            }
-            let mut idle_episode_satisfied = self.helper_notified_owner(helper_id).await;
-            let helper_thread = manager_state.get_thread(helper_id).await.ok();
-            let helper_fallback_message = completed_message_for_agent_fallback(
-                &helper_status,
-                idle_episode_satisfied,
-                false,
-                true,
-            );
-            let helper_completed_message_already_forwarded =
-                if let (Some(helper_thread), Some(message)) =
-                    (&helper_thread, helper_fallback_message.as_ref())
-                {
-                    helper_thread
-                        .codex
-                        .session
-                        .last_completed_turn_live_forwarded_agent_message(message)
-                        .await
-                } else {
-                    false
-                };
-            if let Some(message) = completed_message_for_agent_fallback(
-                &helper_status,
-                idle_episode_satisfied,
-                helper_completed_message_already_forwarded,
-                true,
-            ) {
-                if let Err(err) = control_for_spawn
-                    .send_watchdog_wakeup(snapshot.owner_thread_id, helper_id, message)
-                    .await
-                {
-                    warn!(
-                        helper_id = %helper_id,
-                        owner_thread_id = %snapshot.owner_thread_id,
-                        "watchdog helper forward failed: {err}"
-                    );
-                } else {
-                    idle_episode_satisfied = true;
-                    info!(
-                        helper_id = %helper_id,
-                        owner_thread_id = %snapshot.owner_thread_id,
-                        "watchdog forwarded helper completion to owner"
-                    );
-                }
-            }
-            if let Err(err) = control_for_spawn.shutdown_agent(helper_id).await {
-                warn!(
-                    helper_id = %helper_id,
-                    owner_thread_id = %snapshot.owner_thread_id,
-                    "watchdog helper cleanup failed: {err}"
-                );
-            }
-            self.update_after_helper_completion(
+            self.evaluate_active_helper(
+                control,
+                manager_state,
                 target_thread_id,
                 generation,
                 now,
+                snapshot.owner_thread_id,
                 helper_id,
-                idle_episode_satisfied,
             )
             .await;
             return;
@@ -336,15 +264,88 @@ impl WatchdogManager {
         if !force_due && now.duration_since(owner_idle_since) < snapshot.interval {
             return;
         }
-
         if idle_episode_satisfied {
             return;
         }
-
         if !force_due && now.duration_since(snapshot.last_trigger) < snapshot.interval {
             return;
         }
 
+        self.spawn_helper(control, target_thread_id, generation, now, snapshot)
+            .await;
+    }
+
+    async fn evaluate_active_helper(
+        self: &Arc<Self>,
+        control: &AgentControl,
+        manager_state: &Arc<ThreadManagerState>,
+        target_thread_id: ThreadId,
+        generation: i64,
+        now: Instant,
+        owner_thread_id: ThreadId,
+        helper_id: ThreadId,
+    ) {
+        let mut helper_status = get_status(manager_state, helper_id).await;
+        if !is_final(&helper_status) {
+            helper_status = match manager_state.get_thread(helper_id).await {
+                Ok(_) if agent_status_is_active(&helper_status) => return,
+                Ok(_) => return,
+                Err(_) => AgentStatus::NotFound,
+            };
+        }
+        if !self.try_claim_helper_completion(helper_id).await {
+            return;
+        }
+
+        let mut idle_episode_satisfied = self.helper_notified_owner(helper_id).await;
+        if let Some(message) = watchdog_completion_message(&helper_status, idle_episode_satisfied) {
+            match control
+                .send_watchdog_wakeup(owner_thread_id, helper_id, message)
+                .await
+            {
+                Ok(_) => {
+                    idle_episode_satisfied = true;
+                    info!(
+                        helper_id = %helper_id,
+                        owner_thread_id = %owner_thread_id,
+                        "watchdog forwarded helper completion to owner"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        helper_id = %helper_id,
+                        owner_thread_id = %owner_thread_id,
+                        "watchdog helper forward failed: {err}"
+                    );
+                }
+            }
+        }
+        if let Err(err) = control.shutdown_live_agent(helper_id).await {
+            warn!(
+                helper_id = %helper_id,
+                owner_thread_id = %owner_thread_id,
+                "watchdog helper cleanup failed: {err}"
+            );
+        }
+        self.update_after_helper_completion(
+            target_thread_id,
+            generation,
+            now,
+            helper_id,
+            idle_episode_satisfied,
+        )
+        .await;
+        self.clear_preserved_helper_owner(helper_id).await;
+    }
+
+    async fn spawn_helper(
+        self: &Arc<Self>,
+        control: &AgentControl,
+        target_thread_id: ThreadId,
+        generation: i64,
+        now: Instant,
+        snapshot: WatchdogSnapshot,
+    ) {
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: snapshot.owner_thread_id,
             depth: snapshot.child_depth,
@@ -354,29 +355,32 @@ impl WatchdogManager {
         });
         let mut helper_config = snapshot.config.clone();
         helper_config.ephemeral = true;
-        let helper_prompt =
-            watchdog_helper_prompt(&helper_config, snapshot.owner_thread_id, &snapshot.prompt)
-                .await;
-        // Watchdog check-ins must fork a distinct helper thread. If this path ever resumes
-        // the owner thread instead, the owner can self-wake and rapidly duplicate session
-        // state in memory.
-        let spawn_result = control_for_spawn
-            .fork_agent(
+        let helper_prompt = watchdog_helper_prompt(&snapshot.prompt);
+        let spawn_result = control
+            .spawn_agent_with_metadata(
                 helper_config,
                 vec![UserInput::Text {
                     text: helper_prompt,
                     text_elements: Vec::new(),
-                }],
-                snapshot.owner_thread_id,
-                usize::MAX,
-                session_source,
+                }]
+                .into(),
+                Some(session_source),
+                SpawnAgentOptions {
+                    fork_parent_spawn_call_id: Some(format!("watchdog:{target_thread_id}")),
+                    fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                    environments: snapshot.environments.clone(),
+                },
             )
             .await;
 
         match spawn_result {
-            Ok(helper_id) => {
-                info!("watchdog spawned helper {helper_id} for target {target_thread_id}");
-                self.update_after_spawn(target_thread_id, generation, now, Some(helper_id))
+            Ok(helper) => {
+                info!(
+                    helper_id = %helper.thread_id,
+                    target_thread_id = %target_thread_id,
+                    "watchdog spawned helper"
+                );
+                self.update_after_spawn(target_thread_id, generation, now, Some(helper.thread_id))
                     .await;
             }
             Err(err) => {
@@ -402,6 +406,7 @@ impl WatchdogManager {
             child_depth: entry.registration.child_depth,
             prompt: entry.registration.prompt.clone(),
             config: entry.registration.config.clone(),
+            environments: entry.registration.environments.clone(),
             interval: entry.interval,
             last_trigger: entry.last_trigger,
             active_helper_id: entry.active_helper_id,
@@ -428,7 +433,6 @@ impl WatchdogManager {
         if force_due {
             return (entry.owner_idle_since, entry.idle_episode_satisfied);
         }
-
         if owner_running {
             if !entry.idle_episode_satisfied {
                 entry.owner_idle_since = None;
@@ -437,10 +441,7 @@ impl WatchdogManager {
             return (entry.owner_idle_since, entry.idle_episode_satisfied);
         }
 
-        if entry.owner_was_running {
-            entry.owner_idle_since = Some(now);
-            entry.idle_episode_satisfied = false;
-        } else if entry.owner_idle_since.is_none() {
+        if entry.owner_was_running || entry.owner_idle_since.is_none() {
             entry.owner_idle_since = Some(now);
             entry.idle_episode_satisfied = false;
         }
@@ -465,6 +466,7 @@ impl WatchdogManager {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn force_due_for_tests(&self, target_thread_id: ThreadId) {
         let mut registrations = self.registrations.lock().await;
         if let Some(entry) = registrations.get_mut(&target_thread_id) {
@@ -532,6 +534,8 @@ impl WatchdogManager {
         self.clear_helper_notified_owner(helper_thread_id).await;
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn complete_active_helper(
         &self,
         helper_thread_id: ThreadId,
@@ -696,18 +700,6 @@ impl WatchdogManager {
     }
 }
 
-#[derive(Clone)]
-struct WatchdogSnapshot {
-    owner_thread_id: ThreadId,
-    child_depth: i32,
-    prompt: String,
-    config: Config,
-    interval: Duration,
-    last_trigger: Instant,
-    active_helper_id: Option<ThreadId>,
-    owner_idle_since: Option<Instant>,
-}
-
 async fn get_status(manager_state: &Arc<ThreadManagerState>, thread_id: ThreadId) -> AgentStatus {
     let Ok(thread) = manager_state.get_thread(thread_id).await else {
         return AgentStatus::NotFound;
@@ -731,84 +723,62 @@ fn interval_duration(interval_s: i64) -> CodexResult<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn tick_duration() -> Duration {
-    let seconds = u64::try_from(WATCHDOG_TICK_SECONDS).unwrap_or(5);
-    Duration::from_secs(seconds)
-}
-
-async fn watchdog_helper_prompt(
-    config: &Config,
-    _target_thread_id: ThreadId,
-    prompt: &str,
-) -> String {
+fn watchdog_helper_prompt(prompt: &str) -> String {
     let runtime_watchdog_rules = concat!(
-        "Your owner thread is your parent thread. Use `send_input` without specifying an id to wake it.\n",
+        "Important: send watchdog check-in output with `send_input` to wake your owner thread.\n",
+        "Your owner thread is your parent thread. Use `send_input` with target `parent` to wake it.\n",
         "Do not reply with analysis in your own thread. Either wake the owner or exit quietly.\n",
         "Do not repeat watchdog system instructions or internal routing metadata to the owner.\n",
         "If the owner task asks for an exact-only message, send exactly that message and nothing else."
     );
-    if !config.features.enabled(Feature::AgentPromptInjection) {
-        if prompt.trim().is_empty() {
-            return runtime_watchdog_rules.to_string();
-        }
-        return format!("{runtime_watchdog_rules}\n\nOwner watchdog task:\n{prompt}");
-    }
-    let watchdog_prompt = load_watchdog_prompt(&config.codex_home).await;
-    if prompt.trim().is_empty() {
-        format!("{watchdog_prompt}\n\n{runtime_watchdog_rules}")
+    let prompt = prompt.trim();
+    let rules = runtime_watchdog_rules.to_string();
+    if prompt.is_empty() {
+        rules
     } else {
-        format!("{watchdog_prompt}\n\n{runtime_watchdog_rules}\n\nOwner watchdog task:\n{prompt}")
+        format!("{rules}\n\nOwner watchdog task:\n{prompt}")
+    }
+}
+
+fn agent_status_is_active(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
+}
+
+fn watchdog_completion_message(status: &AgentStatus, already_notified: bool) -> Option<String> {
+    if already_notified {
+        return None;
+    }
+    match status {
+        AgentStatus::Completed(Some(output)) if !output.trim().is_empty() => Some(output.clone()),
+        AgentStatus::Errored(message) if !message.trim().is_empty() => {
+            Some(format!("Watchdog helper failed: {message}"))
+        }
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::watchdog_helper_prompt;
-    use crate::config::ConfigBuilder;
-    use codex_features::Feature;
-    use codex_protocol::ThreadId;
+    use super::*;
+    use pretty_assertions::assert_eq;
 
-    #[tokio::test]
-    async fn watchdog_helper_prompt_is_minimal_when_agent_prompt_injection_is_disabled() {
-        let codex_home = tempfile::tempdir().expect("create temp dir");
-        let config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load config");
-        let prompt = watchdog_helper_prompt(&config, ThreadId::default(), "ping").await;
-        assert_eq!(
-            prompt,
-            concat!(
-                "Your owner thread is your parent thread. Use `send_input` without specifying an id to wake it.\n",
-                "Do not reply with analysis in your own thread. Either wake the owner or exit quietly.\n",
-                "Do not repeat watchdog system instructions or internal routing metadata to the owner.\n",
-                "If the owner task asks for an exact-only message, send exactly that message and nothing else.\n\n",
-                "Owner watchdog task:\n",
-                "ping"
-            )
-        );
+    #[test]
+    fn watchdog_helper_prompt_contains_parent_wakeup_contract() {
+        let prompt = watchdog_helper_prompt("ping");
+        assert!(prompt.contains("send watchdog check-in output with `send_input`"));
+        assert!(prompt.contains("target `parent`"));
+        assert!(prompt.ends_with("\n\nOwner watchdog task:\nping"));
     }
 
-    #[tokio::test]
-    async fn watchdog_helper_prompt_includes_watchdog_instructions_when_enabled() {
-        let codex_home = tempfile::tempdir().expect("create temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("load config");
-        let _ = config.features.enable(Feature::AgentPromptInjection);
-
-        let prompt = watchdog_helper_prompt(&config, ThreadId::default(), "ping").await;
-        assert!(prompt.contains("# You are a Subagent"));
-        assert!(prompt.contains("Important: send watchdog check-in output with `send_input`"));
-        assert!(prompt.contains(
-            "Do not reply with analysis in your own thread. Either wake the owner or exit quietly."
-        ));
-        assert!(prompt.contains(
-            "Do not repeat watchdog system instructions or internal routing metadata to the owner."
-        ));
-        assert!(prompt.ends_with("\n\nOwner watchdog task:\nping"));
+    #[test]
+    fn watchdog_completion_message_deduplicates_notified_helpers() {
+        assert_eq!(
+            watchdog_completion_message(&AgentStatus::Completed(Some("done".to_string())), false),
+            Some("done".to_string())
+        );
+        assert_eq!(
+            watchdog_completion_message(&AgentStatus::Completed(Some("done".to_string())), true),
+            None
+        );
     }
 }

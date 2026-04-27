@@ -1,6 +1,10 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "AbsolutePathBuf": {
+      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+      "type": "string"
+    },
     "AgentPath": {
       "type": "string"
     },
@@ -31,6 +35,7 @@
             "contextWindowExceeded",
             "usageLimitExceeded",
             "serverOverloaded",
+            "cyberPolicy",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -134,49 +139,30 @@
           ],
           "title": "ResponseTooManyFailedAttemptsCodexErrorInfo",
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Returned when `turn/start` or `turn/steer` is submitted while the current active turn cannot accept same-turn steering, for example `/review` or manual `/compact`.",
+          "properties": {
+            "activeTurnNotSteerable": {
+              "properties": {
+                "turnKind": {
+                  "$ref": "#/definitions/NonSteerableTurnKind"
+                }
+              },
+              "required": [
+                "turnKind"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "activeTurnNotSteerable"
+          ],
+          "title": "ActiveTurnNotSteerableCodexErrorInfo",
+          "type": "object"
         }
       ]
-    },
-    "CollabAgentRef": {
-      "properties": {
-        "agentNickname": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "agentRole": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "spawnMode": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/CollabAgentSpawnMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "threadId"
-      ],
-      "type": "object"
-    },
-    "CollabAgentSpawnMode": {
-      "enum": [
-        "spawn",
-        "fork",
-        "watchdog"
-      ],
-      "type": "string"
     },
     "CollabAgentState": {
       "properties": {
@@ -207,43 +193,6 @@
       ],
       "type": "string"
     },
-    "CollabAgentStatusEntry": {
-      "properties": {
-        "agentNickname": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "agentRole": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "spawnMode": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/CollabAgentSpawnMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "status": {
-          "$ref": "#/definitions/CollabAgentState"
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "status",
-        "threadId"
-      ],
-      "type": "object"
-    },
     "CollabAgentTool": {
       "enum": [
         "spawnAgent",
@@ -262,14 +211,6 @@
       ],
       "type": "string"
     },
-    "CollabCloseResult": {
-      "enum": [
-        "closed",
-        "alreadyClosed",
-        "notFound"
-      ],
-      "type": "string"
-    },
     "CommandAction": {
       "oneOf": [
         {
@@ -281,7 +222,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
@@ -520,6 +461,7 @@
     },
     "McpToolCallResult": {
       "properties": {
+        "_meta": true,
         "content": {
           "items": true,
           "type": "array"
@@ -605,6 +547,13 @@
           "type": "string"
         }
       ]
+    },
+    "NonSteerableTurnKind": {
+      "enum": [
+        "review",
+        "compact"
+      ],
+      "type": "string"
     },
     "PatchApplyStatus": {
       "enum": [
@@ -850,12 +799,23 @@
           "type": "integer"
         },
         "cwd": {
-          "description": "Working directory captured for the thread.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Working directory captured for the thread."
         },
         "ephemeral": {
           "description": "Whether the thread is ephemeral and should not be materialized on disk.",
           "type": "boolean"
+        },
+        "forkedFromId": {
+          "description": "Source thread id when this thread was created by forking another thread.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "gitInfo": {
           "anyOf": [
@@ -1129,8 +1089,12 @@
               "type": "array"
             },
             "cwd": {
-              "description": "The command's working directory.",
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                }
+              ],
+              "description": "The command's working directory."
             },
             "durationMs": {
               "description": "The duration of the command execution in milliseconds.",
@@ -1243,6 +1207,12 @@
             "id": {
               "type": "string"
             },
+            "mcpAppResourceUri": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "result": {
               "anyOf": [
                 {
@@ -1304,6 +1274,12 @@
             "id": {
               "type": "string"
             },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "status": {
               "$ref": "#/definitions/DynamicToolCallStatus"
             },
@@ -1336,13 +1312,6 @@
         },
         {
           "properties": {
-            "agentStatuses": {
-              "description": "Optional receiver metadata paired with final statuses.",
-              "items": {
-                "$ref": "#/definitions/CollabAgentStatusEntry"
-              },
-              "type": "array"
-            },
             "agentsStates": {
               "additionalProperties": {
                 "$ref": "#/definitions/CollabAgentState"
@@ -1350,23 +1319,12 @@
               "description": "Last known status of the target agents, when available.",
               "type": "object"
             },
-            "closeResult": {
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/CollabCloseResult"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Optional close result when `tool` is `CloseAgent`."
-            },
             "id": {
               "description": "Unique identifier for this collab tool call.",
               "type": "string"
             },
             "model": {
-              "description": "Requested model when `tool` is `SpawnAgent`.",
+              "description": "Model requested for the spawned agent, when applicable.",
               "type": [
                 "string",
                 "null"
@@ -1388,14 +1346,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Requested reasoning effort when `tool` is `SpawnAgent`."
-            },
-            "receiverAgents": {
-              "description": "Optional receiver metadata paired with receiver thread IDs.",
-              "items": {
-                "$ref": "#/definitions/CollabAgentRef"
-              },
-              "type": "array"
+              "description": "Reasoning effort requested for the spawned agent, when applicable."
             },
             "receiverThreadIds": {
               "description": "Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
@@ -1407,17 +1358,6 @@
             "senderThreadId": {
               "description": "Thread ID of the agent issuing the collab request.",
               "type": "string"
-            },
-            "spawnMode": {
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/CollabAgentSpawnMode"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Spawn mode when `tool` is `SpawnAgent`."
             },
             "status": {
               "allOf": [
@@ -1444,10 +1384,8 @@
             }
           },
           "required": [
-            "agentStatuses",
             "agentsStates",
             "id",
-            "receiverAgents",
             "receiverThreadIds",
             "senderThreadId",
             "status",
@@ -1497,7 +1435,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "enum": [
@@ -1530,9 +1468,13 @@
               ]
             },
             "savedPath": {
-              "type": [
-                "string",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "status": {
@@ -1702,6 +1644,22 @@
     },
     "Turn": {
       "properties": {
+        "completedAt": {
+          "description": "Unix timestamp (in seconds) when the turn completed.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "durationMs": {
+          "description": "Duration between turn start and completion in milliseconds, if known.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "error": {
           "anyOf": [
             {
@@ -1722,6 +1680,14 @@
             "$ref": "#/definitions/ThreadItem"
           },
           "type": "array"
+        },
+        "startedAt": {
+          "description": "Unix timestamp (in seconds) when the turn started.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "status": {
           "$ref": "#/definitions/TurnStatus"
@@ -1994,6 +1960,13 @@
     }
   },
   "properties": {
+    "backwardsCursor": {
+      "description": "Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one thread. Use it with the opposite `sortDirection`; for timestamp sorts it anchors at the start of the page timestamp so same-second updates are not skipped.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "data": {
       "items": {
         "$ref": "#/definitions/Thread"

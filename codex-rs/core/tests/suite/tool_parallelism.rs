@@ -5,7 +5,6 @@ use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_features::Feature;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -36,6 +35,7 @@ async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
@@ -43,7 +43,9 @@ async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -66,15 +68,7 @@ async fn run_turn_and_measure(test: &TestCodex, prompt: &str) -> anyhow::Result<
 
 #[allow(clippy::expect_used)]
 async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
-    let mut builder = test_codex()
-        .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            config.model_provider.supports_websockets = false;
-            config
-                .features
-                .disable(Feature::ShellSnapshot)
-                .expect("test config should allow feature update");
-        });
+    let mut builder = test_codex().with_model("test-gpt-5.1-codex");
     builder.build(server).await
 }
 
@@ -153,13 +147,7 @@ async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
-        config.model_provider.supports_websockets = false;
-        config
-            .features
-            .disable(Feature::ShellSnapshot)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder.build(&server).await?;
 
     let shell_args = json!({
@@ -358,13 +346,7 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     ])
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
-        config.model_provider.supports_websockets = false;
-        config
-            .features
-            .disable(Feature::ShellSnapshot)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex().with_model("gpt-5.4");
     let test = builder
         .build_with_streaming_server(&streaming_server)
         .await?;
@@ -372,6 +354,7 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
     let session_model = test.session_configured.model.clone();
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "stream delayed completion".into(),
                 text_elements: Vec::new(),
@@ -379,7 +362,9 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
             final_output_json_schema: None,
             cwd: test.cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,

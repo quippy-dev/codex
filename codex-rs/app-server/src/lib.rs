@@ -1,12 +1,15 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_requirements::cloud_requirements_loader;
+use codex_config::NoopThreadConfigLoader;
+use codex_config::RemoteThreadConfigLoader;
+use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
-use codex_core::config::ConfigBuilder;
-use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::config_loader::LoaderOverrides;
+use codex_exec_server::EnvironmentManagerArgs;
+use codex_features::Feature;
+use codex_login::AuthManager;
 use codex_utils_cli::CliConfigOverrides;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -17,18 +20,24 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 
+use crate::config_manager::ConfigManager;
 use crate::message_processor::MessageProcessor;
 use crate::message_processor::MessageProcessorArgs;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionState;
 use crate::transport::OutboundConnectionState;
 use crate::transport::TransportEvent;
+use crate::transport::auth::policy_from_settings;
 use crate::transport::route_outgoing_envelope;
+use crate::transport::start_control_socket_acceptor;
+use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
+use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -38,13 +47,15 @@ use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::TextRange as CoreTextRange;
+use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecServerRuntimePaths;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use codex_state::log_db;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use toml::Value as TomlValue;
 use tracing::Level;
 use tracing::error;
 use tracing::info;
@@ -60,12 +71,17 @@ mod app_server_tracing;
 mod bespoke_event_handling;
 mod codex_message_processor;
 mod command_exec;
+mod config;
 mod config_api;
+mod config_manager;
+mod config_manager_service;
+mod device_key_api;
 mod dynamic_tools;
 mod error_code;
 mod external_agent_config_api;
 mod filters;
 mod fs_api;
+mod fs_watch;
 mod fuzzy_file_search;
 pub mod in_process;
 mod message_processor;
@@ -73,15 +89,17 @@ mod models;
 mod outgoing_message;
 mod runtime_bootstrap;
 mod server_request_error;
-mod thread_history_loader;
 mod thread_state;
 mod thread_status;
-mod thread_summary;
 mod transport;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
+pub use crate::transport::app_server_control_socket_path;
+pub use crate::transport::auth::AppServerWebsocketAuthArgs;
+pub use crate::transport::auth::AppServerWebsocketAuthSettings;
+pub use crate::transport::auth::WebsocketAuthCliMode;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 
@@ -92,6 +110,13 @@ enum LogFormat {
 }
 
 type StderrLogLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoader> {
+    match config.experimental_thread_config_endpoint.as_deref() {
+        Some(endpoint) => Arc::new(RemoteThreadConfigLoader::new(endpoint)),
+        None => Arc::new(NoopThreadConfigLoader),
+    }
+}
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
 ///
@@ -106,9 +131,7 @@ enum OutboundControlEvent {
     /// Register a new writer for an opened connection.
     Opened {
         connection_id: ConnectionId,
-        writer: mpsc::Sender<crate::outgoing_message::OutgoingMessage>,
-        // Allow codex/event/* notifications to be emitted.
-        allow_legacy_notifications: bool,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
@@ -273,21 +296,16 @@ fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> 
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ true,
     ) {
-        if !matches!(layer.name, ConfigLayerSource::Project { .. })
-            || layer.disabled_reason.is_none()
-        {
+        let ConfigLayerSource::Project { dot_codex_folder } = &layer.name else {
             continue;
-        }
-        if let ConfigLayerSource::Project { dot_codex_folder } = &layer.name {
-            disabled_folders.push((
-                dot_codex_folder.as_path().display().to_string(),
-                layer
-                    .disabled_reason
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "config.toml is disabled.".to_string()),
-            ));
-        }
+        };
+        let Some(disabled_reason) = &layer.disabled_reason else {
+            continue;
+        };
+        disabled_folders.push((
+            dot_codex_folder.as_path().display().to_string(),
+            disabled_reason.clone(),
+        ));
     }
 
     if disabled_folders.is_empty() {
@@ -295,8 +313,8 @@ fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> 
     }
 
     let mut message = concat!(
-        "Project config.toml files are disabled in the following folders. ",
-        "Settings in those files are ignored, but skills and exec policies still load.\n",
+        "Project-local config, hooks, and exec policies are disabled in the following folders ",
+        "until the project is trusted, but skills still load.\n",
     )
     .to_string();
     for (index, (folder, reason)) in disabled_folders.iter().enumerate() {
@@ -341,6 +359,7 @@ pub async fn run_main(
         None,
         AppServerTransport::Stdio,
         SessionSource::VSCode,
+        AppServerWebsocketAuthSettings::default(),
     )
     .await
 }
@@ -353,50 +372,26 @@ pub async fn run_main_with_transport(
     auth_file: Option<PathBuf>,
     transport: AppServerTransport,
     session_source: SessionSource,
+    auth: AppServerWebsocketAuthSettings,
 ) -> IoResult<()> {
+    let environment_manager = Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::from_env(
+        ExecServerRuntimePaths::from_optional_paths(
+            arg0_paths.codex_self_exe.clone(),
+            arg0_paths.codex_linux_sandbox_exe.clone(),
+        )?,
+    )));
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
     let (outbound_control_tx, mut outbound_control_rx) =
         mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
 
-    enum TransportRuntime {
-        Stdio,
-        WebSocket {
-            accept_handle: JoinHandle<()>,
-            shutdown_token: CancellationToken,
-        },
-    }
-
-    let mut stdio_handles = Vec::<JoinHandle<()>>::new();
-    let transport_runtime = match transport {
-        AppServerTransport::Stdio => {
-            start_stdio_connection(transport_event_tx.clone(), &mut stdio_handles).await?;
-            TransportRuntime::Stdio
-        }
-        AppServerTransport::WebSocket { bind_address } => {
-            let shutdown_token = CancellationToken::new();
-            let accept_handle = start_websocket_acceptor(
-                bind_address,
-                transport_event_tx.clone(),
-                shutdown_token.clone(),
-            )
-            .await?;
-            TransportRuntime::WebSocket {
-                accept_handle,
-                shutdown_token,
-            }
-        }
-    };
-    let single_client_mode = matches!(&transport_runtime, TransportRuntime::Stdio);
-    let shutdown_when_no_connections = single_client_mode;
-    let graceful_signal_restart_enabled = !single_client_mode;
     let runtime_bootstrap::RuntimeBootstrap {
+        auth_storage_home,
         cli_kv_overrides,
         cloud_requirements,
         config,
-        mut config_warnings,
-        auth_storage_home,
+        config_warnings: _bootstrap_config_warnings,
         loader_overrides_for_config_api,
     } = runtime_bootstrap::prepare_runtime_bootstrap(
         &cli_config_overrides,
@@ -404,6 +399,34 @@ pub async fn run_main_with_transport(
         auth_file.clone(),
     )
     .await?;
+
+    let codex_home = config.codex_home.to_path_buf();
+    let discovered_thread_config_loader = configured_thread_config_loader(&config);
+    let config_manager = ConfigManager::new(
+        codex_home,
+        cli_kv_overrides,
+        loader_overrides_for_config_api,
+        cloud_requirements,
+        arg0_paths.clone(),
+        discovered_thread_config_loader,
+    );
+    let mut config_warnings = Vec::new();
+    let config = match config_manager
+        .load_latest_config(/*fallback_cwd*/ None)
+        .await
+    {
+        Ok(config) => config,
+        Err(err) => {
+            let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
+            config_warnings.push(message);
+            config_manager.load_default_config().await.map_err(|e| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("error loading default config after config error: {e}"),
+                )
+            })?
+        }
+    };
 
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         let (path, range) = exec_policy_warning_location(&err);
@@ -427,7 +450,9 @@ pub async fn run_main_with_transport(
             range: None,
         });
     }
-    if let Some(warning) = codex_core::config::missing_system_bwrap_warning() {
+    if let Some(warning) =
+        codex_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
+    {
         config_warnings.push(ConfigWarningNotification {
             summary: warning,
             details: None,
@@ -435,6 +460,12 @@ pub async fn run_main_with_transport(
             range: None,
         });
     }
+
+    let auth_manager = AuthManager::shared_from_config_with_auth_file(
+        &config, /*enable_codex_api_key_env*/ false, auth_file,
+    )?;
+    config_manager
+        .replace_cloud_requirements_loader(auth_manager.clone(), config.chatgpt_base_url.clone());
 
     let feedback = CodexFeedback::new();
 
@@ -470,13 +501,13 @@ pub async fn run_main_with_transport(
 
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
-    let log_db = codex_state::StateRuntime::init(
+    let state_db = codex_state::StateRuntime::init(
         config.sqlite_home.clone(),
         config.model_provider_id.clone(),
     )
     .await
-    .ok()
-    .map(log_db::start);
+    .ok();
+    let log_db = state_db.clone().map(log_db::start);
     let log_db_layer = log_db
         .clone()
         .map(|layer| layer.with_filter(Targets::new().with_default(Level::TRACE)));
@@ -497,6 +528,67 @@ pub async fn run_main_with_transport(
         }
     }
 
+    let transport_shutdown_token = CancellationToken::new();
+    let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
+
+    let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
+    let shutdown_when_no_connections = single_client_mode;
+    let graceful_signal_restart_enabled = !single_client_mode;
+    let mut app_server_client_name_rx = None;
+
+    match &transport {
+        AppServerTransport::Stdio => {
+            let (stdio_client_name_tx, stdio_client_name_rx) = oneshot::channel::<String>();
+            app_server_client_name_rx = Some(stdio_client_name_rx);
+            start_stdio_connection(
+                transport_event_tx.clone(),
+                &mut transport_accept_handles,
+                stdio_client_name_tx,
+            )
+            .await?;
+        }
+        AppServerTransport::UnixSocket { socket_path } => {
+            let accept_handle = start_control_socket_acceptor(
+                socket_path.clone(),
+                transport_event_tx.clone(),
+                transport_shutdown_token.clone(),
+            )
+            .await?;
+            transport_accept_handles.push(accept_handle);
+        }
+        AppServerTransport::WebSocket { bind_address } => {
+            let accept_handle = start_websocket_acceptor(
+                *bind_address,
+                transport_event_tx.clone(),
+                transport_shutdown_token.clone(),
+                policy_from_settings(&auth)?,
+            )
+            .await?;
+            transport_accept_handles.push(accept_handle);
+        }
+        AppServerTransport::Off => {}
+    }
+
+    let remote_control_enabled = config.features.enabled(Feature::RemoteControl);
+    if transport_accept_handles.is_empty() && !remote_control_enabled {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "no transport configured; use --listen or enable remote control",
+        ));
+    }
+
+    let (remote_control_accept_handle, remote_control_handle) = start_remote_control(
+        config.chatgpt_base_url.clone(),
+        state_db.clone(),
+        auth_manager.clone(),
+        transport_event_tx.clone(),
+        transport_shutdown_token.clone(),
+        app_server_client_name_rx,
+        remote_control_enabled,
+    )
+    .await?;
+    transport_accept_handles.push(remote_control_accept_handle);
+
     let outbound_handle = tokio::spawn(async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
         loop {
@@ -510,7 +602,6 @@ pub async fn run_main_with_transport(
                             OutboundControlEvent::Opened {
                                 connection_id,
                                 writer,
-                                allow_legacy_notifications,
                                 disconnect_sender,
                                 initialized,
                                 experimental_api_enabled,
@@ -523,7 +614,6 @@ pub async fn run_main_with_transport(
                                         initialized,
                                         experimental_api_enabled,
                                         opted_out_notification_methods,
-                                        allow_legacy_notifications,
                                         disconnect_sender,
                                     ),
                                 );
@@ -557,31 +647,26 @@ pub async fn run_main_with_transport(
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
         let outbound_control_tx = outbound_control_tx;
-        let cli_overrides: Vec<(String, TomlValue)> = cli_kv_overrides.clone();
-        let loader_overrides = loader_overrides_for_config_api;
-        let mut processor = MessageProcessor::new(MessageProcessorArgs {
+        let auth_manager = auth_manager.clone();
+        let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
             outgoing: outgoing_message_sender,
             auth_storage_home,
             arg0_paths,
             config: Arc::new(config),
-            cli_overrides,
-            loader_overrides,
-            cloud_requirements: cloud_requirements.clone(),
-            auth_manager: None,
-            thread_manager: None,
+            config_manager,
+            environment_manager,
             feedback: feedback.clone(),
             log_db,
             config_warnings,
             session_source,
-            enable_codex_api_key_env: false,
-        });
+            auth_manager,
+            rpc_transport: analytics_rpc_transport(&transport),
+            remote_control_handle: Some(remote_control_handle),
+        }));
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
-        let websocket_accept_shutdown = match &transport_runtime {
-            TransportRuntime::WebSocket { shutdown_token, .. } => Some(shutdown_token.clone()),
-            TransportRuntime::Stdio => None,
-        };
+        let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
@@ -594,9 +679,7 @@ pub async fn run_main_with_transport(
                     shutdown_state.update(running_turn_count, connections.len()),
                     ShutdownAction::Finish
                 ) {
-                    if let Some(shutdown_token) = &websocket_accept_shutdown {
-                        shutdown_token.cancel();
-                    }
+                    transport_shutdown_token.cancel();
                     let _ = outbound_control_tx
                         .send(OutboundControlEvent::DisconnectAll)
                         .await;
@@ -623,8 +706,8 @@ pub async fn run_main_with_transport(
                         match event {
                             TransportEvent::ConnectionOpened {
                                 connection_id,
+                                origin,
                                 writer,
-                                allow_legacy_notifications,
                                 disconnect_sender,
                             } => {
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
@@ -636,7 +719,6 @@ pub async fn run_main_with_transport(
                                     .send(OutboundControlEvent::Opened {
                                         connection_id,
                                         writer,
-                                        allow_legacy_notifications,
                                         disconnect_sender,
                                         initialized: Arc::clone(&outbound_initialized),
                                         experimental_api_enabled: Arc::clone(
@@ -654,6 +736,7 @@ pub async fn run_main_with_transport(
                                 connections.insert(
                                     connection_id,
                                     ConnectionState::new(
+                                        origin,
                                         outbound_initialized,
                                         outbound_experimental_api_enabled,
                                         outbound_opted_out_notification_methods,
@@ -683,23 +766,28 @@ pub async fn run_main_with_transport(
                                             warn!("dropping request from unknown connection: {connection_id:?}");
                                             continue;
                                         };
-                                        let was_initialized = connection_state.session.initialized;
+                                        let was_initialized =
+                                            connection_state.session.initialized();
                                         processor
                                             .process_request(
                                                 connection_id,
                                                 request,
-                                                transport,
-                                                &mut connection_state.session,
+                                                &transport,
+                                                Arc::clone(&connection_state.session),
                                             )
                                             .await;
+                                        let opted_out_notification_methods_snapshot = connection_state
+                                            .session
+                                            .opted_out_notification_methods();
+                                        let experimental_api_enabled =
+                                            connection_state.session.experimental_api_enabled();
+                                        let is_initialized = connection_state.session.initialized();
                                         if let Ok(mut opted_out_notification_methods) = connection_state
                                             .outbound_opted_out_notification_methods
                                             .write()
                                         {
-                                            *opted_out_notification_methods = connection_state
-                                                .session
-                                                .opted_out_notification_methods
-                                                .clone();
+                                            *opted_out_notification_methods =
+                                                opted_out_notification_methods_snapshot;
                                         } else {
                                             warn!(
                                                 "failed to update outbound opted-out notifications"
@@ -708,10 +796,10 @@ pub async fn run_main_with_transport(
                                         connection_state
                                             .outbound_experimental_api_enabled
                                             .store(
-                                                connection_state.session.experimental_api_enabled,
+                                                experimental_api_enabled,
                                                 std::sync::atomic::Ordering::Release,
                                             );
-                                        if !was_initialized && connection_state.session.initialized {
+                                        if !was_initialized && is_initialized {
                                             processor
                                                 .send_initialize_notifications_to_connection(
                                                     connection_id,
@@ -751,12 +839,12 @@ pub async fn run_main_with_transport(
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
-                                let initialized_connection_ids: Vec<ConnectionId> = connections
-                                    .iter()
-                                    .filter_map(|(connection_id, connection_state)| {
-                                        connection_state.session.initialized.then_some(*connection_id)
-                                    })
-                                    .collect();
+                                let mut initialized_connection_ids = Vec::new();
+                                for (connection_id, connection_state) in &connections {
+                                    if connection_state.session.initialized() {
+                                        initialized_connection_ids.push(*connection_id);
+                                    }
+                                }
                                 processor
                                     .try_attach_thread_listener(
                                         thread_id,
@@ -792,16 +880,8 @@ pub async fn run_main_with_transport(
     let _ = processor_handle.await;
     let _ = outbound_handle.await;
 
-    if let TransportRuntime::WebSocket {
-        accept_handle,
-        shutdown_token,
-    } = transport_runtime
-    {
-        shutdown_token.cancel();
-        let _ = accept_handle.await;
-    }
-
-    for handle in stdio_handles {
+    transport_shutdown_token.cancel();
+    for handle in transport_accept_handles {
         let _ = handle.await;
     }
 
@@ -810,6 +890,15 @@ pub async fn run_main_with_transport(
     }
 
     Ok(())
+}
+
+fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransport {
+    match transport {
+        AppServerTransport::Stdio => AppServerRpcTransport::Stdio,
+        AppServerTransport::UnixSocket { .. }
+        | AppServerTransport::WebSocket { .. }
+        | AppServerTransport::Off => AppServerRpcTransport::Websocket,
+    }
 }
 
 #[cfg(test)]
@@ -826,7 +915,10 @@ mod tests {
 
     #[test]
     fn log_format_from_env_value_defaults_for_non_json_values() {
-        assert_eq!(LogFormat::from_env_value(None), LogFormat::Default);
+        assert_eq!(
+            LogFormat::from_env_value(/*value*/ None),
+            LogFormat::Default
+        );
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);

@@ -1,6 +1,15 @@
+use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::InstanceType;
+use schemars::schema::Metadata;
+use schemars::schema::Schema;
+use schemars::schema::SchemaObject;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
+use std::num::NonZeroU64;
+use std::time::Duration;
 use strum_macros::Display;
 use strum_macros::EnumIter;
 use ts_rs::TS;
@@ -66,20 +75,52 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
-#[derive(
-    Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Display, JsonSchema, TS,
-)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Display, TS)]
 #[strum(serialize_all = "snake_case")]
+#[ts(type = r#""user" | "auto_review" | "guardian_subagent""#)]
 /// Configures who approval requests are routed to for review. Examples
 /// include sandbox escapes, blocked network access, MCP approval prompts, and
-/// ARC escalations. Defaults to `user`. `guardian_subagent` uses a carefully
+/// ARC escalations. Defaults to `user`. `auto_review` uses a carefully
 /// prompted subagent to gather relevant context and apply a risk-based
 /// decision framework before approving or denying the request.
 pub enum ApprovalsReviewer {
     #[default]
+    #[serde(rename = "user")]
     User,
-    GuardianSubagent,
+    #[serde(rename = "guardian_subagent", alias = "auto_review")]
+    #[strum(serialize = "guardian_subagent")]
+    AutoReview,
+}
+
+impl JsonSchema for ApprovalsReviewer {
+    fn schema_name() -> String {
+        "ApprovalsReviewer".to_string()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        string_enum_schema_with_description(
+            &["user", "auto_review", "guardian_subagent"],
+            "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
+        )
+    }
+}
+
+fn string_enum_schema_with_description(values: &[&str], description: &str) -> Schema {
+    let mut schema = SchemaObject {
+        instance_type: Some(InstanceType::String.into()),
+        metadata: Some(Box::new(Metadata {
+            description: Some(description.to_string()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    schema.enum_values = Some(
+        values
+            .iter()
+            .map(|value| Value::String((*value).to_string()))
+            .collect(),
+    );
+    Schema::Object(schema)
 }
 
 #[derive(
@@ -259,6 +300,79 @@ pub enum ServiceTier {
 pub enum ForcedLoginMethod {
     Chatgpt,
     Api,
+}
+
+const DEFAULT_PROVIDER_AUTH_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PROVIDER_AUTH_REFRESH_INTERVAL_MS: u64 = 300_000;
+
+/// Configuration for obtaining a provider bearer token from a command.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ModelProviderAuthInfo {
+    /// Command to execute. Bare names are resolved via `PATH`; paths are resolved against `cwd`.
+    pub command: String,
+
+    /// Command arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Maximum time to wait for the token command to exit successfully.
+    #[serde(default = "default_provider_auth_timeout_ms")]
+    pub timeout_ms: NonZeroU64,
+
+    /// Maximum age for the cached token before rerunning the command.
+    /// Set to `0` to disable proactive refresh and only rerun after a 401 retry path.
+    #[serde(default = "default_provider_auth_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
+
+    /// Working directory used when running the token command.
+    #[serde(default = "default_provider_auth_cwd")]
+    #[schemars(skip_serializing_if = "is_default_provider_auth_cwd")]
+    pub cwd: AbsolutePathBuf,
+}
+
+impl ModelProviderAuthInfo {
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms.get())
+    }
+
+    pub fn refresh_interval(&self) -> Option<Duration> {
+        NonZeroU64::new(self.refresh_interval_ms).map(|value| Duration::from_millis(value.get()))
+    }
+}
+
+fn default_provider_auth_timeout_ms() -> NonZeroU64 {
+    non_zero_u64(
+        DEFAULT_PROVIDER_AUTH_TIMEOUT_MS,
+        "model_providers.<id>.auth.timeout_ms",
+    )
+}
+
+fn default_provider_auth_refresh_interval_ms() -> u64 {
+    DEFAULT_PROVIDER_AUTH_REFRESH_INTERVAL_MS
+}
+
+fn non_zero_u64(value: u64, field_name: &str) -> NonZeroU64 {
+    match NonZeroU64::new(value) {
+        Some(value) => value,
+        None => panic!("{field_name} must be non-zero"),
+    }
+}
+
+fn default_provider_auth_cwd() -> AbsolutePathBuf {
+    let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(".");
+    if let Ok(cwd) = AbsolutePathBuf::deserialize(deserializer) {
+        return cwd;
+    }
+
+    match AbsolutePathBuf::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => panic!("provider auth cwd must resolve: {err}"),
+    }
+}
+
+fn is_default_provider_auth_cwd(path: &AbsolutePathBuf) -> bool {
+    path == &default_provider_auth_cwd()
 }
 
 /// Represents the trust level for a project directory.
@@ -475,6 +589,31 @@ mod tests {
             let json = format!("\"{alias}\"");
             let mode: ModeKind = serde_json::from_str(&json).expect("deserialize mode");
             assert_eq!(ModeKind::Default, mode);
+        }
+    }
+
+    #[test]
+    fn approvals_reviewer_serializes_auto_review_and_accepts_legacy_guardian_subagent() {
+        assert_eq!(ApprovalsReviewer::User.to_string(), "user");
+        assert_eq!(
+            serde_json::to_string(&ApprovalsReviewer::User).expect("serialize reviewer"),
+            "\"user\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApprovalsReviewer::AutoReview).expect("serialize reviewer"),
+            "\"guardian_subagent\""
+        );
+
+        for value in ["user", "auto_review", "guardian_subagent"] {
+            let json = format!("\"{value}\"");
+            let reviewer: ApprovalsReviewer =
+                serde_json::from_str(&json).expect("deserialize reviewer");
+            let expected = if value == "user" {
+                ApprovalsReviewer::User
+            } else {
+                ApprovalsReviewer::AutoReview
+            };
+            assert_eq!(expected, reviewer);
         }
     }
 

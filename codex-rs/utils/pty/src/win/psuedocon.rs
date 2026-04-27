@@ -21,9 +21,9 @@
 
 use super::WinChild;
 use crate::win::procthreadattr::ProcThreadAttributeList;
+use anyhow::Error;
 use anyhow::bail;
 use anyhow::ensure;
-use anyhow::Error;
 use filedescriptor::FileDescriptor;
 use filedescriptor::OwnedHandle;
 use lazy_static::lazy_static;
@@ -118,6 +118,10 @@ fn windows_build_number() -> Option<u32> {
 
 pub struct PsuedoCon {
     con: HPCON,
+    // CreatePseudoConsole borrows these pipe handles for the lifetime of the
+    // pseudoconsole, so we must keep owning them until ClosePseudoConsole.
+    _input: FileDescriptor,
+    _output: FileDescriptor,
 }
 
 unsafe impl Send for PsuedoCon {}
@@ -149,7 +153,11 @@ impl PsuedoCon {
             result == S_OK,
             "failed to create psuedo console: HRESULT {result}"
         );
-        Ok(Self { con })
+        Ok(Self {
+            con,
+            _input: input,
+            _output: output,
+        })
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
@@ -356,8 +364,8 @@ fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::windows_build_number;
     use super::MIN_CONPTY_BUILD;
+    use super::windows_build_number;
 
     #[test]
     fn windows_build_number_returns_value() {

@@ -1,8 +1,8 @@
 use anyhow::Result;
-use codex_core::CodexAuth;
-use codex_core::config::types::Personality;
-use codex_core::models_manager::manager::RefreshStrategy;
+use codex_config::types::Personality;
 use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -68,7 +68,6 @@ fn test_model_info(
 ) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
-        request_model: None,
         display_name: display_name.to_string(),
         description: Some(description.to_string()),
         default_reasoning_level: Some(ReasoningEffort::Medium),
@@ -83,6 +82,7 @@ fn test_model_info(
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -93,10 +93,11 @@ fn test_model_info(
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
+        max_context_window: None,
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -114,12 +115,13 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.2-codex");
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
     let test = builder.build(&server).await?;
-    let next_model = "gpt-5.1-codex-max";
+    let next_model = "gpt-5.4";
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -127,7 +129,9 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -144,6 +148,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -156,6 +161,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "switch models".into(),
                 text_elements: Vec::new(),
@@ -163,7 +169,9 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: next_model.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -203,7 +211,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
     .await;
 
     let mut builder = test_codex()
-        .with_model("gpt-5.2-codex")
+        .with_model("gpt-5.3-codex")
         .with_config(|config| {
             config
                 .features
@@ -215,6 +223,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -222,7 +231,9 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: test.session_configured.model.clone(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -239,6 +250,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -251,6 +263,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "switch model and personality".into(),
                 text_elements: Vec::new(),
@@ -258,7 +271,9 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: next_model.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -305,7 +320,7 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
 
     test.submit_turn_with_service_tier("fast turn", Some(ServiceTier::Fast))
         .await?;
-    test.submit_turn_with_service_tier("standard turn", None)
+    test.submit_turn_with_service_tier("standard turn", /*service_tier*/ None)
         .await?;
 
     let requests = resp_mock.requests();
@@ -387,6 +402,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![
                 UserInput::Image {
                     image_url: image_url.clone(),
@@ -399,7 +415,9 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -412,6 +430,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "second turn".to_string(),
                 text_elements: Vec::new(),
@@ -419,7 +438,9 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: text_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -493,7 +514,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_123", "completed", "lobster", "Zm9v"),
-                ev_completed_with_tokens("resp-1", 10),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
             sse_completed("resp-2"),
         ],
@@ -519,6 +540,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
@@ -526,7 +548,9 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             service_tier: None,
@@ -539,6 +563,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
                 text_elements: Vec::new(),
@@ -546,7 +571,9 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             service_tier: None,
@@ -623,7 +650,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_123", "completed", "lobster", "Zm9v"),
-                ev_completed_with_tokens("resp-1", 10),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
             sse_completed("resp-2"),
         ],
@@ -649,6 +676,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
@@ -656,7 +684,9 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             service_tier: None,
@@ -669,6 +699,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
                 text_elements: Vec::new(),
@@ -676,7 +707,9 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: text_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             service_tier: None,
@@ -755,7 +788,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_rollback", "completed", "lobster", "Zm9v"),
-                ev_completed_with_tokens("resp-1", 10),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
             sse_completed("resp-2"),
         ],
@@ -781,6 +814,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
@@ -788,7 +822,9 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             service_tier: None,
@@ -809,6 +845,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after rollback".to_string(),
                 text_elements: Vec::new(),
@@ -816,7 +853,9 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: image_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             service_tier: None,
@@ -873,7 +912,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
 
     let base_model = ModelInfo {
         slug: large_model_slug.to_string(),
-        request_model: None,
         display_name: "Larger Model".to_string(),
         description: Some("larger context window model".to_string()),
         default_reasoning_level: Some(ReasoningEffort::Medium),
@@ -888,6 +926,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -898,10 +937,11 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(large_context_window),
+        max_context_window: None,
         auto_compact_token_limit: None,
         effective_context_window_percent,
         experimental_supported_tools: Vec::new(),
@@ -925,11 +965,11 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_completed_with_tokens("resp-1", 100),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 100),
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
-                ev_completed_with_tokens("resp-2", 120),
+                ev_completed_with_tokens("resp-2", /*total_tokens*/ 120),
             ]),
         ],
     )
@@ -951,11 +991,11 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         "expected {smaller_model_slug} to be available in remote model list"
     );
     let large_model_info = models_manager
-        .get_model_info(large_model_slug, &test.config)
+        .get_model_info(large_model_slug, &test.config.to_models_manager_config())
         .await;
     assert_eq!(large_model_info.context_window, Some(large_context_window));
     let smaller_model_info = models_manager
-        .get_model_info(smaller_model_slug, &test.config)
+        .get_model_info(smaller_model_slug, &test.config.to_models_manager_config())
         .await;
     assert_eq!(
         smaller_model_info.context_window,
@@ -964,6 +1004,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "use larger model".into(),
                 text_elements: Vec::new(),
@@ -971,7 +1012,9 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: large_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,
@@ -1010,6 +1053,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(smaller_model_slug.to_string()),
             effort: None,
@@ -1022,6 +1066,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "switch to smaller model".into(),
                 text_elements: Vec::new(),
@@ -1029,7 +1074,9 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            permission_profile: None,
             model: smaller_model_slug.to_string(),
             effort: test.config.model_reasoning_effort,
             summary: None,

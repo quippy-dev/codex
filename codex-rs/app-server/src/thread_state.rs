@@ -2,22 +2,23 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadHistoryBuilder;
-use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
-use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
+use tracing::error;
 
 type PendingInterruptQueue = Vec<(
     ConnectionRequestId,
@@ -26,9 +27,11 @@ type PendingInterruptQueue = Vec<(
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
-    pub(crate) rollout_path: PathBuf,
+    pub(crate) history_items: Vec<RolloutItem>,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
+    pub(crate) instruction_sources: Vec<AbsolutePathBuf>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
+    pub(crate) include_turns: bool,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
@@ -46,6 +49,7 @@ pub(crate) enum ThreadListenerCommand {
 /// Per-conversation accumulation of the latest states e.g. error message while a turn runs.
 #[derive(Default, Clone)]
 pub(crate) struct TurnSummary {
+    pub(crate) started_at: Option<i64>,
     pub(crate) file_change_started: HashSet<String>,
     pub(crate) command_execution_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
@@ -56,39 +60,13 @@ pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
+    pub(crate) last_terminal_turn_id: Option<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
-    pathless_thread_preview: Option<String>,
-    pathless_thread_turns: Vec<Turn>,
-    pathless_thread_has_materialized_turns: bool,
     listener_thread: Option<Weak<CodexThread>>,
-}
-
-fn preview_from_turns(turns: &[Turn]) -> String {
-    turns
-        .iter()
-        .flat_map(|turn| turn.items.iter())
-        .find_map(|item| match item {
-            ThreadItem::UserMessage { content, .. } => {
-                content.iter().find_map(|input| match input {
-                    V2UserInput::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-            }
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-fn turns_have_materialized_user_message(turns: &[Turn]) -> bool {
-    turns.iter().any(|turn| {
-        turn.items
-            .iter()
-            .any(|item| matches!(item, ThreadItem::UserMessage { .. }))
-    })
 }
 
 impl ThreadState {
@@ -120,9 +98,6 @@ impl ThreadState {
         }
         self.listener_command_tx = None;
         self.current_turn_history.reset();
-        self.pathless_thread_preview = None;
-        self.pathless_thread_turns.clear();
-        self.pathless_thread_has_materialized_turns = false;
         self.listener_thread = None;
     }
 
@@ -140,54 +115,56 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
-    pub(crate) fn set_pathless_thread_history(&mut self, preview: String, turns: Vec<Turn>) {
-        self.pathless_thread_preview = Some(if turns.is_empty() {
-            preview
-        } else {
-            preview_from_turns(&turns)
-        });
-        self.pathless_thread_turns = turns.clone();
-        self.pathless_thread_has_materialized_turns = turns_have_materialized_user_message(&turns);
-        self.current_turn_history.set_completed_turns(turns);
-    }
-
-    pub(crate) fn pathless_thread_preview(&self) -> Option<&str> {
-        self.pathless_thread_preview.as_deref()
-    }
-
-    pub(crate) fn pathless_thread_turns(&self) -> Vec<Turn> {
-        self.pathless_thread_turns.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pathless_thread_has_materialized_turns(&self) -> bool {
-        self.pathless_thread_has_materialized_turns
-    }
-
-    pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {
+    pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
+        if let EventMsg::TurnStarted(payload) = event {
+            self.turn_summary.started_at = payload.started_at;
+        }
         self.current_turn_history.handle_event(event);
-        let pathless_tracking_enabled = self.pathless_thread_preview.is_some();
-        if pathless_tracking_enabled {
-            self.pathless_thread_turns = self.current_turn_history.turns_snapshot();
-            self.pathless_thread_preview = Some(preview_from_turns(&self.pathless_thread_turns));
-            if turns_have_materialized_user_message(&self.pathless_thread_turns) {
-                self.pathless_thread_has_materialized_turns = true;
-            }
+        if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
+            && !self.current_turn_history.has_active_turn()
+        {
+            self.last_terminal_turn_id = Some(event_turn_id.to_string());
+            self.current_turn_history.reset();
         }
-        if !self.current_turn_history.has_active_turn() {
-            if pathless_tracking_enabled {
-                self.current_turn_history
-                    .set_completed_turns(self.pathless_thread_turns.clone());
-            } else {
-                self.current_turn_history.reset();
-            }
-        }
+    }
+}
+
+pub(crate) async fn resolve_server_request_on_thread_listener(
+    thread_state: &Arc<Mutex<ThreadState>>,
+    request_id: RequestId,
+) {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let listener_command_tx = {
+        let state = thread_state.lock().await;
+        state.listener_command_tx()
+    };
+    let Some(listener_command_tx) = listener_command_tx else {
+        error!("failed to remove pending client request: thread listener is not running");
+        return;
+    };
+
+    if listener_command_tx
+        .send(ThreadListenerCommand::ResolveServerRequest {
+            request_id,
+            completion_tx,
+        })
+        .is_err()
+    {
+        error!(
+            "failed to remove pending client request: thread listener command channel is closed"
+        );
+        return;
+    }
+
+    if let Err(err) = completion_rx.await {
+        error!("failed to remove pending client request: {err}");
     }
 }
 
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
     connection_ids: HashSet<ConnectionId>,
+    has_connections_watcher: watch::Sender<bool>,
 }
 
 impl Default for ThreadEntry {
@@ -195,7 +172,18 @@ impl Default for ThreadEntry {
         Self {
             state: Arc::new(Mutex::new(ThreadState::default())),
             connection_ids: HashSet::new(),
+            has_connections_watcher: watch::channel(false).0,
         }
+    }
+}
+
+impl ThreadEntry {
+    fn update_has_connections(&self) {
+        let _ = self.has_connections_watcher.send_if_modified(|current| {
+            let prev = *current;
+            *current = !self.connection_ids.is_empty();
+            prev != *current
+        });
     }
 }
 
@@ -315,12 +303,14 @@ impl ThreadStateManager {
             }
             if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
                 thread_entry.connection_ids.remove(&connection_id);
+                thread_entry.update_has_connections();
             }
         };
 
         true
     }
 
+    #[cfg(test)]
     pub(crate) async fn has_subscribers(&self, thread_id: ThreadId) -> bool {
         self.state
             .lock()
@@ -348,6 +338,7 @@ impl ThreadStateManager {
                 .insert(thread_id);
             let thread_entry = state.threads.entry(thread_id).or_default();
             thread_entry.connection_ids.insert(connection_id);
+            thread_entry.update_has_connections();
             thread_entry.state.clone()
         };
         {
@@ -373,17 +364,14 @@ impl ThreadStateManager {
             .entry(connection_id)
             .or_default()
             .insert(thread_id);
-        state
-            .threads
-            .entry(thread_id)
-            .or_default()
-            .connection_ids
-            .insert(connection_id);
+        let thread_entry = state.threads.entry(thread_id).or_default();
+        thread_entry.connection_ids.insert(connection_id);
+        thread_entry.update_has_connections();
         true
     }
 
-    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) {
-        let thread_states = {
+    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
+        {
             let mut state = self.state.lock().await;
             state.live_connections.remove(&connection_id);
             let thread_ids = state
@@ -393,146 +381,29 @@ impl ThreadStateManager {
             for thread_id in &thread_ids {
                 if let Some(thread_entry) = state.threads.get_mut(thread_id) {
                     thread_entry.connection_ids.remove(&connection_id);
+                    thread_entry.update_has_connections();
                 }
             }
             thread_ids
                 .into_iter()
-                .map(|thread_id| {
-                    (
-                        thread_id,
-                        state
-                            .threads
-                            .get(&thread_id)
-                            .is_none_or(|thread_entry| thread_entry.connection_ids.is_empty()),
-                        state
-                            .threads
-                            .get(&thread_id)
-                            .map(|thread_entry| thread_entry.state.clone()),
-                    )
+                .filter(|thread_id| {
+                    state
+                        .threads
+                        .get(thread_id)
+                        .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
                 })
                 .collect::<Vec<_>>()
-        };
-
-        for (thread_id, no_subscribers, thread_state) in thread_states {
-            if !no_subscribers {
-                continue;
-            }
-            let Some(thread_state) = thread_state else {
-                continue;
-            };
-            let listener_generation = thread_state.lock().await.listener_generation;
-            tracing::debug!(
-                thread_id = %thread_id,
-                connection_id = ?connection_id,
-                listener_generation,
-                "retaining thread listener after connection disconnect left zero subscribers"
-            );
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::ThreadState;
-    use codex_protocol::protocol::AgentMessageEvent;
-    use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::ThreadRolledBackEvent;
-    use codex_protocol::protocol::TurnCompleteEvent;
-    use codex_protocol::protocol::TurnStartedEvent;
-    use codex_protocol::protocol::UserMessageEvent;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn track_current_turn_event_rebuilds_pathless_turn_cache_after_rollback() {
-        let mut state = ThreadState::default();
-        state.set_pathless_thread_history("preview".to_string(), Vec::new());
-
-        for (turn_id, text) in [("turn-1", "first"), ("turn-2", "second")] {
-            state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: turn_id.to_string(),
-                model_context_window: None,
-                collaboration_mode_kind: Default::default(),
-            }));
-            state.track_current_turn_event(&EventMsg::UserMessage(UserMessageEvent {
-                message: text.to_string(),
-                images: None,
-                text_elements: Vec::new(),
-                local_images: Vec::new(),
-            }));
-            state.track_current_turn_event(&EventMsg::AgentMessage(AgentMessageEvent {
-                message: format!("{text} reply"),
-                phase: None,
-                memory_citation: None,
-            }));
-            state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn_id.to_string(),
-                last_agent_message: None,
-            }));
-        }
-
-        assert_eq!(state.pathless_thread_turns().len(), 2);
-
-        state.track_current_turn_event(&EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
-            num_turns: 1,
-        }));
-
-        let turns = state.pathless_thread_turns();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].id, "turn-1");
-        assert_eq!(state.pathless_thread_preview(), Some("first"));
-    }
-
-    #[test]
-    fn track_current_turn_event_waits_for_user_message_before_materializing_pathless_turns() {
-        let mut state = ThreadState::default();
-        state.set_pathless_thread_history("preview".to_string(), Vec::new());
-
-        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: "turn-1".to_string(),
-            model_context_window: None,
-            collaboration_mode_kind: Default::default(),
-        }));
-
-        assert_eq!(state.pathless_thread_preview(), Some(""));
-        assert_eq!(state.pathless_thread_turns().len(), 1);
-        assert!(!state.pathless_thread_has_materialized_turns());
-    }
-
-    #[test]
-    fn track_current_turn_event_clears_pathless_preview_when_rollback_drops_all_turns() {
-        let mut state = ThreadState::default();
-        state.set_pathless_thread_history("preview".to_string(), Vec::new());
-
-        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: "turn-1".to_string(),
-            model_context_window: None,
-            collaboration_mode_kind: Default::default(),
-        }));
-        state.track_current_turn_event(&EventMsg::UserMessage(UserMessageEvent {
-            message: "first".to_string(),
-            images: None,
-            text_elements: Vec::new(),
-            local_images: Vec::new(),
-        }));
-        state.track_current_turn_event(&EventMsg::AgentMessage(AgentMessageEvent {
-            message: "first reply".to_string(),
-            phase: None,
-            memory_citation: None,
-        }));
-        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: "turn-1".to_string(),
-            last_agent_message: None,
-        }));
-
-        assert_eq!(state.pathless_thread_preview(), Some("first"));
-        assert!(state.pathless_thread_has_materialized_turns());
-
-        state.track_current_turn_event(&EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
-            num_turns: 1,
-        }));
-
-        assert_eq!(state.pathless_thread_turns(), Vec::new());
-        assert_eq!(state.pathless_thread_preview(), Some(""));
-        assert!(state.pathless_thread_has_materialized_turns());
+    pub(crate) async fn subscribe_to_has_connections(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<watch::Receiver<bool>> {
+        let state = self.state.lock().await;
+        state
+            .threads
+            .get(&thread_id)
+            .map(|thread_entry| thread_entry.has_connections_watcher.subscribe())
     }
 }
