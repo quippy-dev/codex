@@ -20,6 +20,7 @@ use crate::function_tool::FunctionCallError;
 use crate::shell::default_user_shell;
 use crate::skills::SkillRenderSideEffects;
 use crate::skills::render::SkillMetadataBudget;
+use crate::test_support::models_manager_with_provider;
 use crate::tools::format_exec_output_str;
 
 use codex_features::Feature;
@@ -28,6 +29,8 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::model_info;
+use codex_models_manager::test_support::construct_model_info_offline_for_tests;
+use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -43,7 +46,6 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::NonSteerableTurnKind;
-use codex_protocol::protocol::ReadOnlyAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
@@ -1507,7 +1509,7 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
             conversation_id: ThreadId::default(),
             history: rollout_items,
-            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
         .await;
 
@@ -1536,7 +1538,7 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
             conversation_id: ThreadId::default(),
             history: rollout_items,
-            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
         .await;
 
@@ -1629,7 +1631,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
             conversation_id: ThreadId::default(),
             history: rollout_items,
-            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
         .await;
 
@@ -1713,7 +1715,8 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_configured_omits_permission_profile_for_external_sandbox() -> anyhow::Result<()> {
+async fn session_configured_reports_permission_profile_for_external_sandbox() -> anyhow::Result<()>
+{
     let server = start_mock_server().await;
     let sandbox_policy = SandboxPolicy::ExternalSandbox {
         network_access: codex_protocol::protocol::NetworkAccess::Restricted,
@@ -1731,10 +1734,14 @@ async fn session_configured_omits_permission_profile_for_external_sandbox() -> a
         test.session_configured.sandbox_policy,
         expected_sandbox_policy
     );
+    let expected_permission_profile =
+        codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+            &expected_sandbox_policy,
+        );
     assert_eq!(
-        test.session_configured.permission_profile, None,
-        "ExternalSandbox is enforced outside the PermissionProfile model, so SessionConfigured must \
-         not expose a lossy root-write profile"
+        test.session_configured.permission_profile,
+        Some(expected_permission_profile),
+        "ExternalSandbox is represented explicitly instead of as a lossy root-write profile"
     );
     Ok(())
 }
@@ -2446,11 +2453,9 @@ async fn set_rate_limits_retains_previous_credits() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let config = build_test_config(codex_home.path()).await;
     let config = Arc::new(config);
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
-    );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let reasoning_effort = config.model_reasoning_effort;
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -2552,11 +2557,9 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let config = build_test_config(codex_home.path()).await;
     let config = Arc::new(config);
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
-    );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let reasoning_effort = config.model_reasoning_effort;
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -2888,7 +2891,7 @@ fn session_telemetry(
 ) -> SessionTelemetry {
     SessionTelemetry::new(
         conversation_id,
-        ModelsManager::get_model_offline_for_tests(config.model.as_deref()).as_str(),
+        get_model_offline_for_tests(config.model.as_deref()).as_str(),
         model_info.slug.as_str(),
         /*account_id*/ None,
         Some("test@test.com".to_string()),
@@ -3002,11 +3005,9 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let config = build_test_config(codex_home.path()).await;
     let config = Arc::new(config);
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
-    );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let reasoning_effort = config.model_reasoning_effort;
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -3077,10 +3078,6 @@ async fn session_configuration_apply_preserves_split_file_system_policy_on_cwd_o
     session_configuration.sandbox_policy =
         codex_config::Constrained::allow_any(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
-            read_only_access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                readable_roots: vec![docs_dir.clone()],
-            },
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
@@ -3126,15 +3123,16 @@ async fn session_configuration_apply_permission_profile_preserves_existing_deny_
         },
         access: FileSystemAccessMode::None,
     };
-    let mut existing_file_system_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
-        &workspace_policy,
-        session_configuration.cwd.as_path(),
-    );
+    let mut existing_file_system_policy =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+            &workspace_policy,
+            session_configuration.cwd.as_path(),
+        );
     existing_file_system_policy.glob_scan_max_depth = Some(2);
     existing_file_system_policy.entries.push(deny_entry.clone());
     session_configuration.file_system_sandbox_policy = existing_file_system_policy;
 
-    let requested_file_system_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+    let requested_file_system_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
         &workspace_policy,
         session_configuration.cwd.as_path(),
     );
@@ -3250,24 +3248,16 @@ async fn session_configuration_apply_rederives_legacy_file_system_policy_on_cwd_
     let workspace = tempfile::tempdir().expect("create temp dir");
     let project_root = workspace.path().join("project");
     let original_cwd = project_root.join("subdir");
-    let docs_dir = original_cwd.join("docs");
-    std::fs::create_dir_all(&docs_dir).expect("create docs dir");
-    let docs_dir = docs_dir.abs();
-
     session_configuration.cwd = original_cwd.abs();
     session_configuration.sandbox_policy =
         codex_config::Constrained::allow_any(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
-            read_only_access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                readable_roots: vec![docs_dir],
-            },
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
         });
     session_configuration.file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
             session_configuration.sandbox_policy.get(),
             &session_configuration.cwd,
         );
@@ -3281,7 +3271,7 @@ async fn session_configuration_apply_rederives_legacy_file_system_policy_on_cwd_
 
     assert_eq!(
         updated.file_system_sandbox_policy,
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
             updated.sandbox_policy.get(),
             &project_root,
         )
@@ -3327,17 +3317,14 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     let config = Arc::new(config);
 
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
+        config.model_provider.clone(),
     );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
         settings: Settings {
@@ -3428,20 +3415,17 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let config = Arc::new(config);
     let conversation_id = ThreadId::default();
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+        config.model_provider.clone(),
+    );
     let agent_control = AgentControl::default();
     let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
-    );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let reasoning_effort = config.model_reasoning_effort;
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -3490,7 +3474,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
     let per_turn_config =
         Session::build_per_turn_config(&session_configuration, session_configuration.cwd.clone());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
+    let model_info = construct_model_info_offline_for_tests(
         session_configuration.collaboration_mode.model(),
         &per_turn_config.to_models_manager_config(),
     );
@@ -3570,15 +3554,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
         ),
-        code_mode_service: crate::tools::code_mode::CodeModeService::new(
-            config.js_repl_node_path.clone(),
-        ),
+        code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     };
-    let js_repl = Arc::new(JsReplHandle::with_node_path(
-        config.js_repl_node_path.clone(),
-        config.js_repl_node_module_dirs.clone(),
-    ));
 
     let plugin_outcome = services
         .plugins_manager
@@ -3612,7 +3590,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         turn_environments,
         session_configuration.cwd.clone(),
         "turn_id".to_string(),
-        Arc::clone(&js_repl),
         skills_outcome,
     );
 
@@ -3633,7 +3610,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         idle_pending_input: Mutex::new(Vec::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
-        js_repl,
         next_internal_sub_id: AtomicU64::new(0),
     };
 
@@ -3655,17 +3631,14 @@ async fn make_session_with_config_and_rx(
     mutator(&mut config);
     let config = Arc::new(config);
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
+        config.model_provider.clone(),
     );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
         settings: Settings {
@@ -4797,20 +4770,17 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let config = Arc::new(config);
     let conversation_id = ThreadId::default();
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
+    let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+        config.model_provider.clone(),
+    );
     let agent_control = AgentControl::default();
     let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
-    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
-        model.as_str(),
-        &config.to_models_manager_config(),
-    );
+    let model = get_model_offline_for_tests(config.model.as_deref());
+    let model_info =
+        construct_model_info_offline_for_tests(model.as_str(), &config.to_models_manager_config());
     let reasoning_effort = config.model_reasoning_effort;
     let collaboration_mode = CollaborationMode {
         mode: ModeKind::Default,
@@ -4859,7 +4829,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     };
     let per_turn_config =
         Session::build_per_turn_config(&session_configuration, session_configuration.cwd.clone());
-    let model_info = ModelsManager::construct_model_info_offline_for_tests(
+    let model_info = construct_model_info_offline_for_tests(
         session_configuration.collaboration_mode.model(),
         &per_turn_config.to_models_manager_config(),
     );
@@ -4939,15 +4909,9 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
         ),
-        code_mode_service: crate::tools::code_mode::CodeModeService::new(
-            config.js_repl_node_path.clone(),
-        ),
+        code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     };
-    let js_repl = Arc::new(JsReplHandle::with_node_path(
-        config.js_repl_node_path.clone(),
-        config.js_repl_node_module_dirs.clone(),
-    ));
 
     let plugin_outcome = services
         .plugins_manager
@@ -4981,7 +4945,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         turn_environments,
         session_configuration.cwd.clone(),
         "turn_id".to_string(),
-        Arc::clone(&js_repl),
         skills_outcome,
     ));
 
@@ -5002,7 +4965,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         idle_pending_input: Mutex::new(Vec::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
-        js_repl,
         next_internal_sub_id: AtomicU64::new(0),
     });
 
@@ -5437,17 +5399,19 @@ async fn build_initial_context_trims_skill_metadata_from_context_window_budget()
 #[test]
 fn emit_thread_start_skill_metrics_records_enabled_kept_and_truncated_values() {
     let session_telemetry = test_session_telemetry_without_metadata();
+    let mut outcome = SkillLoadOutcome::default();
+    outcome.skills = vec![SkillMetadata {
+        name: "repo-skill".to_string(),
+        description: "desc".to_string(),
+        short_description: None,
+        interface: None,
+        dependencies: None,
+        policy: None,
+        path_to_skills_md: test_path_buf("/tmp/repo-skill/SKILL.md").abs(),
+        scope: SkillScope::Repo,
+    }];
     let rendered = build_available_skills(
-        &[SkillMetadata {
-            name: "repo-skill".to_string(),
-            description: "desc".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: test_path_buf("/tmp/repo-skill/SKILL.md").abs(),
-            scope: SkillScope::Repo,
-        }],
+        &outcome,
         SkillMetadataBudget::Characters(1),
         SkillRenderSideEffects::ThreadStart {
             session_telemetry: &session_telemetry,
@@ -5507,9 +5471,11 @@ fn emit_thread_start_skill_metrics_records_description_truncated_chars_without_o
             .count()
     };
     let minimum_budget = minimum_skill_line_cost(&alpha) + minimum_skill_line_cost(&beta);
+    let mut outcome = SkillLoadOutcome::default();
+    outcome.skills = vec![alpha, beta];
 
     let rendered = build_available_skills(
-        &[alpha, beta],
+        &outcome,
         SkillMetadataBudget::Characters(minimum_budget + 6),
         SkillRenderSideEffects::ThreadStart {
             session_telemetry: &session_telemetry,
@@ -5712,7 +5678,7 @@ async fn build_initial_context_restates_realtime_start_when_reference_context_is
 }
 
 fn file_system_policy_with_unreadable_glob(turn_context: &TurnContext) -> FileSystemSandboxPolicy {
-    let mut policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+    let mut policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
         turn_context.sandbox_policy.get(),
         &turn_context.cwd,
     );
@@ -5728,10 +5694,11 @@ fn file_system_policy_with_unreadable_glob(turn_context: &TurnContext) -> FileSy
 #[tokio::test]
 async fn turn_context_item_omits_legacy_equivalent_file_system_sandbox_policy() {
     let (_session, mut turn_context) = make_session_and_context().await;
-    turn_context.file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
-        turn_context.sandbox_policy.get(),
-        &turn_context.cwd,
-    );
+    turn_context.file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+            turn_context.sandbox_policy.get(),
+            &turn_context.cwd,
+        );
 
     let item = turn_context.to_turn_context_item();
 

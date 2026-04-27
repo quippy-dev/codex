@@ -1,8 +1,11 @@
 use super::*;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
+use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
+use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -84,7 +87,6 @@ pub(crate) struct TurnContext {
     pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
     pub(crate) tool_call_gate: Arc<ReadinessFlag>,
     pub(crate) truncation_policy: TruncationPolicy,
-    pub(crate) js_repl: Arc<JsReplHandle>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) turn_skills: TurnSkillsContext,
@@ -94,7 +96,8 @@ pub(crate) struct TurnContext {
 }
 impl TurnContext {
     pub(crate) fn permission_profile(&self) -> PermissionProfile {
-        PermissionProfile::from_runtime_permissions(
+        PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(&self.sandbox_policy),
             &self.file_system_sandbox_policy,
             self.network_sandbox_policy,
         )
@@ -117,7 +120,11 @@ impl TurnContext {
         self.features.apps_enabled_for_auth(uses_codex_backend)
     }
 
-    pub(crate) async fn with_model(&self, model: String, models_manager: &ModelsManager) -> Self {
+    pub(crate) async fn with_model(
+        &self,
+        model: String,
+        models_manager: &SharedModelsManager,
+    ) -> Self {
         let mut config = (*self.config).clone();
         config.model = Some(model.clone());
         let model_info = models_manager
@@ -173,6 +180,7 @@ impl TurnContext {
         .with_spawn_agent_usage_hint(config.multi_agent_v2.usage_hint_enabled)
         .with_spawn_agent_usage_hint_text(config.multi_agent_v2.usage_hint_text.clone())
         .with_hide_spawn_agent_metadata(config.multi_agent_v2.hide_spawn_agent_metadata)
+        .with_max_concurrent_threads_per_session(config.agent_max_threads)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &config.agent_roles,
         ));
@@ -218,7 +226,6 @@ impl TurnContext {
             codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.clone(),
             tool_call_gate: Arc::new(ReadinessFlag::new()),
             truncation_policy,
-            js_repl: Arc::clone(&self.js_repl),
             dynamic_tools: self.dynamic_tools.clone(),
             turn_metadata_state: self.turn_metadata_state.clone(),
             turn_skills: self.turn_skills.clone(),
@@ -239,12 +246,21 @@ impl TurnContext {
 
     pub(crate) fn file_system_sandbox_context(
         &self,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     ) -> FileSystemSandboxContext {
-        let base_permissions = self.permission_profile();
-        let permissions =
-            merge_permission_profiles(Some(&base_permissions), additional_permissions.as_ref())
-                .unwrap_or(base_permissions);
+        let file_system_sandbox_policy = effective_file_system_sandbox_policy(
+            &self.file_system_sandbox_policy,
+            additional_permissions.as_ref(),
+        );
+        let network_sandbox_policy = effective_network_sandbox_policy(
+            self.network_sandbox_policy,
+            additional_permissions.as_ref(),
+        );
+        let permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(&self.sandbox_policy),
+            &file_system_sandbox_policy,
+            network_sandbox_policy,
+        );
         FileSystemSandboxContext {
             permissions,
             cwd: Some(self.cwd.clone()),
@@ -262,10 +278,11 @@ impl TurnContext {
         // the legacy sandbox policy. This keeps turn-context payloads stable
         // while both fields exist; once callers consume only the split policy,
         // this comparison and the legacy projection should go away.
-        let legacy_file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
-            self.sandbox_policy.get(),
-            &self.cwd,
-        );
+        let legacy_file_system_sandbox_policy =
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                self.sandbox_policy.get(),
+                &self.cwd,
+            );
         (self.file_system_sandbox_policy != legacy_file_system_sandbox_policy)
             .then(|| self.file_system_sandbox_policy.clone())
     }
@@ -381,13 +398,12 @@ impl Session {
         main_execve_wrapper_exe: Option<&PathBuf>,
         per_turn_config: Config,
         model_info: ModelInfo,
-        models_manager: &ModelsManager,
+        models_manager: &SharedModelsManager,
         network: Option<NetworkProxy>,
         environment: Option<Arc<Environment>>,
         environments: Vec<TurnEnvironment>,
         cwd: AbsolutePathBuf,
         sub_id: String,
-        js_repl: Arc<JsReplHandle>,
         skills_outcome: Arc<SkillLoadOutcome>,
     ) -> TurnContext {
         let reasoning_effort = session_configuration.collaboration_mode.reasoning_effort();
@@ -425,6 +441,7 @@ impl Session {
         .with_spawn_agent_usage_hint(per_turn_config.multi_agent_v2.usage_hint_enabled)
         .with_spawn_agent_usage_hint_text(per_turn_config.multi_agent_v2.usage_hint_text.clone())
         .with_hide_spawn_agent_metadata(per_turn_config.multi_agent_v2.hide_spawn_agent_metadata)
+        .with_max_concurrent_threads_per_session(per_turn_config.agent_max_threads)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &per_turn_config.agent_roles,
         ));
@@ -477,7 +494,6 @@ impl Session {
             codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
             tool_call_gate: Arc::new(ReadinessFlag::new()),
             truncation_policy: model_info.truncation_policy.into(),
-            js_repl,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
             turn_metadata_state,
             turn_skills: TurnSkillsContext::new(skills_outcome),
@@ -662,7 +678,6 @@ impl Session {
             turn_environments,
             cwd,
             sub_id,
-            Arc::clone(&self.js_repl),
             skills_outcome,
         );
         turn_context.realtime_active = self.conversation.running_state().await.is_some();

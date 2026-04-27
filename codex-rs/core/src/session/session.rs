@@ -25,7 +25,6 @@ pub(crate) struct Session {
     pub(super) idle_pending_input: Mutex<Vec<ResponseInputItem>>, // TODO (jif) merge with mailbox!
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
-    pub(super) js_repl: Arc<JsReplHandle>,
     pub(super) next_internal_sub_id: AtomicU64,
 }
 
@@ -94,7 +93,8 @@ impl SessionConfiguration {
     }
 
     pub(super) fn permission_profile(&self) -> PermissionProfile {
-        PermissionProfile::from_runtime_permissions(
+        PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(self.sandbox_policy.get()),
             &self.file_system_sandbox_policy,
             self.network_sandbox_policy,
         )
@@ -120,7 +120,7 @@ impl SessionConfiguration {
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
         let file_system_policy_matches_legacy = self.file_system_sandbox_policy
-            == FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+            == FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                 self.sandbox_policy.get(),
                 &self.cwd,
             );
@@ -182,26 +182,8 @@ impl SessionConfiguration {
             next_configuration.sandbox_policy.set(sandbox_policy)?;
             let (mut file_system_sandbox_policy, network_sandbox_policy) =
                 permission_profile.to_runtime_permissions();
-            if file_system_sandbox_policy.glob_scan_max_depth.is_none() {
-                file_system_sandbox_policy.glob_scan_max_depth =
-                    self.file_system_sandbox_policy.glob_scan_max_depth;
-            }
-            for deny_entry in self
-                .file_system_sandbox_policy
-                .entries
-                .iter()
-                .filter(|entry| {
-                    entry.access == codex_protocol::permissions::FileSystemAccessMode::None
-                })
-            {
-                if !file_system_sandbox_policy
-                    .entries
-                    .iter()
-                    .any(|entry| entry == deny_entry)
-                {
-                    file_system_sandbox_policy.entries.push(deny_entry.clone());
-                }
-            }
+            file_system_sandbox_policy
+                .preserve_deny_read_restrictions_from(&self.file_system_sandbox_policy);
             next_configuration.file_system_sandbox_policy = file_system_sandbox_policy;
             next_configuration.network_sandbox_policy = network_sandbox_policy;
         } else if let Some(sandbox_policy) = updates.sandbox_policy.clone() {
@@ -218,7 +200,7 @@ impl SessionConfiguration {
             // Preserve richer split policies across cwd-only updates; only
             // rederive when the session is already using the legacy bridge.
             next_configuration.file_system_sandbox_policy =
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                     next_configuration.sandbox_policy.get(),
                     &next_configuration.cwd,
                 );
@@ -270,7 +252,7 @@ impl Session {
         mut session_configuration: SessionConfiguration,
         config: Arc<Config>,
         auth_manager: Arc<AuthManager>,
-        models_manager: Arc<ModelsManager>,
+        models_manager: SharedModelsManager,
         exec_policy: Arc<ExecPolicyManager>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
@@ -346,7 +328,7 @@ impl Session {
                             Arc::clone(&thread_store),
                             ResumeThreadParams {
                                 thread_id: resumed_history.conversation_id,
-                                rollout_path: Some(resumed_history.rollout_path.clone()),
+                                rollout_path: resumed_history.rollout_path.clone(),
                                 history: Some(resumed_history.history.clone()),
                                 include_archived: true,
                                 event_persistence_mode,
@@ -783,18 +765,12 @@ impl Session {
                     config.features.enabled(Feature::RuntimeMetrics),
                     Self::build_model_client_beta_features_header(config.as_ref()),
                 ),
-                code_mode_service: crate::tools::code_mode::CodeModeService::new(
-                    config.js_repl_node_path.clone(),
-                ),
+                code_mode_service: crate::tools::code_mode::CodeModeService::new(),
                 environment_manager,
             };
             services
                 .model_client
                 .set_window_generation(window_generation);
-            let js_repl = Arc::new(JsReplHandle::with_node_path(
-                config.js_repl_node_path.clone(),
-                config.js_repl_node_module_dirs.clone(),
-            ));
             let (out_of_band_elicitation_paused, _out_of_band_elicitation_paused_rx) =
                 watch::channel(false);
 
@@ -815,7 +791,6 @@ impl Session {
                 idle_pending_input: Mutex::new(Vec::new()),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
-                js_repl,
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {
@@ -825,14 +800,6 @@ impl Session {
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
             let initial_messages = initial_history.get_event_msgs();
-            let permission_profile = if matches!(
-                session_configuration.file_system_sandbox_policy.kind,
-                FileSystemSandboxKind::ExternalSandbox
-            ) {
-                None
-            } else {
-                Some(session_configuration.permission_profile())
-            };
             let events = std::iter::once(Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
                 msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -845,7 +812,7 @@ impl Session {
                     approval_policy: session_configuration.approval_policy.value(),
                     approvals_reviewer: session_configuration.approvals_reviewer,
                     sandbox_policy: session_configuration.sandbox_policy.get().clone(),
-                    permission_profile,
+                    permission_profile: Some(session_configuration.permission_profile()),
                     cwd: session_configuration.cwd.clone(),
                     reasoning_effort: session_configuration.collaboration_mode.reasoning_effort(),
                     history_log_id,

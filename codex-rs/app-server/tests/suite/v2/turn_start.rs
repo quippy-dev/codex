@@ -40,6 +40,7 @@ use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::PermissionProfile;
 use codex_app_server_protocol::PermissionProfileFileSystemPermissions;
+use codex_app_server_protocol::PermissionProfileNetworkPermissions;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
@@ -781,9 +782,9 @@ async fn turn_start_rejects_invalid_permission_profile_before_starting_turn() ->
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
-            permission_profile: Some(PermissionProfile {
-                network: None,
-                file_system: Some(PermissionProfileFileSystemPermissions {
+            permission_profile: Some(PermissionProfile::Managed {
+                network: PermissionProfileNetworkPermissions { enabled: false },
+                file_system: PermissionProfileFileSystemPermissions::Restricted {
                     entries: vec![FileSystemSandboxEntry {
                         path: FileSystemPath::Path {
                             path: unsupported_write_root,
@@ -791,7 +792,7 @@ async fn turn_start_rejects_invalid_permission_profile_before_starting_turn() ->
                         access: FileSystemAccessMode::Write,
                     }],
                     glob_scan_max_depth: None,
-                }),
+                },
             }),
             ..Default::default()
         })
@@ -2054,7 +2055,6 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             approvals_reviewer: None,
             sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![first_cwd.try_into()?],
-                read_only_access: codex_app_server_protocol::ReadOnlyAccess::FullAccess,
                 network_access: false,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
