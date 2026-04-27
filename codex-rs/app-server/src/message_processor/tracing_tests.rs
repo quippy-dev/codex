@@ -263,10 +263,20 @@ fn build_test_processor(
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
-    let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
-    let outgoing = Arc::new(OutgoingMessageSender::new(outgoing_tx));
     let auth_manager =
         AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false);
+    build_test_processor_with_auth_manager(config, auth_manager)
+}
+
+fn build_test_processor_with_auth_manager(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
+    let outgoing = Arc::new(OutgoingMessageSender::new(outgoing_tx));
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -291,6 +301,26 @@ fn build_test_processor(
         remote_control_handle: None,
     }));
     (processor, outgoing_rx)
+}
+
+#[tokio::test]
+async fn message_processor_reuses_bootstrap_auth_manager_env_flag() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    let auth_manager =
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ true);
+
+    let (processor, _outgoing_rx) =
+        build_test_processor_with_auth_manager(config, auth_manager.clone());
+
+    assert!(auth_manager.codex_api_key_env_enabled());
+    assert!(processor.auth_manager.codex_api_key_env_enabled());
+    Ok(())
 }
 
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>

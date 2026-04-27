@@ -270,7 +270,7 @@ impl MessageProcessor {
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
             outgoing,
-            auth_storage_home,
+            auth_storage_home: _auth_storage_home,
             arg0_paths,
             config,
             config_manager,
@@ -279,16 +279,10 @@ impl MessageProcessor {
             log_db,
             config_warnings,
             session_source,
-            auth_manager: _bootstrap_auth_manager,
+            auth_manager,
             rpc_transport,
             remote_control_handle,
         } = args;
-        let auth_manager = AuthManager::shared(
-            auth_storage_home,
-            /*enable_codex_api_key_env*/ false,
-            config.cli_auth_credentials_store_mode,
-            Some(config.chatgpt_base_url.clone()),
-        );
         auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),

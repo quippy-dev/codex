@@ -13,6 +13,8 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tempfile::tempdir;
@@ -547,6 +549,22 @@ async fn build_config(
     AuthConfig {
         codex_home: codex_home.to_path_buf(),
         auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        auth_file: None,
+        forced_login_method,
+        forced_chatgpt_workspace_id,
+    }
+}
+
+async fn build_config_with_auth_file(
+    codex_home: &Path,
+    auth_file: PathBuf,
+    forced_login_method: Option<ForcedLoginMethod>,
+    forced_chatgpt_workspace_id: Option<String>,
+) -> AuthConfig {
+    AuthConfig {
+        codex_home: codex_home.to_path_buf(),
+        auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        auth_file: Some(auth_file),
         forced_login_method,
         forced_chatgpt_workspace_id,
     }
@@ -681,6 +699,120 @@ async fn enforce_login_restrictions_allows_api_key_if_login_method_not_set_but_f
     assert!(
         codex_home.path().join("auth.json").exists(),
         "auth.json should remain when restrictions pass"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn enforce_login_restrictions_uses_auth_file_override() {
+    let codex_home = tempdir().unwrap();
+    let override_home = tempdir().unwrap();
+    login_with_api_key(
+        codex_home.path(),
+        "sk-default",
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("seed default api key");
+    let _jwt = write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("org_mine".to_string()),
+        },
+        override_home.path(),
+    )
+    .expect("seed override chatgpt auth");
+
+    let config = build_config_with_auth_file(
+        codex_home.path(),
+        override_home.path().join("auth.json"),
+        Some(ForcedLoginMethod::Chatgpt),
+        Some("org_mine".to_string()),
+    )
+    .await;
+
+    super::enforce_login_restrictions(&config).expect("override auth should satisfy restrictions");
+    assert!(
+        codex_home.path().join("auth.json").exists(),
+        "default auth.json should remain untouched"
+    );
+    assert!(
+        override_home.path().join("auth.json").exists(),
+        "override auth.json should remain when restrictions pass"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn enforce_login_restrictions_logs_out_auth_file_override_only() {
+    let codex_home = tempdir().unwrap();
+    let override_home = tempdir().unwrap();
+    login_with_api_key(
+        codex_home.path(),
+        "sk-default",
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("seed default api key");
+    let _jwt = write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("org_mine".to_string()),
+        },
+        override_home.path(),
+    )
+    .expect("seed override chatgpt auth");
+
+    let config = build_config_with_auth_file(
+        codex_home.path(),
+        override_home.path().join("auth.json"),
+        Some(ForcedLoginMethod::Api),
+        /*forced_chatgpt_workspace_id*/ None,
+    )
+    .await;
+
+    let err =
+        super::enforce_login_restrictions(&config).expect_err("override mismatch should error");
+    assert!(err.to_string().contains("API key login is required"));
+    assert!(
+        codex_home.path().join("auth.json").exists(),
+        "default auth.json should remain untouched"
+    );
+    assert!(
+        !override_home.path().join("auth.json").exists(),
+        "override auth.json should be removed on mismatch"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn enforce_login_restrictions_auth_file_override_ignores_codex_api_key_env() {
+    let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+    let codex_home = tempdir().unwrap();
+    let override_home = tempdir().unwrap();
+    let _jwt = write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("org_mine".to_string()),
+        },
+        override_home.path(),
+    )
+    .expect("seed override chatgpt auth");
+
+    let config = build_config_with_auth_file(
+        codex_home.path(),
+        override_home.path().join("auth.json"),
+        Some(ForcedLoginMethod::Chatgpt),
+        Some("org_mine".to_string()),
+    )
+    .await;
+
+    super::enforce_login_restrictions(&config)
+        .expect("auth-file credentials should take precedence over env auth");
+    assert!(
+        override_home.path().join("auth.json").exists(),
+        "override auth.json should not be removed because env auth was ignored"
     );
 }
 

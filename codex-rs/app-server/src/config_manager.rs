@@ -120,17 +120,6 @@ impl ConfigManager {
         }
     }
 
-    pub(crate) fn replace_thread_config_loader(
-        &self,
-        thread_config_loader: Arc<dyn ThreadConfigLoader>,
-    ) {
-        if let Ok(mut guard) = self.thread_config_loader.write() {
-            *guard = thread_config_loader;
-        } else {
-            warn!("failed to update thread config loader");
-        }
-    }
-
     fn current_thread_config_loader(&self) -> Arc<dyn ThreadConfigLoader> {
         self.thread_config_loader
             .read()

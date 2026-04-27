@@ -15,7 +15,6 @@ use codex_login::CLIENT_ID;
 use codex_login::CodexAuth;
 use codex_login::ServerOptions;
 use codex_login::login_with_api_key;
-use codex_login::logout;
 use codex_login::run_device_code_login;
 use codex_login::run_login_server;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -376,9 +375,15 @@ pub async fn run_login_status(
 
 pub async fn run_logout(cli_config_overrides: CliConfigOverrides, auth_file: Option<PathBuf>) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
-    let auth_storage_home = resolve_auth_storage_home_or_exit(&config, auth_file);
+    let auth_runtime = resolve_auth_runtime_or_exit(&config, auth_file);
+    let auth_manager = auth_runtime
+        .shared_auth_manager(/*enable_codex_api_key_env*/ false)
+        .unwrap_or_else(|err| {
+            eprintln!("Error resolving auth storage path: {err}");
+            std::process::exit(1);
+        });
 
-    match logout(&auth_storage_home, config.cli_auth_credentials_store_mode) {
+    match auth_manager.logout_with_revoke().await {
         Ok(true) => {
             eprintln!("Successfully logged out");
             std::process::exit(0);
@@ -413,12 +418,15 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
 }
 
 fn resolve_auth_storage_home_or_exit(config: &Config, auth_file: Option<PathBuf>) -> PathBuf {
+    resolve_auth_runtime_or_exit(config, auth_file).into_auth_storage_home()
+}
+
+fn resolve_auth_runtime_or_exit(config: &Config, auth_file: Option<PathBuf>) -> AuthFileRuntime {
     AuthFileRuntime::new(
         config.codex_home.to_path_buf(),
         config.cli_auth_credentials_store_mode,
         auth_file,
     )
-    .map(AuthFileRuntime::into_auth_storage_home)
     .unwrap_or_else(|err| {
         eprintln!("Error resolving auth storage path: {err}");
         std::process::exit(1);

@@ -45,7 +45,6 @@ use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
 use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
-use codex_core::config::find_codex_home;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::TextRange as CoreTextRange;
 use codex_exec_server::EnvironmentManager;
@@ -388,65 +387,29 @@ pub async fn run_main_with_transport(
         mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
 
     let runtime_bootstrap::RuntimeBootstrap {
-        auth_storage_home, ..
+        auth_storage_home,
+        cli_kv_overrides,
+        cloud_requirements,
+        config,
+        config_warnings: _bootstrap_config_warnings,
+        loader_overrides_for_config_api,
     } = runtime_bootstrap::prepare_runtime_bootstrap(
         &cli_config_overrides,
-        loader_overrides.clone(),
+        loader_overrides,
         auth_file.clone(),
     )
     .await?;
 
-    // Parse CLI overrides once and derive the base Config eagerly so later
-    // components do not need to work with raw TOML values.
-    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("error parsing -c overrides: {e}"),
-        )
-    })?;
-    let codex_home = find_codex_home()?;
+    let codex_home = config.codex_home.to_path_buf();
+    let discovered_thread_config_loader = configured_thread_config_loader(&config);
     let config_manager = ConfigManager::new(
-        codex_home.to_path_buf(),
-        cli_kv_overrides.clone(),
-        loader_overrides,
-        Default::default(),
+        codex_home,
+        cli_kv_overrides,
+        loader_overrides_for_config_api,
+        cloud_requirements,
         arg0_paths.clone(),
-        Arc::new(NoopThreadConfigLoader),
+        discovered_thread_config_loader,
     );
-    match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
-        .await
-    {
-        Ok(config) => {
-            let effective_toml = config.config_layer_stack.effective_config();
-            match effective_toml.try_into() {
-                Ok(config_toml) => {
-                    if let Err(err) = codex_core::personality_migration::maybe_migrate_personality(
-                        &config.codex_home,
-                        &config_toml,
-                    )
-                    .await
-                    {
-                        warn!(error = %err, "Failed to run personality migration");
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to deserialize config for personality migration");
-                }
-            }
-
-            let discovered_thread_config_loader = configured_thread_config_loader(&config);
-            config_manager
-                .replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
-            let auth_manager =
-                AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
-            config_manager.replace_cloud_requirements_loader(auth_manager, config.chatgpt_base_url);
-        }
-        Err(err) => {
-            warn!(error = %err, "Failed to preload config for cloud requirements");
-            // TODO(gt): Make cloud requirements preload failures blocking once we can fail-closed.
-        }
-    };
     let mut config_warnings = Vec::new();
     let config = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
@@ -497,6 +460,12 @@ pub async fn run_main_with_transport(
             range: None,
         });
     }
+
+    let auth_manager = AuthManager::shared_from_config_with_auth_file(
+        &config, /*enable_codex_api_key_env*/ false, auth_file,
+    )?;
+    config_manager
+        .replace_cloud_requirements_loader(auth_manager.clone(), config.chatgpt_base_url.clone());
 
     let feedback = CodexFeedback::new();
 
@@ -600,9 +569,6 @@ pub async fn run_main_with_transport(
         AppServerTransport::Off => {}
     }
 
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
-
     let remote_control_enabled = config.features.enabled(Feature::RemoteControl);
     if transport_accept_handles.is_empty() && !remote_control_enabled {
         return Err(std::io::Error::new(
@@ -681,8 +647,7 @@ pub async fn run_main_with_transport(
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
         let outbound_control_tx = outbound_control_tx;
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        let auth_manager = auth_manager.clone();
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
             outgoing: outgoing_message_sender,
             auth_storage_home,

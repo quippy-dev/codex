@@ -5,6 +5,7 @@
 //! cache used for multi-agent navigation.
 
 use super::*;
+use codex_protocol::config_types::CollaborationModeMask;
 
 impl App {
     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
@@ -433,6 +434,7 @@ impl App {
         app_server: &mut AppServerSession,
         session_start_source: Option<ThreadStartSource>,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
+        initial_collaboration_mode: Option<CollaborationModeMask>,
     ) {
         // Start a fresh in-memory session while preserving resumability via persisted rollout
         // history. If an initial message is provided, `enqueue_primary_thread_session` suppresses it
@@ -467,6 +469,7 @@ impl App {
                         app_server,
                         started,
                         initial_user_message,
+                        initial_collaboration_mode,
                     )
                     .await
                 {
@@ -501,6 +504,7 @@ impl App {
         app_server: &mut AppServerSession,
         started: AppServerStartedThread,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
+        initial_collaboration_mode: Option<CollaborationModeMask>,
     ) -> Result<()> {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
@@ -511,7 +515,11 @@ impl App {
             self.config.clone(),
             initial_user_message,
         );
-        self.replace_chat_widget(ChatWidget::new_with_app_event(init));
+        let mut chat_widget = ChatWidget::new_with_app_event(init);
+        if let Some(collaboration_mode) = initial_collaboration_mode {
+            chat_widget.set_collaboration_mask(collaboration_mode);
+        }
+        self.replace_chat_widget(chat_widget);
         self.enqueue_primary_thread_session(started.session, started.turns)
             .await?;
         self.backfill_loaded_subagent_threads(app_server).await;
@@ -696,6 +704,7 @@ impl App {
                 match self
                     .replace_chat_widget_with_app_server_thread(
                         tui, app_server, resumed, /*initial_user_message*/ None,
+                        /*initial_collaboration_mode*/ None,
                     )
                     .await
                 {

@@ -2,11 +2,17 @@ use crate::JsonSchema;
 use crate::ResponsesApiTool;
 use crate::ToolSpec;
 use codex_protocol::config_types::ModeKind;
-use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use std::collections::BTreeMap;
 
 pub const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+
+const REQUEST_USER_INPUT_SCHEMA_MODES: [ModeKind; 4] = [
+    ModeKind::Default,
+    ModeKind::Plan,
+    ModeKind::Execute,
+    ModeKind::PairProgramming,
+];
 
 pub fn create_request_user_input_tool(description: String) -> ToolSpec {
     let option_props = BTreeMap::from([
@@ -124,11 +130,15 @@ pub fn request_user_input_tool_description(default_mode_request_user_input: bool
 
 fn request_user_input_is_available(mode: ModeKind, default_mode_request_user_input: bool) -> bool {
     mode.allows_request_user_input()
-        || (default_mode_request_user_input && mode == ModeKind::Default)
+        || (default_mode_request_user_input
+            && matches!(
+                mode,
+                ModeKind::Default | ModeKind::Execute | ModeKind::PairProgramming
+            ))
 }
 
 fn format_allowed_modes(default_mode_request_user_input: bool) -> String {
-    let mode_names: Vec<&str> = TUI_VISIBLE_COLLABORATION_MODES
+    let mode_names: Vec<&str> = REQUEST_USER_INPUT_SCHEMA_MODES
         .into_iter()
         .filter(|mode| request_user_input_is_available(*mode, default_mode_request_user_input))
         .map(ModeKind::display_name)
@@ -137,8 +147,8 @@ fn format_allowed_modes(default_mode_request_user_input: bool) -> String {
     match mode_names.as_slice() {
         [] => "no modes".to_string(),
         [mode] => format!("{mode} mode"),
-        [first, second] => format!("{first} or {second} mode"),
-        [..] => format!("modes: {}", mode_names.join(",")),
+        [first, second] => format!("{first} and {second} modes"),
+        [..] => format!("modes: {}", mode_names.join(", ")),
     }
 }
 

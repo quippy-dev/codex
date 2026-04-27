@@ -595,15 +595,17 @@ pub fn load_auth_dot_json(
 pub struct AuthConfig {
     pub codex_home: PathBuf,
     pub auth_credentials_store_mode: AuthCredentialsStoreMode,
+    pub auth_file: Option<PathBuf>,
     pub forced_login_method: Option<ForcedLoginMethod>,
     pub forced_chatgpt_workspace_id: Option<String>,
 }
 
 pub fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
-    let Some(auth) = load_auth(
+    let Some(auth) = load_auth_with_auth_file(
         &config.codex_home,
         /*enable_codex_api_key_env*/ true,
         config.auth_credentials_store_mode,
+        config.auth_file.clone(),
     )?
     else {
         return Ok(());
@@ -632,6 +634,7 @@ pub fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
                 &config.codex_home,
                 message,
                 config.auth_credentials_store_mode,
+                config.auth_file.as_deref(),
             );
         }
     }
@@ -651,6 +654,7 @@ pub fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
                                 "Failed to load ChatGPT credentials while enforcing workspace restrictions: {err}. Logging out."
                             ),
                             config.auth_credentials_store_mode,
+                            config.auth_file.as_deref(),
                         );
                     }
                 };
@@ -670,6 +674,7 @@ pub fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
                 &config.codex_home,
                 message,
                 config.auth_credentials_store_mode,
+                config.auth_file.as_deref(),
             );
         }
     }
@@ -681,10 +686,12 @@ fn logout_with_message(
     codex_home: &Path,
     message: String,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
+    auth_file: Option<&Path>,
 ) -> std::io::Result<()> {
     // External auth tokens live in the ephemeral store, but persistent auth may still exist
     // from earlier logins. Clear both so a forced logout truly removes all active auth.
-    let removal_result = logout_all_stores(codex_home, auth_credentials_store_mode);
+    let removal_result =
+        logout_all_stores_with_auth_file(codex_home, auth_credentials_store_mode, auth_file);
     let error_message = match removal_result {
         Ok(_) => message,
         Err(err) => format!("{message}. Failed to remove auth.json: {err}"),
@@ -692,13 +699,7 @@ fn logout_with_message(
     Err(std::io::Error::other(error_message))
 }
 
-fn logout_all_stores(
-    codex_home: &Path,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-) -> std::io::Result<bool> {
-    logout_all_stores_with_auth_file(codex_home, auth_credentials_store_mode, None)
-}
-
+#[cfg(test)]
 fn load_auth(
     codex_home: &Path,
     enable_codex_api_key_env: bool,
@@ -1254,6 +1255,22 @@ impl AuthManager {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         auth_file: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        Self::new_with_auth_file_and_base_url(
+            codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+            auth_file,
+            /*chatgpt_base_url*/ None,
+        )
+    }
+
+    fn new_with_auth_file_and_base_url(
+        codex_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_file: Option<PathBuf>,
+        chatgpt_base_url: Option<String>,
+    ) -> std::io::Result<Self> {
         validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
         let auth_storage_home = resolve_auth_storage_home(
             codex_home,
@@ -1264,7 +1281,7 @@ impl AuthManager {
             auth_storage_home,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
-            None,
+            chatgpt_base_url,
             auth_file,
         ))
     }
@@ -1583,6 +1600,22 @@ impl AuthManager {
         auth_manager
     }
 
+    pub fn shared_from_config_with_auth_file(
+        config: &impl AuthManagerConfig,
+        enable_codex_api_key_env: bool,
+        auth_file: Option<PathBuf>,
+    ) -> std::io::Result<Arc<Self>> {
+        let auth_manager = Arc::new(Self::new_with_auth_file_and_base_url(
+            config.codex_home(),
+            enable_codex_api_key_env,
+            config.cli_auth_credentials_store_mode(),
+            auth_file,
+            Some(config.chatgpt_base_url()),
+        )?);
+        auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id());
+        Ok(auth_manager)
+    }
+
     pub fn shared_with_auth_file(
         codex_home: PathBuf,
         enable_codex_api_key_env: bool,
@@ -1747,7 +1780,11 @@ impl AuthManager {
         if let Err(err) = revoke_auth_tokens(auth_dot_json.as_ref()).await {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
         }
-        let result = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
+        let result = logout_all_stores_with_auth_file(
+            &self.codex_home,
+            self.auth_credentials_store_mode,
+            self.auth_file.as_deref(),
+        )?;
         // Always reload to clear any cached auth (even if file absent).
         self.reload();
         Ok(result)

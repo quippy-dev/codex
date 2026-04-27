@@ -44,6 +44,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
+#[cfg(test)]
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config_loader::CloudRequirementsLoader;
@@ -51,9 +52,12 @@ use codex_core::config_loader::LoaderOverrides;
 pub use codex_exec_server::EnvironmentManager;
 pub use codex_exec_server::EnvironmentManagerArgs;
 pub use codex_exec_server::ExecServerRuntimePaths;
+#[cfg(test)]
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+#[cfg(test)]
 use codex_login::AuthManager;
+#[cfg(test)]
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::protocol::SessionSource;
 use serde::de::DeserializeOwned;
@@ -369,7 +373,7 @@ pub struct InProcessClientStartArgs {
 #[derive(Clone)]
 struct SharedCoreManagers {
     auth_manager: Arc<AuthManager>,
-    thread_manager: Arc<ThreadManager>,
+    _thread_manager: Arc<ThreadManager>,
 }
 
 fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoader> {
@@ -388,6 +392,8 @@ impl InProcessClientStartArgs {
             self.config.cli_auth_credentials_store_mode,
             Some(self.config.chatgpt_base_url.clone()),
         );
+        auth_manager
+            .set_forced_chatgpt_workspace_id(self.config.forced_chatgpt_workspace_id.clone());
         let thread_manager = Arc::new(ThreadManager::new(
             self.config.as_ref(),
             auth_manager.clone(),
@@ -404,7 +410,7 @@ impl InProcessClientStartArgs {
 
         SharedCoreManagers {
             auth_manager,
-            thread_manager,
+            _thread_manager: thread_manager,
         }
     }
 

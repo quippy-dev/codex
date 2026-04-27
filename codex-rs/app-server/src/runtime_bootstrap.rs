@@ -3,6 +3,7 @@ use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::auth::AuthFileRuntime;
 use codex_core::config::ConfigBuilder;
 use codex_core::config_loader::CloudRequirementsLoader;
+use codex_login::AuthManager;
 use toml::Value as TomlValue;
 
 pub(crate) struct RuntimeBootstrap {
@@ -50,12 +51,11 @@ pub(crate) async fn prepare_runtime_bootstrap(
                 }
             }
 
-            let auth_runtime = AuthFileRuntime::new(
-                config.codex_home.to_path_buf(),
-                config.cli_auth_credentials_store_mode,
+            let auth_manager = AuthManager::shared_from_config_with_auth_file(
+                &config,
+                /*enable_codex_api_key_env*/ false,
                 auth_file.clone(),
             )?;
-            let auth_manager = auth_runtime.shared_auth_manager(false)?;
             cloud_requirements_loader(
                 auth_manager,
                 config.chatgpt_base_url,

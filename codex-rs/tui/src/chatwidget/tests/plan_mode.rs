@@ -69,7 +69,11 @@ async fn plan_implementation_popup_clear_context_emits_clear_submit_event() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let event = rx.try_recv().expect("expected AppEvent");
-    let AppEvent::ClearUiAndSubmitUserMessage { text } = event else {
+    let AppEvent::ClearUiAndSubmitUserMessage {
+        text,
+        collaboration_mode,
+    } = event
+    else {
         panic!("expected ClearUiAndSubmitUserMessage, got {event:?}");
     };
     assert_eq!(
@@ -79,6 +83,7 @@ async fn plan_implementation_popup_clear_context_emits_clear_submit_event() {
         user intent, re-read files as needed, and carry the work through \
         implementation and verification.\n\n- Step 1\n- Step 2\n"
     );
+    assert_eq!(collaboration_mode.mode, Some(ModeKind::Execute));
 }
 
 #[tokio::test]

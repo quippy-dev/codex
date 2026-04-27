@@ -1177,6 +1177,7 @@ impl Session {
                 // turn/start overrides can be merged before we write model-visible context.
                 self.set_previous_turn_settings(/*previous_turn_settings*/ None)
                     .await;
+                plan_retention_cache::clear_latest_proposed_plan_text(self).await;
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
@@ -1253,12 +1254,15 @@ impl Session {
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
         let previous_turn_settings = reconstructed_rollout.previous_turn_settings.clone();
+        let latest_proposed_plan_text = reconstructed_rollout.latest_proposed_plan_text.clone();
         self.replace_history(
             reconstructed_rollout.history,
             reconstructed_rollout.reference_context_item,
         )
         .await;
         self.set_previous_turn_settings(previous_turn_settings.clone())
+            .await;
+        plan_retention_cache::hydrate_latest_proposed_plan_text(self, latest_proposed_plan_text)
             .await;
         previous_turn_settings
     }

@@ -97,18 +97,6 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
     }
 }
 
-fn developer_msg(text: &str) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: text.to_string(),
-        }],
-        end_turn: None,
-        phase: None,
-    }
-}
-
 fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -1081,6 +1069,7 @@ fn drop_last_n_user_turns_clears_reference_context_for_mixed_developer_context_b
     );
     assert!(history.reference_context_item().is_none());
 }
+#[test]
 fn remove_first_item_handles_custom_tool_pair() {
     let items = vec![
         ResponseItem::CustomToolCall {

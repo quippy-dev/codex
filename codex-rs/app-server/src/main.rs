@@ -90,6 +90,7 @@ fn disable_managed_config_from_debug_env() -> bool {
 
     false
 }
+#[cfg(debug_assertions)]
 fn managed_config_path_from_debug_env() -> Option<PathBuf> {
     if let Ok(value) = std::env::var(MANAGED_CONFIG_PATH_ENV_VAR) {
         return if value.is_empty() {

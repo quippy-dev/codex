@@ -115,7 +115,10 @@ pub(crate) fn load_auth_with_auth_file(
         )
     };
 
-    if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
+    if auth_file.is_none()
+        && enable_codex_api_key_env
+        && let Some(api_key) = read_codex_api_key_from_env()
+    {
         let client = crate::default_client::create_client();
         return Ok(Some(CodexAuth::from_api_key_with_client(
             api_key.as_str(),

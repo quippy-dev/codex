@@ -2165,6 +2165,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn resume_include_non_interactive_flag_sets_source_filter_override() {
         let interactive =
             finalize_resume_from_args(["codex", "resume", "--include-non-interactive"].as_ref());
@@ -2490,6 +2491,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn app_server_proxy_subcommand_parses() {
         let app_server = app_server_from_args(["codex", "app-server", "proxy"].as_ref());
         assert!(matches!(
@@ -2600,6 +2602,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn reject_remote_auth_token_env_for_app_server_proxy() {
         let subcommand = AppServerSubcommand::Proxy(AppServerProxyCommand { socket_path: None });
         let err = reject_remote_mode_for_app_server_subcommand(

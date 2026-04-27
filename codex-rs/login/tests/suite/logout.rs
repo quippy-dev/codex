@@ -9,6 +9,7 @@ use codex_login::CLIENT_ID;
 use codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::logout_with_revoke;
 use codex_login::save_auth;
+use codex_login::save_auth_with_auth_file;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
 use core_test_support::skip_if_no_network;
@@ -155,6 +156,68 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
     assert!(removed);
     assert!(manager.auth_cached().is_none());
     assert!(!codex_home.path().join("auth.json").exists());
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch revoke requests")?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .body_json::<Value>()
+            .context("revoke request should be JSON")?,
+        json!({
+            "token": REFRESH_TOKEN,
+            "token_type_hint": "refresh_token",
+            "client_id": CLIENT_ID,
+        })
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[serial_test::serial(logout_revoke)]
+#[tokio::test]
+async fn auth_manager_logout_with_revoke_uses_auth_file_override() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "success"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let _env_guard = EnvGuard::set(
+        REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
+        format!("{}/oauth/revoke", server.uri()),
+    );
+
+    let codex_home = TempDir::new()?;
+    let auth_storage_home = TempDir::new()?;
+    let auth_file = auth_storage_home.path().join("auth.json");
+    std::fs::write(codex_home.path().join("auth.json"), "{}")?;
+    save_auth_with_auth_file(
+        auth_storage_home.path(),
+        &chatgpt_auth_with_refresh_token(REFRESH_TOKEN),
+        AuthCredentialsStoreMode::File,
+        Some(auth_file.clone()),
+    )?;
+    let manager = AuthManager::new_with_auth_file(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some(auth_file.clone()),
+    )?;
+
+    let removed = manager.logout_with_revoke().await?;
+
+    assert!(removed);
+    assert!(manager.auth_cached().is_none());
+    assert!(!auth_file.exists());
+    assert!(codex_home.path().join("auth.json").exists());
 
     let requests = server
         .received_requests()

@@ -61,6 +61,7 @@ pub(crate) fn next_mask(
     None
 }
 
+#[cfg(test)]
 pub(crate) fn default_mode_mask(model_catalog: &ModelCatalog) -> Option<CollaborationModeMask> {
     mask_for_kind(model_catalog, ModeKind::Default)
 }

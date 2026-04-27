@@ -356,6 +356,7 @@ pub fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition
     definition
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata {
     EnabledToolMetadata {
         tool_name: definition.tool_name.clone(),
@@ -365,6 +366,7 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EnabledToolMetadata {
     pub tool_name: ToolName,

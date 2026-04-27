@@ -139,6 +139,7 @@ pub(crate) enum AppEvent {
     /// sees only the explicit prompt carried in `text` once the new session is configured.
     ClearUiAndSubmitUserMessage {
         text: String,
+        collaboration_mode: CollaborationModeMask,
     },
 
     /// Open the resume picker inside the running TUI session.

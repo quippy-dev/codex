@@ -53,12 +53,13 @@ pub(super) fn selection_view_params(
             Vec::new(),
             Some(PLAN_IMPLEMENTATION_EXECUTE_UNAVAILABLE.to_string()),
         ),
-        (Some(_), Some(plan_markdown)) if !plan_markdown.trim().is_empty() => {
+        (Some(mask), Some(plan_markdown)) if !plan_markdown.trim().is_empty() => {
             let user_text =
                 format!("{PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX}\n\n{plan_markdown}");
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 tx.send(AppEvent::ClearUiAndSubmitUserMessage {
                     text: user_text.clone(),
+                    collaboration_mode: mask.clone(),
                 });
             })];
             (actions, None)

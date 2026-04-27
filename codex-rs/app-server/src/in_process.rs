@@ -392,8 +392,14 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
         });
 
         let processor_outgoing = Arc::clone(&outgoing_message_sender);
-        let auth_manager =
-            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env);
+        let auth_manager = AuthManager::shared(
+            args.auth_storage_home.clone(),
+            args.enable_codex_api_key_env,
+            args.config.cli_auth_credentials_store_mode,
+            Some(args.config.chatgpt_base_url.clone()),
+        );
+        auth_manager
+            .set_forced_chatgpt_workspace_id(args.config.forced_chatgpt_workspace_id.clone());
         let config_manager = ConfigManager::new(
             args.config.codex_home.to_path_buf(),
             args.cli_overrides,
@@ -715,11 +721,14 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::Account;
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::DeviceKeyPublicParams;
     use codex_app_server_protocol::DeviceKeySignParams;
     use codex_app_server_protocol::DeviceKeySignPayload;
+    use codex_app_server_protocol::GetAccountParams;
+    use codex_app_server_protocol::GetAccountResponse;
     use codex_app_server_protocol::RemoteControlClientConnectionAudience;
     use codex_app_server_protocol::RemoteControlClientEnrollmentAudience;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
@@ -729,7 +738,10 @@ mod tests {
     use codex_app_server_protocol::TurnCompletedNotification;
     use codex_app_server_protocol::TurnStatus;
     use codex_core::config::ConfigBuilder;
+    use codex_login::AuthCredentialsStoreMode;
+    use codex_login::login_with_api_key;
     use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
 
     async fn build_test_config() -> Config {
         match ConfigBuilder::default().build().await {
@@ -791,6 +803,69 @@ mod tests {
 
         let _parsed: ConfigRequirementsReadResponse =
             serde_json::from_value(response).expect("response should match v2 schema");
+        client
+            .shutdown()
+            .await
+            .expect("in-process runtime should shutdown cleanly");
+    }
+
+    #[tokio::test]
+    async fn in_process_start_uses_resolved_auth_storage_home_for_account_read() {
+        let default_auth_home = tempdir().expect("create default auth home");
+        let override_auth_home = tempdir().expect("create override auth home");
+        login_with_api_key(
+            override_auth_home.path(),
+            "sk-override",
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("seed override api key");
+        let config = Arc::new(
+            ConfigBuilder::default()
+                .codex_home(default_auth_home.path().to_path_buf())
+                .build()
+                .await
+                .expect("config should build"),
+        );
+        let args = InProcessStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            auth_storage_home: override_auth_home.path().to_path_buf(),
+            config,
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
+            feedback: CodexFeedback::new(),
+            log_db: None,
+            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+            config_warnings: Vec::new(),
+            session_source: SessionSource::Cli,
+            enable_codex_api_key_env: false,
+            initialize: InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-in-process-test".to_string(),
+                    title: None,
+                    version: "0.0.0".to_string(),
+                },
+                capabilities: None,
+            },
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        };
+
+        let client = start(args).await.expect("in-process runtime should start");
+        let response = client
+            .request(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(2),
+                params: GetAccountParams {
+                    refresh_token: false,
+                },
+            })
+            .await
+            .expect("request transport should work")
+            .expect("account/read should succeed");
+        let parsed: GetAccountResponse =
+            serde_json::from_value(response).expect("account/read response should parse");
+
+        assert_eq!(parsed.account, Some(Account::ApiKey {}));
         client
             .shutdown()
             .await

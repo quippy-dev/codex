@@ -1,7 +1,6 @@
 mod layer_io;
 #[cfg(target_os = "macos")]
 mod macos;
-mod requirements_pipeline;
 
 #[cfg(test)]
 mod tests;

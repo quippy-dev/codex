@@ -18,7 +18,7 @@ impl App {
             AppEvent::NewSession => {
                 self.start_fresh_session_with_summary_hint(
                     tui, app_server, /*session_start_source*/ None,
-                    /*initial_user_message*/ None,
+                    /*initial_user_message*/ None, /*initial_collaboration_mode*/ None,
                 )
                 .await;
             }
@@ -31,10 +31,14 @@ impl App {
                     app_server,
                     Some(ThreadStartSource::Clear),
                     /*initial_user_message*/ None,
+                    /*initial_collaboration_mode*/ None,
                 )
                 .await;
             }
-            AppEvent::ClearUiAndSubmitUserMessage { text } => {
+            AppEvent::ClearUiAndSubmitUserMessage {
+                text,
+                collaboration_mode,
+            } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
 
@@ -47,6 +51,7 @@ impl App {
                         Vec::new(),
                         Vec::new(),
                     ),
+                    Some(collaboration_mode),
                 )
                 .await;
             }
@@ -137,6 +142,7 @@ impl App {
                             match self
                                 .replace_chat_widget_with_app_server_thread(
                                     tui, app_server, forked, /*initial_user_message*/ None,
+                                    /*initial_collaboration_mode*/ None,
                                 )
                                 .await
                             {

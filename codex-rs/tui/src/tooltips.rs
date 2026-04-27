@@ -142,11 +142,23 @@ pub(crate) mod announcement {
 
     /// Fetch the announcement tip, return None if the prewarm is not done yet.
     pub(crate) fn fetch_announcement_tip(plan: Option<PlanType>) -> Option<String> {
+        if !should_fetch_announcement_tip(CODEX_CLI_VERSION) {
+            return None;
+        }
+
         ANNOUNCEMENT_TIP
             .get()
             .cloned()
             .flatten()
             .and_then(|raw| parse_announcement_tip_toml(&raw, plan))
+    }
+
+    pub(super) fn should_fetch_announcement_tip(version: &str) -> bool {
+        !is_source_build_version(version)
+    }
+
+    fn is_source_build_version(version: &str) -> bool {
+        version.trim() == "0.0.0"
     }
 
     #[derive(Debug, Deserialize)]
@@ -414,6 +426,12 @@ to_date = "2000-01-01"
             Some("latest match".to_string()),
             parse_announcement_tip_toml(toml, /*plan*/ None)
         );
+    }
+
+    #[test]
+    fn announcement_tip_skips_source_build_version() {
+        assert!(!announcement::should_fetch_announcement_tip("0.0.0"));
+        assert!(announcement::should_fetch_announcement_tip("0.120.0"));
     }
 
     #[test]
