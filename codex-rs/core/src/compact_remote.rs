@@ -452,7 +452,7 @@ async fn build_compact_tools(
         cancellation_token,
     )
     .await?;
-    Ok(tool_router.specs())
+    Ok(tool_router.model_visible_specs())
 }
 
 fn estimate_tool_token_count(tools: &[ToolSpec]) -> CodexResult<i64> {

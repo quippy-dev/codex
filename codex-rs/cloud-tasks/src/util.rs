@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_core::config::Config;
-use codex_login::AuthFileRuntime;
 use codex_login::AuthManager;
 use codex_utils_cli::CliConfigOverrides;
 
@@ -58,15 +57,17 @@ pub async fn load_auth_manager(
     )
     .await
     .context("failed to load cloud-tasks config")?;
-    let auth_runtime = AuthFileRuntime::new(
-        config.codex_home.to_path_buf(),
-        config.cli_auth_credentials_store_mode,
+    let chatgpt_base_url = std::env::var("CODEX_CLOUD_TASKS_BASE_URL")
+        .ok()
+        .map(|base_url| normalize_base_url(&base_url))
+        .unwrap_or_else(|| config.chatgpt_base_url.clone());
+    AuthManager::shared_from_config_with_auth_file_and_base_url(
+        &config,
+        /*enable_codex_api_key_env*/ false,
         auth_file,
+        Some(chatgpt_base_url),
     )
-    .map_err(|err| anyhow::anyhow!("failed to resolve cloud-tasks auth storage: {err}"))?;
-    auth_runtime
-        .shared_auth_manager(false)
-        .map_err(|err| anyhow::anyhow!("failed to create cloud-tasks auth manager: {err}"))
+    .map_err(|err| anyhow::anyhow!("failed to create cloud-tasks auth manager: {err}"))
 }
 
 /// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
@@ -214,12 +215,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let auth_file = dir.join("custom").join("auth.json");
-        let err = AuthFileRuntime::new(
-            dir.clone(),
-            AuthCredentialsStoreMode::Keyring,
-            Some(auth_file),
-        )
-        .expect_err("invalid override should fail");
+        let cli_overrides = vec![
+            format!("codex_home={}", dir.display()),
+            "cli_auth_credentials_store=ephemeral".to_string(),
+        ];
+        let cli_overrides = CliConfigOverrides {
+            raw_overrides: cli_overrides,
+        };
+        let err = load_auth_manager(&cli_overrides, Some(auth_file))
+            .await
+            .expect_err("invalid override should fail");
         assert!(
             err.to_string().contains("--auth-file cannot be used"),
             "expected auth-file validation error, got `{err}`"

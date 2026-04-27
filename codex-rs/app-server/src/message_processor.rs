@@ -270,7 +270,7 @@ impl MessageProcessor {
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
             outgoing,
-            auth_storage_home: _auth_storage_home,
+            auth_storage_home,
             arg0_paths,
             config,
             config_manager,
@@ -314,6 +314,7 @@ impl MessageProcessor {
             outgoing: outgoing.clone(),
             analytics_events_client: analytics_events_client.clone(),
             arg0_paths,
+            auth_storage_home,
             config: Arc::clone(&config),
             config_manager: config_manager.clone(),
             feedback,

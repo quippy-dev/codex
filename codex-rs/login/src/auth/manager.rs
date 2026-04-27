@@ -1605,12 +1605,26 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         auth_file: Option<PathBuf>,
     ) -> std::io::Result<Arc<Self>> {
+        Self::shared_from_config_with_auth_file_and_base_url(
+            config,
+            enable_codex_api_key_env,
+            auth_file,
+            Some(config.chatgpt_base_url()),
+        )
+    }
+
+    pub fn shared_from_config_with_auth_file_and_base_url(
+        config: &impl AuthManagerConfig,
+        enable_codex_api_key_env: bool,
+        auth_file: Option<PathBuf>,
+        chatgpt_base_url: Option<String>,
+    ) -> std::io::Result<Arc<Self>> {
         let auth_manager = Arc::new(Self::new_with_auth_file_and_base_url(
             config.codex_home(),
             enable_codex_api_key_env,
             config.cli_auth_credentials_store_mode(),
             auth_file,
-            Some(config.chatgpt_base_url()),
+            chatgpt_base_url,
         )?);
         auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id());
         Ok(auth_manager)

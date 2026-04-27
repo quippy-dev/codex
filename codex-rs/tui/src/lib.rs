@@ -818,6 +818,7 @@ pub async fn run_main(
     .map_err(std::io::Error::other)?;
     crate::voice::set_transcription_session_context(
         auth_runtime.auth_storage_home().to_path_buf(),
+        auth_runtime.auth_credentials_store_mode(),
         config_toml
             .chatgpt_base_url
             .clone()

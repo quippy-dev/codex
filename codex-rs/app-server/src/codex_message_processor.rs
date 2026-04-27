@@ -496,6 +496,7 @@ pub(crate) struct CodexMessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     arg0_paths: Arg0DispatchPaths,
+    auth_storage_home: PathBuf,
     config: Arc<Config>,
     thread_store: Arc<dyn ThreadStore>,
     config_manager: ConfigManager,
@@ -656,6 +657,7 @@ pub(crate) struct CodexMessageProcessorArgs {
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
+    pub(crate) auth_storage_home: PathBuf,
     /// Startup config used as the process baseline. Fresh effective config loads
     /// go through `config_manager`.
     pub(crate) config: Arc<Config>,
@@ -754,6 +756,7 @@ impl CodexMessageProcessor {
             outgoing,
             analytics_events_client,
             arg0_paths,
+            auth_storage_home,
             config,
             config_manager,
             feedback,
@@ -765,6 +768,7 @@ impl CodexMessageProcessor {
             outgoing: outgoing.clone(),
             analytics_events_client,
             arg0_paths,
+            auth_storage_home,
             thread_store: configured_thread_store(&config),
             config,
             config_manager,
@@ -1324,7 +1328,7 @@ impl CodexMessageProcessor {
         }
 
         match login_with_api_key(
-            &self.config.codex_home,
+            &self.auth_storage_home,
             &params.api_key,
             self.config.cli_auth_credentials_store_mode,
         ) {
@@ -1390,7 +1394,7 @@ impl CodexMessageProcessor {
         let opts = LoginServerOptions {
             open_browser: false,
             ..LoginServerOptions::new(
-                config.codex_home.to_path_buf(),
+                self.auth_storage_home.clone(),
                 CLIENT_ID.to_string(),
                 config.forced_chatgpt_workspace_id.clone(),
                 config.cli_auth_credentials_store_mode,
@@ -1711,7 +1715,7 @@ impl CodexMessageProcessor {
         }
 
         if let Err(err) = login_with_chatgpt_auth_tokens(
-            &self.config.codex_home,
+            &self.auth_storage_home,
             &access_token,
             &chatgpt_account_id,
             chatgpt_plan_type.as_deref(),
