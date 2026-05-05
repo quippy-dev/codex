@@ -29,6 +29,7 @@ pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
+pub use codex_app_server::in_process::StateDbHandle;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -41,24 +42,22 @@ use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::CloudRequirementsLoader;
+use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
 #[cfg(test)]
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::config_loader::CloudRequirementsLoader;
-use codex_core::config_loader::LoaderOverrides;
+#[cfg(test)]
+use codex_core::thread_store_from_config;
 pub use codex_exec_server::EnvironmentManager;
 pub use codex_exec_server::EnvironmentManagerArgs;
 pub use codex_exec_server::ExecServerRuntimePaths;
-#[cfg(test)]
-use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 #[cfg(test)]
 use codex_login::AuthManager;
-#[cfg(test)]
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::protocol::SessionSource;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
@@ -103,12 +102,12 @@ pub mod legacy_core {
         pub use codex_core::otel_init::*;
     }
 
-    pub mod personality_migration {
-        pub use codex_core::personality_migration::*;
+    pub mod plugins {
+        pub use codex_core_plugins::PluginsManager;
     }
 
-    pub mod plugins {
-        pub use codex_core::plugins::PluginsManager;
+    pub mod personality_migration {
+        pub use codex_core::personality_migration::*;
     }
 
     pub mod review_format {
@@ -312,7 +311,15 @@ impl fmt::Display for TypedRequestError {
                 write!(f, "{method} transport error: {source}")
             }
             Self::Server { method, source } => {
-                write!(f, "{method} failed: {}", source.message)
+                write!(
+                    f,
+                    "{method} failed: {} (code {})",
+                    source.message, source.code
+                )?;
+                if let Some(data) = source.data.as_ref() {
+                    write!(f, ", data: {data}")?;
+                }
+                Ok(())
             }
             Self::Deserialize { method, source } => {
                 write!(f, "{method} response decode error: {source}")
@@ -349,6 +356,8 @@ pub struct InProcessClientStartArgs {
     pub feedback: CodexFeedback,
     /// SQLite tracing layer used to flush recently emitted logs before feedback upload.
     pub log_db: Option<LogDbLayer>,
+    /// Process-wide SQLite state handle shared with the embedded app-server.
+    pub state_db: Option<StateDbHandle>,
     /// Environment manager used by core execution and filesystem operations.
     pub environment_manager: Arc<EnvironmentManager>,
     /// Startup warnings emitted after initialize succeeds.
@@ -385,27 +394,25 @@ fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoade
 
 impl InProcessClientStartArgs {
     #[cfg(test)]
-    fn shared_core_managers(&self) -> SharedCoreManagers {
+    async fn shared_core_managers(&self) -> SharedCoreManagers {
         let auth_manager = AuthManager::shared(
             self.auth_storage_home.clone(),
             self.enable_codex_api_key_env,
             self.config.cli_auth_credentials_store_mode,
             Some(self.config.chatgpt_base_url.clone()),
-        );
+        )
+        .await;
         auth_manager
             .set_forced_chatgpt_workspace_id(self.config.forced_chatgpt_workspace_id.clone());
+        let thread_store = thread_store_from_config(self.config.as_ref(), self.state_db.clone());
         let thread_manager = Arc::new(ThreadManager::new(
             self.config.as_ref(),
             auth_manager.clone(),
             self.session_source.clone(),
-            CollaborationModesConfig {
-                default_mode_request_user_input: self
-                    .config
-                    .features
-                    .enabled(Feature::RequestUserInputOutsidePlanMode),
-            },
             Arc::clone(&self.environment_manager),
             /*analytics_events_client*/ None,
+            thread_store,
+            self.state_db.clone(),
         ));
 
         SharedCoreManagers {
@@ -448,6 +455,7 @@ impl InProcessClientStartArgs {
             thread_config_loader,
             feedback: self.feedback,
             log_db: self.log_db,
+            state_db: self.state_db,
             environment_manager: self.environment_manager,
             config_warnings: self.config_warnings,
             session_source: self.session_source,
@@ -1029,6 +1037,7 @@ mod tests {
             cloud_requirements: CloudRequirementsLoader::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
+            state_db: None,
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source,
@@ -1079,6 +1088,7 @@ mod tests {
             cloud_requirements: CloudRequirementsLoader::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
+            state_db: None,
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source: SessionSource::Cli,
@@ -1090,10 +1100,11 @@ mod tests {
             channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
         };
 
-        let shared_core = start_args.shared_core_managers();
+        let shared_core = start_args.shared_core_managers().await;
         let removed = shared_core
             .auth_manager
             .logout()
+            .await
             .expect("logout should succeed");
 
         assert_eq!(removed, true);
@@ -1235,6 +1246,7 @@ mod tests {
         ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
             thread_id: "thread".to_string(),
             turn_id: "turn".to_string(),
+            completed_at_ms: 0,
             item: codex_app_server_protocol::ThreadItem::AgentMessage {
                 id: "item".to_string(),
                 text: text.to_string(),
@@ -1497,6 +1509,55 @@ mod tests {
             .await
             .expect("typed request should succeed");
         assert_eq!(response.account, None);
+
+        client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_typed_request_accepts_large_single_frame_response() {
+        let padding = "x".repeat((17 << 20) + 1024);
+        let websocket_url = start_test_remote_server(move |mut websocket| async move {
+            expect_remote_initialize(&mut websocket).await;
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected account/read request");
+            };
+            assert_eq!(request.method, "account/read");
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::json!({
+                        "account": null,
+                        "requiresOpenaiAuth": false,
+                        "padding": padding,
+                    }),
+                }),
+            )
+            .await;
+            websocket.close(None).await.expect("close should succeed");
+        })
+        .await;
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+            .await
+            .expect("remote client should connect");
+
+        let response: GetAccountResponse = client
+            .request_typed(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            })
+            .await
+            .expect("large typed request should succeed");
+        assert_eq!(
+            response,
+            GetAccountResponse {
+                account: None,
+                requires_openai_auth: false,
+            }
+        );
 
         client.shutdown().await.expect("shutdown should complete");
     }
@@ -1975,11 +2036,15 @@ mod tests {
             method: "thread/read".to_string(),
             source: JSONRPCErrorError {
                 code: -32603,
-                data: None,
+                data: Some(serde_json::json!({"detail": "config lock mismatch"})),
                 message: "internal".to_string(),
             },
         };
         assert_eq!(std::error::Error::source(&server).is_some(), false);
+        assert_eq!(
+            server.to_string(),
+            "thread/read failed: internal (code -32603), data: {\"detail\":\"config lock mismatch\"}"
+        );
 
         let deserialize = TypedRequestError::Deserialize {
             method: "thread/start".to_string(),
@@ -2055,6 +2120,7 @@ mod tests {
                     codex_app_server_protocol::ItemCompletedNotification {
                         thread_id: "thread".to_string(),
                         turn_id: "turn".to_string(),
+                        completed_at_ms: 0,
                         item: codex_app_server_protocol::ThreadItem::AgentMessage {
                             id: "item".to_string(),
                             text: "hello".to_string(),
@@ -2085,14 +2151,17 @@ mod tests {
     #[tokio::test]
     async fn runtime_start_args_forward_environment_manager() {
         let config = Arc::new(build_test_config().await);
-        let environment_manager = Arc::new(EnvironmentManager::new(EnvironmentManagerArgs {
-            exec_server_url: Some("ws://127.0.0.1:8765".to_string()),
-            local_runtime_paths: ExecServerRuntimePaths::new(
-                std::env::current_exe().expect("current exe"),
-                /*codex_linux_sandbox_exe*/ None,
+        let environment_manager = Arc::new(
+            EnvironmentManager::create_for_tests(
+                Some("ws://127.0.0.1:8765".to_string()),
+                ExecServerRuntimePaths::new(
+                    std::env::current_exe().expect("current exe"),
+                    /*codex_linux_sandbox_exe*/ None,
+                )
+                .expect("runtime paths"),
             )
-            .expect("runtime paths"),
-        }));
+            .await,
+        );
 
         let runtime_args = InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
@@ -2103,6 +2172,7 @@ mod tests {
             cloud_requirements: CloudRequirementsLoader::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
+            state_db: None,
             environment_manager: environment_manager.clone(),
             config_warnings: Vec::new(),
             session_source: SessionSource::Exec,
@@ -2143,6 +2213,7 @@ mod tests {
             cloud_requirements: CloudRequirementsLoader::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
+            state_db: None,
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source: SessionSource::Exec,

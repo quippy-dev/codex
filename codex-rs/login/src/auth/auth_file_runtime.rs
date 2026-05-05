@@ -7,6 +7,7 @@ use super::AuthManager;
 use super::CodexAuth;
 use super::logout;
 use super::logout_with_auth_file;
+use super::read_codex_access_token_from_env;
 use super::read_codex_api_key_from_env;
 use super::resolve_auth_storage_home;
 use super::storage::create_auth_storage_with_auth_file;
@@ -56,7 +57,7 @@ impl AuthFileRuntime {
         self.auth_credentials_store_mode
     }
 
-    pub fn shared_auth_manager(
+    pub async fn shared_auth_manager(
         &self,
         enable_codex_api_key_env: bool,
     ) -> std::io::Result<Arc<AuthManager>> {
@@ -66,6 +67,7 @@ impl AuthFileRuntime {
             self.auth_credentials_store_mode,
             self.auth_file.clone(),
         )
+        .await
     }
 }
 
@@ -91,11 +93,12 @@ pub(crate) fn logout_all_stores_with_auth_file(
     Ok(removed_ephemeral || removed_managed)
 }
 
-pub(crate) fn load_auth_with_auth_file(
+pub(crate) async fn load_auth_with_auth_file(
     codex_home: &Path,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     auth_file: Option<PathBuf>,
+    chatgpt_base_url: Option<&str>,
 ) -> std::io::Result<Option<CodexAuth>> {
     validate_auth_file_override(auth_credentials_store_mode, auth_file.as_deref())?;
     let auth_storage_home = resolve_auth_storage_home(
@@ -111,6 +114,7 @@ pub(crate) fn load_auth_with_auth_file(
             auth_dot_json,
             storage_mode,
             auth_file.clone(),
+            chatgpt_base_url,
             client,
         )
     };
@@ -132,12 +136,20 @@ pub(crate) fn load_auth_with_auth_file(
         auth_file.clone(),
     );
     if let Some(auth_dot_json) = ephemeral_storage.load()? {
-        let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral)?;
+        let auth = build_auth(auth_dot_json, AuthCredentialsStoreMode::Ephemeral).await?;
         return Ok(Some(auth));
     }
 
     if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
         return Ok(None);
+    }
+
+    if auth_file.is_none()
+        && let Some(agent_identity) = read_codex_access_token_from_env()
+    {
+        return CodexAuth::from_agent_identity_jwt(&agent_identity, chatgpt_base_url)
+            .await
+            .map(Some);
     }
 
     let storage = create_auth_storage_with_auth_file(
@@ -149,6 +161,6 @@ pub(crate) fn load_auth_with_auth_file(
         return Ok(None);
     };
 
-    let auth = build_auth(auth_dot_json, auth_credentials_store_mode)?;
+    let auth = build_auth(auth_dot_json, auth_credentials_store_mode).await?;
     Ok(Some(auth))
 }

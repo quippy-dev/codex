@@ -17,6 +17,7 @@ use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
+use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_features::Feature;
@@ -34,7 +35,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::state_db;
@@ -149,6 +149,7 @@ fn keep_forked_rollout_item(item: &RolloutItem) -> bool {
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::Other,
         ) => false,
@@ -205,18 +206,6 @@ impl AgentControl {
         };
         control.watchdogs.start(control.clone());
         control
-    }
-
-    /// Create a control-plane handle over the same thread manager with an independent live-agent
-    /// registry.
-    pub(crate) fn detached_registry(&self) -> Self {
-        Self {
-            manager: self.manager.clone(),
-            state: Arc::new(AgentRegistry::default()),
-            progress_cache: Arc::clone(&self.progress_cache),
-            watchdogs: Arc::clone(&self.watchdogs),
-            watchdog_compactions_in_progress: Arc::clone(&self.watchdog_compactions_in_progress),
-        }
     }
 
     pub(crate) async fn finish_watchdog_parent_compaction(&self, parent_thread_id: ThreadId) {
@@ -290,6 +279,7 @@ impl AgentControl {
     }
 
     /// Spawn a new agent thread and submit the initial prompt.
+    #[cfg(test)]
     pub(crate) async fn spawn_agent(
         &self,
         config: crate::config::Config,
@@ -474,7 +464,6 @@ impl AgentControl {
                 parent_thread_id, ..
             },
         )) = notification_source.as_ref()
-            && new_thread.thread.enabled(Feature::GeneralAnalytics)
         {
             let client_metadata = match state.get_thread(*parent_thread_id).await {
                 Ok(parent_thread) => {
@@ -594,6 +583,10 @@ impl AgentControl {
             .or(find_thread_path_by_id_str(
                 config.codex_home.as_path(),
                 &parent_thread_id.to_string(),
+                parent_thread
+                    .as_ref()
+                    .and_then(|parent_thread| parent_thread.state_db())
+                    .as_deref(),
             )
             .await?)
             .ok_or_else(|| {
@@ -752,28 +745,34 @@ impl AgentControl {
         let inherited_exec_policy = self
             .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
             .await;
-        let rollout_path =
-            match find_thread_path_by_id_str(config.codex_home.as_path(), &thread_id.to_string())
-                .await?
-            {
-                Some(rollout_path) => rollout_path,
-                None => find_archived_thread_path_by_id_str(
-                    config.codex_home.as_path(),
-                    &thread_id.to_string(),
-                )
-                .await?
-                .ok_or_else(|| CodexErr::ThreadNotFound(thread_id))?,
-            };
+        let state_db_ctx = state_db::get_state_db(&config).await;
+        let rollout_path = match find_thread_path_by_id_str(
+            config.codex_home.as_path(),
+            &thread_id.to_string(),
+            state_db_ctx.as_deref(),
+        )
+        .await?
+        {
+            Some(rollout_path) => rollout_path,
+            None => find_archived_thread_path_by_id_str(
+                config.codex_home.as_path(),
+                &thread_id.to_string(),
+                state_db_ctx.as_deref(),
+            )
+            .await?
+            .ok_or_else(|| CodexErr::ThreadNotFound(thread_id))?,
+        };
 
+        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
         let resumed_thread = state
-            .resume_thread_from_rollout_with_source(
+            .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
                 config,
-                rollout_path,
-                self.clone(),
+                initial_history,
+                agent_control: self.clone(),
                 session_source,
                 inherited_shell_snapshot,
                 inherited_exec_policy,
-            )
+            })
             .await?;
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
@@ -1199,16 +1198,6 @@ impl AgentControl {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         Ok(thread.subscribe_status())
-    }
-
-    pub(crate) async fn get_total_token_usage(&self, agent_id: ThreadId) -> Option<TokenUsage> {
-        let Ok(state) = self.upgrade() else {
-            return None;
-        };
-        let Ok(thread) = state.get_thread(agent_id).await else {
-            return None;
-        };
-        thread.total_token_usage().await
     }
 
     pub(crate) async fn format_environment_context_subagents(

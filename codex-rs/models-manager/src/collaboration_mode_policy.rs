@@ -15,24 +15,18 @@ pub fn tui_visible_mode_names() -> String {
     format_mode_names(&TUI_VISIBLE_COLLABORATION_MODES)
 }
 
-fn request_user_input_allowed_for_mode(
-    mode: ModeKind,
-    request_user_input_outside_plan_mode: bool,
-) -> bool {
-    mode.allows_request_user_input()
-        || (request_user_input_outside_plan_mode
-            && matches!(
-                mode,
-                ModeKind::Default | ModeKind::Execute | ModeKind::PairProgramming
-            ))
-}
-
 pub fn request_user_input_availability_message(
     mode: ModeKind,
     request_user_input_outside_plan_mode: bool,
 ) -> String {
     let mode_name = mode.display_name();
-    if request_user_input_allowed_for_mode(mode, request_user_input_outside_plan_mode) {
+    if mode.allows_request_user_input()
+        || (request_user_input_outside_plan_mode
+            && matches!(
+                mode,
+                ModeKind::Default | ModeKind::Execute | ModeKind::PairProgramming
+            ))
+    {
         format!("The `request_user_input` tool is available in {mode_name} mode.")
     } else {
         format!(

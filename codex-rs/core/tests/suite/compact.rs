@@ -2038,7 +2038,6 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: remote_summary.to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         codex_protocol::models::ResponseItem::Compaction {
@@ -2618,21 +2617,25 @@ async fn manual_compact_retries_after_context_window_error() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.unwrap();
-    let EventMsg::BackgroundEvent(event) =
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::BackgroundEvent(_))).await
-    else {
-        panic!("expected background event after compact retry");
-    };
+    let trimmed_warning_message = wait_for_event_match(&codex, |event| match event {
+        EventMsg::Warning(WarningEvent { message })
+            if message.contains("Trimmed 1 older thread item") =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    })
+    .await;
     assert!(
-        event.message.contains("Trimmed 1 older thread item"),
-        "background event should mention trimmed item count: {}",
-        event.message
+        trimmed_warning_message.contains("Trimmed 1 older thread item"),
+        "warning should mention trimmed item count: {trimmed_warning_message}"
     );
-    let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
-    let EventMsg::Warning(WarningEvent { message }) = warning_event else {
-        panic!("expected warning event after compact retry");
-    };
-    assert_eq!(message, COMPACT_WARNING_MESSAGE);
+    let compact_warning_message = wait_for_event_match(&codex, |event| match event {
+        EventMsg::Warning(WarningEvent { message }) => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(compact_warning_message, COMPACT_WARNING_MESSAGE);
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
@@ -3388,7 +3391,6 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "REMOTE_COMPACT_SUMMARY".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         codex_protocol::models::ResponseItem::Compaction {
@@ -3512,7 +3514,6 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "REMOTE_COMPACT_SUMMARY".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         codex_protocol::models::ResponseItem::Compaction {

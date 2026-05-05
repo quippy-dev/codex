@@ -336,16 +336,17 @@ fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::ContextCompaction { .. }
         | ResponseItem::Other => false,
     }
 }
 
 #[derive(Debug)]
-struct CompactRequestLogData {
+pub(crate) struct CompactRequestLogData {
     failing_compaction_request_model_visible_bytes: i64,
 }
 
-fn build_compact_request_log_data(
+pub(crate) fn build_compact_request_log_data(
     input: &[ResponseItem],
     instructions: &str,
     tools: &[ToolSpec],
@@ -365,7 +366,7 @@ fn build_compact_request_log_data(
     }
 }
 
-fn log_remote_compact_failure(
+pub(crate) fn log_remote_compact_failure(
     turn_context: &TurnContext,
     log_data: &CompactRequestLogData,
     total_usage_breakdown: TotalTokenUsageBreakdown,
@@ -384,7 +385,7 @@ fn log_remote_compact_failure(
     );
 }
 
-fn trim_history_to_fit_context_window_for_remote_compaction(
+pub(crate) fn trim_history_to_fit_context_window_for_remote_compaction(
     history: &mut ContextManager,
     turn_context: &TurnContext,
     base_instructions: &BaseInstructions,
@@ -455,7 +456,7 @@ async fn build_compact_tools(
     Ok(tool_router.model_visible_specs())
 }
 
-fn estimate_tool_token_count(tools: &[ToolSpec]) -> CodexResult<i64> {
+pub(crate) fn estimate_tool_token_count(tools: &[ToolSpec]) -> CodexResult<i64> {
     let tools_json = create_tools_json_for_responses_api(tools)?;
     let serialized = serde_json::to_string(&tools_json)?;
     Ok(i64::try_from(approx_token_count(&serialized)).unwrap_or(i64::MAX))
@@ -481,7 +482,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "first goal".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let middle_assistant = ResponseItem::Message {
@@ -490,7 +490,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "older response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let latest_user = ResponseItem::Message {
@@ -499,7 +498,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "latest question".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         history.record_items(
@@ -541,7 +539,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "session prefix".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let first_user = ResponseItem::Message {
@@ -550,7 +547,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "first goal".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let old_assistant = ResponseItem::Message {
@@ -559,7 +555,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "older response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let middle_user = ResponseItem::Message {
@@ -568,7 +563,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "middle question".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let latest_user = ResponseItem::Message {
@@ -577,7 +571,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "latest question".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let latest_assistant = ResponseItem::Message {
@@ -586,7 +579,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "latest answer".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         history.record_items(
@@ -636,7 +628,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "session prefix".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let only_user = ResponseItem::Message {
@@ -645,7 +636,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "single goal".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let oldest_tail = ResponseItem::Message {
@@ -654,7 +644,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "older response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let middle_tail = ResponseItem::Message {
@@ -663,7 +652,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "middle response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let newest_tail = ResponseItem::Message {
@@ -672,7 +660,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "newest response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         history.record_items(
@@ -715,7 +702,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "system guidance".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let tool_output = ResponseItem::FunctionCallOutput {
@@ -752,7 +738,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "only user turn".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let assistant = ResponseItem::Message {
@@ -761,7 +746,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "assistant output".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let tool_output = ResponseItem::FunctionCallOutput {

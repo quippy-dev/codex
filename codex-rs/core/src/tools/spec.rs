@@ -57,10 +57,7 @@ fn map_mcp_tools_for_plan(mcp_tools: &HashMap<String, ToolInfo>) -> McpToolPlanI
                     tool.callable_namespace.clone(),
                     ToolNamespace {
                         name: tool.callable_namespace.clone(),
-                        description: tool
-                            .connector_description
-                            .clone()
-                            .or_else(|| tool.server_instructions.clone()),
+                        description: tool.namespace_description.clone(),
                     },
                 )
             })
@@ -80,17 +77,18 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::CodeModeExecuteHandler;
     use crate::tools::handlers::CodeModeWaitHandler;
     use crate::tools::handlers::DynamicToolHandler;
+    use crate::tools::handlers::GoalHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::RequestPermissionsHandler;
+    use crate::tools::handlers::RequestPluginInstallHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
     use crate::tools::handlers::TestSyncHandler;
     use crate::tools::handlers::ToolSearchHandler;
-    use crate::tools::handlers::ToolSuggestHandler;
     use crate::tools::handlers::UnavailableToolHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
@@ -120,7 +118,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
                 name: tool.canonical_tool_name(),
                 server_name: tool.server_name.as_str(),
                 connector_name: tool.connector_name.as_deref(),
-                connector_description: tool.connector_description.as_deref(),
+                description: tool.namespace_description.as_deref(),
             })
             .collect::<Vec<_>>()
     });
@@ -157,15 +155,16 @@ pub(crate) fn build_specs_with_discoverable_tools(
     let shell_command_handler = Arc::new(ShellCommandHandler::from(config.shell_command_backend));
     let request_permissions_handler = Arc::new(RequestPermissionsHandler);
     let request_user_input_handler = Arc::new(RequestUserInputHandler {
-        default_mode_request_user_input: config.default_mode_request_user_input,
+        available_modes: config.request_user_input_available_modes.clone(),
     });
+    let goal_handler = Arc::new(GoalHandler);
     let deferred_dynamic_tools = dynamic_tools
         .iter()
         .filter(|tool| tool.defer_loading)
         .cloned()
         .collect::<Vec<_>>();
     let mut tool_search_handler = None;
-    let tool_suggest_handler = Arc::new(ToolSuggestHandler);
+    let request_plugin_install_handler = Arc::new(RequestPluginInstallHandler);
     let code_mode_handler = Arc::new(CodeModeExecuteHandler);
     let code_mode_wait_handler = Arc::new(CodeModeWaitHandler);
     let unavailable_tool_handler = Arc::new(UnavailableToolHandler);
@@ -214,6 +213,9 @@ pub(crate) fn build_specs_with_discoverable_tools(
             ToolHandlerKind::FollowupTaskV2 => {
                 builder.register_handler(handler.name, Arc::new(FollowupTaskHandlerV2));
             }
+            ToolHandlerKind::Goal => {
+                builder.register_handler(handler.name, goal_handler.clone());
+            }
             ToolHandlerKind::ListAgentsV1 => {
                 builder.register_handler(handler.name, Arc::new(ListAgentsHandlerV1));
             }
@@ -237,6 +239,9 @@ pub(crate) fn build_specs_with_discoverable_tools(
             }
             ToolHandlerKind::RequestPermissions => {
                 builder.register_handler(handler.name, request_permissions_handler.clone());
+            }
+            ToolHandlerKind::RequestPluginInstall => {
+                builder.register_handler(handler.name, request_plugin_install_handler.clone());
             }
             ToolHandlerKind::RequestUserInput => {
                 builder.register_handler(handler.name, request_user_input_handler.clone());
@@ -276,9 +281,6 @@ pub(crate) fn build_specs_with_discoverable_tools(
                 if let Some(tool_search_handler) = tool_search_handler.as_ref() {
                     builder.register_handler(handler.name, tool_search_handler.clone());
                 }
-            }
-            ToolHandlerKind::ToolSuggest => {
-                builder.register_handler(handler.name, tool_suggest_handler.clone());
             }
             ToolHandlerKind::UnifiedExec => {
                 builder.register_handler(handler.name, unified_exec_handler.clone());

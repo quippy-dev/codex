@@ -77,15 +77,6 @@ impl AgentProgressCache {
                     )
                 });
             }
-            EventMsg::AgentReasoningDelta(ev) => {
-                state.update(thread_id, |entry| {
-                    append_text_preview(
-                        &mut entry.reasoning_buffer,
-                        &mut entry.snapshot.reasoning_summary,
-                        &ev.delta,
-                    )
-                });
-            }
             EventMsg::AgentMessage(ev) => {
                 state.update(thread_id, |entry| {
                     entry.latest_message_stream = None;
@@ -432,7 +423,7 @@ mod tests {
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::protocol::AgentMessageContentDeltaEvent;
     use codex_protocol::protocol::AgentMessageEvent;
-    use codex_protocol::protocol::AgentReasoningDeltaEvent;
+    use codex_protocol::protocol::AgentReasoningEvent;
     use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::ExecCommandBeginEvent;
@@ -461,22 +452,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_event_accumulates_reasoning_and_message_deltas() {
+    async fn observe_event_updates_reasoning_and_accumulates_message_deltas() {
         let cache = AgentProgressCache::default();
         let thread_id = ThreadId::new();
         cache
             .observe_event(
                 thread_id,
-                &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                    delta: "considering ".to_string(),
+                &EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "considering ".to_string(),
                 }),
             )
             .await;
         cache
             .observe_event(
                 thread_id,
-                &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                    delta: "options".to_string(),
+                &EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "options".to_string(),
                 }),
             )
             .await;
@@ -505,10 +496,7 @@ mod tests {
 
         let snapshots = cache.snapshots(&[thread_id]).await;
         let snapshot = snapshots.get(&thread_id).expect("snapshot should exist");
-        assert_eq!(
-            snapshot.reasoning_summary.as_deref(),
-            Some("considering options")
-        );
+        assert_eq!(snapshot.reasoning_summary.as_deref(), Some("options"));
         assert_eq!(snapshot.latest_message_preview.as_deref(), Some("working"));
         assert_eq!(snapshot.cursor, 4);
     }
@@ -554,8 +542,8 @@ mod tests {
         cache
             .observe_event(
                 thread_id,
-                &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                    delta: "thinking".to_string(),
+                &EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "thinking".to_string(),
                 }),
             )
             .await;
@@ -702,8 +690,8 @@ mod tests {
         cache
             .observe_event(
                 thread_id,
-                &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                    delta: "old section".to_string(),
+                &EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "old section".to_string(),
                 }),
             )
             .await;
@@ -719,8 +707,8 @@ mod tests {
         cache
             .observe_event(
                 thread_id,
-                &EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent {
-                    delta: "new section".to_string(),
+                &EventMsg::AgentReasoning(AgentReasoningEvent {
+                    text: "new section".to_string(),
                 }),
             )
             .await;
@@ -850,6 +838,7 @@ mod tests {
                     call_id: "call-2".to_string(),
                     process_id: None,
                     turn_id: "turn".to_string(),
+                    started_at_ms: 0,
                     command: vec!["sleep".to_string(), "1".to_string()],
                     cwd: AbsolutePathBuf::try_from(PathBuf::from("/tmp")).expect("absolute path"),
                     parsed_cmd: vec![],
@@ -890,6 +879,7 @@ mod tests {
                     call_id: "call".to_string(),
                     process_id: None,
                     turn_id: "turn".to_string(),
+                    completed_at_ms: 0,
                     command: vec!["echo".to_string()],
                     cwd: AbsolutePathBuf::try_from(PathBuf::from("/tmp")).expect("absolute path"),
                     parsed_cmd: vec![],

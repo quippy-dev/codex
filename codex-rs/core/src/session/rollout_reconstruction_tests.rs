@@ -22,7 +22,6 @@ fn user_message(text: &str) -> ResponseItem {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -34,7 +33,6 @@ fn assistant_message(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -53,7 +51,6 @@ fn inter_agent_assistant_message(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: serde_json::to_string(&communication).unwrap(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -70,7 +67,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
@@ -111,7 +108,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
@@ -317,6 +314,7 @@ async fn reconstruct_history_hydrates_latest_proposed_plan_text_from_plan_item_c
                 id: "plan-item-id".to_string(),
                 text: plan_text.clone(),
             }),
+            completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
@@ -426,6 +424,7 @@ async fn reconstruct_history_ignores_obsolete_plan_items_before_replacement_hist
                 id: "obsolete-plan-id".to_string(),
                 text: obsolete_plan_text,
             }),
+            completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
@@ -1119,7 +1118,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
@@ -1198,7 +1197,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             current_date: turn_context.current_date.clone(),
             timezone: turn_context.timezone.clone(),
             approval_policy: turn_context.approval_policy.value(),
-            sandbox_policy: turn_context.sandbox_policy.get().clone(),
+            sandbox_policy: turn_context.sandbox_policy(),
             permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
@@ -1361,7 +1360,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
@@ -1477,7 +1476,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
@@ -1591,7 +1590,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
@@ -1744,7 +1743,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,

@@ -1,11 +1,10 @@
-use crate::codex_message_processor::ApiVersion;
-use crate::codex_message_processor::read_rollout_items_from_rollout;
-use crate::codex_message_processor::read_summary_from_rollout;
-use crate::codex_message_processor::summary_to_thread;
 use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::request_processors::read_rollout_items_from_rollout;
+use crate::request_processors::read_summary_from_rollout;
+use crate::request_processors::summary_to_thread;
 use crate::server_request_error::is_turn_transition_server_request_error;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
@@ -48,7 +47,6 @@ use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionPr
 use codex_app_server_protocol::GuardianWarningNotification;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
-use codex_app_server_protocol::InterruptConversationResponse;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -149,12 +147,28 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::error;
 use tracing::warn;
 
 type JsonValue = serde_json::Value;
+
+fn now_unix_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApiVersion {
+    #[allow(dead_code)]
+    V1,
+    V2,
+}
 
 enum CommandExecutionApprovalPresentation {
     Network(V2NetworkApprovalContext),
@@ -417,7 +431,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             if let ApiVersion::V2 = api_version {
                 let notification = ThreadRealtimeStartedNotification {
                     thread_id: conversation_id.to_string(),
-                    session_id: event.session_id,
+                    realtime_session_id: event.realtime_session_id,
                     version: event.version,
                 };
                 outgoing
@@ -625,6 +639,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     if first_start {
                         let item = build_file_change_approval_request_item(&event);
                         let notification = ItemStartedNotification {
+                            started_at_ms: now_unix_timestamp_ms(),
                             thread_id: conversation_id.to_string(),
                             turn_id: event_turn_id.clone(),
                             item,
@@ -1006,6 +1021,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     duration_ms: None,
                 };
                 let notification = ItemStartedNotification {
+                    started_at_ms: now_unix_timestamp_ms(),
                     thread_id: conversation_id.to_string(),
                     turn_id: turn_id.clone(),
                     item,
@@ -1078,6 +1094,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     duration_ms,
                 };
                 let notification = ItemCompletedNotification {
+                    completed_at_ms: now_unix_timestamp_ms(),
                     thread_id: conversation_id.to_string(),
                     turn_id: response.turn_id,
                     item,
@@ -1123,6 +1140,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1162,6 +1180,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states,
             };
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1184,6 +1203,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1212,6 +1232,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states: [(receiver_id, received_status)].into_iter().collect(),
             };
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1238,6 +1259,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1276,6 +1298,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states,
             };
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1297,6 +1320,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1339,6 +1363,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 agents_states,
             };
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1350,6 +1375,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::CollabResumeBegin(begin_event) => {
             let item = collab_resume_begin_item(begin_event);
             let notification = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1361,6 +1387,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::CollabResumeEnd(end_event) => {
             let item = collab_resume_end_item(end_event);
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1525,6 +1552,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 path: view_image_event.path.clone(),
             };
             let started = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item: item.clone(),
@@ -1533,6 +1561,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ItemStarted(started))
                 .await;
             let completed = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1550,6 +1579,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 review,
             };
             let started = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item: item.clone(),
@@ -1558,6 +1588,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ItemStarted(started))
                 .await;
             let completed = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1569,6 +1600,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::ItemStarted(item_started_event) => {
             let item: ThreadItem = item_started_event.item.clone().into();
             let notification = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1580,6 +1612,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::ItemCompleted(item_completed_event) => {
             let item: ThreadItem = item_completed_event.item.clone().into();
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1622,6 +1655,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 review,
             };
             let started = ItemStartedNotification {
+                started_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item: item.clone(),
@@ -1630,6 +1664,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ItemStarted(started))
                 .await;
             let completed = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -1671,6 +1706,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             if first_start {
                 let item = build_file_change_begin_item(&patch_begin_event);
                 let notification = ItemStartedNotification {
+                    started_at_ms: now_unix_timestamp_ms(),
                     thread_id: conversation_id.to_string(),
                     turn_id: event_turn_id.clone(),
                     item,
@@ -1747,6 +1783,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     duration_ms: None,
                 };
                 let notification = ItemStartedNotification {
+                    started_at_ms: now_unix_timestamp_ms(),
                     thread_id: conversation_id.to_string(),
                     turn_id: event_turn_id.clone(),
                     item,
@@ -1835,6 +1872,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             let item = build_command_execution_end_item(&exec_command_end_event);
 
             let notification = ItemCompletedNotification {
+                completed_at_ms: now_unix_timestamp_ms(),
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 item,
@@ -2080,6 +2118,7 @@ async fn complete_file_change_item(
         .remove(&item_id);
 
     let notification = ItemCompletedNotification {
+        completed_at_ms: now_unix_timestamp_ms(),
         thread_id: conversation_id.to_string(),
         turn_id,
         item,
@@ -2110,6 +2149,7 @@ async fn start_command_execution_item(
     };
     if first_start {
         let notification = ItemStartedNotification {
+            started_at_ms: now_unix_timestamp_ms(),
             thread_id: conversation_id.to_string(),
             turn_id,
             item: ThreadItem::CommandExecution {
@@ -2169,6 +2209,7 @@ async fn complete_command_execution_item(
         duration_ms: None,
     };
     let notification = ItemCompletedNotification {
+        completed_at_ms: now_unix_timestamp_ms(),
         thread_id: conversation_id.to_string(),
         turn_id,
         item,
@@ -2226,6 +2267,7 @@ pub(crate) async fn maybe_emit_hook_prompt_item_completed(
     };
 
     let notification = ItemCompletedNotification {
+        completed_at_ms: now_unix_timestamp_ms(),
         thread_id: conversation_id.to_string(),
         turn_id: turn_id.to_string(),
         item: ThreadItem::HookPrompt {
@@ -2332,27 +2374,15 @@ async fn handle_thread_rollback_failed(
 async fn respond_to_pending_interrupts(
     thread_state: &Arc<Mutex<ThreadState>>,
     outgoing: &ThreadScopedOutgoingMessageSender,
-    abort_reason: Option<codex_protocol::protocol::TurnAbortReason>,
+    _abort_reason: Option<codex_protocol::protocol::TurnAbortReason>,
 ) {
     let pending = {
         let mut state = thread_state.lock().await;
         std::mem::take(&mut state.pending_interrupts)
     };
 
-    for (rid, ver) in pending {
-        match ver {
-            ApiVersion::V1 => {
-                let Some(abort_reason) = abort_reason.clone() else {
-                    debug_assert!(false, "v1 interrupts only resolve from TurnAborted");
-                    continue;
-                };
-                let response = InterruptConversationResponse { abort_reason };
-                outgoing.send_response(rid, response).await;
-            }
-            ApiVersion::V2 => {
-                outgoing.send_response(rid, TurnInterruptResponse {}).await;
-            }
-        }
+    for rid in pending {
+        outgoing.send_response(rid, TurnInterruptResponse {}).await;
     }
 }
 
@@ -3038,6 +3068,7 @@ async fn construct_mcp_tool_call_notification(
         duration_ms: None,
     };
     ItemStartedNotification {
+        started_at_ms: now_unix_timestamp_ms(),
         thread_id,
         turn_id,
         item,
@@ -3086,6 +3117,7 @@ async fn construct_mcp_tool_call_end_notification(
         duration_ms,
     };
     ItemCompletedNotification {
+        completed_at_ms: now_unix_timestamp_ms(),
         thread_id,
         turn_id,
         item,
@@ -3413,7 +3445,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let thread_state = new_thread_state();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -3482,7 +3517,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let thread_state = new_thread_state();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -3572,7 +3610,10 @@ mod tests {
         let thread_state = new_thread_state();
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -3993,7 +4034,7 @@ mod tests {
             file_system: Some(CoreFileSystemPermissions {
                 entries: vec![FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                     },
                     access: FileSystemAccessMode::Write,
                 }],
@@ -4039,7 +4080,7 @@ mod tests {
             file_system: Some(CoreFileSystemPermissions {
                 entries: vec![FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                     },
                     access: FileSystemAccessMode::Write,
                 }],
@@ -4111,6 +4152,7 @@ mod tests {
     fn collab_resume_begin_maps_to_item_started_resume_agent() {
         let event = CollabResumeBeginEvent {
             call_id: "call-1".to_string(),
+            started_at_ms: 0,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
@@ -4137,6 +4179,7 @@ mod tests {
     fn collab_resume_end_maps_to_item_completed_resume_agent() {
         let event = CollabResumeEndEvent {
             call_id: "call-2".to_string(),
+            completed_at_ms: 0,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
@@ -4199,7 +4242,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let event_turn_id = "complete1".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4265,7 +4311,10 @@ mod tests {
         )
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4313,7 +4362,10 @@ mod tests {
         )
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4355,7 +4407,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_turn_plan_update_emits_notification_for_v2() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4409,7 +4464,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let turn_id = "turn-123".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4498,7 +4556,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let turn_id = "turn-456".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4545,6 +4606,7 @@ mod tests {
         .await;
 
         let expected = ItemStartedNotification {
+            started_at_ms: now_unix_timestamp_ms(),
             thread_id,
             turn_id,
             item: ThreadItem::McpToolCall {
@@ -4571,7 +4633,10 @@ mod tests {
         let thread_state = new_thread_state();
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4707,6 +4772,7 @@ mod tests {
         .await;
 
         let expected = ItemStartedNotification {
+            started_at_ms: now_unix_timestamp_ms(),
             thread_id,
             turn_id,
             item: ThreadItem::McpToolCall {
@@ -4762,6 +4828,7 @@ mod tests {
         .await;
 
         let expected = ItemCompletedNotification {
+            completed_at_ms: now_unix_timestamp_ms(),
             thread_id,
             turn_id,
             item: ThreadItem::McpToolCall {
@@ -4810,6 +4877,7 @@ mod tests {
         .await;
 
         let expected = ItemCompletedNotification {
+            completed_at_ms: now_unix_timestamp_ms(),
             thread_id,
             turn_id,
             item: ThreadItem::McpToolCall {
@@ -4833,7 +4901,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_turn_diff_emits_v2_notification() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4871,7 +4942,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_turn_diff_is_noop_for_v1() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4897,7 +4971,10 @@ mod tests {
     #[tokio::test]
     async fn test_hook_prompt_raw_response_emits_item_completed() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
         let conversation_id = ThreadId::new();
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,

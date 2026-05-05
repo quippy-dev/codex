@@ -18,7 +18,6 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
-use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -219,11 +218,13 @@ async fn run_compact_task_inner_impl(
         match attempt_result {
             Ok(()) => {
                 if truncated_count > 0 {
-                    sess.notify_background_event(
+                    sess.send_event(
                         turn_context.as_ref(),
-                        format!(
-                            "Trimmed {truncated_count} older thread item(s) before compacting so the prompt fits the model context window."
-                        ),
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "Trimmed {truncated_count} older thread item(s) before compacting so the prompt fits the model context window."
+                            ),
+                        }),
                     )
                     .await;
                 }
@@ -342,7 +343,7 @@ impl CompactionAnalyticsAttempt {
         implementation: CompactionImplementation,
         phase: CompactionPhase,
     ) -> Self {
-        let enabled = sess.enabled(Feature::GeneralAnalytics);
+        let enabled = true;
         let active_context_tokens_before = sess.get_total_token_usage().await;
         Self {
             enabled,
@@ -515,7 +516,6 @@ fn build_compacted_history_with_limit(
             content: vec![ContentItem::InputText {
                 text: message.clone(),
             }],
-            end_turn: None,
             phase: None,
         });
     }
@@ -530,7 +530,6 @@ fn build_compacted_history_with_limit(
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: summary_text }],
-        end_turn: None,
         phase: None,
     });
 

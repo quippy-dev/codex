@@ -67,6 +67,7 @@ pub async fn load_auth_manager(
         auth_file,
         Some(chatgpt_base_url),
     )
+    .await
     .map_err(|err| anyhow::anyhow!("failed to create cloud-tasks auth manager: {err}"))
 }
 

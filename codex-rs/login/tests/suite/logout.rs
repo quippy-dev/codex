@@ -144,7 +144,8 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*chatgpt_base_url*/ None,
-    );
+    )
+    .await;
     save_auth(
         codex_home.path(),
         &chatgpt_auth_with_refresh_token("newer-disk-refresh-token"),
@@ -210,7 +211,8 @@ async fn auth_manager_logout_with_revoke_uses_auth_file_override() -> Result<()>
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         Some(auth_file.clone()),
-    )?;
+    )
+    .await?;
 
     let removed = manager.logout_with_revoke().await?;
 

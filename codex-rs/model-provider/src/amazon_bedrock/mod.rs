@@ -21,10 +21,10 @@ use codex_protocol::openai_models::ModelsResponse;
 use crate::provider::ModelProvider;
 use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
+use crate::provider::ProviderCapabilities;
 use auth::resolve_provider_auth;
-use auth::resolve_region;
 pub(crate) use catalog::static_model_catalog;
-use mantle::base_url;
+use mantle::runtime_base_url;
 
 /// Runtime provider for Amazon Bedrock's OpenAI-compatible Mantle endpoint.
 #[derive(Clone, Debug)]
@@ -55,6 +55,14 @@ impl ModelProvider for AmazonBedrockModelProvider {
         &self.info
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            namespace_tools: false,
+            image_generation: false,
+            web_search: false,
+        }
+    }
+
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         None
     }
@@ -71,10 +79,13 @@ impl ModelProvider for AmazonBedrockModelProvider {
     }
 
     async fn api_provider(&self) -> Result<Provider> {
-        let region = resolve_region(&self.aws).await?;
         let mut api_provider_info = self.info.clone();
-        api_provider_info.base_url = Some(base_url(&region)?);
+        api_provider_info.base_url = Some(runtime_base_url(&self.aws).await?);
         api_provider_info.to_api_provider(/*auth_mode*/ None)
+    }
+
+    async fn runtime_base_url(&self) -> Result<Option<String>> {
+        Ok(Some(runtime_base_url(&self.aws).await?))
     }
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
@@ -106,14 +117,30 @@ mod tests {
         let region = "eu-central-1";
         let mut api_provider_info =
             ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
-        api_provider_info.base_url = Some(base_url(region).expect("supported region"));
+        api_provider_info.base_url = Some(mantle::base_url(region).expect("supported region"));
         let api_provider = api_provider_info
             .to_api_provider(/*auth_mode*/ None)
             .expect("api provider should build");
 
         assert_eq!(
             api_provider.base_url,
-            "https://bedrock-mantle.eu-central-1.api.aws/v1"
+            "https://bedrock-mantle.eu-central-1.api.aws/openai/v1"
+        );
+    }
+
+    #[test]
+    fn capabilities_disable_unsupported_launch_features() {
+        let provider = AmazonBedrockModelProvider::new(
+            ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
+        );
+
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+            }
         );
     }
 }

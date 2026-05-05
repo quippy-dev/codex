@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
+use crate::config::RolloutConfig;
 use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
@@ -1243,6 +1244,7 @@ async fn find_thread_path_by_id_str_in_subdir(
     codex_home: &Path,
     subdir: &str,
     id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
     // Validate UUID format early.
     if Uuid::parse_str(id_str).is_err() {
@@ -1257,8 +1259,8 @@ async fn find_thread_path_by_id_str_in_subdir(
         _ => None,
     };
     let thread_id = ThreadId::from_string(id_str).ok();
-    let state_db_ctx = state_db::open_if_present(codex_home, "").await;
-    if let Some(state_db_ctx) = state_db_ctx.as_deref()
+    let mut unverified_db_path = None;
+    if let Some(state_db_ctx) = state_db_ctx
         && let Some(thread_id) = thread_id
         && let Some(db_path) = state_db::find_rollout_path_by_id(
             Some(state_db_ctx),
@@ -1269,21 +1271,43 @@ async fn find_thread_path_by_id_str_in_subdir(
         .await
     {
         if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-            return Ok(Some(db_path));
+            match read_session_meta_line(&db_path).await {
+                Ok(meta_line) if meta_line.meta.id == thread_id => {
+                    return Ok(Some(db_path));
+                }
+                Ok(meta_line) => {
+                    tracing::error!(
+                        "state db returned rollout path for thread {id_str} but file belongs to thread {}: {}",
+                        meta_line.meta.id,
+                        db_path.display()
+                    );
+                    tracing::warn!(
+                        "state db discrepancy during find_thread_path_by_id_str_in_subdir: mismatched_db_path"
+                    );
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "state db returned rollout path for thread {id_str} that could not be verified: {}: {err}",
+                        db_path.display()
+                    );
+                    unverified_db_path = Some(db_path);
+                }
+            }
+        } else {
+            tracing::error!(
+                "state db returned stale rollout path for thread {id_str}: {}",
+                db_path.display()
+            );
+            tracing::warn!(
+                "state db discrepancy during find_thread_path_by_id_str_in_subdir: stale_db_path"
+            );
         }
-        tracing::error!(
-            "state db returned stale rollout path for thread {id_str}: {}",
-            db_path.display()
-        );
-        tracing::warn!(
-            "state db discrepancy during find_thread_path_by_id_str_in_subdir: stale_db_path"
-        );
     }
 
     let mut root = codex_home.to_path_buf();
     root.push(subdir);
     if !root.exists() {
-        return Ok(None);
+        return Ok(unverified_db_path);
     }
     // This is safe because we know the values are valid.
     #[allow(clippy::unwrap_used)]
@@ -1305,7 +1329,7 @@ async fn find_thread_path_by_id_str_in_subdir(
             "state db discrepancy during find_thread_path_by_id_str_in_subdir: falling_back"
         );
         state_db::read_repair_rollout_path(
-            state_db_ctx.as_deref(),
+            state_db_ctx,
             thread_id,
             archived_only,
             found_path.as_path(),
@@ -1313,7 +1337,7 @@ async fn find_thread_path_by_id_str_in_subdir(
         .await;
     }
 
-    Ok(found)
+    Ok(found.or(unverified_db_path))
 }
 
 async fn try_unarchive_thread_path_by_id_str(
@@ -1324,7 +1348,8 @@ async fn try_unarchive_thread_path_by_id_str(
         return Ok(None);
     };
     let Some(archived_path) =
-        find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str).await?
+        find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str, None)
+            .await?
     else {
         return Ok(None);
     };
@@ -1389,7 +1414,14 @@ async fn try_unarchive_thread_path_by_id_str(
         }
     }
 
-    if let Some(state_db_ctx) = state_db::open_if_present(codex_home, "").await
+    let config = RolloutConfig {
+        codex_home: codex_home.to_path_buf(),
+        sqlite_home: codex_home.to_path_buf(),
+        cwd: PathBuf::new(),
+        model_provider_id: String::new(),
+        generate_memories: false,
+    };
+    if let Some(state_db_ctx) = state_db::get_state_db(&config).await
         && let Ok(thread_id) = ThreadId::from_string(id_str)
     {
         let _ = state_db_ctx
@@ -1408,8 +1440,9 @@ async fn try_unarchive_thread_path_by_id_str(
 pub async fn find_thread_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
-    find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str).await
+    find_thread_path_by_id_str_in_subdir(codex_home, SESSIONS_SUBDIR, id_str, state_db_ctx).await
 }
 
 /// Locate a thread rollout file by UUID string, restoring it from `archived_sessions/` when
@@ -1418,7 +1451,7 @@ pub async fn find_or_unarchive_thread_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
 ) -> io::Result<Option<PathBuf>> {
-    if let Some(active_path) = find_thread_path_by_id_str(codex_home, id_str).await? {
+    if let Some(active_path) = find_thread_path_by_id_str(codex_home, id_str, None).await? {
         return Ok(Some(active_path));
     }
 
@@ -1429,8 +1462,10 @@ pub async fn find_or_unarchive_thread_path_by_id_str(
 pub async fn find_archived_thread_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> io::Result<Option<PathBuf>> {
-    find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str).await
+    find_thread_path_by_id_str_in_subdir(codex_home, ARCHIVED_SESSIONS_SUBDIR, id_str, state_db_ctx)
+        .await
 }
 
 /// Resolve a stored fork-reference rollout path to the current on-disk location.
@@ -1456,10 +1491,11 @@ pub async fn resolve_fork_reference_rollout_path(
     };
     let thread_id = thread_uuid.to_string();
 
-    if let Some(active_path) = find_thread_path_by_id_str(codex_home, &thread_id).await? {
+    if let Some(active_path) = find_thread_path_by_id_str(codex_home, &thread_id, None).await? {
         return Ok(active_path);
     }
-    if let Some(archived_path) = find_archived_thread_path_by_id_str(codex_home, &thread_id).await?
+    if let Some(archived_path) =
+        find_archived_thread_path_by_id_str(codex_home, &thread_id, None).await?
     {
         return Ok(archived_path);
     }

@@ -14,19 +14,20 @@ use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::model_info::with_config_overrides;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_tools::AdditionalProperties;
 use codex_tools::ConfiguredToolSpec;
 use codex_tools::DiscoverableTool;
 use codex_tools::JsonSchema;
+use codex_tools::LoadableToolSpec;
+use codex_tools::REQUEST_PLUGIN_INSTALL_TOOL_NAME;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ShellCommandBackendConfig;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
-use codex_tools::TOOL_SUGGEST_TOOL_NAME;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::ToolsConfig;
@@ -43,6 +44,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::*;
+use crate::tools::tool_search_entry::build_tool_search_entries_for_config;
 
 fn mcp_tool(name: &str, description: &str, input_schema: serde_json::Value) -> rmcp::model::Tool {
     rmcp::model::Tool {
@@ -63,12 +65,11 @@ fn mcp_tool_info(tool: rmcp::model::Tool) -> ToolInfo {
         server_name: "test_server".to_string(),
         callable_name: tool.name.to_string(),
         callable_namespace: "mcp__test_server__".to_string(),
-        server_instructions: None,
+        namespace_description: None,
         tool,
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
-        connector_description: None,
     }
 }
 
@@ -82,12 +83,11 @@ fn mcp_tool_info_with_display_name(display_name: &str, tool: rmcp::model::Tool) 
         server_name: "test_server".to_string(),
         callable_name,
         callable_namespace,
-        server_instructions: None,
+        namespace_description: None,
         tool,
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
-        connector_description: None,
     }
 }
 
@@ -233,7 +233,7 @@ async fn multi_agent_v2_tools_config() -> ToolsConfig {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     })
     .with_max_concurrent_threads_per_session(Some(4))
@@ -300,31 +300,6 @@ fn build_specs_with_unavailable_tools(
 }
 
 #[tokio::test]
-async fn model_provided_unified_exec_is_blocked_for_windows_sandboxed_policies() {
-    let mut model_info = model_info_from_models_json("gpt-5.4").await;
-    model_info.shell_type = ConfigShellToolType::UnifiedExec;
-    let features = Features::with_defaults();
-    let available_models = Vec::new();
-    let config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &model_info,
-        available_models: &available_models,
-        features: &features,
-        image_generation_tool_auth_allowed: true,
-        web_search_mode: Some(WebSearchMode::Cached),
-        session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::new_workspace_write_policy(),
-        windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-    });
-
-    let expected_shell_type = if cfg!(target_os = "windows") {
-        ConfigShellToolType::ShellCommand
-    } else {
-        ConfigShellToolType::UnifiedExec
-    };
-    assert_eq!(config.shell_type, expected_shell_type);
-}
-
-#[tokio::test]
 async fn get_memory_requires_feature_flag() {
     let config = test_config().await;
     let model_info = construct_model_info_offline("gpt-5.4", &config);
@@ -338,7 +313,7 @@ async fn get_memory_requires_feature_flag() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(
@@ -370,7 +345,7 @@ async fn assert_model_tools(
         image_generation_tool_auth_allowed: true,
         web_search_mode,
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let router = ToolRouter::from_config(
@@ -653,7 +628,7 @@ async fn test_build_specs_default_shell_present() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Live),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(
@@ -685,7 +660,7 @@ async fn request_user_input_description_reflects_default_mode_feature_flag() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
@@ -705,7 +680,7 @@ async fn request_user_input_description_reflects_default_mode_feature_flag() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
@@ -737,7 +712,7 @@ async fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Live),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let user_shell = Shell {
@@ -837,7 +812,36 @@ async fn spawn_agent_description_uses_configured_usage_hint_text() {
 }
 
 #[tokio::test]
-async fn tool_suggest_requires_apps_and_plugins_features() {
+async fn multi_agent_v2_wait_agent_schema_uses_configured_min_timeout() {
+    let wait_agent_min_timeout_ms = Some(60_000);
+    let tools_config = multi_agent_v2_tools_config()
+        .await
+        .with_wait_agent_min_timeout_ms(wait_agent_min_timeout_ms);
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    )
+    .build();
+    let wait_agent = find_tool(&tools, "wait_agent");
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = &wait_agent.spec else {
+        panic!("wait_agent should be a function tool");
+    };
+    let timeout_description = parameters
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("timeout_ms"))
+        .and_then(|schema| schema.description.as_deref());
+
+    assert_eq!(
+        timeout_description,
+        Some("Optional timeout in milliseconds. Defaults to 60000, min 60000, max 3600000.")
+    );
+}
+
+#[tokio::test]
+async fn request_plugin_install_requires_apps_and_plugins_features() {
     let model_info = search_capable_model_info().await;
     let discoverable_tools = Some(vec![discoverable_connector(
         "connector_2128aebfecb84f64a069897515042a44",
@@ -861,7 +865,7 @@ async fn tool_suggest_requires_apps_and_plugins_features() {
             image_generation_tool_auth_allowed: true,
             web_search_mode: Some(WebSearchMode::Cached),
             session_source: SessionSource::Cli,
-            sandbox_policy: &SandboxPolicy::DangerFullAccess,
+            permission_profile: &PermissionProfile::Disabled,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
         });
         let (tools, _) = build_specs_with_discoverable_tools(
@@ -877,7 +881,7 @@ async fn tool_suggest_requires_apps_and_plugins_features() {
         assert!(
             !tools
                 .iter()
-                .any(|tool| tool.name() == TOOL_SUGGEST_TOOL_NAME),
+                .any(|tool| tool.name() == REQUEST_PLUGIN_INSTALL_TOOL_NAME),
             "tool_suggest should be absent when {disabled_feature:?} is disabled"
         );
     }
@@ -897,7 +901,7 @@ async fn search_tool_description_handles_no_enabled_mcp_tools() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -931,7 +935,7 @@ async fn search_tool_description_falls_back_to_connector_name_without_descriptio
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -944,7 +948,7 @@ async fn search_tool_description_falls_back_to_connector_name_without_descriptio
                 server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
                 callable_name: "_create_event".to_string(),
                 callable_namespace: "mcp__codex_apps__calendar".to_string(),
-                server_instructions: None,
+                namespace_description: None,
                 tool: mcp_tool(
                     "calendar_create_event",
                     "Create calendar event",
@@ -953,7 +957,6 @@ async fn search_tool_description_falls_back_to_connector_name_without_descriptio
                 connector_id: Some("calendar".to_string()),
                 connector_name: Some("Calendar".to_string()),
                 plugin_display_names: Vec::new(),
-                connector_description: None,
             },
         )])),
         &[],
@@ -982,7 +985,7 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -996,7 +999,7 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
                     server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
                     callable_name: "_create_event".to_string(),
                     callable_namespace: "mcp__codex_apps__calendar".to_string(),
-                    server_instructions: None,
+                    namespace_description: None,
                     tool: mcp_tool(
                         "calendar-create-event",
                         "Create calendar event",
@@ -1004,7 +1007,6 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
                     ),
                     connector_id: Some("calendar".to_string()),
                     connector_name: Some("Calendar".to_string()),
-                    connector_description: None,
                     plugin_display_names: Vec::new(),
                 },
             ),
@@ -1014,7 +1016,7 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
                     server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
                     callable_name: "_list_events".to_string(),
                     callable_namespace: "mcp__codex_apps__calendar".to_string(),
-                    server_instructions: None,
+                    namespace_description: None,
                     tool: mcp_tool(
                         "calendar-list-events",
                         "List calendar events",
@@ -1022,7 +1024,6 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
                     ),
                     connector_id: Some("calendar".to_string()),
                     connector_name: Some("Calendar".to_string()),
-                    connector_description: None,
                     plugin_display_names: Vec::new(),
                 },
             ),
@@ -1032,11 +1033,10 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
                     server_name: "rmcp".to_string(),
                     callable_name: "echo".to_string(),
                     callable_namespace: "mcp__rmcp__".to_string(),
-                    server_instructions: None,
+                    namespace_description: None,
                     tool: mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
                     connector_id: None,
                     connector_name: None,
-                    connector_description: None,
                     plugin_display_names: Vec::new(),
                 },
             ),
@@ -1054,6 +1054,62 @@ async fn search_tool_registers_namespaced_mcp_tool_aliases() {
 }
 
 #[tokio::test]
+async fn tool_search_entries_skip_namespace_outputs_when_namespace_tools_are_disabled() {
+    let model_info = search_capable_model_info().await;
+    let mut features = Features::with_defaults();
+    features.enable(Feature::ToolSearch);
+    let available_models = Vec::new();
+    let mut tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    tools_config.namespace_tools = false;
+    let mcp_tools = HashMap::from([(
+        "mcp__test_server__echo".to_string(),
+        mcp_tool_info(mcp_tool(
+            "echo",
+            "Echo",
+            serde_json::json!({"type": "object"}),
+        )),
+    )]);
+    let dynamic_tools = vec![
+        DynamicToolSpec {
+            namespace: Some("codex_app".to_string()),
+            name: "automation_update".to_string(),
+            description: "Create or update automations.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            defer_loading: true,
+        },
+        DynamicToolSpec {
+            namespace: None,
+            name: "plain_dynamic".to_string(),
+            description: "Plain dynamic tool.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            defer_loading: true,
+        },
+    ];
+
+    let entries =
+        build_tool_search_entries_for_config(&tools_config, Some(&mcp_tools), &dynamic_tools);
+    let outputs = entries
+        .into_iter()
+        .map(|entry| entry.output)
+        .collect::<Vec<_>>();
+
+    assert_eq!(outputs.len(), 1);
+    match &outputs[0] {
+        LoadableToolSpec::Function(tool) => assert_eq!(tool.name, "plain_dynamic"),
+        LoadableToolSpec::Namespace(_) => panic!("namespace tool_search output should be hidden"),
+    }
+}
+
+#[tokio::test]
 async fn direct_mcp_tools_register_namespaced_handlers() {
     let config = test_config().await;
     let model_info = construct_model_info_offline("gpt-5.4", &config);
@@ -1067,7 +1123,7 @@ async fn direct_mcp_tools_register_namespaced_handlers() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -1104,7 +1160,7 @@ async fn unavailable_mcp_tools_are_exposed_as_dummy_function_tools() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -1153,7 +1209,7 @@ async fn test_mcp_tool_property_missing_type_defaults_to_string() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -1216,7 +1272,7 @@ async fn test_mcp_tool_preserves_integer_schema() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -1278,7 +1334,7 @@ async fn test_mcp_tool_array_without_items_gets_default_string_items() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -1342,7 +1398,7 @@ async fn test_mcp_tool_anyof_defaults_to_string() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
@@ -1411,7 +1467,7 @@ async fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(

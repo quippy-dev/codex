@@ -6,6 +6,8 @@ Your active mode changes only when new developer instructions with a different `
 
 ## request_user_input availability
 
+Use the `request_user_input` tool only when it is listed in the available tools for this turn.
+
 {{REQUEST_USER_INPUT_AVAILABILITY}}
 
 {{ASKING_QUESTIONS_GUIDANCE}}

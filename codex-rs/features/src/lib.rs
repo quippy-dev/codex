@@ -16,6 +16,7 @@ use toml::Table;
 
 mod feature_configs;
 mod legacy;
+pub use feature_configs::AppsMcpPathOverrideConfigToml;
 pub use feature_configs::MultiAgentV2ConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
@@ -71,7 +72,8 @@ impl Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     // Stable.
-    /// Create a ghost commit at each turn.
+    /// Removed compatibility flag retained as a no-op so old configs can
+    /// still parse `undo`.
     GhostCommit,
     /// Enable the default shell tool.
     ShellTool,
@@ -91,6 +93,8 @@ pub enum Feature {
     UnifiedExec,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
+    /// Reflow transcript scrollback when the terminal is resized.
+    TerminalResizeReflow,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
     /// Stream structured progress while apply_patch input is being generated.
@@ -126,8 +130,6 @@ pub enum Feature {
     CodexGitCommit,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
-    /// Enable thread lifecycle analytics emitted via the app-server analytics pipeline.
-    GeneralAnalytics,
     /// Persist rollout metadata to a local SQLite database.
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
@@ -146,6 +148,10 @@ pub enum Feature {
     SpawnCsv,
     /// Enable apps.
     Apps,
+    /// Enable MCP apps.
+    EnableMcpApps,
+    /// Use the new path for the built-in apps MCP server.
+    AppsMcpPathOverride,
     /// Enable the tool_search tool for apps.
     ToolSearch,
     /// Always defer MCP tools behind tool_search instead of exposing small sets directly.
@@ -156,6 +162,8 @@ pub enum Feature {
     ToolSuggest,
     /// Enable plugins.
     Plugins,
+    /// Enable plugin-bundled lifecycle hooks.
+    PluginHooks,
     /// Allow the in-app browser pane in desktop apps.
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
@@ -164,6 +172,10 @@ pub enum Feature {
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
     BrowserUse,
+    /// Allow Browser Use integration with external browsers.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    BrowserUseExternal,
     /// Allow Codex Computer Use.
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
@@ -183,6 +195,8 @@ pub enum Feature {
     Steer,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
+    /// Enable persisted thread goals and automatic goal continuation.
+    Goals,
     /// Enable collaboration modes (Plan, Default).
     /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
     CollaborationModes,
@@ -213,6 +227,8 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
+    /// Enable remote compaction v2 over the normal Responses API.
+    RemoteCompactionV2,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
 }
@@ -388,6 +404,9 @@ impl Features {
                 "tui_app_server" => {
                     continue;
                 }
+                "undo" => {
+                    continue;
+                }
                 "js_repl" => {
                     continue;
                 }
@@ -547,6 +566,8 @@ pub fn is_known_feature_key(key: &str) -> bool {
 pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps_mcp_path_override: Option<FeatureToml<AppsMcpPathOverrideConfigToml>>,
     /// Boolean feature toggles keyed by canonical or legacy feature name.
     #[serde(flatten)]
     entries: BTreeMap<String, bool>,
@@ -565,7 +586,45 @@ impl FeaturesToml {
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
         }
+        if let Some(enabled) = self
+            .apps_mcp_path_override
+            .as_ref()
+            .and_then(FeatureToml::enabled)
+        {
+            entries.insert(Feature::AppsMcpPathOverride.key().to_string(), enabled);
+        }
         entries
+    }
+
+    pub fn materialize_resolved_enabled(&mut self, features: &Features) {
+        let Self {
+            multi_agent_v2,
+            apps_mcp_path_override,
+            entries,
+        } = self;
+        for key in legacy::legacy_feature_keys() {
+            entries.remove(key);
+        }
+        for spec in FEATURES {
+            let enabled = features.enabled(spec.id);
+            if spec.id == Feature::MultiAgentV2 {
+                materialize_resolved_feature_enabled(multi_agent_v2, enabled);
+            } else if spec.id == Feature::AppsMcpPathOverride {
+                materialize_resolved_feature_enabled(apps_mcp_path_override, enabled);
+            } else {
+                entries.insert(spec.key.to_string(), enabled);
+            }
+        }
+    }
+}
+
+fn materialize_resolved_feature_enabled<T: FeatureConfig>(
+    feature: &mut Option<FeatureToml<T>>,
+    enabled: bool,
+) {
+    match feature {
+        Some(feature) => feature.set_enabled(enabled),
+        None => *feature = Some(FeatureToml::Enabled(enabled)),
     }
 }
 
@@ -594,12 +653,20 @@ impl<T: FeatureConfig> FeatureToml<T> {
             Self::Config(config) => config.enabled(),
         }
     }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::Enabled(value) => *value = enabled,
+            Self::Config(config) => config.set_enabled(enabled),
+        }
+    }
 }
 
 // A trait to be implemented by custom feature config structs when defining a feature that needs more configuration than
 // just enabled/disabled.
 pub trait FeatureConfig {
     fn enabled(&self) -> Option<bool>;
+    fn set_enabled(&mut self, enabled: bool);
 }
 
 /// Single, easy-to-read registry of all feature definitions.
@@ -616,7 +683,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GhostCommit,
         key: "undo",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -668,6 +735,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::TerminalResizeReflow,
+        key: "terminal_resize_reflow",
+        stage: Stage::Experimental {
+            name: "Terminal resize reflow",
+            menu_description: "Rebuild Codex-owned transcript scrollback when the terminal width changes.",
+            announcement: "",
+        },
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::WebSearchRequest,
         key: "web_search_request",
         stage: Stage::Deprecated,
@@ -699,12 +776,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::GeneralAnalytics,
-        key: "general_analytics",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::Sqlite,
         key: "sqlite",
         stage: Stage::Removed,
@@ -716,7 +787,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         stage: Stage::Experimental {
             name: "Memories",
             menu_description: "Allow Codex to create new memories from conversations and bring relevant memories into new conversations.",
-            announcement: "NEW: Codex can now generate and uses memories. Try is now with `/memories`",
+            announcement: "NEW: Codex can now generate and use memories. Try it now with `/memories`",
         },
         default_enabled: false,
     },
@@ -752,7 +823,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     },
     FeatureSpec {
         id: Feature::CodexHooks,
-        key: "codex_hooks",
+        key: "hooks",
         stage: Stage::Stable,
         default_enabled: true,
     },
@@ -829,6 +900,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::EnableMcpApps,
+        key: "enable_mcp_apps",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AppsMcpPathOverride,
+        key: "apps_mcp_path_override",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ToolSearch,
         key: "tool_search",
         stage: Stage::Stable,
@@ -843,8 +926,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::UnavailableDummyTools,
         key: "unavailable_dummy_tools",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ToolSuggest,
@@ -859,6 +942,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::PluginHooks,
+        key: "plugin_hooks",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::InAppBrowser,
         key: "in_app_browser",
         stage: Stage::Stable,
@@ -867,6 +956,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::BrowserUse,
         key: "browser_use",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::BrowserUseExternal,
+        key: "browser_use_external",
         stage: Stage::Stable,
         default_enabled: true,
     },
@@ -921,6 +1016,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "guardian_approval",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::Goals,
+        key: "goals",
+        stage: Stage::Experimental {
+            name: "Goals",
+            menu_description: "Set a persistent goal Codex can continue over time",
+            announcement: "",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CollaborationModes,
@@ -1020,6 +1125,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
         stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RemoteCompactionV2,
+        key: "remote_compaction_v2",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {

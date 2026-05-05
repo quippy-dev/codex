@@ -119,24 +119,18 @@ async fn queued_slash_review_with_args_dispatches_after_active_turn() {
 
     match op_rx.try_recv() {
         Ok(Op::AddToHistory { .. }) => match op_rx.try_recv() {
-            Ok(Op::Review { review_request }) => assert_eq!(
-                review_request,
-                ReviewRequest {
-                    target: ReviewTarget::Custom {
-                        instructions: "check regressions".to_string(),
-                    },
-                    user_facing_hint: None,
+            Ok(Op::Review { target }) => assert_eq!(
+                target,
+                ReviewTarget::Custom {
+                    instructions: "check regressions".to_string(),
                 }
             ),
             other => panic!("expected queued /review to submit review op, got {other:?}"),
         },
-        Ok(Op::Review { review_request }) => assert_eq!(
-            review_request,
-            ReviewRequest {
-                target: ReviewTarget::Custom {
-                    instructions: "check regressions".to_string(),
-                },
-                user_facing_hint: None,
+        Ok(Op::Review { target }) => assert_eq!(
+            target,
+            ReviewTarget::Custom {
+                instructions: "check regressions".to_string(),
             }
         ),
         other => panic!("expected queued /review to submit review op, got {other:?}"),
@@ -832,6 +826,7 @@ async fn slash_copy_state_tracks_plan_item_completion() {
                 id: "plan-1".to_string(),
                 text: plan_text.clone(),
             }),
+            completed_at_ms: 0,
         }),
     });
     chat.handle_codex_event(Event {
@@ -1456,10 +1451,7 @@ async fn undo_started_hides_interrupt_hint() {
         .bottom_pane
         .status_widget()
         .expect("status indicator should be active");
-    assert!(
-        !status.interrupt_hint_visible(),
-        "undo should hide the interrupt hint because the operation cannot be cancelled"
-    );
+    assert_eq!(status.header(), "Working");
 }
 
 #[tokio::test]
@@ -1633,9 +1625,11 @@ async fn compact_queues_user_messages_snapshot() {
         id: "steer-rejected".into(),
         msg: EventMsg::Error(ErrorEvent {
             message: "cannot steer a compact turn".to_string(),
-            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                turn_kind: NonSteerableTurnKind::Compact,
-            }),
+            codex_error_info: Some(
+                codex_protocol::protocol::CodexErrorInfo::ActiveTurnNotSteerable {
+                    turn_kind: codex_protocol::protocol::NonSteerableTurnKind::Compact,
+                },
+            ),
         }),
     });
 

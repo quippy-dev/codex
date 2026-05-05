@@ -2,7 +2,7 @@ use super::*;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::auth::AuthFileRuntime;
 use codex_core::config::ConfigBuilder;
-use codex_core::config_loader::CloudRequirementsLoader;
+use codex_config::CloudRequirementsLoader;
 use codex_login::AuthManager;
 use toml::Value as TomlValue;
 
@@ -55,7 +55,8 @@ pub(crate) async fn prepare_runtime_bootstrap(
                 &config,
                 /*enable_codex_api_key_env*/ false,
                 auth_file.clone(),
-            )?;
+            )
+            .await?;
             cloud_requirements_loader(
                 auth_manager,
                 config.chatgpt_base_url,

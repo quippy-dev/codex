@@ -1,4 +1,5 @@
 use crate::CommandToolOptions;
+use crate::REQUEST_PLUGIN_INSTALL_TOOL_NAME;
 use crate::REQUEST_USER_INPUT_TOOL_NAME;
 use crate::ResponsesApiNamespace;
 use crate::ResponsesApiNamespaceTool;
@@ -6,7 +7,6 @@ use crate::ShellToolOptions;
 use crate::SpawnAgentToolOptions;
 use crate::TOOL_SEARCH_DEFAULT_LIMIT;
 use crate::TOOL_SEARCH_TOOL_NAME;
-use crate::TOOL_SUGGEST_TOOL_NAME;
 use crate::ToolHandlerKind;
 use crate::ToolName;
 use crate::ToolRegistryPlan;
@@ -19,16 +19,18 @@ use crate::ViewImageToolOptions;
 use crate::WebSearchToolOptions;
 use crate::coalesce_loadable_tool_specs;
 use crate::collect_code_mode_exec_prompt_tool_definitions;
+use crate::collect_request_plugin_install_entries;
 use crate::collect_tool_search_source_infos;
-use crate::collect_tool_suggest_entries;
 use crate::create_apply_patch_freeform_tool;
 use crate::create_apply_patch_json_tool;
 use crate::create_close_agent_tool_v1;
 use crate::create_close_agent_tool_v2;
 use crate::create_code_mode_tool;
 use crate::create_compact_parent_context_tool;
+use crate::create_create_goal_tool;
 use crate::create_exec_command_tool;
 use crate::create_followup_task_tool;
+use crate::create_get_goal_tool;
 use crate::create_image_generation_tool;
 use crate::create_list_agents_tool;
 use crate::create_list_agents_tool_v1;
@@ -40,6 +42,7 @@ use crate::create_peek_agents_tool;
 use crate::create_read_mcp_resource_tool;
 use crate::create_report_agent_job_result_tool;
 use crate::create_request_permissions_tool;
+use crate::create_request_plugin_install_tool;
 use crate::create_request_user_input_tool;
 use crate::create_resume_agent_tool;
 use crate::create_send_input_tool_v1;
@@ -51,7 +54,7 @@ use crate::create_spawn_agent_tool_v2;
 use crate::create_spawn_agents_on_csv_tool;
 use crate::create_test_sync_tool;
 use crate::create_tool_search_tool;
-use crate::create_tool_suggest_tool;
+use crate::create_update_goal_tool;
 use crate::create_update_plan_tool;
 use crate::create_view_image_tool;
 use crate::create_wait_agent_tool_v1;
@@ -135,7 +138,7 @@ pub fn build_tool_registry_plan(
         );
     }
 
-    if config.has_environment {
+    if config.environment_mode.has_environment() {
         match &config.shell_type {
             ConfigShellToolType::Default => {
                 plan.push_spec(
@@ -184,7 +187,9 @@ pub fn build_tool_registry_plan(
         }
     }
 
-    if config.has_environment && config.shell_type != ConfigShellToolType::Disabled {
+    if config.environment_mode.has_environment()
+        && config.shell_type != ConfigShellToolType::Disabled
+    {
         plan.register_handler("shell", ToolHandlerKind::Shell);
         plan.register_handler("container.exec", ToolHandlerKind::Shell);
         plan.register_handler("local_shell", ToolHandlerKind::Shell);
@@ -218,10 +223,30 @@ pub fn build_tool_registry_plan(
         config.code_mode_enabled,
     );
     plan.register_handler("update_plan", ToolHandlerKind::Plan);
+    if config.goal_tools {
+        plan.push_spec(
+            create_get_goal_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.register_handler("get_goal", ToolHandlerKind::Goal);
+        plan.push_spec(
+            create_create_goal_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.register_handler("create_goal", ToolHandlerKind::Goal);
+        plan.push_spec(
+            create_update_goal_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.register_handler("update_goal", ToolHandlerKind::Goal);
+    }
 
     plan.push_spec(
         create_request_user_input_tool(request_user_input_tool_description(
-            config.default_mode_request_user_input,
+            &config.request_user_input_available_modes,
         )),
         /*supports_parallel_tool_calls*/ false,
         config.code_mode_enabled,
@@ -243,20 +268,24 @@ pub fn build_tool_registry_plan(
     let deferred_dynamic_tools = params
         .dynamic_tools
         .iter()
-        .filter(|tool| tool.defer_loading)
+        .filter(|tool| tool.defer_loading && (config.namespace_tools || tool.namespace.is_none()))
         .collect::<Vec<_>>();
+    let deferred_mcp_tools_for_search = if config.namespace_tools {
+        params.deferred_mcp_tools
+    } else {
+        None
+    };
 
     if config.search_tool
-        && (params.deferred_mcp_tools.is_some() || !deferred_dynamic_tools.is_empty())
+        && (deferred_mcp_tools_for_search.is_some() || !deferred_dynamic_tools.is_empty())
     {
-        let mut search_source_infos = params
-            .deferred_mcp_tools
+        let mut search_source_infos = deferred_mcp_tools_for_search
             .map(|deferred_mcp_tools| {
                 collect_tool_search_source_infos(deferred_mcp_tools.iter().map(|tool| {
                     ToolSearchSource {
                         server_name: tool.server_name,
                         connector_name: tool.connector_name,
-                        connector_description: tool.connector_description,
+                        description: tool.description,
                     }
                 }))
             })
@@ -276,7 +305,7 @@ pub fn build_tool_registry_plan(
         );
         plan.register_handler(TOOL_SEARCH_TOOL_NAME, ToolHandlerKind::ToolSearch);
 
-        if let Some(deferred_mcp_tools) = params.deferred_mcp_tools {
+        if let Some(deferred_mcp_tools) = deferred_mcp_tools_for_search {
             for tool in deferred_mcp_tools {
                 plan.register_handler(tool.name.clone(), ToolHandlerKind::Mcp);
             }
@@ -288,14 +317,19 @@ pub fn build_tool_registry_plan(
             params.discoverable_tools.filter(|tools| !tools.is_empty())
     {
         plan.push_spec(
-            create_tool_suggest_tool(&collect_tool_suggest_entries(discoverable_tools)),
+            create_request_plugin_install_tool(&collect_request_plugin_install_entries(
+                discoverable_tools,
+            )),
             /*supports_parallel_tool_calls*/ true,
             /*code_mode_enabled*/ false,
         );
-        plan.register_handler(TOOL_SUGGEST_TOOL_NAME, ToolHandlerKind::ToolSuggest);
+        plan.register_handler(
+            REQUEST_PLUGIN_INSTALL_TOOL_NAME,
+            ToolHandlerKind::RequestPluginInstall,
+        );
     }
 
-    if config.has_environment
+    if config.environment_mode.has_environment()
         && let Some(apply_patch_tool_type) = &config.apply_patch_tool_type
     {
         match apply_patch_tool_type {
@@ -317,7 +351,7 @@ pub fn build_tool_registry_plan(
         plan.register_handler("apply_patch", ToolHandlerKind::ApplyPatch);
     }
 
-    if config.has_environment
+    if config.environment_mode.has_environment()
         && config
             .experimental_supported_tools
             .iter()
@@ -364,7 +398,7 @@ pub fn build_tool_registry_plan(
         );
     }
 
-    if config.has_environment {
+    if config.environment_mode.has_environment() {
         plan.push_spec(
             create_view_image_tool(ViewImageToolOptions {
                 can_request_original_image_detail: config.can_request_original_image_detail,
@@ -588,6 +622,11 @@ pub fn build_tool_registry_plan(
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
+    }
+
+    if !config.namespace_tools {
+        plan.specs
+            .retain(|configured_tool| !matches!(&configured_tool.spec, ToolSpec::Namespace(_)));
     }
 
     plan

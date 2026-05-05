@@ -8,20 +8,27 @@ fn preset_names_use_mode_display_names() {
         default_preset(CollaborationModesConfig::default()).name,
         ModeKind::Default.display_name()
     );
+    assert_eq!(plan_preset().model, None);
     assert_eq!(
         plan_preset().reasoning_effort,
         Some(Some(ReasoningEffort::Medium))
+    );
+    assert_eq!(
+        default_preset(CollaborationModesConfig::default()).model,
+        None
+    );
+    assert_eq!(
+        default_preset(CollaborationModesConfig::default()).reasoning_effort,
+        None
     );
 }
 
 #[test]
 fn default_mode_instructions_replace_mode_names_placeholder() {
-    let default_instructions = default_preset(CollaborationModesConfig {
-        default_mode_request_user_input: true,
-    })
-    .developer_instructions
-    .expect("default preset should include instructions")
-    .expect("default instructions should be set");
+    let default_instructions = default_preset(CollaborationModesConfig::default())
+        .developer_instructions
+        .expect("default preset should include instructions")
+        .expect("default instructions should be set");
 
     assert!(!default_instructions.contains("{{KNOWN_MODE_NAMES}}"));
     assert!(!default_instructions.contains("{{REQUEST_USER_INPUT_AVAILABILITY}}"));
@@ -31,23 +38,27 @@ fn default_mode_instructions_replace_mode_names_placeholder() {
     let expected_snippet = format!("Known mode names are {known_mode_names}.");
     assert!(default_instructions.contains(&expected_snippet));
 
-    let expected_availability_message = request_user_input_availability_message(
-        ModeKind::Default,
-        /*default_mode_request_user_input*/ true,
+    assert!(
+        default_instructions
+            .contains("The `request_user_input` tool is unavailable in Default mode.")
     );
-    assert!(default_instructions.contains(&expected_availability_message));
-    assert!(default_instructions.contains("prefer using the `request_user_input` tool"));
-}
-
-#[test]
-fn default_mode_instructions_use_plain_text_questions_when_feature_disabled() {
-    let default_instructions = default_preset(CollaborationModesConfig::default())
-        .developer_instructions
-        .expect("default preset should include instructions")
-        .expect("default instructions should be set");
-
-    assert!(!default_instructions.contains("prefer using the `request_user_input` tool"));
     assert!(
         default_instructions.contains("ask the user directly with a concise plain-text question")
     );
+}
+
+#[test]
+fn default_mode_instructions_reflect_request_user_input_feature_flag() {
+    let disabled = default_mode_instructions(CollaborationModesConfig {
+        default_mode_request_user_input: false,
+    });
+    let enabled = default_mode_instructions(CollaborationModesConfig {
+        default_mode_request_user_input: true,
+    });
+
+    assert!(disabled.contains("The `request_user_input` tool is unavailable in Default mode."));
+    assert!(disabled.contains("ask the user directly with a concise plain-text question"));
+
+    assert!(enabled.contains("The `request_user_input` tool is available in Default mode."));
+    assert!(enabled.contains("prefer using the `request_user_input` tool"));
 }

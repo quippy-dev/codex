@@ -180,19 +180,19 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
     remote_models: RwLock<Vec<ModelInfo>>,
-    collaboration_modes_config: CollaborationModesConfig,
     etag: RwLock<Option<String>>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
+    collaboration_modes_config: CollaborationModesConfig,
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
 #[derive(Debug)]
 pub struct StaticModelsManager {
     remote_models: Vec<ModelInfo>,
-    collaboration_modes_config: CollaborationModesConfig,
     auth_manager: Option<Arc<AuthManager>>,
+    collaboration_modes_config: CollaborationModesConfig,
 }
 
 impl OpenAiModelsManager {
@@ -208,11 +208,11 @@ impl OpenAiModelsManager {
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
             remote_models: RwLock::new(remote_models),
-            collaboration_modes_config,
             etag: RwLock::new(None),
             cache_manager,
             endpoint_client,
             auth_manager,
+            collaboration_modes_config,
         }
     }
 }
@@ -226,8 +226,8 @@ impl StaticModelsManager {
     ) -> Self {
         Self {
             remote_models: model_catalog.models,
-            collaboration_modes_config,
             auth_manager,
+            collaboration_modes_config,
         }
     }
 }
