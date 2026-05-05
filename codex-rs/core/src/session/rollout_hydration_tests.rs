@@ -64,7 +64,6 @@ async fn sample_rollout(
         content: vec![ContentItem::InputText {
             text: "first user".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
     live_history.record_items(
@@ -79,7 +78,6 @@ async fn sample_rollout(
         content: vec![ContentItem::OutputText {
             text: "assistant reply one".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
     live_history.record_items(
@@ -94,7 +92,6 @@ async fn sample_rollout(
         content: vec![ContentItem::InputText {
             text: "second user".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
     live_history.record_items(
@@ -109,7 +106,6 @@ async fn sample_rollout(
         content: vec![ContentItem::OutputText {
             text: "assistant reply two".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
     live_history.record_items(

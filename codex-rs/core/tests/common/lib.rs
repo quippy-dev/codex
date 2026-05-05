@@ -3,6 +3,7 @@
 use anyhow::Context as _;
 use anyhow::ensure;
 use codex_arg0::Arg0PathEntryGuard;
+use codex_config::ConfigRequirementsToml;
 use codex_utils_cargo_bin::CargoBinError;
 use ctor::ctor;
 use std::sync::OnceLock;
@@ -10,6 +11,7 @@ use tempfile::TempDir;
 
 use codex_config::CloudRequirementsLoader;
 use codex_config::LoaderOverrides;
+use codex_config::NetworkRequirementsToml;
 use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -192,6 +194,19 @@ pub async fn load_default_config_for_test_with_cloud_requirements(
         .build()
         .await
         .expect("defaults for test should always succeed")
+}
+
+pub fn managed_network_requirements_loader() -> CloudRequirementsLoader {
+    CloudRequirementsLoader::new(async {
+        Ok(Some(ConfigRequirementsToml {
+            network: Some(NetworkRequirementsToml {
+                enabled: Some(true),
+                allow_local_binding: Some(true),
+                ..NetworkRequirementsToml::default()
+            }),
+            ..ConfigRequirementsToml::default()
+        }))
+    })
 }
 
 #[cfg(target_os = "linux")]

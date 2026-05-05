@@ -14,6 +14,7 @@ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHand
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::registry::ToolRegistry;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_features::Feature;
 use codex_login::AuthManager;
@@ -157,6 +158,23 @@ where
     }
 }
 
+fn expect_response_output(response: ResponseInputItem) -> (String, Option<bool>) {
+    match response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => {
+            let content = match output.body {
+                FunctionCallOutputBody::Text(text) => text,
+                FunctionCallOutputBody::ContentItems(items) => {
+                    codex_protocol::models::function_call_output_content_items_to_text(&items)
+                        .unwrap_or_default()
+                }
+            };
+            (content, output.success)
+        }
+        other => panic!("expected function output, got {other:?}"),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ListAgentsResult {
     agents: Vec<ListedAgentResult>,
@@ -268,11 +286,15 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
             "agent_type": "explorer"
         })),
     );
-    let output = SpawnAgentHandler
-        .handle(invocation)
-        .await
-        .expect("spawn_agent should succeed");
-    let (content, _) = expect_text_output(output);
+    let output = ToolRegistry::with_handler_for_test(
+        codex_tools::ToolName::plain("spawn_agent"),
+        Arc::new(SpawnAgentHandler),
+    )
+    .dispatch_any(invocation)
+    .await
+    .expect("spawn_agent should succeed")
+    .into_response();
+    let (content, _) = expect_response_output(output);
     let result: SpawnAgentResult =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
     let agent_id = parse_agent_id(&result.agent_id);
@@ -1707,8 +1729,24 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
     );
 }
 
-#[tokio::test]
-async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+#[test]
+fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+    std::thread::Builder::new()
+        .name("spawn-agent-runtime-sandbox-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(spawn_agent_reapplies_runtime_sandbox_after_role_config_inner());
+        })
+        .expect("test thread should spawn")
+        .join()
+        .expect("test thread should complete");
+}
+
+async fn spawn_agent_reapplies_runtime_sandbox_after_role_config_inner() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,

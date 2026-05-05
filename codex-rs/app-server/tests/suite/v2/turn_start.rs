@@ -1098,9 +1098,11 @@ async fn turn_start_uses_thread_feature_overrides_for_request_user_input_tool_de
     let request = response_mock.single_request();
     let payload_text = request.body_json().to_string();
     assert!(
-        payload_text.contains(
-            "This tool is only available in modes: Plan,Default,Execute,Pair Programming."
-        ),
+        payload_text.contains("The `request_user_input` tool is available in Default mode."),
+        "{payload_text}"
+    );
+    assert!(
+        payload_text.contains("prefer using the `request_user_input` tool"),
         "{payload_text}"
     );
 

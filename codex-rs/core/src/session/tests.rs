@@ -609,7 +609,6 @@ async fn later_plain_plan_mode_messages_do_not_clear_cached_latest_proposed_plan
             content: vec![ContentItem::OutputText {
                 text: format!("<proposed_plan>\n{plan_text}</proposed_plan>\n"),
             }],
-            end_turn: None,
             phase: None,
         },
     )
@@ -627,7 +626,6 @@ async fn later_plain_plan_mode_messages_do_not_clear_cached_latest_proposed_plan
             content: vec![ContentItem::OutputText {
                 text: "trailing explanation without plan markup".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     )
@@ -655,7 +653,7 @@ fn make_mcp_tool(
         server_name: server_name.to_string(),
         callable_name: tool_name.to_string(),
         callable_namespace,
-        server_instructions: None,
+        namespace_description: None,
         tool: Tool {
             name: tool_name.to_string().into(),
             title: None,
@@ -670,7 +668,6 @@ fn make_mcp_tool(
         connector_id: connector_id.map(str::to_string),
         connector_name: connector_name.map(str::to_string),
         plugin_display_names: Vec::new(),
-        connector_description: None,
     }
 }
 

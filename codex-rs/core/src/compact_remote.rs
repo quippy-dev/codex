@@ -482,7 +482,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "first goal".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let middle_assistant = ResponseItem::Message {
@@ -491,7 +490,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "older response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let latest_user = ResponseItem::Message {
@@ -500,7 +498,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "latest question".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         history.record_items(
@@ -542,7 +539,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "session prefix".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let first_user = ResponseItem::Message {
@@ -551,7 +547,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "first goal".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let old_assistant = ResponseItem::Message {
@@ -560,7 +555,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "older response".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let middle_user = ResponseItem::Message {
@@ -569,7 +563,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "middle question".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let latest_user = ResponseItem::Message {
@@ -578,7 +571,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "latest question".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let latest_assistant = ResponseItem::Message {
@@ -587,7 +579,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "latest answer".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         history.record_items(
@@ -637,7 +628,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "system guidance".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let tool_output = ResponseItem::FunctionCallOutput {
@@ -674,7 +664,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "only user turn".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let assistant = ResponseItem::Message {
@@ -683,7 +672,6 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "assistant output".to_string(),
             }],
-            end_turn: None,
             phase: None,
         };
         let tool_output = ResponseItem::FunctionCallOutput {

@@ -314,6 +314,7 @@ async fn reconstruct_history_hydrates_latest_proposed_plan_text_from_plan_item_c
                 id: "plan-item-id".to_string(),
                 text: plan_text.clone(),
             }),
+            completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
@@ -423,6 +424,7 @@ async fn reconstruct_history_ignores_obsolete_plan_items_before_replacement_hist
                 id: "obsolete-plan-id".to_string(),
                 text: obsolete_plan_text,
             }),
+            completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {

@@ -8,6 +8,7 @@ use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
 
 use base64::Engine;
+use codex_client::CodexHttpClient;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use pretty_assertions::assert_eq;
@@ -357,7 +358,9 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         codex_home.path(),
         updated_auth_dot_json,
         AuthCredentialsStoreMode::File,
+        /*auth_file*/ None,
         /*chatgpt_base_url*/ None,
+        CodexHttpClient::new(reqwest::Client::new()),
     )
     .await
     .expect("updated auth should parse");
@@ -659,6 +662,7 @@ async fn build_config(
     AuthConfig {
         codex_home: codex_home.to_path_buf(),
         auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        auth_file: None,
         forced_login_method,
         forced_chatgpt_workspace_id,
         chatgpt_base_url: None,

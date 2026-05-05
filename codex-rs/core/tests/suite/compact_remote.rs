@@ -151,7 +151,7 @@ async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
             output_modality: RealtimeOutputModality::Audio,
             prompt: Some(Some("backend prompt".to_string())),
-            session_id: None,
+            realtime_session_id: None,
             transport: None,
             voice: None,
         }))
@@ -167,8 +167,12 @@ async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
 
     wait_for_event_match(codex, |msg| match msg {
         EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
-            payload: RealtimeEvent::SessionUpdated { session_id, .. },
-        }) => Some(session_id.clone()),
+            payload:
+                RealtimeEvent::SessionUpdated {
+                    realtime_session_id,
+                    ..
+                },
+        }) => Some(realtime_session_id.clone()),
         _ => None,
     })
     .await;
@@ -1364,7 +1368,6 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::OutputText {
                 text: "COMPACTED_ASSISTANT_NOTE".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     ];
@@ -1503,7 +1506,6 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
             content: vec![ContentItem::InputText {
                 text: stale_developer_message.to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Compaction {
@@ -1641,7 +1643,6 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
             content: vec![ContentItem::InputText {
                 text: stale_developer_message.to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::Compaction {
@@ -2246,8 +2247,9 @@ async fn snapshot_request_shape_remote_mid_turn_realtime_end() -> Result<()> {
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
         let _ = config.features.enable(Feature::RequestPermissionsTool);
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.permissions.sandbox_policy =
-            Constrained::allow_any(SandboxPolicy::new_read_only_policy());
+        config
+            .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy())
+            .expect("set sandbox policy");
     });
     let test = builder.build(&server).await?;
     let rollout_path = test
@@ -2350,8 +2352,9 @@ async fn snapshot_request_shape_remote_resume_after_same_turn_realtime_end_uses_
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
         let _ = config.features.enable(Feature::RequestPermissionsTool);
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.permissions.sandbox_policy =
-            Constrained::allow_any(SandboxPolicy::new_read_only_policy());
+        config
+            .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy())
+            .expect("set sandbox policy");
     });
     let initial = builder.build(&server).await?;
     let home = initial.home.clone();
@@ -2434,8 +2437,9 @@ async fn snapshot_request_shape_remote_resume_after_same_turn_realtime_end_uses_
         remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
             let _ = config.features.enable(Feature::RequestPermissionsTool);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-            config.permissions.sandbox_policy =
-                Constrained::allow_any(SandboxPolicy::new_read_only_policy());
+            config
+                .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy())
+                .expect("set sandbox policy");
         });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
 
@@ -2493,8 +2497,9 @@ async fn snapshot_request_shape_remote_compact_resume_after_same_turn_realtime_e
     let mut builder = remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
         let _ = config.features.enable(Feature::RequestPermissionsTool);
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.permissions.sandbox_policy =
-            Constrained::allow_any(SandboxPolicy::new_read_only_policy());
+        config
+            .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy())
+            .expect("set sandbox policy");
     });
     let initial = builder.build(&server).await?;
     let home = initial.home.clone();
@@ -2588,8 +2593,9 @@ async fn snapshot_request_shape_remote_compact_resume_after_same_turn_realtime_e
         remote_realtime_test_codex_builder(&realtime_server).with_config(|config| {
             let _ = config.features.enable(Feature::RequestPermissionsTool);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-            config.permissions.sandbox_policy =
-                Constrained::allow_any(SandboxPolicy::new_read_only_policy());
+            config
+                .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy())
+                .expect("set sandbox policy");
         });
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
 

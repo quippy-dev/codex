@@ -1754,7 +1754,7 @@ mod tests {
         start_embedded_app_server(
             Arg0DispatchPaths::default(),
             config.clone(),
-            config.codex_home.clone(),
+            config.codex_home.to_path_buf(),
             Vec::new(),
             LoaderOverrides::default(),
             CloudRequirementsLoader::default(),
@@ -2102,7 +2102,7 @@ mod tests {
         let result = start_embedded_app_server_with(
             Arg0DispatchPaths::default(),
             config.clone(),
-            config.codex_home.clone(),
+            config.codex_home.to_path_buf(),
             Vec::new(),
             LoaderOverrides::default(),
             CloudRequirementsLoader::default(),

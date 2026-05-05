@@ -113,7 +113,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "hello".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Reasoning {
@@ -140,7 +139,6 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "hello".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Reasoning {

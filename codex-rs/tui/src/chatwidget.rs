@@ -6097,7 +6097,8 @@ impl ChatWidget {
                     self.enter_review_mode_with_hint(review, /*from_replay*/ true);
                 }
             }
-            ThreadItem::ExitedReviewMode { .. } => {
+            ThreadItem::ExitedReviewMode { review, .. } => {
+                self.record_agent_markdown(&review);
                 self.exit_review_mode_after_item();
             }
             ThreadItem::ContextCompaction { .. } => {

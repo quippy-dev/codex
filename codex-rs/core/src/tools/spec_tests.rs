@@ -660,7 +660,7 @@ async fn request_user_input_description_reflects_default_mode_feature_flag() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
@@ -680,7 +680,7 @@ async fn request_user_input_description_reflects_default_mode_feature_flag() {
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
-        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
