@@ -3,6 +3,7 @@ use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use codex_git_utils::CreateGhostCommitOptions;
+use codex_git_utils::GhostSnapshotConfig as GitGhostSnapshotConfig;
 use codex_git_utils::GhostSnapshotReport;
 use codex_git_utils::GitToolingError;
 use codex_git_utils::create_ghost_commit_with_report;
@@ -80,7 +81,11 @@ impl SessionTask for GhostSnapshotTask {
                 _ = async {
                     let repo_path = initial_turn_context_for_task.cwd.clone();
                     let ghost_snapshot = initial_turn_context_for_task.ghost_snapshot.clone();
-                    let ghost_snapshot_for_commit = ghost_snapshot.clone();
+                    let ghost_snapshot_for_commit = GitGhostSnapshotConfig {
+                        ignore_large_untracked_files: ghost_snapshot.ignore_large_untracked_files,
+                        ignore_large_untracked_dirs: ghost_snapshot.ignore_large_untracked_dirs,
+                        disable_warnings: ghost_snapshot.disable_warnings,
+                    };
                     // Required to run in a dedicated blocking pool.
                     match tokio::task::spawn_blocking(move || {
                         let options =
@@ -135,7 +140,10 @@ impl SessionTask for GhostSnapshotTask {
                                 format!("Snapshots disabled after ghost snapshot panic: {err}.");
                             session
                                 .session
-                                .notify_background_event(&initial_turn_context_for_task, message)
+                                .send_event(
+                                    &initial_turn_context_for_task,
+                                    EventMsg::Warning(WarningEvent { message }),
+                                )
                                 .await;
                         }
                     }
@@ -246,7 +254,3 @@ fn format_bytes(bytes: i64) -> String {
     }
     format!("{bytes} B")
 }
-
-#[cfg(test)]
-#[path = "ghost_snapshot_tests.rs"]
-mod tests;

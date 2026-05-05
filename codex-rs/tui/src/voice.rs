@@ -6,12 +6,11 @@ use crate::audio_device::preferred_input_config;
 use crate::audio_device::select_configured_input_device_and_config;
 use crate::legacy_core::config::Config;
 use base64::Engine;
+use codex_app_server_protocol::ThreadRealtimeAudioChunk;
 use codex_client::build_reqwest_client_with_custom_ca;
 use codex_login::AuthMode;
 use codex_login::CodexAuth;
 use codex_login::default_client::get_codex_user_agent;
-use codex_protocol::protocol::ConversationAudioParams;
-use codex_protocol::protocol::RealtimeAudioFrame;
 use cpal::traits::DeviceTrait;
 use cpal::traits::HostTrait;
 use cpal::traits::StreamTrait;
@@ -485,14 +484,12 @@ fn send_realtime_audio_chunk(
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     let samples_per_channel = (samples.len() / usize::from(MODEL_AUDIO_CHANNELS)) as u32;
 
-    tx.realtime_conversation_audio(ConversationAudioParams {
-        frame: RealtimeAudioFrame {
-            data: encoded,
-            sample_rate: MODEL_AUDIO_SAMPLE_RATE,
-            num_channels: MODEL_AUDIO_CHANNELS,
-            samples_per_channel: Some(samples_per_channel),
-            item_id: None,
-        },
+    tx.realtime_conversation_audio(ThreadRealtimeAudioChunk {
+        data: encoded,
+        sample_rate: MODEL_AUDIO_SAMPLE_RATE,
+        num_channels: MODEL_AUDIO_CHANNELS,
+        samples_per_channel: Some(samples_per_channel),
+        item_id: None,
     });
 }
 
@@ -581,7 +578,7 @@ impl RealtimeAudioPlayer {
         })
     }
 
-    pub(crate) fn enqueue_frame(&self, frame: &RealtimeAudioFrame) -> Result<(), String> {
+    pub(crate) fn enqueue_frame(&self, frame: &ThreadRealtimeAudioChunk) -> Result<(), String> {
         if frame.num_channels == 0 || frame.sample_rate == 0 {
             return Err("invalid realtime audio frame format".to_string());
         }
@@ -932,7 +929,9 @@ async fn resolve_auth() -> Result<TranscriptionAuthContext, String> {
     let auth = CodexAuth::from_auth_storage(
         &auth_input.auth_storage_home,
         auth_input.auth_credentials_store_mode,
+        Some(auth_input.chatgpt_base_url.as_str()),
     )
+    .await
     .map_err(|e| format!("failed to read auth.json: {e}"))?
     .ok_or_else(|| "No Codex auth is configured; please run `codex login`".to_string())?;
 

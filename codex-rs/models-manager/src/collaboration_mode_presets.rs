@@ -1,5 +1,3 @@
-use crate::collaboration_mode_policy::asking_questions_guidance_message;
-use crate::collaboration_mode_policy::request_user_input_availability_message;
 use crate::collaboration_mode_policy::tui_visible_mode_names;
 use codex_collaboration_mode_templates::DEFAULT as COLLABORATION_MODE_DEFAULT;
 use codex_collaboration_mode_templates::EXECUTE as COLLABORATION_MODE_EXECUTE;
@@ -7,9 +5,14 @@ use codex_collaboration_mode_templates::PLAN as COLLABORATION_MODE_PLAN;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::openai_models::ReasoningEffort;
-const KNOWN_MODE_NAMES_PLACEHOLDER: &str = "{{KNOWN_MODE_NAMES}}";
-const REQUEST_USER_INPUT_AVAILABILITY_PLACEHOLDER: &str = "{{REQUEST_USER_INPUT_AVAILABILITY}}";
-const ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER: &str = "{{ASKING_QUESTIONS_GUIDANCE}}";
+use codex_utils_template::Template;
+use std::sync::LazyLock;
+
+const KNOWN_MODE_NAMES_TEMPLATE_KEY: &str = "KNOWN_MODE_NAMES";
+static COLLABORATION_MODE_DEFAULT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    Template::parse(COLLABORATION_MODE_DEFAULT)
+        .unwrap_or_else(|err| panic!("collaboration mode default template must parse: {err}"))
+});
 
 /// Stores feature flags that control collaboration-mode behavior.
 ///
@@ -63,23 +66,13 @@ fn execute_preset() -> CollaborationModeMask {
 }
 
 fn default_mode_instructions(collaboration_modes_config: CollaborationModesConfig) -> String {
+    let CollaborationModesConfig {
+        default_mode_request_user_input: _,
+    } = collaboration_modes_config;
     let known_mode_names = tui_visible_mode_names();
-    let default_mode_request_user_input =
-        collaboration_modes_config.default_mode_request_user_input;
-    let request_user_input_availability =
-        request_user_input_availability_message(ModeKind::Default, default_mode_request_user_input);
-    let asking_questions_guidance =
-        asking_questions_guidance_message(default_mode_request_user_input);
-    COLLABORATION_MODE_DEFAULT
-        .replace(KNOWN_MODE_NAMES_PLACEHOLDER, &known_mode_names)
-        .replace(
-            REQUEST_USER_INPUT_AVAILABILITY_PLACEHOLDER,
-            &request_user_input_availability,
-        )
-        .replace(
-            ASKING_QUESTIONS_GUIDANCE_PLACEHOLDER,
-            &asking_questions_guidance,
-        )
+    COLLABORATION_MODE_DEFAULT_TEMPLATE
+        .render([(KNOWN_MODE_NAMES_TEMPLATE_KEY, known_mode_names.as_str())])
+        .unwrap_or_else(|err| panic!("collaboration mode default template must render: {err}"))
 }
 
 #[cfg(test)]

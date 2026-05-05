@@ -34,7 +34,6 @@ pub(crate) fn retained_proposed_plan_context_message(plan_text: &str) -> Respons
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText { text }],
-        end_turn: None,
         phase: None,
     }
 }

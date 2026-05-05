@@ -14,6 +14,7 @@ use codex_login::AuthFileRuntime;
 use codex_login::CLIENT_ID;
 use codex_login::CodexAuth;
 use codex_login::ServerOptions;
+use codex_login::login_with_access_token;
 use codex_login::login_with_api_key;
 use codex_login::run_device_code_login;
 use codex_login::run_login_server;
@@ -34,6 +35,8 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
     "ChatGPT login is disabled. Use API key login instead.";
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
+const ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE: &str =
+    "Access token login is disabled. Use API key login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
 
 /// Installs a small file-backed tracing layer for direct `codex login` flows.
@@ -196,31 +199,80 @@ pub async fn run_login_with_api_key(
     }
 }
 
+pub async fn run_login_with_access_token(
+    cli_config_overrides: CliConfigOverrides,
+    access_token: String,
+    auth_file: Option<PathBuf>,
+) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    let _login_log_guard = init_login_file_logging(&config);
+    tracing::info!("starting access token login flow");
+
+    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
+        eprintln!("{ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE}");
+        std::process::exit(1);
+    }
+
+    let auth_storage_home = resolve_auth_storage_home_or_exit(&config, auth_file);
+
+    match login_with_access_token(
+        &auth_storage_home,
+        &access_token,
+        config.cli_auth_credentials_store_mode,
+        Some(&config.chatgpt_base_url),
+    )
+    .await
+    {
+        Ok(_) => {
+            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error logging in with access token: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub fn read_api_key_from_stdin() -> String {
+    read_stdin_secret(
+        "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`.",
+        "Reading API key from stdin...",
+        "No API key provided via stdin.",
+    )
+}
+
+pub fn read_access_token_from_stdin() -> String {
+    read_stdin_secret(
+        "--with-access-token expects the access token on stdin. Try piping it, e.g. `printenv CODEX_ACCESS_TOKEN | codex login --with-access-token`.",
+        "Reading access token from stdin...",
+        "No access token provided via stdin.",
+    )
+}
+
+fn read_stdin_secret(terminal_message: &str, reading_message: &str, empty_message: &str) -> String {
     let mut stdin = std::io::stdin();
 
     if stdin.is_terminal() {
-        eprintln!(
-            "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
-        );
+        eprintln!("{terminal_message}");
         std::process::exit(1);
     }
 
-    eprintln!("Reading API key from stdin...");
+    eprintln!("{reading_message}");
 
     let mut buffer = String::new();
     if let Err(err) = stdin.read_to_string(&mut buffer) {
-        eprintln!("Failed to read API key from stdin: {err}");
+        eprintln!("Failed to read stdin: {err}");
         std::process::exit(1);
     }
 
-    let api_key = buffer.trim().to_string();
-    if api_key.is_empty() {
-        eprintln!("No API key provided via stdin.");
+    let secret = buffer.trim().to_string();
+    if secret.is_empty() {
+        eprintln!("{empty_message}");
         std::process::exit(1);
     }
 
-    api_key
+    secret
 }
 
 /// Login using the OAuth device code flow.
@@ -339,9 +391,15 @@ pub async fn run_login_status(
     auth_file: Option<PathBuf>,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
-    let auth_storage_home = resolve_auth_storage_home_or_exit(&config, auth_file);
 
-    match CodexAuth::from_auth_storage(&auth_storage_home, config.cli_auth_credentials_store_mode) {
+    match CodexAuth::from_auth_storage_with_auth_file(
+        &config.codex_home,
+        config.cli_auth_credentials_store_mode,
+        auth_file,
+        Some(&config.chatgpt_base_url),
+    )
+    .await
+    {
         Ok(Some(auth)) => match auth.auth_mode() {
             AuthMode::ApiKey => match auth.get_token() {
                 Ok(api_key) => {
@@ -358,7 +416,7 @@ pub async fn run_login_status(
                 std::process::exit(0);
             }
             AuthMode::AgentIdentity => {
-                eprintln!("Logged in using Agent Identity");
+                eprintln!("Logged in using access token");
                 std::process::exit(0);
             }
         },
@@ -378,6 +436,7 @@ pub async fn run_logout(cli_config_overrides: CliConfigOverrides, auth_file: Opt
     let auth_runtime = resolve_auth_runtime_or_exit(&config, auth_file);
     let auth_manager = auth_runtime
         .shared_auth_manager(/*enable_codex_api_key_env*/ false)
+        .await
         .unwrap_or_else(|err| {
             eprintln!("Error resolving auth storage path: {err}");
             std::process::exit(1);

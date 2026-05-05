@@ -4,6 +4,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
+use codex_git_utils::GhostSnapshotConfig as GitGhostSnapshotConfig;
 use codex_git_utils::RestoreGhostCommitOptions;
 use codex_git_utils::restore_ghost_commit_with_options;
 use codex_protocol::models::ResponseItem;
@@ -97,6 +98,11 @@ impl SessionTask for UndoTask {
         let commit_id = ghost_commit.id().to_string();
         let repo_path = initial_turn_context.cwd.clone();
         let ghost_snapshot = initial_turn_context.ghost_snapshot.clone();
+        let ghost_snapshot = GitGhostSnapshotConfig {
+            ignore_large_untracked_files: ghost_snapshot.ignore_large_untracked_files,
+            ignore_large_untracked_dirs: ghost_snapshot.ignore_large_untracked_dirs,
+            disable_warnings: ghost_snapshot.disable_warnings,
+        };
         let restore_result = tokio::task::spawn_blocking(move || {
             let options = RestoreGhostCommitOptions::new(&repo_path).ghost_snapshot(ghost_snapshot);
             restore_ghost_commit_with_options(&options, &ghost_commit)
